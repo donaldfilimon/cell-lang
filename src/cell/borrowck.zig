@@ -1336,7 +1336,24 @@ test "R5: an exclusive borrow while a shared one is live is rejected" {
     );
 }
 
-test "R5: reading the owner through a live exclusive borrow is rejected" {
+test "R5: reading the whole owner through a live exclusive borrow is rejected" {
+    // R5's own example wording, naming the place as a whole. `println` has no
+    // signature here, so the argument is a plain read rather than a move.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    println(buf)
+        \\    use_it(e)
+        \\}
+    ,
+        \\t.cell:12:13: error: cannot use 'buf' while it is exclusively borrowed
+        \\t.cell:11:28: note: the exclusive borrow starts here and lasts to the end of this block
+        \\
+    );
+}
+
+test "R5: reading a field of the owner through a live exclusive borrow is rejected" {
     try expectDiagnostics(prelude ++
         \\pub fn main() {
         \\    let owned buf = Buffer { data: [], len: 0 }
