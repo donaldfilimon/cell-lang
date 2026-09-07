@@ -58,6 +58,7 @@ const std = @import("std");
 const Io = std.Io;
 const ast = @import("ast.zig");
 const hir = @import("hir.zig");
+const abi = @import("abi.zig");
 const types = @import("types.zig");
 const diag = @import("diag.zig");
 
@@ -137,6 +138,9 @@ const Emitter = struct {
 
     /// Set when a string pattern needed memcmp, so its declaration is emitted.
     uses_memcmp: bool = false,
+    /// The sret pointer's name while emitting a function that returns an
+    /// aggregate indirectly, or null.
+    sret: ?[]const u8 = null,
 
     const StringGlobal = struct { name: []const u8, bytes: []const u8 };
 
@@ -175,7 +179,18 @@ const Emitter = struct {
                 try self.unsupported(f.span, "declared return type");
                 continue;
             }
+            const sret_decl = abi.classifyReturn(self.module, f.ret) == .indirect;
             try self.out.print("  func.func private @{s}(", .{f.symbol});
+            if (sret_decl) {
+                // An aggregate too large for registers comes back through a
+                // caller-allocated buffer passed as a hidden FIRST parameter.
+                // Returning it by value here is not merely inconsistent with
+                // the LLVM backend, it is WRONG at a C boundary: measured, a
+                // 24-byte struct came back as 21248159473 instead of 21.
+                const nat = self.mlirTypeOwned(f.ret, .owned) orelse "!llvm.struct<()>";
+                try self.out.print("!llvm.ptr {{llvm.sret = {s}}}", .{nat});
+                if (f.param_count != 0) try self.out.writeAll(", ");
+            }
             var ok = true;
             for (f.params(), 0..) |p, i| {
                 if (i != 0) try self.out.writeAll(", ");
@@ -191,7 +206,9 @@ const Emitter = struct {
                 continue;
             }
             try self.out.writeAll(")");
-            if (ret) |r| try self.out.print(" -> {s}", .{r});
+            if (!sret_decl) {
+                if (ret) |r| try self.out.print(" -> {s}", .{r});
+            }
             try self.out.writeAll("\n");
         }
 
@@ -252,7 +269,14 @@ const Emitter = struct {
         try self.slot_ptr_to.resize(self.arena, f.bindings.len);
         for (self.slot_ptr_to.items) |*v| v.* = null;
 
+        const uses_sret = abi.classifyReturn(self.module, f.ret) == .indirect;
+        self.sret = if (uses_sret) "%sret" else null;
         try self.out.print("  func.func @{s}(", .{f.symbol});
+        if (uses_sret) {
+            const nat = self.mlirTypeOwned(f.ret, .owned) orelse "!llvm.struct<()>";
+            try self.out.print("%sret: !llvm.ptr {{llvm.sret = {s}}}", .{nat});
+            if (f.param_count != 0) try self.out.writeAll(", ");
+        }
         for (f.params(), 0..) |p, i| {
             if (i != 0) try self.out.writeAll(", ");
             const t = self.paramType(p.ty, p.ownership) orelse {
@@ -262,7 +286,9 @@ const Emitter = struct {
             try self.out.print("%arg{d}: {s}", .{ i, t });
         }
         try self.out.writeAll(")");
-        if (ret) |r| try self.out.print(" -> {s}", .{r});
+        if (!uses_sret) {
+            if (ret) |r| try self.out.print(" -> {s}", .{r});
+        }
         try self.out.writeAll(" {\n");
         self.indent = 4;
 
@@ -308,7 +334,9 @@ const Emitter = struct {
 
         // func.func requires a terminator on every block.
         if (!self.returned) {
-            if (ret) |r| {
+            if (uses_sret) {
+                try self.line("return", .{});
+            } else if (ret) |r| {
                 const zero = try self.nextSsa();
                 try self.line("{s} = arith.constant 0 : {s}", .{ zero, r });
                 try self.line("return {s} : {s}", .{ zero, r });
@@ -396,6 +424,9 @@ const Emitter = struct {
                 if (maybe) |e| {
                     const val = try self.emitExpr(&e);
                     if (val.isNone()) {
+                        try self.line("return", .{});
+                    } else if (self.sret) |dest| {
+                        try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ val.text, dest, val.ty });
                         try self.line("return", .{});
                     } else {
                         try self.line("return {s} : {s}", .{ val.text, val.ty });
@@ -690,7 +721,18 @@ const Emitter = struct {
             if (vals[i].isNone()) return Value.none;
         }
 
-        const ret = self.mlirType(e.ty);
+        const via_sret = abi.classifyReturn(self.module, e.ty) == .indirect;
+        var sret_slot: []const u8 = "";
+        if (via_sret) {
+            // The callee writes into a buffer WE allocate and returns nothing,
+            // so the result exists before the call rather than after it.
+            const nat = self.mlirTypeOwned(e.ty, .owned) orelse "!llvm.struct<()>";
+            const one = try self.nextSsa();
+            try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
+            sret_slot = try self.nextSsa();
+            try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ sret_slot, one, nat });
+        }
+        const ret = if (via_sret) null else self.mlirType(e.ty);
         var result: []const u8 = "";
         if (ret != null) {
             result = try self.nextSsa();
@@ -700,11 +742,19 @@ const Emitter = struct {
             try self.linePrefix();
         }
         try self.out.print("call @{s}(", .{sym});
+        if (via_sret) {
+            try self.out.writeAll(sret_slot);
+            if (vals.len != 0) try self.out.writeAll(", ");
+        }
         for (vals, 0..) |v, i| {
             if (i != 0) try self.out.writeAll(", ");
             try self.out.writeAll(v.text);
         }
         try self.out.writeAll(") : (");
+        if (via_sret) {
+            try self.out.writeAll("!llvm.ptr");
+            if (vals.len != 0) try self.out.writeAll(", ");
+        }
         for (vals, 0..) |v, i| {
             if (i != 0) try self.out.writeAll(", ");
             try self.out.writeAll(v.ty);
@@ -713,6 +763,12 @@ const Emitter = struct {
         if (ret) |r| try self.out.writeAll(r) else try self.out.writeAll("()");
         try self.out.writeAll("\n");
 
+        if (via_sret) {
+            const nat = self.mlirTypeOwned(e.ty, .owned) orelse "!llvm.struct<()>";
+            const loaded = try self.nextSsa();
+            try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ loaded, sret_slot, nat });
+            return .{ .text = loaded, .ty = nat };
+        }
         if (ret) |r| return .{ .text = result, .ty = r };
         return Value.none;
     }
@@ -1433,4 +1489,104 @@ test "[T] lowers as the runtime's type-erased slice header" {
     try std.testing.expect(!e.bag.hasErrors());
     try expectContains(e.text, "!llvm.struct<(ptr, i64, i64)>");
     try expectContains(e.text, "llvm.mlir.zero : !llvm.ptr");
+}
+
+test "a struct return over 16 bytes uses sret, because by value is WRONG" {
+    // This was not a consistency gap, it was a miscompile, and the plan said
+    // otherwise until it was measured. Returning a 24-byte struct by value
+    // from MLIR and calling it from C gave 21248159473 where the answer is 21.
+    // The LLVM backend already used sret and was already correct.
+    var e = try emitSource(
+        \\pub struct Big { copy a: Int, copy b: Int, copy c: Int }
+        \\pub fn make(copy n: Int) -> Big { return Big { a: n, b: n, c: n } }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "llvm.sret = !llvm.struct<(i64, i64, i64)>");
+    try expectContains(e.text, "llvm.store");
+}
+
+test "an sret round trip computes the right answer through the whole pipeline" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const mlir_opt = (try findTool(gpa, "mlir-opt")) orelse return error.SkipZigTest;
+    defer gpa.free(mlir_opt);
+    const mlir_translate = (try findTool(gpa, "mlir-translate")) orelse return error.SkipZigTest;
+    defer gpa.free(mlir_translate);
+    const llc = (try findTool(gpa, "llc")) orelse return error.SkipZigTest;
+    defer gpa.free(llc);
+
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub struct Big { copy a: Int, copy b: Int, copy c: Int }
+        \\pub fn make(copy n: Int) -> Big { return Big { a: n, b: n, c: n } }
+        \\pub fn sum(copy v: Big) -> Int { return v.a + v.b + v.c }
+        \\pub fn main() { print_int(sum(copy make(copy 7))) }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.mlir", .data = e.text });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "drv.c",
+        .data = "extern void cell_main(void);\nint main(void){cell_main();return 0;}\n",
+    });
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, mlir_opt);
+    try argv.append(gpa, "m.mlir");
+    for (lowering_passes) |p| try argv.append(gpa, p);
+    try argv.append(gpa, "-o");
+    try argv.append(gpa, "low.mlir");
+    const lowered = try std.process.run(gpa, io, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } });
+    defer gpa.free(lowered.stdout);
+    defer gpa.free(lowered.stderr);
+    if (!lowered.term.success()) {
+        std.debug.print("mlir-opt rejected:\n{s}\n--- mlir ---\n{s}\n", .{ lowered.stderr, e.text });
+        return error.MlirOptRejectedOutput;
+    }
+
+    const tr = try std.process.run(gpa, io, .{
+        .argv = &.{ mlir_translate, "--mlir-to-llvmir", "low.mlir", "-o", "m.ll" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(tr.stdout);
+    defer gpa.free(tr.stderr);
+    if (!tr.term.success()) return error.MlirTranslateFailed;
+
+    const co = try std.process.run(gpa, io, .{
+        .argv = &.{ llc, "-filetype=obj", "m.ll", "-o", "m.o" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(co.stdout);
+    defer gpa.free(co.stderr);
+    if (!co.term.success()) return error.LlcFailed;
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const rt_c = try std.fmt.allocPrint(gpa, "{s}/runtime/cell_rt.c", .{cwd_buf[0..cwd_len]});
+    defer gpa.free(rt_c);
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{cwd_buf[0..cwd_len]});
+    defer gpa.free(include);
+
+    const link = try std.process.run(gpa, io, .{
+        .argv = &.{ "cc", "m.o", "drv.c", rt_c, "-I", include, "-o", "prog" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(link.stdout);
+    defer gpa.free(link.stderr);
+    if (!link.term.success()) {
+        std.debug.print("link failed:\n{s}\n", .{link.stderr});
+        return error.LinkFailed;
+    }
+
+    const run = try std.process.run(gpa, io, .{ .argv = &.{"./prog"}, .cwd = .{ .dir = tmp.dir } });
+    defer gpa.free(run.stdout);
+    defer gpa.free(run.stderr);
+    if (!run.term.success()) return error.ProgramFailed;
+    // 7 * 3. By value this came back as 21248159473.
+    try std.testing.expectEqualStrings("21\n", run.stdout);
 }
