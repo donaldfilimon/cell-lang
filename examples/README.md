@@ -110,6 +110,7 @@ implemented.
 | `ownership.cell` | all five ownership modes; R2/R3/R5/R8/R14 enforced |
 | `arc.cell` | the `arc` mode and what the runtime already provides |
 | `backends.cell` | the cross-backend agreement case: scalar-only, carried by C, LLVM and MLIR alike, and all three print `24` |
+| `borrows.cell` | every borrow spelling (`shared`/`&`, `exclusive`/`&mut`/`&var`/`&exclusive`) and the keyword-wins rule for mixing |
 
 ## The future corpus
 

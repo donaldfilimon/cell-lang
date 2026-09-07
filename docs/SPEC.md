@@ -184,6 +184,55 @@ pairing rows of section 1.2. Re-deriving the 149-row index against the current
 tree is a separate, counted task; it was deliberately not attempted here rather
 than guessed at. Nothing else in section 12 was re-verified for this delta.
 
+### 0.8 Delta: the union with CELL v2.0, and three backends
+
+Two changes landed on 2026-09-07 that this index does not yet count. Recorded
+as a delta rather than patched into 0.2, for the reason 0.7 already gives: the
+149-row index is a measurement with a date on it, and re-deriving it is a
+separate counted task.
+
+**A second Cell exists, and this specification now says so.** A different
+implementation, "CELL v2.0", uses the same name and the same `.cell`/`.cel`
+extensions for a Zig-shaped language with error unions, `error_scope`/`raise`,
+and its own package manifest. Donald's decision is a deliberate union of the
+two surfaces: constructs are admitted one at a time, on evidence, and the
+ownership model and the C ABI are not up for negotiation. What has landed:
+
+- **`&var x` is a third spelling of `&mut x` and `&exclusive x`** (section 6.5).
+  It builds the identical AST node, so no later stage has a case for it; R15
+  compares it against the parameter exactly as it does the others. Measured:
+  `take(&var buf)` against an `owned` parameter is rejected with "the argument
+  is passed as 'exclusive'".
+- **A trailing `;` after an item is accepted and ignored** (section 7.1 already
+  made semicolons optional on statements; items were the exception). A `;`
+  cannot start an item, so this is unambiguous.
+
+**Explicitly refused, with the reason, so the decision is not re-litigated:**
+
+| Refused | Why |
+|---|---|
+| `switch` | `match` is implemented and lowers to C. In the other tree `kw_match` is declared but absent from its keyword map, so `match` does not even lex there, and its own README states "one construct, one keyword". Admitting `switch` also needs `\|x\|` captures, and `\|` is reserved here for pattern alternatives (2.10). |
+| `i32` / `f64` | Section 3.1 is normative and exhaustive. The largest known hole in the compiler is that an unrecognized type name silently becomes `void*`; the fix is an enumeration of known names, and doubling that enumeration for pure synonyms widens the hole for no expressiveness. |
+| `@import("std")` | Neither implementation resolves modules (8.4). Adding `@` to the lexer to admit a namespace that binds nothing is surface debt. |
+| `const Foo = struct { }` | A second item grammar for a meaning the existing one already expresses. The genuinely missing feature underneath it, a top-level `const` value binding, is worth having on its own and is not this. |
+| macros | The other implementation states outright that its expander is not hygienic. A construct that can invisibly introduce a binding can silently change which place a move kills, and the diagnostic would point into expanded source. That is not deferrable in a language whose claim is that ownership is checkable. |
+| `.bod` as a package manifest | Section 1.2 is normative: `.bod` is a body file. See below. |
+
+**The `.bod` collision, stated normatively.** Another implementation reads
+`.bod` as a package manifest. This specification does not, and a conforming
+implementation MUST treat `.bod` and `.body` as body files paired to a
+`.cell`/`.cel` module by filename stem, per section 1.2. The other reading is
+recorded here only so the conflict is visible rather than discovered.
+
+**Three backends.** `cell emit` now takes `--target=c|llvm|mlir`. C remains the
+only backend that lowers the whole language. The LLVM IR and MLIR backends go
+through a typed IR (`src/cell/hir.zig`) and are scalar-first: `String`, `[T]`,
+`T?`, `Result`, `arc`, and (for MLIR) structs produce a `cannot lower`
+diagnostic at the offending span rather than wrong output. Both are verified by
+executing what they emit. `examples/backends.cell` prints `24` through all
+three. Section 10's C ABI contract is unchanged and remains normative for the
+C backend.
+
 ---
 
 ## 1. Source files and modules
@@ -903,6 +952,20 @@ Inside call arguments the struct-literal restriction is lifted
 condition.
 
 ### 6.5 Unary operators
+
+**Borrow sigils, and the three spellings of a unique borrow.** `&x` is an
+alternative spelling of `shared x`, and `&mut x`, `&var x` and `&exclusive x`
+are all alternative spellings of `exclusive x`. The parser builds one node per
+mode, so the four unique-borrow forms are indistinguishable after parsing.
+`&var` is the CELL v2.0 spelling, admitted by the union recorded in 0.8.
+
+At a **call site**, a keyword prefix wins over an inner sigil: `f(owned &buf)`
+passes `buf` as `owned`, because the written keyword is the mode and the sigil
+is redundant with it. This differs from a **parameter**, where mixing an
+annotation with an ownership-qualified type (`fn f(owned a: shared Int)`) is
+specified as an error in 3.8, because those two annotations land in different
+places and produce different C, so there is no single coherent meaning to pick.
+
 
 **Status: `-` and `!` implemented. Reference operators parsed, then collapsed.**
 

@@ -1,0 +1,35 @@
+// The three spellings of a borrow, and the one rule for mixing them.
+//
+// This file exists because the union of the two Cell surfaces admits CELL
+// v2.0's `&var x` alongside this language's own keywords. They are not
+// similar constructs that happen to agree: the parser builds the SAME AST node
+// for all of them, so the borrow checker, the typechecker and every backend
+// have no case for the new spelling at all.
+
+pub struct Buffer { copy len: Int }
+
+pub fn look(shared b: Buffer) { }
+
+pub fn grow(exclusive b: Buffer) { }
+
+pub fn main() {
+    var owned buf = Buffer { len: 0 }
+
+    // A shared borrow. `shared buf` and `&buf` are the same thing.
+    look(shared buf)
+    look(&buf)
+
+    // A unique borrow, three ways. `&mut` is the Rust spelling, `&var` is the
+    // CELL v2.0 spelling, `&exclusive` is this language's keyword sigil, and
+    // `exclusive buf` is the keyword form.
+    grow(exclusive buf)
+    grow(&mut buf)
+    grow(&var buf)
+    grow(&exclusive buf)
+
+    // Mixing a keyword with an inner sigil is defined, not an error: the
+    // KEYWORD WINS. `exclusive &buf` is passed exclusively, because the
+    // written keyword is the mode and the sigil is redundant with it.
+    // src/cell/borrowck.zig records the rule where it is implemented.
+    grow(exclusive &buf)
+}

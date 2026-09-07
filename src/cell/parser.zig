@@ -41,6 +41,13 @@ pub const Parser = struct {
         errdefer items.deinit(self.allocator);
 
         while (!self.check(.eof)) {
+            // A trailing `;` after an item is accepted and ignored, so
+            // `pub struct Point { copy x: Float };` parses. SPEC 7.1 already
+            // makes semicolons optional on statements; items were the one
+            // place that was not true, and a `;` can never START an item
+            // (parseItem dispatches only on pub/fn/struct/enum/use), so
+            // skipping them here is unambiguous.
+            if (self.match(.semicolon)) continue;
             const parsed = try self.parseItem();
             try items.append(self.allocator, parsed);
         }
@@ -257,7 +264,15 @@ pub const Parser = struct {
             return self.unary(.not, try self.parseUnary(), start);
         }
         if (self.match(.amp)) {
-            const exclusive = self.match(.kw_mut) or self.match(.kw_exclusive);
+            // Three spellings of one unique borrow: `&mut x` (Rust), `&var x`
+            // (the CELL v2.0 surface), and `&exclusive x` (this language's own
+            // keyword). They are the SAME node, so borrowck, typecheck and
+            // codegen need no case for the new one -- `refKind` already
+            // normalizes every sigil to a LoanKind, and R15 already compares
+            // sigil-derived modes against the parameter's.
+            const exclusive = self.match(.kw_mut) or
+                self.match(.kw_exclusive) or
+                self.match(.kw_var);
             const operand = try self.parseUnary();
             return self.unary(if (exclusive) .ref_exclusive else .ref_shared, operand, start);
         }
@@ -1009,4 +1024,60 @@ test "a recorded parse failure renders as a diagnostic with a caret" {
         \\                    ^
         \\
     , w.buffered());
+}
+
+test "&var is a third spelling of &mut and &exclusive" {
+    // The union admits CELL v2.0's `&var x`. All three must build the SAME
+    // AST node, because every later stage keys off ref_exclusive and none of
+    // them was taught about the new spelling.
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "&mut b", "&var b", "&exclusive b" }) |spelling| {
+        const source = try std.fmt.allocPrint(gpa,
+            \\pub fn f(exclusive b: Int) {{ g({s}) }}
+        , .{spelling});
+        defer gpa.free(source);
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var lex = lexer.Lexer.init(source, "t.cell");
+        const tokens = try lex.tokenizeAll(a);
+        var p = Parser.init(a, tokens.items, "t.cell");
+        const module = try p.parseModule();
+
+        const body = module.items[0].kind.fn_def.body.?;
+        const call = body[0].kind.expr.kind.call;
+        try std.testing.expectEqual(ast.UnaryOp.ref_exclusive, call.args[0].kind.unary.op);
+    }
+}
+
+test "a bare & is still a shared borrow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var lex = lexer.Lexer.init("pub fn f(shared b: Int) { g(&b) }", "t.cell");
+    const tokens = try lex.tokenizeAll(a);
+    var p = Parser.init(a, tokens.items, "t.cell");
+    const module = try p.parseModule();
+    const call = module.items[0].kind.fn_def.body.?[0].kind.expr.kind.call;
+    try std.testing.expectEqual(ast.UnaryOp.ref_shared, call.args[0].kind.unary.op);
+}
+
+test "a trailing semicolon after an item is accepted and ignored" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var lex = lexer.Lexer.init(
+        \\pub struct Point { copy x: Float };
+        \\pub enum Color { Red };
+        \\pub fn f() { };
+        \\;
+        \\pub fn g() { }
+    , "t.cell");
+    const tokens = try lex.tokenizeAll(a);
+    var p = Parser.init(a, tokens.items, "t.cell");
+    const module = try p.parseModule();
+    // Four items, and the lone stray `;` on its own line contributes none.
+    try std.testing.expectEqual(@as(usize, 4), module.items.len);
 }

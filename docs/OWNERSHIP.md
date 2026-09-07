@@ -424,6 +424,14 @@ documentation rather than implying `copy` is safe.
 
 ### R13. Annotations must be consistent
 
+**R13.0 -- the borrow sigils are spellings, not annotations.** `&x` spells
+`shared x`; `&mut x`, `&var x` and `&exclusive x` all spell `exclusive x`.
+`refKind` normalizes every one of them to a `LoanKind` before any rule runs, so
+none of R1-R17 has a case for them and R15 compares a sigil-derived mode
+against a parameter exactly as it compares a written keyword. `&var` was
+admitted from the CELL v2.0 surface and required no change to this checker.
+
+
 1. A parameter may be annotated before the name (`shared a: Int`) or on the
    type (`a: shared Int`), never both.
 
