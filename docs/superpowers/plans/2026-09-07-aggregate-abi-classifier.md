@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build `src/cell/abi.zig`, a leaf module that classifies how a Cell type is passed and returned under AAPCS64, prove it against clang, and make the LLVM backend use it — which fixes a latent bug where structs are passed by a convention C does not agree with.
+**Goal:** Build `src/cell/abi.zig`, a leaf module that classifies how a Cell type is passed and returned under AAPCS64, prove it against clang, and make the LLVM backend use it — which fixes a real bug where BORROWED structs are passed by value while the C backend declares them as pointers.
 
 **Architecture:** A pure function of `(module, type, ownership)` returning a `Class`. It imports `hir.zig` and `types.zig` and nothing else, so it is testable standalone and neither backend can smuggle target knowledge past it. Correctness is enforced by a test that compiles a C probe with clang and asserts the classifier predicted clang's exact signature.
 
@@ -806,7 +806,17 @@ expectation to match, which is how a real regression gets absorbed."
 - Consumes: `classifyParam`, `classifyReturn` (Task 3).
 - Produces: no new public API. Behavior change: struct parameters and returns now use the AAPCS64 form.
 
-This is the spec's step 0, the latent-bug fix. `llvmemit` currently passes `%cell_Point` directly where AAPCS64 says `[2 x double]`. It is masked because struct passing is Cell-to-Cell within one emitted module, so both sides are consistently wrong together.
+**CORRECTED during execution.** This task originally described the
+`%cell_Point` HFA case as a latent bug. It is not one: LLVM lowers a
+first-class `{double, double}` argument and `[2 x double]` to identical
+assembly (`fadd d0, d0, d1`), and both are correct across a real C boundary.
+Measured. "clang spells it differently" is not the same as "we are wrong".
+
+The real defect is BORROWED aggregates. The C backend declares
+`const cell_Buffer *b` and reads `b->len`; the LLVM backend passed by value, so
+a `len` of 42 came back as 6098707152 across that boundary. Fixing it needs
+pointer-aware field access as well as a signature change, which is the gap this
+plan originally missed and which split Task 5 in two.
 
 **The three existing assertions in the `%cell_Point` test at `src/cell/llvmemit.zig:956` do NOT change.** They cover the type definition, the `alloca` and the `insertvalue`, none of which this task touches, and that test's `main()` takes no parameters. Verified before writing this plan. If any of them does change, stop and investigate rather than editing the assertion.
 

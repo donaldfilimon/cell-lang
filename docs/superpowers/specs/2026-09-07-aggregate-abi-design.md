@@ -93,14 +93,33 @@ The rules this implies:
 
 ## A defect this measurement exposed
 
-`src/cell/llvmemit.zig` already emits `%cell_Point = type { double, double }`
-and passes it **directly**. AAPCS64 says `[2 x double]`.
+**CORRECTED 2026-09-07 during implementation. The original version of this
+section named the wrong defect, and the correction is worth keeping because the
+reasoning that produced it is a trap anyone reading this could fall into.**
 
-This is currently harmless because struct passing is Cell-to-Cell inside one
-emitted module, so both sides use the same wrong convention consistently and
-agree. It breaks the moment a struct crosses to C, and `examples/hello.cell`
-declares exactly such a struct. It is a latent bug, not a theoretical one, and
-it is fixed first (see Sequencing).
+This section originally claimed that `llvmemit` passing `%cell_Point` directly,
+where clang writes `[2 x double]`, was a latent ABI bug. **It is not a bug.**
+Measured directly: LLVM lowers a first-class `{double, double}` argument and a
+`[2 x double]` argument to *identical* assembly, `fadd d0, d0, d1`, and both
+return the right answer when called from C with a real struct. LLVM's backend
+applies the AAPCS64 HFA rule to a first-class struct argument itself, so the
+difference is one of spelling, not of convention.
+
+The lesson: "clang spells it differently" is not the same as "we are wrong".
+Only running it across a real boundary settles that, and the first version of
+the boundary test used an HFA and therefore proved nothing, passing equally
+before and after the change.
+
+**The real defect is BORROWED aggregates.** The C backend declares
+`int64_t cell_read(const cell_Buffer *b)` and reads `b->len`. The LLVM backend
+passed the same parameter **by value**. Linking those two and calling across
+reads the pointer as an integer. Measured: a `len` of 42 came back as
+`6098707152`.
+
+That one is fixed here, and the regression test is a C driver declaring the
+function the way the C backend declares it. Emitting `[2 x double]` for HFAs is
+kept anyway, because matching clang's spelling exactly is cheaper to verify
+than arguing about when two spellings coincide.
 
 ## Design
 
@@ -251,9 +270,12 @@ Each step ends at a green gate: `zig build -Dswift=false`, `zig build test
 -Dswift=false`, the four `examples/README.md` corpus contracts, and
 `examples/backends.cell` printing 24 through all three backends.
 
-0. **Fix `%cell_Point`.** Pass HFA structs as `[2 x double]`. Add a test that a
-   struct crosses to C correctly, which is the test whose absence let this
-   defect ship. No new types yet.
+0. **Fix borrowed aggregates**, which is the real defect (see above). Pass a
+   `shared`/`exclusive` struct as `ptr` and read its fields through
+   `getelementptr`, matching what the C backend already does. Add a C-boundary
+   test that declares the function the way the C backend declares it. Emit
+   `[2 x double]` for HFAs at the same time, for spelling agreement rather than
+   correctness.
 
    **This step changes a shipped test.** `src/cell/llvmemit.zig:956` asserts
    `%cell_Point = type { double, double }`. The type DEFINITION is correct and

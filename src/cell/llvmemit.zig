@@ -43,6 +43,7 @@ const ast = @import("ast.zig");
 const hir = @import("hir.zig");
 const types = @import("types.zig");
 const diag = @import("diag.zig");
+const abi = @import("abi.zig");
 
 pub const EmitError = Io.Writer.Error || std.mem.Allocator.Error;
 
@@ -50,6 +51,12 @@ pub const EmitError = Io.Writer.Error || std.mem.Allocator.Error;
 const Value = struct {
     text: []const u8,
     ty: []const u8,
+    /// When set, `text` is the ADDRESS of an aggregate of this LLVM type
+    /// rather than the aggregate itself. A borrowed struct parameter arrives
+    /// as a pointer under AAPCS64 (the C backend spells it
+    /// `const cell_Buffer *`), so a field read has to `getelementptr` through
+    /// it instead of `extractvalue` out of it.
+    ptr_to: ?[]const u8 = null,
 
     const void_value: Value = .{ .text = "", .ty = "void" };
 
@@ -84,7 +91,17 @@ const Emitter = struct {
     strings: std.ArrayList(StringGlobal) = .empty,
     /// Slot -> alloca operand, for the function being emitted.
     slots: std.ArrayList([]const u8) = .empty,
+    /// Slot -> pointee LLVM type, when the slot holds an ADDRESS rather than a
+    /// value. Only borrowed aggregate parameters are stored this way, because
+    /// an `exclusive` borrow must write through to the caller's object; a copy
+    /// would silently drop every mutation.
+    slot_ptr_to: std.ArrayList(?[]const u8) = .empty,
     current_fn: []const u8 = "",
+    /// The return type as the body computes it, and as the ABI writes it.
+    /// They differ whenever the ABI coerces, e.g. a 16-byte non-HFA struct is
+    /// computed as %cell_T and returned as [2 x i64].
+    ret_natural: []const u8 = "void",
+    ret_abi: []const u8 = "void",
     /// Set once a terminator has been written into the current basic block, so
     /// a second one is not appended. LLVM rejects a block with two.
     terminated: bool = false,
@@ -183,14 +200,21 @@ const Emitter = struct {
     }
 
     fn emitDeclare(self: *Emitter, f: *const hir.Fn) EmitError!void {
-        const ret = self.llType(f.ret) orelse {
+        if (abi.classifyReturn(self.module, f.ret) == .indirect) {
+            // An sret return changes the SIGNATURE, not just a type: the
+            // function returns void and takes a hidden pointer. That is its
+            // own slice, so refuse rather than emit something plausible.
+            try self.unsupported(f.span, "a struct return larger than 16 bytes needs sret, not implemented yet");
+            return;
+        }
+        const ret = abi.renderReturn(self.arena, self.module, f.ret) orelse {
             try self.unsupported(f.span, "declared return type");
             return;
         };
         try self.out.print("declare {s} @{s}(", .{ ret, f.symbol });
         for (f.params(), 0..) |p, i| {
             if (i != 0) try self.out.writeAll(", ");
-            const t = self.llType(p.ty) orelse {
+            const t = abi.renderParam(self.arena, self.module, p.ty, p.ownership) orelse {
                 try self.unsupported(f.span, "declared parameter type");
                 return;
             };
@@ -204,10 +228,17 @@ const Emitter = struct {
 
     fn emitFn(self: *Emitter, f: *const hir.Fn) EmitError!void {
         const body = f.body orelse return;
-        const ret = self.llType(f.ret) orelse {
+        if (abi.classifyReturn(self.module, f.ret) == .indirect) {
+            try self.unsupported(f.span, "a struct return larger than 16 bytes needs sret, not implemented yet");
+            return;
+        }
+        const ret = abi.renderReturn(self.arena, self.module, f.ret) orelse {
             try self.unsupported(f.span, "return type");
             return;
         };
+        // The natural in-memory type of the return, which is what the body
+        // computes. It differs from `ret` whenever the ABI coerces.
+        const ret_natural = self.llType(f.ret) orelse ret;
 
         self.temp = 0;
         self.label = 0;
@@ -215,11 +246,16 @@ const Emitter = struct {
         self.current_fn = f.name;
         self.slots.clearRetainingCapacity();
         try self.slots.resize(self.arena, f.bindings.len);
+        self.slot_ptr_to.clearRetainingCapacity();
+        try self.slot_ptr_to.resize(self.arena, f.bindings.len);
+        for (self.slot_ptr_to.items) |*p| p.* = null;
+        self.ret_natural = ret_natural;
+        self.ret_abi = ret;
 
         try self.out.print("define {s} @{s}(", .{ ret, f.symbol });
         for (f.params(), 0..) |p, i| {
             if (i != 0) try self.out.writeAll(", ");
-            const t = self.llType(p.ty) orelse {
+            const t = abi.renderParam(self.arena, self.module, p.ty, p.ownership) orelse {
                 try self.unsupported(f.span, "parameter type");
                 return;
             };
@@ -244,11 +280,50 @@ const Emitter = struct {
                 try self.out.print("  {s} = alloca i8\n", .{name});
                 continue;
             };
-            try self.out.print("  {s} = alloca {s}\n", .{ name, t });
+            // A borrowed aggregate parameter's slot holds a pointer, so it is
+            // one word rather than the whole struct.
+            const is_ref = i < f.param_count and blk: {
+                const p = f.bindings[i];
+                if (p.ty.tag() != .struct_type) break :blk false;
+                break :blk switch (abi.classifyParam(self.module, p.ty, p.ownership)) {
+                    .direct => |sp| std.mem.eql(u8, sp, "ptr"),
+                    else => false,
+                };
+            };
+            try self.out.print("  {s} = alloca {s}\n", .{ name, if (is_ref) "ptr" else t });
         }
         for (f.params(), 0..) |p, i| {
-            const t = self.llType(p.ty) orelse continue;
-            try self.out.print("  store {s} %arg{d}, ptr {s}\n", .{ t, i, self.slots.items[i] });
+            const natural = self.llType(p.ty) orelse continue;
+            switch (abi.classifyParam(self.module, p.ty, p.ownership)) {
+                .direct => |spelling| {
+                    if (std.mem.eql(u8, spelling, "ptr") and p.ty.tag() == .struct_type) {
+                        // A borrowed aggregate. Keep the ADDRESS: an
+                        // `exclusive` borrow must write through to the
+                        // caller's object, and copying it in would silently
+                        // drop every mutation.
+                        self.slot_ptr_to.items[i] = natural;
+                        try self.out.print("  store ptr %arg{d}, ptr {s}\n", .{ i, self.slots.items[i] });
+                    } else {
+                        try self.out.print("  store {s} %arg{d}, ptr {s}\n", .{ natural, i, self.slots.items[i] });
+                    }
+                },
+                // A coerced aggregate arrives as [n x i64] or [n x double] and
+                // the slot is the natural struct. Storing the coerced value
+                // straight into it is legal and is what clang does: pointers
+                // are opaque, so the alloca is just correctly sized memory.
+                .coerce_int, .coerce_float => {
+                    const coerced = abi.renderParam(self.arena, self.module, p.ty, p.ownership) orelse continue;
+                    try self.out.print("  store {s} %arg{d}, ptr {s}\n", .{ coerced, i, self.slots.items[i] });
+                },
+                .indirect => {
+                    // Passed as a pointer to a caller-owned copy, but owned by
+                    // us, so copy it in.
+                    const tmp = try self.nextTemp();
+                    try self.out.print("  {s} = load {s}, ptr %arg{d}\n", .{ tmp, natural, i });
+                    try self.out.print("  store {s} {s}, ptr {s}\n", .{ natural, tmp, self.slots.items[i] });
+                },
+                .unclassified => continue,
+            }
         }
 
         for (body) |stmt| try self.emitStmt(&stmt);
@@ -334,6 +409,18 @@ const Emitter = struct {
                     const val = try self.emitExpr(&e);
                     if (val.isVoid()) {
                         try self.out.writeAll("  ret void\n");
+                    } else if (!std.mem.eql(u8, self.ret_abi, self.ret_natural)) {
+                        // The ABI returns a coerced form, e.g. a 16-byte
+                        // non-HFA struct computed as %cell_T and returned as
+                        // [2 x i64]. Round-trip through memory, which is what
+                        // clang does and what keeps this correct without a
+                        // bitcast that opaque pointers no longer allow.
+                        const slot = try self.nextTemp();
+                        try self.out.print("  {s} = alloca {s}\n", .{ slot, self.ret_natural });
+                        try self.out.print("  store {s} {s}, ptr {s}\n", .{ val.ty, val.text, slot });
+                        const out = try self.nextTemp();
+                        try self.out.print("  {s} = load {s}, ptr {s}\n", .{ out, self.ret_abi, slot });
+                        try self.out.print("  ret {s} {s}\n", .{ self.ret_abi, out });
                     } else {
                         try self.out.print("  ret {s} {s}\n", .{ val.ty, val.text });
                     }
@@ -401,6 +488,15 @@ const Emitter = struct {
                     try self.unsupported(e.span, "type of a binding");
                     return Value.void_value;
                 };
+                // A borrowed aggregate's slot holds the caller's ADDRESS, so
+                // loading it gives a pointer, not the struct.
+                if (slot < self.slot_ptr_to.items.len) {
+                    if (self.slot_ptr_to.items[slot]) |pointee| {
+                        const addr = try self.nextTemp();
+                        try self.out.print("  {s} = load ptr, ptr {s}\n", .{ addr, self.slots.items[slot] });
+                        return .{ .text = addr, .ty = "ptr", .ptr_to = pointee };
+                    }
+                }
                 const tmp = try self.nextTemp();
                 try self.out.print("  {s} = load {s}, ptr {s}\n", .{ tmp, t, self.slots.items[slot] });
                 return .{ .text = tmp, .ty = t };
@@ -415,6 +511,20 @@ const Emitter = struct {
                     try self.unsupported(e.span, "field type");
                     return Value.void_value;
                 };
+                // Reading a field of a BORROWED aggregate goes through its
+                // address, the way the C backend writes `b->len`. Using
+                // extractvalue here would be an extract out of a pointer,
+                // which is not valid IR.
+                if (base.ptr_to) |pointee| {
+                    const gep = try self.nextTemp();
+                    try self.out.print(
+                        "  {s} = getelementptr inbounds {s}, ptr {s}, i32 0, i32 {d}\n",
+                        .{ gep, pointee, base.text, f.sel.index },
+                    );
+                    const loaded = try self.nextTemp();
+                    try self.out.print("  {s} = load {s}, ptr {s}\n", .{ loaded, t, gep });
+                    return .{ .text = loaded, .ty = t };
+                }
                 const tmp = try self.nextTemp();
                 try self.out.print(
                     "  {s} = extractvalue {s} {s}, {d}\n",
@@ -1112,4 +1222,124 @@ test "control flow and match produce the same answer the C backend does" {
     const out = try runEmitted(e.text);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("24\n", out);
+}
+
+test "an HFA struct parameter uses the AAPCS64 coerced form" {
+    // The defect this fixes. Measured with clang: a {double, double}
+    // parameter is [2 x double], not the struct type. Passing it directly was
+    // invisible while both sides of a call were Cell, and wrong the moment it
+    // crossed to C.
+    var e = try emitSource(
+        \\pub struct Point { copy x: Float, copy y: Float }
+        \\pub fn getx(copy p: Point) -> Float { return p.x }
+    );
+    defer e.deinit();
+    try expectContains(e.text, "define double @cell_getx([2 x double]");
+}
+
+test "a borrowed struct parameter is a pointer and its fields are read through it" {
+    // Matches what the C backend emits: `const cell_Buffer *b` and `b->len`.
+    // An extractvalue here would be an extract out of a pointer, which is not
+    // valid IR, so the field path has to change with the signature.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn read(shared b: Buffer) -> Int { return b.len }
+    );
+    defer e.deinit();
+    try expectContains(e.text, "define i64 @cell_read(ptr");
+    try expectContains(e.text, "getelementptr inbounds %cell_Buffer");
+}
+
+test "a non-HFA struct of 16 bytes coerces to integer words" {
+    var e = try emitSource(
+        \\pub struct Pair { copy a: Int, copy b: Int }
+        \\pub fn first(copy v: Pair) -> Int { return v.a }
+    );
+    defer e.deinit();
+    try expectContains(e.text, "define i64 @cell_first([2 x i64]");
+}
+
+test "a struct return over 16 bytes is refused rather than guessed" {
+    // sret changes the SIGNATURE, not just a type: the function returns void
+    // and takes a hidden pointer. That is its own slice, so refuse.
+    var e = try emitSource(
+        \\pub struct Big { copy a: Int, copy b: Int, copy c: Int }
+        \\pub fn make() -> Big { return Big { a: 1, b: 2, c: 3 } }
+    );
+    defer e.deinit();
+    try std.testing.expect(e.bag.hasErrors());
+    var found = false;
+    for (e.bag.list.items) |d| {
+        if (std.mem.indexOf(u8, d.message, "sret") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "a borrowed struct crosses to C as a pointer, with the right value" {
+    // THE regression test, and it guards a MEASURED defect rather than a
+    // suspected one.
+    //
+    // The C backend declares `int64_t cell_read(const cell_Buffer *b)`. Before
+    // this change the LLVM backend passed the struct BY VALUE for the same
+    // signature. Linking those two together and calling across reads the
+    // pointer as an integer: measured, a `len` of 42 came back as
+    // 6098707152.
+    //
+    // A wrong calling convention is invisible Cell-to-Cell, because both
+    // halves share it. Only a real C boundary shows it, which is why this test
+    // compiles a C driver that declares the function the way the C backend
+    // does.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn read(shared b: Buffer) -> Int { return b.len }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "prog.ll", .data = e.text });
+    try tmp.dir.writeFile(io, .{ .sub_path = "drv.c", .data =
+        \\#include <stdio.h>
+        \\typedef struct { long long len; } Buffer;
+        \\extern long long cell_read(const Buffer *b);
+        \\int main(void) {
+        \\    Buffer b = { 42 };
+        \\    printf("%lld\n", cell_read(&b));
+        \\    return 0;
+        \\}
+    });
+
+    const obj = try std.process.run(gpa, io, .{
+        .argv = &.{ "cc", "-Wno-override-module", "-x", "ir", "prog.ll", "-c", "-o", "prog.o" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(obj.stdout);
+    defer gpa.free(obj.stderr);
+    if (!obj.term.success()) {
+        std.debug.print("clang rejected emitted IR:\n{s}\n--- ir ---\n{s}\n", .{ obj.stderr, e.text });
+        return error.ClangRejectedEmittedIr;
+    }
+
+    const link = try std.process.run(gpa, io, .{
+        .argv = &.{ "cc", "prog.o", "drv.c", "-o", "prog" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(link.stdout);
+    defer gpa.free(link.stderr);
+    if (!link.term.success()) {
+        std.debug.print("link failed:\n{s}\n", .{link.stderr});
+        return error.LinkFailed;
+    }
+
+    const run = try std.process.run(gpa, io, .{ .argv = &.{"./prog"}, .cwd = .{ .dir = tmp.dir } });
+    defer gpa.free(run.stdout);
+    defer gpa.free(run.stderr);
+    if (!run.term.success()) return error.ProgramFailed;
+    // Passing the struct by value here yields the POINTER reinterpreted as an
+    // integer, not 42.
+    try std.testing.expectEqualStrings("42\n", run.stdout);
 }
