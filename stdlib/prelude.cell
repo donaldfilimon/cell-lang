@@ -1,0 +1,13 @@
+// Cell standard prelude (sketch)
+
+pub struct Result {
+    // Result<T, E> is a built-in for now; this is documentation form
+}
+
+pub fn print(shared msg: String) {
+    // host intrinsic
+}
+
+pub fn assert(shared cond: Bool) {
+    // host intrinsic
+}

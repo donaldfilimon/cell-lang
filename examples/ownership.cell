@@ -1,0 +1,32 @@
+// Ownership model demo (Rust + Swift + Zig blend)
+
+pub struct Buffer {
+    owned data: [Byte]
+    copy len: Int
+}
+
+/// shared  = immutable borrow (&T / borrowing)
+/// exclusive = mutable borrow (&mut T / inout)
+/// owned = unique owner moves
+/// arc = shared ownership (Swift class / Arc)
+/// copy = bitwise / value semantics
+
+pub fn grow(exclusive buf: Buffer, shared extra: Int) {
+    // exclusive borrow allows mutation of caller's buffer
+    let copy new_len = buf.len + extra
+    buf.len = new_len
+}
+
+pub fn share_name(arc name: String) -> arc String {
+    return name
+}
+
+pub fn take(owned b: Buffer) {
+    // b is moved in; caller may not use it afterward
+}
+
+pub fn main() {
+    let owned buf = Buffer { data: [], len: 0 }
+    grow(exclusive buf, shared 16)
+    take(owned buf)
+}

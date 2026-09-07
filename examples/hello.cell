@@ -1,0 +1,25 @@
+// Cell language example — hello
+// Ownership keywords: owned | shared | exclusive | arc | copy
+
+use std.io
+
+pub struct Point {
+    copy x: Float64
+    copy y: Float64
+}
+
+pub enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+pub fn add(shared a: Int, shared b: Int) -> Int {
+    return a + b
+}
+
+pub fn main() {
+    let owned p = Point { x: 1.0, y: 2.0 }
+    let copy n = add(shared 40, shared 2)
+    print(n)
+}

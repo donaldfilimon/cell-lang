@@ -1,0 +1,3 @@
+.cell-cache/
+zig-out/
+.zig-cache/
