@@ -22,11 +22,24 @@ pub fn compile(allocator: std.mem.Allocator, source: []const u8, path: []const u
     return try p.parseModule();
 }
 
-/// Type-check a parsed module.
-pub fn check(allocator: std.mem.Allocator, module: *ast.Module) !void {
+/// Type-check a parsed module, rendering every diagnostic to `writer`.
+///
+/// `source` is the module's source buffer when the caller still has it; with it
+/// each diagnostic gains the offending source line and a caret. Returns
+/// `error.TypeError` once the bag has been written, so a caller can exit
+/// non-zero without re-inspecting it.
+pub fn check(
+    allocator: std.mem.Allocator,
+    module: *ast.Module,
+    source: ?[]const u8,
+    writer: *Io.Writer,
+) !void {
     var tc = typecheck.Checker.init(allocator);
     defer tc.deinit();
+    tc.diagnostics.source = source;
     try tc.checkModule(module);
+    try tc.diagnostics.printAll(writer);
+    if (tc.diagnostics.hasErrors()) return error.TypeError;
 }
 
 /// Emit C ABI sketch from a checked module.

@@ -60,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "check")) {
         var module = try cell.compile(arena, source, path);
         defer module.deinit(arena);
-        try cell.check(arena, &module);
+        try checkAndReport(arena, io, &module, source);
         std.debug.print("ok: {s} ({d} items)\n", .{ path, module.items.len });
         return;
     }
@@ -78,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "emit")) {
         var module = try cell.compile(arena, source, path);
         defer module.deinit(arena);
-        try cell.check(arena, &module);
+        try checkAndReport(arena, io, &module, source);
         var buf: [8192]u8 = undefined;
         var fw: Io.File.Writer = .init(.stdout(), io, &buf);
         try cell.emit(arena, &module, &fw.interface);
@@ -89,6 +89,25 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("error: unknown command '{s}'\n\n", .{cmd});
     try printUsage(io);
     std.process.exit(1);
+}
+
+/// Typecheck and render the diagnostics to stderr, exiting 1 when any of them
+/// is an error. Exiting here rather than propagating keeps the rendered caret
+/// as the last thing the user sees, instead of a Zig error trace after it.
+fn checkAndReport(
+    allocator: std.mem.Allocator,
+    io: Io,
+    module: *cell.ast.Module,
+    source: []const u8,
+) !void {
+    var buf: [4096]u8 = undefined;
+    var fw: Io.File.Writer = .init(.stderr(), io, &buf);
+    cell.check(allocator, module, source, &fw.interface) catch |err| {
+        try fw.interface.flush();
+        if (err == error.TypeError) std.process.exit(1);
+        return err;
+    };
+    try fw.interface.flush();
 }
 
 fn printUsage(io: Io) !void {
