@@ -112,6 +112,8 @@ const Emitter = struct {
     /// has to follow the bodies, because that is when this is known, and
     /// bodies are buffered for exactly this reason.
     uses_panic: bool = false,
+    /// Set when a string pattern needed memcmp, so its declaration is emitted.
+    uses_memcmp: bool = false,
     /// Where a `break` and a `continue` jump, for the innermost enclosing
     /// loop. Null outside a loop, which the typechecker already rejects.
     break_label: ?[]const u8 = null,
@@ -201,6 +203,12 @@ const Emitter = struct {
         // symbol and clang refuses it outright.
         if (self.uses_panic and self.module.findFn("panic") == null) {
             try self.out.writeAll("declare void @cell_panic(ptr)\n");
+        }
+        // memcmp is real libc, unlike cell_str_eq which is `static inline`
+        // and has no symbol. It is the one runtime helper this backend can
+        // actually call.
+        if (self.uses_memcmp) {
+            try self.out.writeAll("declare i32 @memcmp(ptr, ptr, i64)\n");
         }
         if (self.module.fns.len != 0) try self.out.writeAll("\n");
 
@@ -921,6 +929,62 @@ const Emitter = struct {
         return .{ .text = tmp, .ty = dest_ty };
     }
 
+    /// Compare a `cell_str_t` against a literal, producing an i1.
+    ///
+    /// Faithful to `cell_str_eq` (runtime/cell_rt.h:184), which cannot be
+    /// called because it is `static inline` and has no symbol. Its order
+    /// matters and is preserved: lengths first, then the empty case, then the
+    /// null guard, and only then memcmp. Calling memcmp on a null pointer or
+    /// with a mismatched length would be undefined behaviour, so the guards
+    /// are not decoration.
+    fn emitStringEq(self: *Emitter, scrutinee: Value, literal: []const u8) EmitError!Value {
+        const len = try self.nextTemp();
+        try self.out.print("  {s} = extractvalue %cell_str {s}, 1\n", .{ len, scrutinee.text });
+        const len_eq = try self.nextTemp();
+        try self.out.print("  {s} = icmp eq i64 {s}, {d}\n", .{ len_eq, len, literal.len });
+
+        // An empty pattern matches exactly when the scrutinee is empty, and
+        // cell_str_eq returns true there without touching either pointer.
+        if (literal.len == 0) return .{ .text = len_eq, .ty = "i1" };
+
+        self.uses_memcmp = true;
+        const g = try self.internString(literal);
+
+        const res = try self.nextTemp();
+        try self.out.print("  {s} = alloca i1\n", .{res});
+        try self.out.print("  store i1 false, ptr {s}\n", .{res});
+
+        const cmp_b = try self.nextLabel("streq.cmp");
+        const mem_b = try self.nextLabel("streq.mem");
+        const end_b = try self.nextLabel("streq.end");
+
+        try self.out.print("  br i1 {s}, label %{s}, label %{s}\n", .{ len_eq, cmp_b, end_b });
+
+        try self.out.print("{s}:\n", .{cmp_b});
+        const ptr = try self.nextTemp();
+        try self.out.print("  {s} = extractvalue %cell_str {s}, 0\n", .{ ptr, scrutinee.text });
+        const is_null = try self.nextTemp();
+        try self.out.print("  {s} = icmp eq ptr {s}, null\n", .{ is_null, ptr });
+        try self.out.print("  br i1 {s}, label %{s}, label %{s}\n", .{ is_null, end_b, mem_b });
+
+        try self.out.print("{s}:\n", .{mem_b});
+        const r = try self.nextTemp();
+        try self.out.print(
+            "  {s} = call i32 @memcmp(ptr {s}, ptr @{s}, i64 {d})\n",
+            .{ r, ptr, g, literal.len },
+        );
+        const eq = try self.nextTemp();
+        try self.out.print("  {s} = icmp eq i32 {s}, 0\n", .{ eq, r });
+        try self.out.print("  store i1 {s}, ptr {s}\n", .{ eq, res });
+        try self.out.print("  br label %{s}\n", .{end_b});
+
+        try self.out.print("{s}:\n", .{end_b});
+        self.terminated = false;
+        const out = try self.nextTemp();
+        try self.out.print("  {s} = load i1, ptr {s}\n", .{ out, res });
+        return .{ .text = out, .ty = "i1" };
+    }
+
     fn emitMatch(
         self: *Emitter,
         e: *const hir.Expr,
@@ -967,28 +1031,38 @@ const Emitter = struct {
                     .{ g.text, body_label, next_label },
                 );
             } else {
-                const test_val: ?Value = switch (arm.pattern.kind) {
-                    .int => |v| Value{
-                        .text = try std.fmt.allocPrint(self.arena, "{d}", .{v}),
-                        .ty = scrutinee.ty,
-                    },
-                    .bool => |v| Value{ .text = if (v) "true" else "false", .ty = "i1" },
-                    .enum_variant => |ev| Value{
-                        .text = try std.fmt.allocPrint(self.arena, "{d}", .{ev.value}),
-                        .ty = "i32",
-                    },
-                    .float, .string => null,
-                    .wildcard, .binding => unreachable,
-                };
-                const tv = test_val orelse {
-                    try self.unsupported(arm.span, "this match pattern is not lowered to LLVM IR yet");
-                    return Value.void_value;
-                };
-                const cmp = try self.nextTemp();
-                try self.out.print(
-                    "  {s} = icmp eq {s} {s}, {s}\n",
-                    .{ cmp, scrutinee.ty, scrutinee.text, tv.text },
-                );
+                // A string pattern is not a single comparison, so it is
+                // computed first and the arm chain branches on the result.
+                var cmp: []const u8 = undefined;
+                if (arm.pattern.kind == .string) {
+                    const eq = try self.emitStringEq(scrutinee, arm.pattern.kind.string);
+                    if (eq.isVoid()) return Value.void_value;
+                    cmp = eq.text;
+                } else {
+                    const test_val: ?Value = switch (arm.pattern.kind) {
+                        .int => |v| Value{
+                            .text = try std.fmt.allocPrint(self.arena, "{d}", .{v}),
+                            .ty = scrutinee.ty,
+                        },
+                        .bool => |v| Value{ .text = if (v) "true" else "false", .ty = "i1" },
+                        .enum_variant => |ev| Value{
+                            .text = try std.fmt.allocPrint(self.arena, "{d}", .{ev.value}),
+                            .ty = "i32",
+                        },
+                        .float, .string => null,
+                        .wildcard, .binding => unreachable,
+                    };
+                    const tv = test_val orelse {
+                        try self.unsupported(arm.span, "this match pattern is not lowered to LLVM IR yet");
+                        return Value.void_value;
+                    };
+                    const c = try self.nextTemp();
+                    try self.out.print(
+                        "  {s} = icmp eq {s} {s}, {s}\n",
+                        .{ c, scrutinee.ty, scrutinee.text, tv.text },
+                    );
+                    cmp = c;
+                }
                 if (arm.guard) |g_expr| {
                     // The guard gets its own block, because it must be
                     // evaluated ONLY when the pattern matched. Folding it into
@@ -1598,4 +1672,65 @@ test "a String reaches the real runtime and prints" {
     const out = try runEmitted(e.text);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("hello from Cell via LLVM\n", out);
+}
+
+test "a string pattern compares length, guards null, then calls memcmp" {
+    // Faithful to cell_str_eq (runtime/cell_rt.h:184), which cannot be called
+    // because it is `static inline`. The ORDER is the point: calling memcmp on
+    // a null pointer or with a mismatched length is undefined behaviour.
+    var e = try emitSource(
+        \\pub fn f(shared s: String) -> Int { return match s { "yes" => 1, _ => 0, } }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "declare i32 @memcmp(ptr, ptr, i64)");
+    try expectContains(e.text, "icmp eq i64");           // length first
+    try expectContains(e.text, "icmp eq ptr");           // then the null guard
+    try expectContains(e.text, "call i32 @memcmp(");     // only then memcmp
+}
+
+test "an empty string pattern needs no memcmp at all" {
+    // cell_str_eq returns true for two empty strings without touching either
+    // pointer, so the lowering must not call memcmp with length 0.
+    var e = try emitSource(
+        \\pub fn f(shared s: String) -> Int { return match s { "" => 1, _ => 0, } }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    if (std.mem.indexOf(u8, e.text, "@memcmp") != null) {
+        std.debug.print("unexpected memcmp for an empty pattern:\n{s}\n", .{e.text});
+        return error.UnexpectedMemcmp;
+    }
+}
+
+test "string matching computes the same answers the C backend does" {
+    // The C backend prints 1 2 3 9 for this program, including the empty case.
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn classify(shared s: String) -> Int {
+        \\  return match s { "yes" => 1, "no" => 2, "" => 3, _ => 9, }
+        \\}
+        \\pub fn main() {
+        \\  print_int(classify(shared "yes"))
+        \\  print_int(classify(shared "no"))
+        \\  print_int(classify(shared ""))
+        \\  print_int(classify(shared "other"))
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    const out = try runEmitted(e.text);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("1\n2\n3\n9\n", out);
+}
+
+test "a [Byte] field and an empty list literal lower" {
+    var e = try emitSource(
+        \\pub struct Buffer { owned data: [Byte], copy len: Int }
+        \\pub fn main() { let owned b = Buffer { data: [], len: 9 } }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "%cell_slice = type { ptr, i64, i64 }");
+    try expectContains(e.text, "insertvalue %cell_slice undef, ptr null, 0");
 }

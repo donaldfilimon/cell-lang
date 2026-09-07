@@ -135,6 +135,9 @@ const Emitter = struct {
     /// scope once the bodies that reference them are known.
     strings: std.ArrayList(StringGlobal) = .empty,
 
+    /// Set when a string pattern needed memcmp, so its declaration is emitted.
+    uses_memcmp: bool = false,
+
     const StringGlobal = struct { name: []const u8, bytes: []const u8 };
 
     fn run(self: *Emitter) EmitError!void {
@@ -206,6 +209,11 @@ const Emitter = struct {
         body_buf = body_writer.toArrayList();
         self.out = saved;
 
+        // memcmp is real libc, unlike cell_str_eq which is `static inline`
+        // and has no symbol.
+        if (self.uses_memcmp) {
+            try self.out.writeAll("  func.func private @memcmp(!llvm.ptr, !llvm.ptr, i64) -> i32\n");
+        }
         for (self.strings.items) |g| {
             try self.out.print("  llvm.mlir.global private constant @{s}(\"", .{g.name});
             for (g.bytes) |b| {
@@ -765,6 +773,66 @@ const Emitter = struct {
     /// `match` becomes a chain of compare-and-branch blocks, one per arm,
     /// which is the same shape the LLVM backend emits and the same shape the C
     /// backend's if/else chain compiles to.
+    /// Compare a string against a literal, producing an i1.
+    ///
+    /// Faithful to `cell_str_eq` (runtime/cell_rt.h:184), which is `static
+    /// inline` and has no symbol. The order matters and is preserved: lengths,
+    /// then the empty case, then the null guard, then memcmp. Calling memcmp
+    /// on a null pointer or a mismatched length is undefined behaviour.
+    fn emitStringEq(self: *Emitter, scrutinee: Value, literal: []const u8) EmitError!Value {
+        const st = "!llvm.struct<(ptr, i64)>";
+        const len = try self.nextSsa();
+        try self.line("{s} = llvm.extractvalue {s}[1] : {s}", .{ len, scrutinee.text, st });
+        const want = try self.nextSsa();
+        try self.line("{s} = arith.constant {d} : i64", .{ want, literal.len });
+        const len_eq = try self.nextSsa();
+        try self.line("{s} = arith.cmpi eq, {s}, {s} : i64", .{ len_eq, len, want });
+
+        if (literal.len == 0) return .{ .text = len_eq, .ty = "i1" };
+
+        self.uses_memcmp = true;
+        const g = try self.internString(literal);
+
+        const res = try self.nextSsa();
+        try self.line("{s} = memref.alloca() : memref<i1>", .{res});
+        const false_v = try self.nextSsa();
+        try self.line("{s} = arith.constant 0 : i1", .{false_v});
+        try self.line("memref.store {s}, {s}[] : memref<i1>", .{ false_v, res });
+
+        const cmp_b = self.nextBlock();
+        const mem_b = self.nextBlock();
+        const end_b = self.nextBlock();
+        try self.line("cf.cond_br {s}, {s}, {s}", .{ len_eq, cmp_b, end_b });
+
+        try self.block_label(cmp_b);
+        const ptr = try self.nextSsa();
+        try self.line("{s} = llvm.extractvalue {s}[0] : {s}", .{ ptr, scrutinee.text, st });
+        const nul = try self.nextSsa();
+        try self.line("{s} = llvm.mlir.zero : !llvm.ptr", .{nul});
+        const is_null = try self.nextSsa();
+        try self.line("{s} = llvm.icmp \"eq\" {s}, {s} : !llvm.ptr", .{ is_null, ptr, nul });
+        try self.line("cf.cond_br {s}, {s}, {s}", .{ is_null, end_b, mem_b });
+
+        try self.block_label(mem_b);
+        const lit = try self.nextSsa();
+        try self.line("{s} = llvm.mlir.addressof @{s} : !llvm.ptr", .{ lit, g });
+        const n = try self.nextSsa();
+        try self.line("{s} = arith.constant {d} : i64", .{ n, literal.len });
+        const r = try self.nextSsa();
+        try self.line("{s} = call @memcmp({s}, {s}, {s}) : (!llvm.ptr, !llvm.ptr, i64) -> i32", .{ r, ptr, lit, n });
+        const zero = try self.nextSsa();
+        try self.line("{s} = arith.constant 0 : i32", .{zero});
+        const eq = try self.nextSsa();
+        try self.line("{s} = arith.cmpi eq, {s}, {s} : i32", .{ eq, r, zero });
+        try self.line("memref.store {s}, {s}[] : memref<i1>", .{ eq, res });
+        try self.line("cf.br {s}", .{end_b});
+
+        try self.block_label(end_b);
+        const out = try self.nextSsa();
+        try self.line("{s} = memref.load {s}[] : memref<i1>", .{ out, res });
+        return .{ .text = out, .ty = "i1" };
+    }
+
     fn emitMatch(
         self: *Emitter,
         e: *const hir.Expr,
@@ -806,23 +874,33 @@ const Emitter = struct {
                 if (g.isNone()) return Value.none;
                 try self.line("cf.cond_br {s}, {s}, {s}", .{ g.text, body_b, next_b });
             } else {
-                const test_text: ?[]const u8 = switch (arm.pattern.kind) {
-                    .int => |v| try std.fmt.allocPrint(self.arena, "{d}", .{v}),
-                    .bool => |v| try std.fmt.allocPrint(self.arena, "{d}", .{@intFromBool(v)}),
-                    .enum_variant => |ev| try std.fmt.allocPrint(self.arena, "{d}", .{ev.value}),
-                    .float, .string => null,
-                    .wildcard, .binding => unreachable,
-                };
-                const tt = test_text orelse {
-                    try self.unsupported(arm.span, "this match pattern is not lowered to MLIR yet");
-                    return Value.none;
-                };
-                const konst = try self.nextSsa();
-                try self.line("{s} = arith.constant {s} : {s}", .{ konst, tt, scrutinee.ty });
-                const cmp = try self.nextSsa();
-                try self.line("{s} = arith.cmpi eq, {s}, {s} : {s}", .{
-                    cmp, scrutinee.text, konst, scrutinee.ty,
-                });
+                // A string pattern is not a single comparison, so it is
+                // computed first and the arm chain branches on the result.
+                var cmp: []const u8 = undefined;
+                if (arm.pattern.kind == .string) {
+                    const eq = try self.emitStringEq(scrutinee, arm.pattern.kind.string);
+                    if (eq.isNone()) return Value.none;
+                    cmp = eq.text;
+                } else {
+                    const test_text: ?[]const u8 = switch (arm.pattern.kind) {
+                        .int => |v| try std.fmt.allocPrint(self.arena, "{d}", .{v}),
+                        .bool => |v| try std.fmt.allocPrint(self.arena, "{d}", .{@intFromBool(v)}),
+                        .enum_variant => |ev| try std.fmt.allocPrint(self.arena, "{d}", .{ev.value}),
+                        .float, .string => null,
+                        .wildcard, .binding => unreachable,
+                    };
+                    const tt = test_text orelse {
+                        try self.unsupported(arm.span, "this match pattern is not lowered to MLIR yet");
+                        return Value.none;
+                    };
+                    const konst = try self.nextSsa();
+                    try self.line("{s} = arith.constant {s} : {s}", .{ konst, tt, scrutinee.ty });
+                    const c = try self.nextSsa();
+                    try self.line("{s} = arith.cmpi eq, {s}, {s} : {s}", .{
+                        c, scrutinee.text, konst, scrutinee.ty,
+                    });
+                    cmp = c;
+                }
                 if (arm.guard) |g_expr| {
                     // Its own block, so the guard runs only when the pattern
                     // matched. A guard may call a function.
@@ -1333,4 +1411,26 @@ test "an unused struct with an unrepresentable field is still refused" {
         if (std.mem.indexOf(u8, d.message, "cannot represent") != null) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "a string pattern guards before calling memcmp here too" {
+    var e = try emitSource(
+        \\pub fn f(shared s: String) -> Int { return match s { "yes" => 1, _ => 0, } }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "func.func private @memcmp");
+    try expectContains(e.text, "llvm.icmp \"eq\"");
+    try expectContains(e.text, "call @memcmp(");
+}
+
+test "[T] lowers as the runtime's type-erased slice header" {
+    var e = try emitSource(
+        \\pub struct Buffer { owned data: [Byte], copy len: Int }
+        \\pub fn main() { let owned b = Buffer { data: [], len: 9 } }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "!llvm.struct<(ptr, i64, i64)>");
+    try expectContains(e.text, "llvm.mlir.zero : !llvm.ptr");
 }
