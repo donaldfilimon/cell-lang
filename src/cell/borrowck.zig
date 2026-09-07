@@ -1,7 +1,7 @@
 //! Borrow and move checker for Cell.
 //!
 //! Implements `docs/OWNERSHIP.md` rules R1, R2, R3, R3a, R4, R5, R6, R8, R14
-//! and the part of R15 the AST can still see. It is deliberately independent of
+//! and R15. It is deliberately independent of
 //! `typecheck.zig`: it carries its own scope stack, its own signature table,
 //! and imports only `ast.zig` and `diag.zig`, so it neither depends on nor
 //! disturbs the type checker.
@@ -600,14 +600,20 @@ pub const Checker = struct {
             else
                 null;
 
-            // R15. `&x` / `&mut x` are explicit mode today. A keyword prefix
-            // is stored on `.annotated` and is intentionally ignored until
-            // Task 2; `refKind` peels that wrapper so an inner sigil still
-            // counts.
+            // R15. A keyword prefix on the argument is the written mode.
+            // `&x` / `&mut x` are the same check when no keyword was written.
+            // Do not overwrite a keyword with an inner sigil: `owned &buf`
+            // is still passed as owned. Always peel to the place inside.
             var explicit: ?Ownership = null;
             var operand: *const ast.Expr = arg;
+            if (arg.kind == .annotated) {
+                explicit = arg.kind.annotated.ownership;
+                operand = arg.kind.annotated.value;
+            }
             if (refKind(arg)) |r| {
-                explicit = if (r.kind == .exclusive) .exclusive else .shared;
+                if (explicit == null) {
+                    explicit = if (r.kind == .exclusive) .exclusive else .shared;
+                }
                 operand = r.operand;
             }
             if (explicit) |ex| {
@@ -1399,6 +1405,37 @@ test "R15: an ampersand argument matching the parameter is accepted" {
         \\    let owned buf = Buffer { data: [], len: 0 }
         \\    grow(&mut buf, 16)
         \\    read(&buf)
+        \\}
+    );
+}
+
+test "R15: a keyword argument whose mode differs from the parameter is rejected" {
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    take(shared buf)
+        \\}
+    ,
+        \\t.cell:11:10: error: 'take' expects parameter 'b' as 'owned', but the argument is passed as 'shared'
+        \\
+    );
+}
+
+test "R15: a keyword argument matching the parameter is accepted" {
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    grow(exclusive buf, 16)
+        \\    take(owned buf)
+        \\}
+    );
+}
+
+test "R15: omitting the call-site prefix infers from the parameter" {
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    take(buf)
         \\}
     );
 }
