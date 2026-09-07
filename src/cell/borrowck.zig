@@ -600,8 +600,10 @@ pub const Checker = struct {
             else
                 null;
 
-            // R15. The parser keeps `&x` and `&mut x` but drops the keyword
-            // spelling, so only the sigil form can be checked.
+            // R15. `&x` / `&mut x` are explicit mode today. A keyword prefix
+            // is stored on `.annotated` and is intentionally ignored until
+            // Task 2; `refKind` peels that wrapper so an inner sigil still
+            // counts.
             var explicit: ?Ownership = null;
             var operand: *const ast.Expr = arg;
             if (refKind(arg)) |r| {
@@ -1024,9 +1026,11 @@ fn typeIsBorrow(ty: *const ast.TypeExpr) ?LoanKind {
     };
 }
 
-/// `&x` and `&mut x`, the two call-site annotations the parser preserves.
+/// `&x` and `&mut x`. Peels `.annotated` so a keyword prefix wrapping an
+/// inner sigil (`shared &buf`) still counts as the sigil form.
 fn refKind(e: *const ast.Expr) ?Ref {
     return switch (e.kind) {
+        .annotated => |a| refKind(a.value),
         .unary => |u| switch (u.op) {
             .ref_shared => .{ .kind = .shared, .operand = u.operand },
             .ref_exclusive => .{ .kind = .exclusive, .operand = u.operand },
@@ -1367,6 +1371,21 @@ test "R15: an ampersand argument whose mode differs from the parameter is reject
         \\pub fn main() {
         \\    let owned buf = Buffer { data: [], len: 0 }
         \\    take(&buf)
+        \\}
+    ,
+        \\t.cell:11:10: error: 'take' expects parameter 'b' as 'owned', but the argument is passed as 'shared'
+        \\
+    );
+}
+
+test "R15: a keyword-prefixed ampersand argument whose mode differs is still rejected" {
+    // Grammar is `primary = [ownership] unary`, so `shared &buf` is
+    // `.annotated` wrapping `&buf`. The inner sigil is still R15 explicit
+    // mode; peeling `.annotated` must not drop it.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    take(shared &buf)
         \\}
     ,
         \\t.cell:11:10: error: 'take' expects parameter 'b' as 'owned', but the argument is passed as 'shared'

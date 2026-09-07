@@ -10,9 +10,9 @@
 //!   2. Every Cell symbol is mangled `cell_<name>`, at the definition AND at
 //!      the call, so `print(x)` reaches the runtime's `cell_print`.
 //!   3. Call sites lower against the callee's declared parameter ownership.
-//!      The parser discards call-site ownership prefixes, so `grow(exclusive
-//!      buf, ...)` arrives as `grow(buf, ...)`; the signature is the only
-//!      remaining evidence that the argument must be passed as `&buf`.
+//!      A written prefix such as `grow(exclusive buf, ...)` is kept on the
+//!      AST as `.annotated`; emission still ignores that wrapper and uses
+//!      the callee signature to decide that the argument is passed as `&buf`.
 //!
 //! Expression-position `if`, `match`, `block`, and non-empty list literals
 //! lower to a GNU statement expression `({ ... })`. That is a Clang and GCC
@@ -833,9 +833,10 @@ pub const Generator = struct {
     }
 
     /// Emit `arg` where a value of type `want` is required, inserting the
-    /// address-of, dereference, or view conversion the ABI needs. The parser
-    /// drops call-site ownership prefixes, so this is the only place that can
-    /// turn `grow(buf, 16)` back into `cell_grow(&buf, 16)`.
+    /// address-of, dereference, or view conversion the ABI needs. Call-site
+    /// ownership prefixes are `.annotated` wrappers; this still lowers from
+    /// the callee signature, so `grow(buf, 16)` becomes `cell_grow(&buf, 16)`
+    /// because `grow` takes `exclusive Buffer`, not because of a written prefix.
     fn emitArgLike(self: *Generator, arg: *const ast.Expr, want: CType, indent: usize) EmitError!void {
         const out = self.writer;
         const have = try self.inferExpr(arg);
@@ -1613,8 +1614,8 @@ test "a call site is lowered against the callee's parameter ownership" {
         \\}
     );
     defer e.deinit();
-    // The parser discards `exclusive` at the call, so the signature is what
-    // turns `buf` into `&buf`.
+    // Emission still follows the callee signature, so `exclusive buf`
+    // becomes `&buf` because `grow` takes `exclusive Buffer`.
     try expectContains(e.text, "cell_grow(&buf, 16);");
     try expectContains(e.text, "cell_read_only(&buf);");
     // Inside grow, buf is a pointer, so field selection uses `->`.
