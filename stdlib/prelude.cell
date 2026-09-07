@@ -16,82 +16,109 @@
 // The declarations are split into three groups on purpose:
 //   (1) declarations whose emitted C prototype MATCHES a real runtime symbol
 //   (2) declarations whose runtime symbol exists but whose emitted prototype
-//       does NOT match it yet, because codegen has not adopted the runtime's
-//       value model
+//       does NOT match it
 //   (3) declarations that correspond to no symbol anywhere
 // Groups 2 and 3 will not link. That is stated rather than hidden.
+//
+// CORRECTED 2026-09-07: groups 1 and 2 were INVERTED, and had been since
+// codegen adopted the runtime's value model without this file being re-read.
+// Group 2's header asserted that "codegen still emits const char*"; measured
+// against `./zig-out/bin/cell emit stdlib/prelude.cell`, the string
+// `const char*` does not appear in the emitted output even once. All four of
+// the old group 2 therefore MATCH the runtime exactly and have moved to group
+// 1, while `rt_version` and `panic` -- which the old group 1 asserted were
+// matches, one of them with a reason that was precisely backwards -- do not
+// match and have moved to group 2. Every line below was re-measured against
+// the emitted C and runtime/cell_rt.h rather than carried forward.
 
 // ---------------------------------------------------------------------------
 // Group 1: emitted prototype matches a real symbol in runtime/cell_rt.c
 //
 // Mangling is `cell_<name>` (SPEC section 10.2), so these names land exactly
-// on the runtime's existing exports. Checked against the C source, not the
-// header alone.
+// on the runtime's existing exports. Every entry was checked by diffing the
+// emitted prototype against the C header line, not by reading the C source
+// and inferring what codegen would do.
 // ---------------------------------------------------------------------------
 
-/// Runtime version string.
-/// Emits `const char* cell_rt_version()`.
-/// Runtime:  const char *cell_rt_version(void)
-pub fn rt_version() -> String;
-
-/// Abort with a message.
-/// Emits `void cell_panic(const char* msg)`.
-/// Runtime:  void cell_panic(const char *msg) __attribute__((noreturn))
-/// Cell has no noreturn annotation, so the emitted prototype loses that fact.
-/// Note this is the one intrinsic that still takes a C string rather than a
-/// cell_str_t, which is why it lands in group 1 and `print` does not.
-pub fn panic(shared msg: String);
-
-/// C++ bridge probe. Nonzero when cell_rt.cpp is linked.
-/// Runtime:  int cell_cxx_probe(void)
-pub fn cxx_probe() -> Int32;
-
-/// Swift bridge probe. Nonzero when CellBridge.swift is linked.
-/// Runtime:  int cell_swift_probe(void)
-pub fn swift_probe() -> Int32;
-
-/// Abort unless the condition holds.
-/// Emits `void cell_assert(bool cond)`.
-/// Runtime:  void cell_assert(bool cond)
-pub fn assert(copy cond: Bool);
-
-// Caveat on all five: Cell emits `f()` where the runtime header writes
-// `f(void)`. Measured with clang: this COMPILES, at -std=c11 and -std=c17,
-// with no diagnostic, and the mismatch is only reported under
-// `-Wstrict-prototypes`, as "a function declaration without a prototype is
-// deprecated in all versions of C". So it is a portability wart rather than
-// the hard error an older note here claimed. SPEC section 10.1 records it.
-
-// ---------------------------------------------------------------------------
-// Group 2: the runtime symbol exists, the emitted prototype does not match it
-//
-// runtime/cell_rt.h specifies `String` as a length-prefixed cell_str_t, and
-// codegen still emits `const char*` (SPEC section 10.3). Every declaration
-// below therefore emits a prototype that CONFLICTS with the real symbol. They
-// are written in their final intended form; they start linking when codegen
-// adopts the runtime value model, and not before.
-// ---------------------------------------------------------------------------
-
-/// Runtime:  void cell_print(cell_str_t msg)
+/// Write a string to standard output.
+/// Emits    void cell_print(cell_str_t msg)
+/// Runtime: void cell_print(cell_str_t msg)
 pub fn print(shared msg: String);
 
-/// Runtime:  void cell_println(cell_str_t msg)
+/// Write a string to standard output followed by a newline.
+/// Emits    void cell_println(cell_str_t msg)
+/// Runtime: void cell_println(cell_str_t msg)
 pub fn println(shared msg: String);
 
-/// Runtime:  void cell_print_int(int64_t value)
+/// Write an integer to standard output.
+/// Emits    void cell_print_int(int64_t value)
+/// Runtime: void cell_print_int(int64_t value)
 /// A separate name rather than an overload of `print`: the Cell ABI is C and
 /// C has no overloading, so each argument type needs its own symbol.
 pub fn print_int(copy value: Int);
 
-/// Runtime:  void cell_assert_msg(bool cond, cell_str_t msg)
+/// Abort unless the condition holds.
+/// Emits    void cell_assert(bool cond)
+/// Runtime: void cell_assert(bool cond)
+pub fn assert(copy cond: Bool);
+
+/// Abort unless the condition holds, reporting a message.
+/// Emits    void cell_assert_msg(bool cond, cell_str_t msg)
+/// Runtime: void cell_assert_msg(bool cond, cell_str_t msg)
 pub fn assert_msg(copy cond: Bool, shared msg: String);
 
+/// C++ bridge probe. Nonzero when cell_rt.cpp is linked.
+/// Emits    int32_t cell_cxx_probe(void)
+/// Runtime: int cell_cxx_probe(void)
+/// `int32_t` and `int` are the same type on every target this repo builds
+/// for, so this matches rather than merely resembling a match.
+pub fn cxx_probe() -> Int32;
+
+/// Swift bridge probe. Nonzero when CellBridge.swift is linked.
+/// Emits    int32_t cell_swift_probe(void)
+/// Runtime: int cell_swift_probe(void)
+pub fn swift_probe() -> Int32;
+
+// A note that used to sit here claimed Cell emits `f()` where the runtime
+// header writes `f(void)`, making every entry above a -Wstrict-prototypes
+// wart. That is no longer true and is removed rather than softened: the
+// emitted output reads `cell_cxx_probe(void)` and `cell_rt_version(void)`,
+// with the explicit `void`. Measured, not remembered.
+
+// ---------------------------------------------------------------------------
+// Group 2: the runtime symbol exists, the emitted prototype does not match it
+//
+// Two declarations, both stranded by the same historical detail: these are the
+// only runtime entry points still speaking in C strings, while codegen now
+// lowers every Cell `String` to the length-prefixed `cell_str_t`. So the
+// mismatch is the runtime's to close, not codegen's -- the opposite of what
+// this section said when it held the printing functions.
+//
+// A program calling either of these emits a call whose argument or return
+// type conflicts with the real symbol. They are written in their intended
+// form and start linking when the runtime adopts cell_str_t here too.
+// ---------------------------------------------------------------------------
+
+/// Runtime version string.
+/// Emits    cell_string_t cell_rt_version(void)
+/// Runtime: const char *cell_rt_version(void)
+pub fn rt_version() -> String;
+
+/// Abort with a message.
+/// Emits    void cell_panic(cell_str_t msg)
+/// Runtime: void cell_panic(const char *msg) __attribute__((noreturn))
+/// Cell has no noreturn annotation, so the emitted prototype loses that fact
+/// as well. An earlier note here called this "the one intrinsic that still
+/// takes a C string rather than a cell_str_t, which is why it lands in group
+/// 1": that reason was exactly backwards, and it is the runtime side, not the
+/// emitted side, that still takes `const char *`.
+pub fn panic(shared msg: String);
+
 // The arena, slice, string, optional and arc entry points in cell_rt.h are
-// deliberately NOT declared here. They take pointers and aggregate types
-// (`cell_arena_t*`, `cell_slice_t*`, `cell_arc_t`) and Cell has no way to name
-// any of them: there are no pointer types, and `arc T` maps to `void*` rather
-// than to `cell_arc_t`. Declaring them with the wrong signature would be worse
-// than omitting them.
+// deliberately NOT declared in this file. They take pointers and aggregate
+// types (`cell_arena_t*`, `cell_arc_t`) and Cell has no way to name any of
+// them: there are no pointer types, and `arc T` does not map to `cell_arc_t`.
+// Declaring them with the wrong signature would be worse than omitting them.
 
 // ---------------------------------------------------------------------------
 // Group 3: declared here, backed by nothing
@@ -137,9 +164,15 @@ pub fn max_float(copy a: Float, copy b: Float) -> Float;
 
 // -- Strings ---------------------------------------------------------------
 //
-// `String` is a borrowed, NUL-terminated `const char*` with no length
-// (SPEC section 10.3). Length is therefore O(n) and a string cannot contain an
-// interior NUL. Both are inherited from the C mapping, not chosen here.
+// CORRECTED 2026-09-07, and the previous text here had it exactly backwards.
+// It said `String` is "a borrowed, NUL-terminated `const char*` with no
+// length", concluding that length is O(n) and that a string cannot hold an
+// interior NUL. Measured: a `shared String` lowers to `cell_str_t`, which
+// runtime/cell_rt.h:155 defines as `{ const char *ptr; size_t len; }`, and an
+// `owned String` lowers to `cell_string_t` (`{ char *ptr; size_t len; size_t
+// cap; }`). Both carry the length. So length is O(1), and an interior NUL is
+// representable. Neither limitation the old note inherited "from the C
+// mapping" is real.
 
 pub fn str_len(shared s: String) -> Int;
 pub fn str_eq(shared a: String, shared b: String) -> Bool;
@@ -155,9 +188,14 @@ pub fn str_from_bool(copy v: Bool) -> owned String;
 
 // -- Byte lists ------------------------------------------------------------
 //
-// `[T]` has no representation (SPEC section 3.3): it maps to `void*` with no
-// length and no element type. These signatures describe the intended API and
-// cannot be implemented until a list representation is chosen.
+// CORRECTED 2026-09-07. The previous text said `[T]` "has no representation:
+// it maps to `void*` with no length and no element type", and that these
+// signatures "cannot be implemented until a list representation is chosen".
+// A representation was chosen and shipped: `[Byte]` lowers to `cell_slice_t`,
+// and `exclusive [Byte]` to `cell_slice_t *`, which is why `bytes_push` below
+// emits `void cell_bytes_push(cell_slice_t *xs, uint8_t value)` rather than
+// anything involving `void*`. These remain group 3 because no SYMBOL backs
+// them, which is a different and much smaller gap than having no type.
 
 pub fn bytes_len(shared xs: [Byte]) -> Int;
 pub fn bytes_at(shared xs: [Byte], copy index: Int) -> Byte;
