@@ -26,7 +26,7 @@ pub const Layout = struct {
 ///
 /// Null is not an error. It means the caller must refuse rather than guess,
 /// which is the discipline both new backends already follow.
-pub fn layoutOf(m: *const hir.Module, ty: hir.Ty) ?Layout {
+pub fn layoutOf(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) ?Layout {
     return switch (ty) {
         .int, .uint, .float => .{ .size = 8, .alignment = 8 },
         .int32, .float32 => .{ .size = 4, .alignment = 4 },
@@ -36,12 +36,30 @@ pub fn layoutOf(m: *const hir.Module, ty: hir.Ty) ?Layout {
         .boolean, .byte => .{ .size = 1, .alignment = 1 },
         .unit => .{ .size = 0, .alignment = 1 },
         .struct_type => |name| structLayout(m, name),
-        // Out of scope for now: String, [T], T?, Result. Adding them means
-        // threading ownership through, because `shared String` is a 16-byte
-        // cell_str_t while `owned String` is a 24-byte cell_string_t. Until
-        // then a null here becomes a `cannot lower` diagnostic, which is what
-        // both backends already do with these types.
-        .string, .list, .optional, .result, .func, .unknown => null,
+        // String is the one type whose SIZE depends on ownership, which is why
+        // this function takes it. codegen maps `shared String` to a 16-byte
+        // cell_str_t (a borrowed {ptr, len} view) and `owned`/`copy String` to
+        // a 24-byte cell_string_t (an owning {ptr, len, cap} buffer).
+        .string => switch (own) {
+            .shared, .exclusive => .{ .size = 16, .alignment = 8 },
+            .owned, .copy => .{ .size = 24, .alignment = 8 },
+            // arc String is a cell_arc_t over a heap cell_string_t. arc has no
+            // retain/release insertion yet (OWNERSHIP R11), so placing one
+            // correctly would be lowering half a feature.
+            .arc => null,
+        },
+        // Still out of scope: [T], T?, Result.
+        .list, .optional, .result, .func, .unknown => null,
+    };
+}
+
+/// The LLVM struct type a `String` occupies, by ownership. Null when this
+/// module does not place it.
+pub fn stringStruct(own: hir.Ownership) ?[]const u8 {
+    return switch (own) {
+        .shared, .exclusive => "%cell_str",
+        .owned, .copy => "%cell_string",
+        .arc => null,
     };
 }
 
@@ -52,7 +70,7 @@ fn structLayout(m: *const hir.Module, name: []const u8) ?Layout {
     var offset: u32 = 0;
     var max_align: u32 = 1;
     for (s.fields) |f| {
-        const fl = layoutOf(m, f.ty) orelse return null;
+        const fl = layoutOf(m, f.ty, f.ownership) orelse return null;
         if (fl.alignment > max_align) max_align = fl.alignment;
         offset = alignUp(offset, fl.alignment) + fl.size;
     }
@@ -169,11 +187,16 @@ pub fn classifyParam(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) Class
     // fixes this and the language depends on it, so the check comes first.
     if (scalarSpelling(ty)) |s| return .{ .direct = s };
 
-    const layout = layoutOf(m, ty) orelse return .unclassified;
+    const layout = layoutOf(m, ty, own) orelse return .unclassified;
 
-    switch (own) {
-        .shared, .exclusive => return .{ .direct = "ptr" },
-        .owned, .copy, .arc => {},
+    // A borrowed STRUCT is a pointer, matching codegen's `const cell_T *`. A
+    // borrowed String is NOT: cell_str_t is already a borrowed view and is
+    // passed by value, which cell_rt.h section 2 fixes.
+    if (ty.tag() == .struct_type) {
+        switch (own) {
+            .shared, .exclusive => return .{ .direct = "ptr" },
+            .owned, .copy, .arc => {},
+        }
     }
 
     // The HFA rule is checked BEFORE the size cutoff, because it ignores it.
@@ -188,7 +211,9 @@ pub fn classifyParam(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) Class
 pub fn classifyReturn(m: *const hir.Module, ty: hir.Ty) Class {
     if (scalarSpelling(ty)) |s| return .{ .direct = s };
 
-    const layout = layoutOf(m, ty) orelse return .unclassified;
+    // A return carries no ownership annotation, and codegen treats `-> String`
+    // as owning (cell_string_t), so classify it that way.
+    const layout = layoutOf(m, ty, .owned) orelse return .unclassified;
 
     // The measured asymmetry: an HFA PARAMETER coerces to [n x double], but an
     // HFA RETURN is the struct itself. This is the case a single classify()
@@ -279,14 +304,14 @@ fn emptyModule() hir.Module {
 
 test "scalar layouts match the C ABI in cell_rt.h" {
     const m = emptyModule();
-    try std.testing.expectEqual(@as(u32, 8), layoutOf(&m, types.t_int).?.size);
-    try std.testing.expectEqual(@as(u32, 4), layoutOf(&m, types.t_int32).?.size);
-    try std.testing.expectEqual(@as(u32, 8), layoutOf(&m, types.t_float).?.size);
-    try std.testing.expectEqual(@as(u32, 4), layoutOf(&m, types.t_float32).?.size);
-    try std.testing.expectEqual(@as(u32, 1), layoutOf(&m, types.t_bool).?.size);
-    try std.testing.expectEqual(@as(u32, 1), layoutOf(&m, types.t_byte).?.size);
+    try std.testing.expectEqual(@as(u32, 8), layoutOf(&m, types.t_int, .copy).?.size);
+    try std.testing.expectEqual(@as(u32, 4), layoutOf(&m, types.t_int32, .copy).?.size);
+    try std.testing.expectEqual(@as(u32, 8), layoutOf(&m, types.t_float, .copy).?.size);
+    try std.testing.expectEqual(@as(u32, 4), layoutOf(&m, types.t_float32, .copy).?.size);
+    try std.testing.expectEqual(@as(u32, 1), layoutOf(&m, types.t_bool, .copy).?.size);
+    try std.testing.expectEqual(@as(u32, 1), layoutOf(&m, types.t_byte, .copy).?.size);
     // An enum is an int32_t typedef in the C ABI, SPEC 10.3.
-    try std.testing.expectEqual(@as(u32, 4), layoutOf(&m, .{ .enum_type = "Color" }).?.size);
+    try std.testing.expectEqual(@as(u32, 4), layoutOf(&m, .{ .enum_type = "Color" }, .copy).?.size);
 }
 
 test "a struct is laid out with C padding rules" {
@@ -298,7 +323,7 @@ test "a struct is laid out with C padding rules" {
         .{ .name = "Padded", .fields = &fields, .is_public = true },
     };
     const m = testModule(&structs);
-    const l = layoutOf(&m, .{ .struct_type = "Padded" }).?;
+    const l = layoutOf(&m, .{ .struct_type = "Padded" }, .copy).?;
     // byte at 0, 7 bytes padding, i64 at 8. Total 16, aligned 8.
     try std.testing.expectEqual(@as(u32, 16), l.size);
     try std.testing.expectEqual(@as(u32, 8), l.alignment);
@@ -306,7 +331,7 @@ test "a struct is laid out with C padding rules" {
 
 test "an out-of-scope type has no layout yet" {
     const m = emptyModule();
-    try std.testing.expect(layoutOf(&m, types.t_string) == null);
+    try std.testing.expect(layoutOf(&m, types.t_string, .arc) == null);
 }
 
 test "two doubles are an HFA of two" {
@@ -446,8 +471,42 @@ test "a non-HFA over 16 bytes is indirect in both positions" {
 
 test "an out-of-scope type is unclassified, not guessed" {
     const m = emptyModule();
-    try std.testing.expect(classifyParam(&m, types.t_string, .shared) == .unclassified);
-    try std.testing.expect(classifyReturn(&m, types.t_string) == .unclassified);
+    // [T] still has no representation at all (SPEC 3.3).
+    const elem = types.t_byte;
+    const list_ty: hir.Ty = .{ .list = &elem };
+    try std.testing.expect(classifyParam(&m, list_ty, .shared) == .unclassified);
+    try std.testing.expect(classifyReturn(&m, list_ty) == .unclassified);
+    // arc String is refused too: arc has no retain/release insertion yet, so
+    // placing one correctly would be lowering half a feature.
+    try std.testing.expect(classifyParam(&m, types.t_string, .arc) == .unclassified);
+}
+
+test "String's size depends on ownership, and only String's does" {
+    // codegen maps `shared String` to a 16-byte cell_str_t, a borrowed
+    // {ptr, len} view, and `owned String` to a 24-byte cell_string_t, an
+    // owning {ptr, len, cap} buffer. Measured from the C the backend emits:
+    //   int64_t cell_a(cell_str_t s);      // shared
+    //   int64_t cell_b(cell_string_t s);   // owned
+    const m = emptyModule();
+    try std.testing.expectEqual(@as(u32, 16), layoutOf(&m, types.t_string, .shared).?.size);
+    try std.testing.expectEqual(@as(u32, 24), layoutOf(&m, types.t_string, .owned).?.size);
+    try std.testing.expectEqual(@as(u32, 24), layoutOf(&m, types.t_string, .copy).?.size);
+}
+
+test "a shared String coerces to two words; an owned one is indirect" {
+    const m = emptyModule();
+    switch (classifyParam(&m, types.t_string, .shared)) {
+        .coerce_int => |n| try std.testing.expectEqual(@as(u32, 2), n),
+        else => return error.WrongClass,
+    }
+    // 24 bytes, so it goes indirect rather than in registers.
+    try std.testing.expect(classifyParam(&m, types.t_string, .owned) == .indirect);
+    // A borrowed String is NOT a pointer, unlike a borrowed struct: a
+    // cell_str_t is already a borrowed view and passes by value.
+    switch (classifyParam(&m, types.t_string, .shared)) {
+        .direct => return error.ShouldNotBePointer,
+        else => {},
+    }
 }
 
 // ---------------------------------------------------------------------------
