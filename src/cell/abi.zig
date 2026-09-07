@@ -48,8 +48,34 @@ pub fn layoutOf(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) ?Layout {
             // correctly would be lowering half a feature.
             .arc => null,
         },
-        // Still out of scope: [T], T?, Result.
-        .list, .optional, .result, .func, .unknown => null,
+        // An optional is `{ bool has_value; T value; }` (the
+        // CELL_DEFINE_OPTIONAL macro in cell_rt.h), so it lays out like any
+        // other two-field struct: the tag, padding to the payload's
+        // alignment, the payload, then trailing padding.
+        .optional => |inner| blk: {
+            const il = layoutOf(m, inner.*, .copy) orelse break :blk null;
+            const al = @max(il.alignment, 1);
+            break :blk .{ .size = alignUp(alignUp(1, al) + il.size, al), .alignment = al };
+        },
+        // Still out of scope: [T] has no representation at all (SPEC 3.3), and
+        // Result's payload is a union this module does not model yet.
+        .list, .result, .func, .unknown => null,
+    };
+}
+
+/// The runtime's optional-instance base for an element type, matching what
+/// codegen emits: `Int?` is a `cell_opt_i64_t`. Null for an element the
+/// runtime has no pre-defined instance for.
+pub fn optionalBase(elem: hir.Ty) ?[]const u8 {
+    return switch (elem) {
+        .int => "cell_opt_i64",
+        .uint => "cell_opt_u64",
+        .int32 => "cell_opt_i32",
+        .float => "cell_opt_f64",
+        .boolean => "cell_opt_bool",
+        .byte => "cell_opt_byte",
+        .string => "cell_opt_str",
+        else => null,
     };
 }
 

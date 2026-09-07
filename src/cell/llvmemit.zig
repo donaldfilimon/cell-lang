@@ -102,6 +102,9 @@ const Emitter = struct {
     /// computed as %cell_T and returned as [2 x i64].
     ret_natural: []const u8 = "void",
     ret_abi: []const u8 = "void",
+    /// The sret pointer's name while emitting a function that returns an
+    /// aggregate indirectly, or null.
+    sret: ?[]const u8 = null,
     /// Set once a terminator has been written into the current basic block, so
     /// a second one is not appended. LLVM rejects a block with two.
     terminated: bool = false,
@@ -127,6 +130,13 @@ const Emitter = struct {
         try self.out.writeAll(
             \\%cell_str = type { ptr, i64 }
             \\%cell_string = type { ptr, i64, i64 }
+            \\%cell_opt_i64 = type { i8, i64 }
+            \\%cell_opt_u64 = type { i8, i64 }
+            \\%cell_opt_i32 = type { i8, i32 }
+            \\%cell_opt_f64 = type { i8, double }
+            \\%cell_opt_bool = type { i8, i8 }
+            \\%cell_opt_byte = type { i8, i8 }
+            \\%cell_opt_str = type { i8, %cell_str }
             \\
             \\
         );
@@ -211,18 +221,21 @@ const Emitter = struct {
     }
 
     fn emitDeclare(self: *Emitter, f: *const hir.Fn) EmitError!void {
-        if (abi.classifyReturn(self.module, f.ret) == .indirect) {
-            // An sret return changes the SIGNATURE, not just a type: the
-            // function returns void and takes a hidden pointer. That is its
-            // own slice, so refuse rather than emit something plausible.
-            try self.unsupported(f.span, "a struct return larger than 16 bytes needs sret, not implemented yet");
-            return;
-        }
+        const sret = abi.classifyReturn(self.module, f.ret) == .indirect;
         const ret = abi.renderReturn(self.arena, self.module, f.ret) orelse {
             try self.unsupported(f.span, "declared return type");
             return;
         };
         try self.out.print("declare {s} @{s}(", .{ ret, f.symbol });
+        if (sret) {
+            // An aggregate too large for registers is returned through a
+            // caller-allocated buffer, passed as a hidden FIRST parameter. The
+            // function itself returns void. `sret(T)` is what tells LLVM this
+            // is that convention rather than an ordinary pointer argument.
+            const natural = self.llTypeOwned(f.ret, .owned) orelse "i8";
+            try self.out.print("ptr sret({s})", .{natural});
+            if (f.param_count != 0) try self.out.writeAll(", ");
+        }
         for (f.params(), 0..) |p, i| {
             if (i != 0) try self.out.writeAll(", ");
             const t = abi.renderParam(self.arena, self.module, p.ty, p.ownership) orelse {
@@ -239,10 +252,7 @@ const Emitter = struct {
 
     fn emitFn(self: *Emitter, f: *const hir.Fn) EmitError!void {
         const body = f.body orelse return;
-        if (abi.classifyReturn(self.module, f.ret) == .indirect) {
-            try self.unsupported(f.span, "a struct return larger than 16 bytes needs sret, not implemented yet");
-            return;
-        }
+        const uses_sret = abi.classifyReturn(self.module, f.ret) == .indirect;
         const ret = abi.renderReturn(self.arena, self.module, f.ret) orelse {
             try self.unsupported(f.span, "return type");
             return;
@@ -262,8 +272,14 @@ const Emitter = struct {
         for (self.slot_ptr_to.items) |*p| p.* = null;
         self.ret_natural = ret_natural;
         self.ret_abi = ret;
+        self.sret = if (uses_sret) "%sret" else null;
 
         try self.out.print("define {s} @{s}(", .{ ret, f.symbol });
+        if (uses_sret) {
+            const natural = self.llTypeOwned(f.ret, .owned) orelse "i8";
+            try self.out.print("ptr sret({s}) %sret", .{natural});
+            if (f.param_count != 0) try self.out.writeAll(", ");
+        }
         for (f.params(), 0..) |p, i| {
             if (i != 0) try self.out.writeAll(", ");
             const t = abi.renderParam(self.arena, self.module, p.ty, p.ownership) orelse {
@@ -419,6 +435,11 @@ const Emitter = struct {
                 if (maybe) |e| {
                     const val = try self.emitExpr(&e);
                     if (val.isVoid()) {
+                        try self.out.writeAll("  ret void\n");
+                    } else if (self.sret) |dest| {
+                        // The value goes into the caller's buffer, and the
+                        // function itself returns nothing.
+                        try self.out.print("  store {s} {s}, ptr {s}\n", .{ val.ty, val.text, dest });
                         try self.out.writeAll("  ret void\n");
                     } else if (!std.mem.eql(u8, self.ret_abi, self.ret_natural)) {
                         // The ABI returns a coerced form, e.g. a 16-byte
@@ -738,10 +759,25 @@ const Emitter = struct {
             vals[i] = v;
         }
 
-        const ret = self.llType(e.ty) orelse {
+        // A call's result is an OWNED value, which matters for String: the
+        // callee hands back a cell_string_t, not a borrowed cell_str_t.
+        const natural = self.llTypeOwned(e.ty, .owned) orelse {
             try self.unsupported(e.span, "call return type");
             return Value.void_value;
         };
+        const ret = abi.renderReturn(self.arena, self.module, e.ty) orelse {
+            try self.unsupported(e.span, "call return type");
+            return Value.void_value;
+        };
+        const via_sret = abi.classifyReturn(self.module, e.ty) == .indirect;
+
+        // An sret callee writes into a buffer WE allocate and returns void, so
+        // the result has to exist before the call rather than after it.
+        var sret_slot: []const u8 = "";
+        if (via_sret) {
+            sret_slot = try self.nextTemp();
+            try self.out.print("  {s} = alloca {s}\n", .{ sret_slot, natural });
+        }
 
         const is_void = std.mem.eql(u8, ret, "void");
         var result: []const u8 = "";
@@ -752,14 +788,33 @@ const Emitter = struct {
             try self.out.writeAll("  ");
         }
         try self.out.print("call {s} @{s}(", .{ ret, sym });
+        if (via_sret) {
+            try self.out.print("ptr sret({s}) {s}", .{ natural, sret_slot });
+            if (vals.len != 0) try self.out.writeAll(", ");
+        }
         for (vals, 0..) |v, i| {
             if (i != 0) try self.out.writeAll(", ");
             try self.out.print("{s} {s}", .{ v.ty, v.text });
         }
         try self.out.writeAll(")\n");
 
+        if (via_sret) {
+            const loaded = try self.nextTemp();
+            try self.out.print("  {s} = load {s}, ptr {s}\n", .{ loaded, natural, sret_slot });
+            return .{ .text = loaded, .ty = natural };
+        }
         if (is_void) return Value.void_value;
-        return .{ .text = result, .ty = ret };
+        // The ABI may have returned a coerced form; the rest of the body wants
+        // the natural one.
+        if (!std.mem.eql(u8, ret, natural)) {
+            const slot = try self.nextTemp();
+            try self.out.print("  {s} = alloca {s}\n", .{ slot, natural });
+            try self.out.print("  store {s} {s}, ptr {s}\n", .{ ret, result, slot });
+            const back = try self.nextTemp();
+            try self.out.print("  {s} = load {s}, ptr {s}\n", .{ back, natural, slot });
+            return .{ .text = back, .ty = natural };
+        }
+        return .{ .text = result, .ty = natural };
     }
 
     fn emitStructLit(
@@ -1017,7 +1072,11 @@ const Emitter = struct {
             // String may be owning instead, which is why slots and parameters
             // go through llTypeOwned below rather than here.
             .string => "%cell_str",
-            .list, .optional, .result, .func, .unknown => null,
+            .optional => |inner| blk: {
+                const base = abi.optionalBase(inner.*) orelse break :blk null;
+                break :blk std.fmt.allocPrint(self.arena, "%{s}", .{base}) catch null;
+            },
+            .list, .result, .func, .unknown => null,
         };
     }
 
@@ -1191,9 +1250,12 @@ test "unsigned division uses udiv, signed uses sdiv" {
     try expectContains(e.text, "udiv i64");
 }
 
-test "String is refused with a diagnostic rather than emitted wrongly" {
+test "[T] is still refused with a diagnostic rather than emitted wrongly" {
+    // String USED to be here. It now lowers, so this test moved to the type
+    // that is still genuinely unrepresentable: SPEC 3.3 says [T] has no
+    // representation at all, not merely no LLVM placement.
     var e = try emitSource(
-        \\pub fn f() -> String { return "hi" }
+        \\pub fn f(shared xs: [Byte]) -> Int;
     );
     defer e.deinit();
     try std.testing.expect(e.bag.hasErrors());
@@ -1337,20 +1399,20 @@ test "a non-HFA struct of 16 bytes coerces to integer words" {
     try expectContains(e.text, "define i64 @cell_first([2 x i64]");
 }
 
-test "a struct return over 16 bytes is refused rather than guessed" {
-    // sret changes the SIGNATURE, not just a type: the function returns void
-    // and takes a hidden pointer. That is its own slice, so refuse.
+test "a struct return over 16 bytes uses sret" {
+    // Too large for registers, so it comes back through a caller-allocated
+    // buffer passed as a hidden first parameter, and the function returns
+    // void. This test previously asserted the case was REFUSED; sret is now
+    // implemented, so it asserts the convention instead.
     var e = try emitSource(
         \\pub struct Big { copy a: Int, copy b: Int, copy c: Int }
         \\pub fn make() -> Big { return Big { a: 1, b: 2, c: 3 } }
     );
     defer e.deinit();
-    try std.testing.expect(e.bag.hasErrors());
-    var found = false;
-    for (e.bag.list.items) |d| {
-        if (std.mem.indexOf(u8, d.message, "sret") != null) found = true;
-    }
-    try std.testing.expect(found);
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "define void @cell_make(ptr sret(%cell_Big) %sret)");
+    try expectContains(e.text, "store %cell_Big");
+    try expectContains(e.text, "ret void");
 }
 
 test "a borrowed struct crosses to C as a pointer, with the right value" {
@@ -1459,17 +1521,45 @@ test "an argument is coerced to the form the callee declares" {
     try expectContains(e.text, "call i64 @cell_slen([2 x i64]");
 }
 
-test "a String return is refused: it needs sret" {
+test "a String return comes back through sret as an owning cell_string" {
+    // A return carries no ownership annotation and codegen treats `-> String`
+    // as owning, so it is a 24-byte cell_string_t, too large for registers.
     var e = try emitSource(
         \\pub fn make() -> String;
     );
     defer e.deinit();
-    try std.testing.expect(e.bag.hasErrors());
-    var found = false;
-    for (e.bag.list.items) |d| {
-        if (std.mem.indexOf(u8, d.message, "sret") != null) found = true;
-    }
-    try std.testing.expect(found);
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "declare void @cell_make(ptr sret(%cell_string))");
+}
+
+test "an optional lowers to the runtime's tagged instance" {
+    // Int? is cell_opt_i64_t, `{ bool has_value; int64_t value; }`, 16 bytes,
+    // so it coerces to two words. String? is 24 and goes indirect.
+    var e = try emitSource(
+        \\pub fn f(shared v: Int?) -> Bool;
+        \\pub fn g(shared s: String?) -> Bool;
+    );
+    defer e.deinit();
+    try expectContains(e.text, "%cell_opt_i64 = type { i8, i64 }");
+    try expectContains(e.text, "declare i1 @cell_f([2 x i64])");
+    try expectContains(e.text, "declare i1 @cell_g(ptr)");
+}
+
+test "a struct returned through sret and consumed again computes correctly" {
+    // End to end: a 24-byte struct built in one function, returned via sret,
+    // passed indirectly into another, and summed. 7 * 3 = 21.
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub struct Big { copy a: Int, copy b: Int, copy c: Int }
+        \\pub fn make(copy n: Int) -> Big { return Big { a: n, b: n, c: n } }
+        \\pub fn sum(copy v: Big) -> Int { return v.a + v.b + v.c }
+        \\pub fn main() { print_int(sum(copy make(copy 7))) }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    const out = try runEmitted(e.text);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("21\n", out);
 }
 
 test "a String reaches the real runtime and prints" {
