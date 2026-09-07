@@ -1,0 +1,6 @@
+// DOES NOT PARSE. There is no `<` `>` handling anywhere in parseType, so a
+// generic type argument list is a parse error at the closing paren of the
+// parameter list. SPEC section 3.4.
+pub fn read_file(shared path: String) -> Result<String, Int> {
+    return path
+}

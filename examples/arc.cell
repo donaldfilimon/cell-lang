@@ -1,0 +1,42 @@
+// The `arc` ownership mode.
+//
+// Status: parses and passes `cell check`. `arc` has NO runtime effect in the
+// emitted C: no retain, no release, and `arc T` maps to void* rather than to
+// the `cell_arc_t` that runtime/cell_rt.h defines. See SPEC 4.1.4 and 10.3.
+//
+// The runtime machinery is real and works: cell_arc_new, cell_arc_clone, and
+// cell_arc_drop in runtime/cell_rt.c do genuine refcount increments and
+// decrements and call a drop function at zero. Codegen never calls them.
+//
+// WARNING: those refcount operations are NON-ATOMIC plain increments and
+// decrements. `arc` values are not safe to share across threads.
+
+pub struct Session {
+    arc name: String
+    copy id: Int
+}
+
+/// An `arc` argument is never made dead by passing it. Both the caller and the
+/// callee hold a live reference afterward. That is the whole point of the mode.
+pub fn observe(arc name: String) -> Int;
+
+/// A returned `arc` is returned already retained: the caller owns that
+/// reference and must release it. See docs/OWNERSHIP.md R11.
+pub fn share_name(arc name: String) -> arc String {
+    return name
+}
+
+/// Passing an `arc` place to a `shared` parameter borrows the pointee for the
+/// call and does NOT retain. Safe because a borrow may not escape (R8).
+pub fn inspect(shared name: String) -> Int;
+
+pub fn main() {
+    let arc label = "session"
+    let copy first = observe(arc label)
+    let copy second = observe(arc label)
+    let copy third = inspect(shared label)
+}
+
+// `arc` grants shared access only in this revision. Mutating through `arc` is
+// an error (OWNERSHIP.md R9), because Cell has no interior mutability yet.
+// See examples/rejected/arc_mutation.cell.

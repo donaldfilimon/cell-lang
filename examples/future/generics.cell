@@ -1,0 +1,5 @@
+// DOES NOT PARSE. There are no type parameters on functions or types.
+// SPEC section 3.4.
+pub fn identity<T>(owned value: T) -> T {
+    return value
+}

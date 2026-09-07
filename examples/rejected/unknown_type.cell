@@ -1,0 +1,12 @@
+// EXPECT: currently-accepted
+// Violates: docs/SPEC.md section 3.1 (unknown type name rejection).
+//
+// `mapPrimitive` knows exactly eleven names and falls through to `void*` for
+// everything else, with no diagnostic. So a misspelled `Strng`, an integer
+// width Cell does not have (`UInt32`), and a type that does not exist at all
+// are indistinguishable from a user struct. The mistake surfaces later as a C
+// error on the first field access, if at all.
+
+pub fn misspelled(shared s: Strng) -> Int;
+pub fn no_such_width(copy v: UInt32) -> Int;
+pub fn entirely_invented(shared v: Widget) -> Int;

@@ -1,0 +1,11 @@
+// EXPECT: currently-accepted
+// Violates: docs/OWNERSHIP.md R13.1 (annotated twice).
+//
+// `owned a: shared Int` puts an ownership keyword both before the name, where
+// it lands on Param.ownership, and on the type, where it builds a TypeExpr.ref.
+// The two mean different things and the combination means nothing coherent.
+// SPEC 3.8 picks the canonical position for each context.
+
+pub fn f(owned a: shared Int) -> Int {
+    return a
+}

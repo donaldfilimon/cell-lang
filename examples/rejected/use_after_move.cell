@@ -1,0 +1,16 @@
+// EXPECT: currently-accepted
+// Violates: docs/OWNERSHIP.md R2 (use after move).
+//
+// `take` consumes `buf`, so `buf` is dead afterward and the second call is a
+// use-after-move. There is no borrow checker, so this passes `cell check` with
+// exit 0. It is the first test the move checker should fail on.
+
+pub struct Buffer { copy len: Int }
+
+pub fn take(owned b: Buffer) { }
+
+pub fn main() {
+    let owned buf = Buffer { len: 0 }
+    take(owned buf)
+    take(owned buf)
+}

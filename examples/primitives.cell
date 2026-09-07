@@ -1,0 +1,42 @@
+// The eleven primitive types and their exact C mapping.
+//
+// Status: parses, passes `cell check`, and the emitted parameter and return
+// types are correct C. Verified with `cell emit examples/primitives.cell`.
+// This is the one example whose emitted C is faithful, because it contains
+// only declarations and no bodies.
+//
+// Cell        C                 note
+// Int         int64_t           default integer
+// Int64       int64_t           same C type as Int
+// Int32       int32_t
+// UInt        uint64_t          default unsigned
+// UInt64      uint64_t          same C type as UInt
+// Float       double            default float
+// Float64     double            same C type as Float
+// Float32     float
+// Bool        bool
+// String      const char*       borrowed, NUL-terminated, no length
+// Byte        uint8_t
+//
+// TRAP: any other type name silently becomes void* with no diagnostic.
+// `Int8`, `UInt32`, and a misspelled `Strng` are all void*. See SPEC 3.1.
+
+pub fn take_int(copy v: Int) -> Int;
+pub fn take_int64(copy v: Int64) -> Int64;
+pub fn take_int32(copy v: Int32) -> Int32;
+pub fn take_uint(copy v: UInt) -> UInt;
+pub fn take_uint64(copy v: UInt64) -> UInt64;
+pub fn take_float(copy v: Float) -> Float;
+pub fn take_float64(copy v: Float64) -> Float64;
+pub fn take_float32(copy v: Float32) -> Float32;
+pub fn take_bool(copy v: Bool) -> Bool;
+pub fn take_string(shared v: String) -> String;
+pub fn take_byte(copy v: Byte) -> Byte;
+
+// No `->` clause means the unit type, emitted as C `void`.
+pub fn returns_unit(copy v: Int);
+
+// Compound type syntax that parses. Both map to void* today (SPEC 3.2, 3.3).
+pub fn take_optional(shared v: Int?) -> Bool;
+pub fn take_list(shared v: [Byte]) -> Int;
+pub fn take_nested(shared v: [Int?]) -> Int;

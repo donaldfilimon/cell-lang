@@ -1,0 +1,49 @@
+// Structs and enums, including per-field ownership.
+//
+// Status: parses and passes `cell check`. Struct and enum EMISSION is faithful:
+// this is the part of codegen that produces valid C. Field ownership reaches
+// the output only as a trailing comment.
+
+// Field separators are fully optional and interchangeable: comma, semicolon,
+// or nothing all parse, and mixing them within one struct parses. SPEC 8.2
+// specifies standardizing on the comma; that is not implemented.
+pub struct Buffer {
+    owned data: [Byte]
+    copy len: Int,
+    copy capacity: Int;
+}
+
+// Emits:
+//   typedef struct cell_Buffer {
+//     void* data;      // owned
+//     int64_t len;     // copy
+//     int64_t capacity;// copy
+//   } cell_Buffer;
+//
+// Note `data` is void* because [Byte] has no representation (SPEC 3.3).
+
+pub struct Point {
+    copy x: Float64
+    copy y: Float64
+}
+
+// A struct used in type position falls through to void*, because mapPrimitive
+// only knows the eleven primitive names. See SPEC 3.1 and 3.6.
+pub fn distance_squared(shared p: Point, shared q: Point) -> Float64;
+
+// Enum variants carry no data. `Some(Int)` is a parse error, and EnumDef
+// cannot represent a payload at all. See examples/future/enum_payload.cell.
+pub enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+// Emits:
+//   typedef enum cell_Color {
+//     cell_Color_Red,
+//     cell_Color_Green,
+//     cell_Color_Blue,
+//   } cell_Color;
+
+pub enum Direction { North, South, East, West }

@@ -1,0 +1,33 @@
+// BODY FILE. Implements geometry.cell.
+//
+// Status: DESIGNED, NOT IMPLEMENTED. Nothing pairs this with geometry.cell.
+// It parses on its own because the CLI ignores extensions entirely.
+//
+// Under SPEC 1.2 the rules a compiler must enforce here are:
+//   - every `pub` definition must match a declaration in geometry.cell by
+//     name, arity, ownership, parameter types, and return type (rule 11)
+//   - a `pub` definition with no declaration is an error (rule 8)
+//   - a function with a body in BOTH files is a duplicate definition (rule 10)
+//   - a non-`pub` item needs no declaration and is private to the pair (rule 9)
+//   - this file may not exist without geometry.cell (rule 5)
+
+pub fn distance_squared(shared a: Point, shared b: Point) -> Float64 {
+    let copy dx = a.x - b.x
+    let copy dy = a.y - b.y
+    return dx * dx + dy * dy
+}
+
+pub fn quadrant_of(shared p: Point) -> Quadrant {
+    if p.x > 0.0 {
+        if p.y > 0.0 { return Quadrant.First }
+        return Quadrant.Fourth
+    }
+    if p.y > 0.0 { return Quadrant.Second }
+    return Quadrant.Third
+}
+
+// Not `pub`, so it needs no declaration in geometry.cell and is private to the
+// pair.
+fn origin() -> Point {
+    return Point { x: 0.0, y: 0.0 }
+}

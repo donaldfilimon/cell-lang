@@ -1,0 +1,5 @@
+// DOES NOT PARSE. The postfix `?` is only accepted after a bare type name,
+// never after a `]`. `[Int]?` and `Int??` both fail. SPEC section 3.2.
+pub fn maybe_bytes(shared xs: [Byte]?) -> Int {
+    return 0
+}

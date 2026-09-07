@@ -1,0 +1,13 @@
+// EXPECT: currently-rejected
+// Violates: docs/OWNERSHIP.md R14, through a field path.
+//
+// The assignment target is an expression and `ast.rootName` walks the field
+// chain down to `b`, so this is caught. An earlier revision of the compiler
+// missed it, because the target was stored as the joined string "b.len".
+
+pub struct Buffer { copy len: Int }
+
+pub fn main() {
+    let owned b = Buffer { len: 0 }
+    b.len = 1
+}

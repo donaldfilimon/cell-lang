@@ -1,0 +1,28 @@
+// MODULE FILE. Pairs with geometry.body by filename stem.
+//
+// Status: DESIGNED, NOT IMPLEMENTED. This file and geometry.body each parse
+// individually and each pass `cell check`, but NOTHING LINKS THEM. The
+// compiler has no notion of a file extension at all: `cell check` accepts
+// `.bod`, `.cel`, `.txt`, and a file with no extension, and treats every one
+// as a standalone module. Measured. See docs/SPEC.md section 1.2.
+//
+// A module file may declare, define, or both. This one only declares, which is
+// the header-shaped use the split exists for.
+
+pub struct Point {
+    copy x: Float64
+    copy y: Float64
+}
+
+pub enum Quadrant { First, Second, Third, Fourth }
+
+/// Declared here, defined in geometry.body.
+pub fn distance_squared(shared a: Point, shared b: Point) -> Float64;
+
+/// Declared here, defined in geometry.body.
+pub fn quadrant_of(shared p: Point) -> Quadrant;
+
+/// Declared here and NEVER defined. That is legal and deliberate: an external
+/// symbol supplied at link time. SPEC 1.2 rule 7. This is what the whole
+/// prelude is.
+pub fn host_plot(shared p: Point);

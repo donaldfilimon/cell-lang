@@ -1,13 +1,179 @@
-// Cell standard prelude (sketch)
+// Cell standard prelude.
+//
+// This is a MODULE FILE in the sense of docs/SPEC.md section 1.2: it declares
+// and does not define. Every function here is bodyless, so `cell emit` gives a
+// C prototype and no definition, and the symbol must come from somewhere else
+// at link time.
+//
+// STATUS. Everything in this file parses and passes `cell check`. Verified
+// against commit 9fb12af:
+//     ./zig-out/bin/cell check stdlib/prelude.cell
+//     ./zig-out/bin/cell emit  stdlib/prelude.cell
+// Nothing here is imported automatically. There is no module resolution in the
+// compiler (SPEC section 8.4), so `use std.prelude` binds no names. This file
+// is a specification of the intended surface, checked by the parser.
+//
+// The declarations are split into three groups on purpose:
+//   (1) declarations whose emitted C prototype MATCHES a real runtime symbol
+//   (2) declarations whose runtime symbol exists but whose emitted prototype
+//       does NOT match it yet, because codegen has not adopted the runtime's
+//       value model
+//   (3) declarations that correspond to no symbol anywhere
+// Groups 2 and 3 will not link. That is stated rather than hidden.
 
-pub struct Result {
-    // Result<T, E> is a built-in for now; this is documentation form
-}
+// ---------------------------------------------------------------------------
+// Group 1: emitted prototype matches a real symbol in runtime/cell_rt.c
+//
+// Mangling is `cell_<name>` (SPEC section 10.2), so these names land exactly
+// on the runtime's existing exports. Checked against the C source, not the
+// header alone.
+// ---------------------------------------------------------------------------
 
-pub fn print(shared msg: String) {
-    // host intrinsic
-}
+/// Runtime version string.
+/// Emits `const char* cell_rt_version()`.
+/// Runtime:  const char *cell_rt_version(void)
+pub fn rt_version() -> String;
 
-pub fn assert(shared cond: Bool) {
-    // host intrinsic
-}
+/// Abort with a message.
+/// Emits `void cell_panic(const char* msg)`.
+/// Runtime:  void cell_panic(const char *msg) __attribute__((noreturn))
+/// Cell has no noreturn annotation, so the emitted prototype loses that fact.
+/// Note this is the one intrinsic that still takes a C string rather than a
+/// cell_str_t, which is why it lands in group 1 and `print` does not.
+pub fn panic(shared msg: String);
+
+/// C++ bridge probe. Nonzero when cell_rt.cpp is linked.
+/// Runtime:  int cell_cxx_probe(void)
+pub fn cxx_probe() -> Int32;
+
+/// Swift bridge probe. Nonzero when CellBridge.swift is linked.
+/// Runtime:  int cell_swift_probe(void)
+pub fn swift_probe() -> Int32;
+
+/// Abort unless the condition holds.
+/// Emits `void cell_assert(bool cond)`.
+/// Runtime:  void cell_assert(bool cond)
+pub fn assert(copy cond: Bool);
+
+// Caveat on all five: Cell emits `f()` where C wants `f(void)`. In C17 an empty
+// parameter list is an unprototyped declaration, not a zero-argument one. That
+// is a real defect in codegen, recorded in SPEC section 10.1.
+
+// ---------------------------------------------------------------------------
+// Group 2: the runtime symbol exists, the emitted prototype does not match it
+//
+// runtime/cell_rt.h specifies `String` as a length-prefixed cell_str_t, and
+// codegen still emits `const char*` (SPEC section 10.3). Every declaration
+// below therefore emits a prototype that CONFLICTS with the real symbol. They
+// are written in their final intended form; they start linking when codegen
+// adopts the runtime value model, and not before.
+// ---------------------------------------------------------------------------
+
+/// Runtime:  void cell_print(cell_str_t msg)
+pub fn print(shared msg: String);
+
+/// Runtime:  void cell_println(cell_str_t msg)
+pub fn println(shared msg: String);
+
+/// Runtime:  void cell_assert_msg(bool cond, cell_str_t msg)
+pub fn assert_msg(copy cond: Bool, shared msg: String);
+
+// The arena, slice, string, optional and arc entry points in cell_rt.h are
+// deliberately NOT declared here. They take pointers and aggregate types
+// (`cell_arena_t*`, `cell_slice_t*`, `cell_arc_t`) and Cell has no way to name
+// any of them: there are no pointer types, and `arc T` maps to `void*` rather
+// than to `cell_arc_t`. Declaring them with the wrong signature would be worse
+// than omitting them.
+
+// ---------------------------------------------------------------------------
+// Group 3: declared here, backed by nothing
+//
+// These are the prelude Cell should have. No implementation exists in this
+// repository, in the runtime, or anywhere else. A program that calls one emits
+// a C call to an undefined symbol and fails at link time.
+// ---------------------------------------------------------------------------
+
+// -- Output ----------------------------------------------------------------
+
+/// Write a string to standard error followed by a newline.
+pub fn eprintln(shared msg: String);
+
+// -- Integer and float conversion ------------------------------------------
+//
+// Cell has no cast operator (SPEC section 5.2), so conversion is by function.
+// Named for the destination, following Swift's initializer style rather than
+// Rust's `as`.
+
+pub fn int_from_int32(copy v: Int32) -> Int;
+pub fn int32_from_int(copy v: Int) -> Int32;
+pub fn uint_from_int(copy v: Int) -> UInt;
+pub fn int_from_uint(copy v: UInt) -> Int;
+pub fn float_from_int(copy v: Int) -> Float;
+pub fn int_from_float(copy v: Float) -> Int;
+pub fn float32_from_float(copy v: Float) -> Float32;
+pub fn float_from_float32(copy v: Float32) -> Float;
+pub fn byte_from_int(copy v: Int) -> Byte;
+pub fn int_from_byte(copy v: Byte) -> Int;
+
+// -- Numeric helpers -------------------------------------------------------
+//
+// `%` is not in the lexer (SPEC section 2.10), so remainder is a function.
+
+pub fn abs_int(copy v: Int) -> Int;
+pub fn min_int(copy a: Int, copy b: Int) -> Int;
+pub fn max_int(copy a: Int, copy b: Int) -> Int;
+pub fn rem_int(copy a: Int, copy b: Int) -> Int;
+pub fn abs_float(copy v: Float) -> Float;
+pub fn min_float(copy a: Float, copy b: Float) -> Float;
+pub fn max_float(copy a: Float, copy b: Float) -> Float;
+
+// -- Strings ---------------------------------------------------------------
+//
+// `String` is a borrowed, NUL-terminated `const char*` with no length
+// (SPEC section 10.3). Length is therefore O(n) and a string cannot contain an
+// interior NUL. Both are inherited from the C mapping, not chosen here.
+
+pub fn str_len(shared s: String) -> Int;
+pub fn str_eq(shared a: String, shared b: String) -> Bool;
+pub fn str_concat(shared a: String, shared b: String) -> owned String;
+pub fn str_byte_at(shared s: String, copy index: Int) -> Byte;
+pub fn str_from_int(copy v: Int) -> owned String;
+pub fn str_from_float(copy v: Float) -> owned String;
+pub fn str_from_bool(copy v: Bool) -> owned String;
+
+// The `owned String` returns above transfer ownership to the caller, who must
+// release them. There is no release function yet, because there is no
+// allocator surface yet, which is the next thing this prelude needs.
+
+// -- Byte lists ------------------------------------------------------------
+//
+// `[T]` has no representation (SPEC section 3.3): it maps to `void*` with no
+// length and no element type. These signatures describe the intended API and
+// cannot be implemented until a list representation is chosen.
+
+pub fn bytes_len(shared xs: [Byte]) -> Int;
+pub fn bytes_at(shared xs: [Byte], copy index: Int) -> Byte;
+pub fn bytes_push(exclusive xs: [Byte], copy value: Byte);
+pub fn bytes_pop(exclusive xs: [Byte]) -> Byte?;
+pub fn bytes_clear(exclusive xs: [Byte]);
+pub fn bytes_empty() -> owned [Byte];
+pub fn bytes_with_capacity(copy cap: Int) -> owned [Byte];
+
+// `bytes_pop` returns `Byte?` and there is no way to test or unwrap an
+// optional (SPEC section 3.2), so this signature is currently unusable even if
+// it were implemented.
+
+// -- Reference counting ----------------------------------------------------
+//
+// The retain and release the checker would insert are described in
+// docs/OWNERSHIP.md R11. These are the explicit forms, for the case where a
+// program wants to be deliberate. `arc String` is used rather than a generic
+// `arc T` because Cell has no generics (SPEC section 3.4).
+//
+// The runtime's cell_arc_clone and cell_arc_drop use ATOMIC refcounts as of
+// commit 562f116, so the count itself is thread safe. The pointee is not
+// synchronized, and nothing else in the runtime is thread safe.
+
+pub fn arc_retain_string(arc value: String) -> arc String;
+pub fn arc_release_string(arc value: String);
+pub fn arc_count_string(arc value: String) -> Int;

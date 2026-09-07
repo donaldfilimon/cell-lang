@@ -1,0 +1,22 @@
+// EXPECT: currently-accepted
+// Violates: docs/SPEC.md section 2.5 (reserved words) and 7.5.
+//
+// THIS IS THE MOST DANGEROUS FILE IN THE CORPUS, because it looks like working
+// code and compiles clean.
+//
+// `while` is not a keyword: it lexes as an ordinary identifier. So
+// `while (total < n)` is a CALL to a function named `while`, and the block
+// that follows is a separate block expression statement, evaluated for its
+// effect and discarded. Nothing loops. Nothing warns. `cell check` exits 0.
+//
+// A conforming implementation reserves `while` and rejects this outright,
+// which is why SPEC 2.5 lists the reservation as a language rule rather than a
+// style note.
+
+pub fn count_up(copy n: Int) -> Int {
+    var total = 0
+    while (total < n) {
+        total = total + 1
+    }
+    return total
+}

@@ -1,0 +1,7 @@
+// DOES NOT PARSE. parseEnum accepts a comma-separated list of bare identifiers
+// and fails at the `(`. EnumDef.variants is [][]const u8, so the AST cannot
+// represent a payload even if the parser accepted one. SPEC section 8.3.
+pub enum Maybe {
+    None,
+    Some(Int),
+}

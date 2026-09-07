@@ -1,0 +1,31 @@
+// Declarations without bodies, and the C-ABI-first story.
+//
+// Status: parses and passes `cell check`. This is the ONE example whose
+// emitted C is both valid and useful: a set of prototypes with `cell_` names.
+//
+// A function written with `;` instead of a block is a declaration. It emits a
+// C prototype and no definition, and the symbol must come from elsewhere at
+// link time. This is the mechanism behind body files (SPEC 1.2) and behind
+// stdlib/prelude.cell.
+
+use std.io
+use std.mem.alloc
+
+// `use` is recorded and emitted as a comment. There is NO module resolution:
+// nothing a `use` names becomes available. See SPEC 8.4.
+
+/// Emits: int64_t cell_host_read(const char* path);
+pub fn host_read(shared path: String) -> Int;
+
+/// Emits: void cell_host_write(const char* path, const char* data);
+pub fn host_write(shared path: String, shared data: String);
+
+/// A non-pub declaration still emits an externally visible C prototype with
+/// the same linkage as a pub one. The only difference is the `// export`
+/// comment above pub items. Real visibility is not implemented (SPEC 8.5).
+fn internal_helper(copy v: Int) -> Int;
+
+/// A declaration may be mixed freely with definitions in the same file.
+pub fn double(copy v: Int) -> Int {
+    return v + v
+}

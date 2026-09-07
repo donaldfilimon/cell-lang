@@ -1,0 +1,63 @@
+// Pattern matching.
+//
+// Status: parses and passes `cell check`. The emitted C is WRONG: every
+// `match` becomes the literal text `/*match*/`, so a match computes nothing.
+// Nothing checks exhaustiveness. See docs/SPEC.md section 9.
+
+pub enum Color { Red, Green, Blue }
+
+// A qualified variant pattern is unambiguous and is the form to prefer.
+pub fn qualified(copy c: Color) -> Int {
+    return match c {
+        Color.Red => 0,
+        Color.Green => 1,
+        Color.Blue => 2,
+    }
+}
+
+// TRAP: a bare identifier pattern is read as an enum VARIANT if its first
+// letter is uppercase and as a BINDING otherwise. That is a naming convention
+// promoted to a parse rule, decided before any name is resolved, so a
+// lowercase variant can never be matched by its bare name. SPEC 9.1.
+pub fn bare(copy c: Color) -> Int {
+    return match c {
+        Red => 0,        // enum variant, because 'R' is uppercase
+        other => 9,      // binding, because 'o' is lowercase
+    }
+}
+
+// Literal patterns, including negative numbers. A pattern is not an expression
+// and cannot contain a unary operator, so `-1` is folded by the parser into a
+// single negative literal pattern.
+pub fn literals(copy n: Int) -> Int {
+    return match n {
+        0 => 100,
+        1 => 101,
+        -1 => 102,
+        _ => 999,
+    }
+}
+
+pub fn strings(shared s: String) -> Int {
+    return match s {
+        "yes" => 1,
+        "no" => 0,
+        _ => -1,
+    }
+}
+
+pub fn booleans(copy b: Bool) -> Int {
+    return match b {
+        true => 1,
+        false => 0,
+    }
+}
+
+// NOT SUPPORTED, and each is designed-not-implemented in SPEC 9.2:
+//   payload patterns   Some(x)          enum variants carry no data
+//   struct patterns    Point { x, y }
+//   or-patterns        Red | Green      there is no `|` operator in the lexer
+//   guards             n if n > 0
+//   range patterns     0..9
+// Exhaustiveness is not checked either: `booleans` above happens to be
+// exhaustive and nothing verified that.

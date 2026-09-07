@@ -1,0 +1,55 @@
+// Conditionals.
+//
+// Status: parses and passes `cell check`. The emitted C is WRONG: every `if`
+// becomes the literal text `/*if*/;`, because codegen has no lowering for
+// branches. See docs/SPEC.md section 6.9. Do not read this file as evidence
+// that Cell has working control flow. It does not.
+//
+// The parser is complete here. `if cond { }`, `else`, and `else if` chains all
+// parse, and a bare identifier condition works because the parser implements
+// Rust's rule that a struct literal is not allowed in condition position
+// (SPEC 6.7). An earlier revision of the compiler failed on `if c {` and that
+// trap is gone.
+
+pub fn plain(shared c: Bool) -> Int {
+    if c { return 1 }
+    return 0
+}
+
+pub fn with_else(shared c: Bool) -> Int {
+    if c { return 1 } else { return 2 }
+    return 0
+}
+
+pub fn chain(shared n: Int) -> Int {
+    if n > 10 {
+        return 3
+    } else if n > 5 {
+        return 2
+    } else if n > 0 {
+        return 1
+    } else {
+        return 0
+    }
+    return 0
+}
+
+// A struct literal in condition position needs parentheses, exactly as in Rust.
+pub struct Flag { copy on: Bool }
+
+pub fn literal_condition() -> Int {
+    if (Flag { on: true }.on) { return 1 }
+    return 0
+}
+
+// A block is an expression, so it may stand anywhere an expression may.
+pub fn block_expression() -> Int {
+    let copy a = 1
+    { let copy inner = 2 }
+    return a
+}
+
+// THERE ARE NO LOOPS. `while`, `for`, `loop`, `break`, and `continue` are not
+// keywords, and because a block is an expression, a loop-shaped program parses
+// cleanly and does nothing at all. That trap has its own file:
+// examples/rejected/while_is_not_a_loop.cell.

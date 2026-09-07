@@ -1,0 +1,32 @@
+// Bindings, mutability, and the one rule the compiler actually enforces.
+//
+// Status: parses and passes `cell check`.
+
+pub fn bindings() {
+    // `let` is immutable. Assigning to `total` here would be an error.
+    let copy total: Int = 0
+
+    // `let mut` is mutable.
+    let mut copy running: Int = 0
+    running = running + total
+
+    // `var` is mutable. NOTE: `var mut x` is a PARSE ERROR, because `var`
+    // short circuits before `mut` can be consumed. See SPEC 7.2.
+    var counter: Int = 0
+    counter = counter + 1
+
+    // Ownership defaults to `owned` when omitted, in every position.
+    let implicitly_owned = 7
+
+    // The type annotation is optional, but there is no type inference:
+    // an unannotated binding is emitted as int64_t no matter what it holds.
+    let copy inferred_as_int64 = 3.5
+
+    // Semicolons are optional everywhere. Both styles are the same program.
+    let copy a = 1; let copy b = 2;
+}
+
+// The enforced rule, demonstrated in examples/rejected/immutable_assign.cell:
+//     let copy x = 1
+//     x = 2
+// gives `err: cannot assign to immutable binding` and exit 1.

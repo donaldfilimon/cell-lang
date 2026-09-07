@@ -1,0 +1,46 @@
+// Operator precedence and associativity, exactly as the parser implements it.
+//
+// Status: parses, passes `cell check`, and the emitted C is faithful because
+// codegen fully parenthesizes every binary expression.
+//
+// Precedence, tightest to loosest:
+//   unary   - ! & &mut
+//   6       * /
+//   5       + -
+//   4       < <= > >=
+//   3       == !=
+//   2       &&
+//   1       ||
+// All binary operators are LEFT associative.
+//
+// There is no %, no bitwise operator, no shift, and no compound assignment.
+// See docs/SPEC.md section 5.
+
+pub fn mixed(shared a: Int, shared b: Int, shared c: Int) -> Bool {
+    // Emits: (((((a + (b * c)) - (a / b)) == c) && (a < b)) || !c)
+    return a + b * c - a / b == c && a < b || !c
+}
+
+pub fn left_associative(shared a: Int, shared b: Int) -> Int {
+    // Emits: ((a - b) - a), not (a - (b - a))
+    return a - b - a
+}
+
+pub fn grouping(shared a: Int, shared b: Int, shared c: Int) -> Int {
+    return (a + b) * c
+}
+
+pub fn negation(shared a: Int) -> Int {
+    return -a
+}
+
+pub fn logical_not(shared a: Bool) -> Bool {
+    return !a
+}
+
+// Comparison operators are all one level and left associative, so this parses
+// as ((a < b) < c) rather than being rejected. Chained comparison is specified
+// as an error in SPEC 5.1 and is not implemented.
+pub fn chained(shared a: Int, shared b: Int, shared c: Int) -> Bool {
+    return a < b < c
+}

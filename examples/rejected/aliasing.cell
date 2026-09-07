@@ -1,0 +1,19 @@
+// EXPECT: currently-accepted
+// Violates: docs/OWNERSHIP.md R5 (shared XOR exclusive).
+//
+// `e` holds an exclusive loan of `buf` that lives to the end of the block, so
+// the shared borrow on the next line conflicts with it. Under the lexical
+// scoping of OWNERSHIP.md section 0.3 this is a hard error; under NLL it would
+// also be an error here, because `e` is used afterward.
+
+pub struct Buffer { copy len: Int }
+
+pub fn read(shared b: Buffer) -> Int { return b.len }
+pub fn use_it(exclusive b: Buffer) { }
+
+pub fn main() {
+    let owned buf = Buffer { len: 0 }
+    let exclusive e = &mut buf
+    let copy n = read(shared buf)
+    use_it(e)
+}

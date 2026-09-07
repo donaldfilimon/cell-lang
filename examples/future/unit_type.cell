@@ -1,0 +1,7 @@
+// DOES NOT PARSE. parseType requires an identifier, so `()` in type position
+// is a parse error. Omitting the `->` clause is the only way to say "unit"
+// today. TypeExpr.unit exists in the AST and nothing constructs it.
+// SPEC section 3.5.
+pub fn nothing() -> () {
+    return
+}

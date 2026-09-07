@@ -1,0 +1,11 @@
+// EXPECT: currently-accepted
+// Violates: docs/OWNERSHIP.md R3 (cannot move out of a borrow).
+//
+// `b` is an exclusive borrow, so the callee does not own it and cannot hand
+// ownership back to its own caller.
+
+pub struct Buffer { copy len: Int }
+
+pub fn steal(exclusive b: Buffer) -> Buffer {
+    return b
+}

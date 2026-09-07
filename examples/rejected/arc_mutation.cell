@@ -1,0 +1,12 @@
+// EXPECT: currently-rejected
+// Violates: docs/OWNERSHIP.md R9 (arc grants shared access only).
+//
+// Caught today, but for the wrong reason and with the wrong message. The
+// checker derives parameter mutability as `exclusive or owned`, so `arc` lands
+// on the immutable side and R14 fires with its generic text. R9 should be a
+// rule of its own so the diagnostic explains that mutation through `arc` needs
+// interior mutability, which Cell does not have.
+
+pub fn rename(arc n: Int) {
+    n = 1
+}

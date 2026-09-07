@@ -1,5 +1,10 @@
-// Cell language example — hello
+// Cell language example: hello.
 // Ownership keywords: owned | shared | exclusive | arc | copy
+//
+// Status: parses and passes `cell check`. The emitted C does NOT compile:
+// `Point { x: 1.0, y: 2.0 }` becomes the bare identifier `Point`, and the call
+// to `add` is emitted unmangled as `add(...)` while its definition is emitted
+// as `cell_add`. See docs/SPEC.md sections 6.7 and 10.2.
 
 use std.io
 

@@ -1,0 +1,19 @@
+// EXPECT: currently-accepted
+// Violates: docs/OWNERSHIP.md R15 (call-site annotation must match).
+//
+// `take` wants its argument moved in, and the call site asks to lend it
+// instead. Nothing catches this because the parser DISCARDS the ownership
+// keyword on a call argument: `take(shared buf)` and `take(owned buf)` build
+// the identical AST node, and both emit `take(buf)`. Measured.
+//
+// Keeping that annotation on the argument node is the highest-value front-end
+// change left for ownership work. See OWNERSHIP.md section 6, step 3.
+
+pub struct Buffer { copy len: Int }
+
+pub fn take(owned b: Buffer) { }
+
+pub fn main() {
+    let owned buf = Buffer { len: 0 }
+    take(shared buf)
+}
