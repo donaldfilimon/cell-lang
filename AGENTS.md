@@ -20,8 +20,9 @@ branch of this work.
 ## Toolchain and gates
 
 This project targets Zig **master**, not a release. It was developed against
-`0.17.0-dev.2018+ab30a0b9a`; `build.zig.zon` sets `minimum_zig_version` to
-`0.17.0-dev.1252+e4b325c19`.
+`0.17.0-dev.2018+ab30a0b9a`. `build.zig.zon` carries `minimum_zig_version`;
+read the number there rather than quoting one here, because it is bumped as
+the toolchain moves.
 
 Master moves weekly and removes things. When a std API disagrees with what you
 recall, read the source that ships with your own toolchain rather than guessing:
@@ -34,11 +35,19 @@ zig env            # .std_dir is the stdlib source, .lib_dir/../doc/langref.html
 Compiling proves removal; the langref proves deprecation. Check both.
 
 ```bash
-zig build -Dswift=false          # compile
-zig build test -Dswift=false     # unit tests
-zig build examples -Dswift=false # typecheck examples/hello.cell
+zig build -Dswift=false              # compile
+zig build test -Dswift=false         # Zig unit tests + the C runtime harness
+zig build test-runtime -Dswift=false # the C ABI harness alone
+zig build examples -Dswift=false     # typechecks examples/hello.cell, and only that
 ./zig-out/bin/cell check examples/hello.cell
 ```
+
+`test-runtime` builds `runtime/tests/test_cell_rt.c` with `-Werror` and
+deliberately does **not** link `cell_rt.cpp`, so it exercises the weak-symbol
+fallbacks for `cell_cxx_probe` and `cell_swift_probe`. `zig build test` depends
+on it, so a green package gate covers it.
+
+`zig build examples` checks one file. It is not the example gate; see below.
 
 **Always pass `-Dswift=false` unless you are deliberately testing the Swift
 bridge.** The Swift step in `build.zig` shells out to `swiftc` and hardcodes
@@ -60,22 +69,58 @@ run of the binary. This has already produced one false green here.
 
 Build scratch belongs under `/private/tmp`, never in an iCloud path.
 
+## The example corpus is the other half of the gate
+
+`zig build test` does not run the examples, and `zig build examples` checks
+only `hello.cell`. The real contract lives in `examples/README.md`: top-level
+`examples/*.cell` must pass `cell check`, `examples/future/*` must fail, and
+every file in `examples/rejected/` must match its own `// EXPECT:` header. Run
+those three loops after any change to the front end, the typechecker, or
+borrowck. A rule landing turns a `currently-accepted` header into a mismatch,
+and the protocol is to update the header in the same commit as the rule.
+
+`examples/pairing/geometry.cell` and `geometry.body` must both pass now that
+stem pairing is implemented.
+
 ## A green gate is only as strong as the tests
 
-`zig test src/root.zig` currently runs the typechecker, borrow checker, and
-codegen tests (including a `cc -c` of emitted C). `zig build test -Dswift=false`
-is the package gate. Check the test count before citing a green run, and add
-tests with the code you write. `main.zig`'s `"cli smoke"` still asserts `true`
-and is not evidence.
+`zig build test -Dswift=false` is the package gate and prints nothing on
+success, so it cannot tell you the count. To see one:
+
+```bash
+zig test src/root.zig 2>&1 | tail -1   # e.g. "All 158 tests passed." on 67529a9
+```
+
+Run a single test by filtering a file directly. `zig build test` does **not**
+accept `--test-filter`; it is not wired into `build.zig`.
+
+```bash
+zig test src/root.zig --test-filter "escaping borrow"
+zig test src/cell/borrowck.zig --test-filter "R5"
+```
+
+`src/root.zig` pulls in every stage through `refAllDecls`, so filtering it
+reaches the whole library including the codegen tests that shell out to `cc -c`.
+
+`zig test src/main.zig` appears to work and is a trap. It succeeds only because
+`"cli smoke"` references nothing, and Zig analyzes top-level declarations
+lazily, so neither `@import("cell")` nor the three `extern fn`s are ever
+resolved. The first real test of `main.zig` will need the module mapping and
+the linked C runtime, which means `zig build test`.
+
+Check the count before citing a green run, and add tests with the code you
+write. `main.zig`'s `"cli smoke"` still asserts `true` and is not evidence.
 
 ## Status honesty
 
 State what is implemented, what is parsed but not enforced, and what is only
 designed.
 
-- **Ownership.** R2, R3, R5, R8, and R14 are enforced by `src/cell/borrowck.zig`
-  through `cell check`. Call-site prefixes (R15) are still discarded. `arc`
-  retain/release is not inserted.
+- **Ownership.** R2, R3, R5, R8, R14, and R15 are enforced by
+  `src/cell/borrowck.zig` through `cell check`. The rule set moves, so cite
+  that file's header comment, which names the rules it implements, rather than
+  this line. `arc` retain/release is not inserted, and there is no drop
+  insertion and no NLL.
 - **Types.** `src/cell/types.zig` is a real type representation. Scopes do not
   leak parameters between functions.
 - **Codegen.** `if` / `else`, `match`, blocks, struct literals, list literals,
@@ -92,6 +137,16 @@ change what is true.
 Syntax parsing is not implementation. Verify a claim by running the compiler.
 
 ## Layout
+
+One compilation unit flows through the stages in this order. `load.zig`
+classifies the path by extension, finds a same-directory stem-mate when the
+path is a body, and merges the module's declarations into the body unit;
+`lexer` and `parser` produce an `ast.Module`; `typecheck.Checker` and
+`borrowck.Checker` then run **independently**, each accumulating into its own
+`diag.Bag`. `root.check` prints both bags and returns `error.TypeError` if
+either has errors, so borrowck still runs and still reports when typecheck has
+already failed. `codegen.Generator` lowers a checked module to C against
+`runtime/cell_rt.h`.
 
 `src/root.zig` is the library entry and exports `compile`, `check`, `emit`.
 `src/main.zig` is the CLI (`check`, `dump`, `emit`, `version`, `help`) and

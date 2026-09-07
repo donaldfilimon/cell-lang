@@ -46,9 +46,9 @@ counts in section 0.2 are derived from it.
 Note a distinction that recurs: a construct can be **implemented in the parser
 and not lowered by codegen**. Those are tagged **parsed, not enforced** with
 the reason stated. `if` and `match` used to be in that column (`/*if*/` /
-`/*match*/` placeholders); they now lower to C (section 0.6). The remaining
-parser-only cases include `T?`, `[T]` as a type, `use`, and call-site ownership
-prefixes.
+`/*match*/` placeholders); they now lower to C (section 0.6). Call-site
+ownership prefixes have left that column too (section 0.7). The remaining
+parser-only cases include `T?`, `[T]` as a type, and `use`.
 
 ### 0.2 Status summary
 
@@ -66,8 +66,9 @@ R2/R3/R5/R8/R14, and C lowering for the flagship examples are real.** As of
 the working tree the lexer, parser, AST, diagnostics, typechecker, and
 borrowck are wired into `cell check`. `if` / `else`, `match`, blocks, struct
 literals, list literals, and mangled calls lower to C. What is still designed
-includes loops, generics, `Result<T,E>`, stem pairing, NLL, R15 call-site
-prefixes, and `arc` retain/release. `docs/OWNERSHIP.md` is the normative rule
+includes loops, generics, `Result<T,E>`, NLL, and `arc` retain/release. Stem
+pairing (section 1.2) and R15 call-site prefixes (section 0.7) have since
+landed and are not counted in 0.2. `docs/OWNERSHIP.md` is the normative rule
 list; section 12 is the construct-by-construct index.
 
 ### 0.3 Verification method
@@ -138,8 +139,9 @@ placeholder codegen. Measured against a binary built with `-Dswift=false`:
 - R2, R3, R5, R8, and R14 are enforced. `examples/rejected/use_after_move.cell`,
   `move_out_of_borrow.cell`, `aliasing.cell`, `escaping_borrow.cell`,
   `immutable_assign.cell`, and `field_assign_immutable.cell` are
-  `currently-rejected`. Call-site prefixes (R15) are still discarded, so
-  `callsite_mismatch.cell` remains `currently-accepted`.
+  `currently-rejected`. Call-site prefixes (R15) were still discarded at this
+  point, so `callsite_mismatch.cell` remained `currently-accepted`; section
+  0.7 supersedes that.
 - `if` / `else`, `match`, blocks, struct literals, list literals, and calls
   lower to real C. `cell emit examples/hello.cell` compiles with `cc -c`.
   Linked against `runtime/cell_rt.c` it prints `42`.
@@ -161,6 +163,26 @@ says so in its header.
 Re-derive the index from the source before trusting the counts in 0.2 if
 `git log` shows further commits after `8dd5673` touching `src/`. The counts are
 a measurement with a date on it, not a standing property of the language.
+
+### 0.7 Delta: call-site ownership prefixes (R15)
+
+Measured against a binary built from `67529a9` with `-Dswift=false`:
+
+- The parser now keeps the ownership keyword written on a call argument
+  (`b39c158`), `refKind` peels the annotated wrapper (`9917ec7`), and borrowck
+  compares the written mode against the callee's parameter (`67529a9`). R15 is
+  **implemented**. `examples/rejected/callsite_mismatch.cell` is
+  `currently-rejected` with `error: 'take' expects parameter 'b' as 'owned',
+  but the argument is passed as 'shared'`, and its `// EXPECT:` header was
+  updated to match.
+- `src/cell/borrowck.zig`'s file header is the authoritative list of the rules
+  the checker implements. Read it rather than any prose list in this document.
+
+**The 0.2 counts are now stale by at least the R15 row**, which section 12
+still tags *designed, not implemented* in its Ownership table, and by the stem
+pairing rows of section 1.2. Re-deriving the 149-row index against the current
+tree is a separate, counted task; it was deliberately not attempted here rather
+than guessed at. Nothing else in section 12 was re-verified for this delta.
 
 ---
 
@@ -649,9 +671,9 @@ statement of the rules a checker must enforce, written as numbered rules with
 violating examples and diagnostics. This section defines the vocabulary.
 
 **Status of the whole model: partially enforced.** Annotations are accepted by
-the parser and recorded on the AST. `cell check` enforces R2, R3, R5, R8, and
-R14. Call-site prefixes (R15) are still discarded. There is no `arc`
-retain/release, no drop insertion, and no NLL. See 0.6.
+the parser and recorded on the AST. `cell check` enforces R2, R3, R5, R8, R14,
+and R15. There is no `arc` retain/release, no drop insertion, and no NLL. See
+0.6 and 0.7.
 
 ### 4.1 The five annotations
 
@@ -764,8 +786,8 @@ and omitting it is allowed and inferred from the callee's signature. The
 
 ### 4.3 What ownership does today
 
-`cell check` enforces R2, R3, R5, R8, and R14 through `src/cell/borrowck.zig`.
-Call-site prefixes (R15) are still discarded. Codegen lowers `shared` aggregates
+`cell check` enforces R2, R3, R5, R8, R14, and R15 through
+`src/cell/borrowck.zig`. Codegen lowers `shared` aggregates
 to `const T *`, `exclusive` aggregates to `T *`, and `arc` parameters to
 `cell_arc_t`. It does **not** insert retain or release for `arc`, and it does
 not box a string literal into an arc, so `examples/arc.cell` emit does not
@@ -1593,7 +1615,7 @@ records the missing lowering.
 | `arc` annotation | parsed, not enforced |
 | `copy` annotation | implemented |
 | Default ownership is `owned` | implemented |
-| Call-site ownership prefix | designed, not implemented |
+| Call-site ownership prefix | implemented (see 0.7; this row postdates the 0.2 count) |
 | Move checking | implemented |
 | Shared-XOR-exclusive aliasing | implemented |
 | Retain / release insertion for `arc` | designed, not implemented |

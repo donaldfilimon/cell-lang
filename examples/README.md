@@ -14,7 +14,7 @@ Verified with a binary built by `~/.zvm/bin/zig build -Dswift=false`.
 | `examples/*.cell` | must **pass** `cell check` (exit 0) | a regression in the parser or checker |
 | `examples/future/` | must **fail** `cell check` | the parser grew a feature: move the file up and rewrite its header |
 | `examples/rejected/` | each file declares `// EXPECT: currently-accepted` or `// EXPECT: currently-rejected` | a checker rule landed, or one regressed |
-| `examples/pairing/` | `geometry.cell` must **pass**; `geometry.body` must **fail** until stem pairing exists | `geometry.body` passing means the pairing landed |
+| `examples/pairing/` | both `geometry.cell` and `geometry.body` must **pass** now that stem pairing is implemented | `geometry.body` failing means pairing regressed |
 
 ## Running the checks
 
@@ -61,7 +61,8 @@ arc boxing exists. `if` / `match` / blocks / struct and list literals lower
 to C, not placeholder comments.
 
 Still not implemented: loops, generics, `Result<T,E>`, enum payloads, hex /
-underscore / exponent literals, stem pairing, and `arc` retain/release.
+underscore / exponent literals, and `arc` retain/release. Stem pairing is
+implemented.
 
 ## The top-level examples
 
@@ -95,8 +96,9 @@ the `docs/SPEC.md` section that specifies it.
 
 Programs a conforming Cell implementation must reject. Each file declares
 `// EXPECT: currently-accepted` or `currently-rejected`. R2, R3, R5, R8, and
-R14 files are rejected. Call-site mismatch (R15) is still accepted because
-the parser discards argument ownership prefixes.
+R14 files are rejected, and so is call-site mismatch (R15) since `67529a9`:
+the parser now keeps the argument ownership prefix and borrowck compares it
+against the parameter.
 
 Three of them are not ownership bugs at all. Two are currently-rejected for
 the wrong reason (unknown identifier); only `unknown_type.cell` is still

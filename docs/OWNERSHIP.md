@@ -12,9 +12,12 @@ source, believe the source.
 
 **Implementation status.** `src/cell/borrowck.zig` is wired into `cell check`
 and enforces R2 (use-after-move), R3 (move-out-of-borrow), R5 (shared XOR
-exclusive), R8 (escaping borrow), and R14 (assignment through an immutable
-place, including fields). Diagnostics name the place and land at the use site.
-R10/R11 retain-release insertion, NLL, and stem pairing are still designed.
+exclusive), R8 (escaping borrow), R14 (assignment through an immutable place,
+including fields), and R15 (call-site annotation agreement). Diagnostics name
+the place and land at the use site. That file's header comment is the
+authoritative list and moves with the code; believe it over this paragraph.
+R10/R11 retain-release insertion and NLL are still designed. Stem pairing has
+since landed (SPEC section 1.2).
 
 ---
 
@@ -496,17 +499,21 @@ pub fn main() {
 the same check applies to those, and those two *do* survive into the AST as
 `UnaryOp.ref_shared` and `UnaryOp.ref_exclusive`.
 
-**Still blocked on the parser, and this is the one place where it is.**
-`parsePrimary` consumes the ownership keyword, parses the operand, and returns
-the operand's kind with only the span widened; the ownership itself is
-discarded. The prefix never reaches the checker, which is why R15 is still
-blocked. Measured C is `cell_grow(&buf, 16)`: mangling and the exclusive
-parameter's address-of come from the callee signature, not from the written
-prefix. The argument node must carry an optional ownership before R15 can be
-implemented at all. That is a small AST change (`Expr.Kind` gains an
-`annotated` case, or `call.args` becomes a slice of `{ ownership: ?Ownership,
-value: Expr }`) and it is the highest-value front-end change left for
-ownership work.
+**Implemented as of `67529a9`.** This rule was blocked on the parser for most
+of the project's life: `parsePrimary` consumed the ownership keyword and
+returned the operand's kind with only the span widened, so the prefix never
+reached the checker. Three commits closed it. `b39c158` keeps the prefix as an
+`annotated` wrapper on the argument node, `9917ec7` teaches `refKind` to peel
+that wrapper so a written prefix does not disturb loan provenance, and
+`67529a9` compares the written mode against the parameter's and reports the
+diagnostic above.
+
+Codegen learned about the new node (both `b39c158` and `9917ec7` touch
+`codegen.zig`) but the emitted C for a call is unchanged: it still takes its
+mangling and its address-of from the callee's signature, so `exclusive` still
+emits `cell_grow(&buf, 16)`. The codegen test `a call site is lowered against
+the callee's parameter ownership` pins that. The prefix is a checked assertion
+about the call, not a lowering instruction.
 
 ---
 
@@ -546,7 +553,8 @@ Ordered so each step is testable and none depends on a later one. Steps marked
    value, and needs only a per-place live/dead flag plus the spans that already
    exist. `examples/rejected/use_after_move.cell` is the first test.
 3. *(front end)* **Keep the call-argument ownership annotation**, then **R15**
-   and the explicit form of **R9**.
+   and the explicit form of **R9**. The annotation and **R15** are **done** as
+   of `67529a9`; the explicit form of **R9** is not.
 4. **R4, R5**: shared XOR exclusive, with the lexical loan scopes of 0.3.
    Needs loan provenance recovered from `&`/`&mut` initializers.
 5. **R6**: field-path disjointness, using `Expr.field` and `rootName`.

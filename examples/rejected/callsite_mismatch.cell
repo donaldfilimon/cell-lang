@@ -1,13 +1,14 @@
-// EXPECT: currently-accepted
+// EXPECT: currently-rejected
 // Violates: docs/OWNERSHIP.md R15 (call-site annotation must match).
 //
 // `take` wants its argument moved in, and the call site asks to lend it
-// instead. Nothing catches this because the parser DISCARDS the ownership
-// keyword on a call argument: `take(shared buf)` and `take(owned buf)` build
-// the identical AST node, and both emit `take(buf)`. Measured.
+// instead. This is caught as of `67529a9`: the parser keeps the ownership
+// keyword on a call argument, so `take(shared buf)` and `take(owned buf)` no
+// longer build the identical AST node, and borrowck compares the written mode
+// against the parameter's. Measured:
 //
-// Keeping that annotation on the argument node is the highest-value front-end
-// change left for ownership work. See OWNERSHIP.md section 6, step 3.
+//   error: 'take' expects parameter 'b' as 'owned', but the argument is
+//   passed as 'shared'
 
 pub struct Buffer { copy len: Int }
 

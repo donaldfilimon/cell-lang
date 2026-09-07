@@ -53,8 +53,8 @@ copy T         // value / trivial copy (Swift struct default)
 ```
 
 Ownership defaults to `owned` when omitted, in every position, so a bare
-`f(x)` is a move. Move, aliasing, escape, and immutable-assignment rules are
-enforced; call-site prefixes and `arc` retain/release are not. See *Status*.
+`f(x)` is a move. Move, aliasing, escape, immutable-assignment, and call-site
+agreement rules are enforced; `arc` retain/release is not. See *Status*.
 
 ## Source file extensions
 
@@ -120,9 +120,9 @@ arc boxing exists.
 
 Ownership rules R2 (use-after-move), R3 (move-out-of-borrow), R5 (shared XOR
 exclusive), R8 (escaping borrow), and R14 (immutable assignment, including
-fields) are enforced. Call-site ownership prefixes are still discarded (R15).
-Retain/release for `arc`, loops, generics, `Result<T,E>`, and enum payloads
-are still designed. `.cell`/`.cel` modules pair with `.body`/`.bod` by stem.
+fields) are enforced, and so is R15: an explicit ownership prefix on a call
+argument must match the parameter's annotation. Retain/release for `arc`,
+loops, generics, `Result<T,E>`, and enum payloads are still designed. `.cell`/`.cel` modules pair with `.body`/`.bod` by stem.
 See `docs/SPEC.md` section 12 and `docs/OWNERSHIP.md`.
 
 There are no loops of any kind. `while` is not a keyword, so a loop-shaped
