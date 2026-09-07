@@ -124,6 +124,92 @@ fn collectHfa(m: *const hir.Module, name: []const u8, elem: *?[]const u8, count:
     return true;
 }
 
+pub const Class = union(enum) {
+    /// Passed and returned as this exact LLVM type: "i64", "double", "i1",
+    /// "ptr", or, for an HFA return, the struct's bare NAME. The caller adds
+    /// the `%cell_` prefix, which keeps this module allocation free and is
+    /// what makes it a leaf.
+    direct: []const u8,
+    /// Coerced to [n x i64].
+    coerce_int: u32,
+    /// Coerced to [count x elem]. HFA parameters only.
+    coerce_float: struct { count: u32, elem: []const u8 },
+    /// Parameter: a plain `ptr`. Return: the function returns void and takes
+    /// an `sret` pointer as a prepended first parameter.
+    indirect,
+    /// Not classified by this module. The caller emits `cannot lower` and
+    /// refuses the module. NEVER guess: a refusal is a fact about the
+    /// compiler, a wrong placement is a crash in someone's program.
+    unclassified,
+};
+
+/// The LLVM spelling of a scalar, or null when `ty` is not a scalar.
+fn scalarSpelling(ty: hir.Ty) ?[]const u8 {
+    return switch (ty) {
+        .int, .uint => "i64",
+        .int32 => "i32",
+        .float => "double",
+        .float32 => "float",
+        .boolean => "i1",
+        .byte => "i8",
+        .enum_type => "i32",
+        .unit => "void",
+        else => null,
+    };
+}
+
+/// How a parameter of `(ty, own)` is placed.
+///
+/// Ownership is a parameter because it changes the answer:
+/// `codegen.applyOwnership` makes `shared Buffer` a `const cell_Buffer *` and
+/// `exclusive Buffer` a `cell_Buffer *`, while `owned` and `copy` pass by
+/// value.
+pub fn classifyParam(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) Class {
+    // Primitives pass by value in EVERY ownership mode. cell_rt.h section 1
+    // fixes this and the language depends on it, so the check comes first.
+    if (scalarSpelling(ty)) |s| return .{ .direct = s };
+
+    const layout = layoutOf(m, ty) orelse return .unclassified;
+
+    switch (own) {
+        .shared, .exclusive => return .{ .direct = "ptr" },
+        .owned, .copy, .arc => {},
+    }
+
+    // The HFA rule is checked BEFORE the size cutoff, because it ignores it.
+    if (hfaOf(m, ty)) |h| return .{ .coerce_float = .{ .count = h.count, .elem = h.elem } };
+
+    if (layout.size > 16) return .indirect;
+    return .{ .coerce_int = wordsFor(layout.size) };
+}
+
+/// How a return of `ty` is placed. Takes no ownership: `hir.Fn.ret` is a bare
+/// `Ty` with no annotation the backend acts on.
+pub fn classifyReturn(m: *const hir.Module, ty: hir.Ty) Class {
+    if (scalarSpelling(ty)) |s| return .{ .direct = s };
+
+    const layout = layoutOf(m, ty) orelse return .unclassified;
+
+    // The measured asymmetry: an HFA PARAMETER coerces to [n x double], but an
+    // HFA RETURN is the struct itself. This is the case a single classify()
+    // with a flag would get wrong at one call site and not the others.
+    if (hfaOf(m, ty) != null) {
+        return switch (ty) {
+            .struct_type => |n| .{ .direct = n },
+            else => .unclassified,
+        };
+    }
+
+    if (layout.size > 16) return .indirect;
+    return .{ .coerce_int = wordsFor(layout.size) };
+}
+
+/// Size in 8-byte words, rounded up. A 4-byte aggregate is one word.
+fn wordsFor(size: u32) u32 {
+    if (size == 0) return 0;
+    return (size + 7) / 8;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -234,4 +320,83 @@ test "more than four leaf members is not an HFA" {
 test "a bare float is not an HFA; only aggregates are" {
     const m = emptyModule();
     try std.testing.expect(hfaOf(&m, types.t_float) == null);
+}
+
+fn expectDirect(c: Class, want: []const u8) !void {
+    switch (c) {
+        .direct => |got| try std.testing.expectEqualStrings(want, got),
+        else => return error.NotDirect,
+    }
+}
+
+test "primitives pass by value in every ownership mode" {
+    // cell_rt.h section 1 is explicit, and examples/hello.cell depends on it:
+    // add(shared a: Int, shared b: Int) computes a + b, which would not
+    // compile if a shared primitive became a pointer.
+    const m = emptyModule();
+    for ([_]hir.Ownership{ .owned, .shared, .exclusive, .copy, .arc }) |own| {
+        try expectDirect(classifyParam(&m, types.t_int, own), "i64");
+        try expectDirect(classifyParam(&m, types.t_float, own), "double");
+        try expectDirect(classifyParam(&m, types.t_bool, own), "i1");
+    }
+}
+
+test "a borrowed struct is a pointer, an owned struct is by value" {
+    var fields = [_]hir.Field{
+        .{ .name = "a", .ty = types.t_int, .ownership = .copy },
+        .{ .name = "b", .ty = types.t_int, .ownership = .copy },
+    };
+    var structs = [_]hir.Struct{.{ .name = "Int2", .fields = &fields, .is_public = true }};
+    const m = testModule(&structs);
+    const ty: hir.Ty = .{ .struct_type = "Int2" };
+
+    try expectDirect(classifyParam(&m, ty, .shared), "ptr");
+    try expectDirect(classifyParam(&m, ty, .exclusive), "ptr");
+    switch (classifyParam(&m, ty, .owned)) {
+        .coerce_int => |n| try std.testing.expectEqual(@as(u32, 2), n),
+        else => return error.WrongClass,
+    }
+}
+
+test "an HFA coerces to floats as a parameter and returns directly" {
+    // Measured: clang emits `define double @f_hfa2([2 x double] %0)` but
+    // `define %struct.Hfa2 @r_hfa2()`. The two positions genuinely disagree,
+    // which is why this module has two entry points rather than one flag.
+    var fields = [_]hir.Field{
+        .{ .name = "x", .ty = types.t_float, .ownership = .copy },
+        .{ .name = "y", .ty = types.t_float, .ownership = .copy },
+    };
+    var structs = [_]hir.Struct{.{ .name = "Point", .fields = &fields, .is_public = true }};
+    const m = testModule(&structs);
+    const ty: hir.Ty = .{ .struct_type = "Point" };
+
+    switch (classifyParam(&m, ty, .owned)) {
+        .coerce_float => |f| {
+            try std.testing.expectEqual(@as(u32, 2), f.count);
+            try std.testing.expectEqualStrings("double", f.elem);
+        },
+        else => return error.WrongClass,
+    }
+    // The bare NAME, not "%cell_Point": this module is allocation free, so the
+    // caller owns the prefix.
+    try expectDirect(classifyReturn(&m, ty), "Point");
+}
+
+test "a non-HFA over 16 bytes is indirect in both positions" {
+    var fields = [_]hir.Field{
+        .{ .name = "a", .ty = types.t_int, .ownership = .copy },
+        .{ .name = "b", .ty = types.t_int, .ownership = .copy },
+        .{ .name = "c", .ty = types.t_int, .ownership = .copy },
+    };
+    var structs = [_]hir.Struct{.{ .name = "Int3", .fields = &fields, .is_public = true }};
+    const m = testModule(&structs);
+    const ty: hir.Ty = .{ .struct_type = "Int3" };
+    try std.testing.expect(classifyParam(&m, ty, .owned) == .indirect);
+    try std.testing.expect(classifyReturn(&m, ty) == .indirect);
+}
+
+test "an out-of-scope type is unclassified, not guessed" {
+    const m = emptyModule();
+    try std.testing.expect(classifyParam(&m, types.t_string, .shared) == .unclassified);
+    try std.testing.expect(classifyReturn(&m, types.t_string) == .unclassified);
 }
