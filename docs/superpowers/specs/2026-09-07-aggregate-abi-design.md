@@ -126,9 +126,26 @@ pub const Class = union(enum) {
     unclassified,
 };
 
-pub fn classifyParam(m: *const hir.Module, ty: hir.Ty) Class;
+pub fn classifyParam(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) Class;
 pub fn classifyReturn(m: *const hir.Module, ty: hir.Ty) Class;
 ```
+
+**Amended 2026-09-07, while writing the implementation plan: `classifyParam`
+takes ownership.** The original sketch omitted it and would have been wrong on
+its first real call. `codegen.applyOwnership` (`src/cell/codegen.zig:997-1009`)
+makes ownership change an aggregate's C type: `shared Buffer` lowers to
+`const cell_Buffer *` and `exclusive Buffer` to `cell_Buffer *`, while `owned`
+and `copy` pass by value. Separately, `shared String` is a 16-byte
+`cell_str_t` where `owned String` is a 24-byte `cell_string_t`.
+
+`classifyReturn` does not take ownership, because `hir.Fn.ret` is a bare `Ty`
+with no annotation the backend acts on.
+
+Primitives are exempt from all of this: `runtime/cell_rt.h` section 1 states
+they pass and return by value in every ownership mode, and the language depends
+on it. `examples/hello.cell` declares `add(shared a: Int, shared b: Int)` whose
+body is `a + b`, which would not compile if a shared primitive became a
+pointer.
 
 **Two entry points, not one with a flag.** The measurement above shows the two
 positions genuinely disagree for HFAs and for the indirect case. A single
