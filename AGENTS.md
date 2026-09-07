@@ -19,17 +19,19 @@ branch of this work.
 
 ## Toolchain and gates
 
-Zig here is **master through zvm**, not a release:
+This project targets Zig **master**, not a release. It was developed against
+`0.17.0-dev.2018+ab30a0b9a`; `build.zig.zon` sets `minimum_zig_version` to
+`0.17.0-dev.1252+e4b325c19`.
 
-```
-/Users/donaldfilimon/.zvm/bin/zig     # 0.17.0-dev.2018+ab30a0b9a
+Master moves weekly and removes things. When a std API disagrees with what you
+recall, read the source that ships with your own toolchain rather than guessing:
+
+```sh
+zig version
+zig env            # .std_dir is the stdlib source, .lib_dir/../doc/langref.html the reference
 ```
 
-`build.zig.zon` sets `minimum_zig_version` to `0.17.0-dev.1252+e4b325c19`, so
-the toolchain is well ahead of the floor. Master moves weekly; when a std API
-disagrees with what you recall, read `/Users/donaldfilimon/.zvm/master/lib/std/`
-rather than guessing. The `zig-toolchain` skill covers the zvm layout, including
-the dangling `~/.zvm/current` symlink and the second zig on PATH.
+Compiling proves removal; the langref proves deprecation. Check both.
 
 ```bash
 zig build -Dswift=false          # compile
