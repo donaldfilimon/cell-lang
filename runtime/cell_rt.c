@@ -238,6 +238,10 @@ void cell_println(cell_str_t msg) {
     cell_print(msg);
 }
 
+void cell_print_int(int64_t value) {
+    printf("%lld\n", (long long)value);
+}
+
 void cell_assert(bool cond) {
     if (!cond) cell_panic("assertion failed");
 }

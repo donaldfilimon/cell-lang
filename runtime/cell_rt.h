@@ -426,6 +426,15 @@ void cell_print(cell_str_t msg);
 void cell_println(cell_str_t msg);
 
 /**
+ * `pub fn print_int(copy value: Int)`.
+ * Writes the decimal form of `value` to stdout followed by a single newline.
+ * A separate name rather than an overload of cell_print: the Cell ABI is C,
+ * and C has no overloading, so every distinct argument type needs its own
+ * symbol. See cell_assert_msg for the same pattern on arity.
+ */
+void cell_print_int(int64_t value);
+
+/**
  * `pub fn assert(shared cond: Bool)`.
  * No-op when true; calls cell_panic and aborts when false.
  */

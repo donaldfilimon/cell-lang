@@ -78,6 +78,11 @@ pub fn print(shared msg: String);
 /// Runtime:  void cell_println(cell_str_t msg)
 pub fn println(shared msg: String);
 
+/// Runtime:  void cell_print_int(int64_t value)
+/// A separate name rather than an overload of `print`: the Cell ABI is C and
+/// C has no overloading, so each argument type needs its own symbol.
+pub fn print_int(copy value: Int);
+
 /// Runtime:  void cell_assert_msg(bool cond, cell_str_t msg)
 pub fn assert_msg(copy cond: Bool, shared msg: String);
 

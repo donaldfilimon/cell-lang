@@ -1,19 +1,19 @@
 // Cell language example: hello.
 // Ownership keywords: owned | shared | exclusive | arc | copy
 //
-// Status: parses and passes `cell check`. The emitted C does NOT compile:
-// 3 errors from `cc -c`, measured. The struct literal is parsed faithfully and
-// then emitted as the placeholder comment
-// `/*struct literal Point with 2 fields*/`, and the calls to `add` and `print`
-// are emitted unmangled while the definition of `add` is emitted as `cell_add`.
-// See docs/SPEC.md sections 6.7 and 10.2.
+// Status: parses, passes `cell check`, and the emitted C compiles and runs.
+// Verified with:
+//   cell emit examples/hello.cell > hello.c
+//   zig cc -std=c11 -Wall -Wextra -Werror -I runtime hello.c runtime/cell_rt.c
+// It prints 42.
 
 use std.io
 
-// `use` binds no names (SPEC 8.4), and the checker now resolves identifiers, so
-// anything this file calls must be declared in this file. `print` is declared
-// bodyless: an external symbol supplied at link time.
-pub fn print(copy value: Int);
+// `use` binds no names (SPEC 8.4), and the checker resolves identifiers, so
+// anything this file calls must be declared here. Declared bodyless: an
+// external symbol supplied at link time by runtime/cell_rt.c. `print` itself
+// takes a String, so printing an Int uses the separate `print_int` intrinsic.
+pub fn print_int(copy value: Int);
 
 pub struct Point {
     copy x: Float64
@@ -33,5 +33,5 @@ pub fn add(shared a: Int, shared b: Int) -> Int {
 pub fn main() {
     let owned p = Point { x: 1.0, y: 2.0 }
     let copy n = add(shared 40, shared 2)
-    print(n)
+    print_int(n)
 }
