@@ -1814,3 +1814,39 @@ test "the hello example emits runtime-backed C" {
     try expectContains(e.text, "cell_Point p = (cell_Point){ .x = 1.0, .y = 2.0 };");
     try expectContains(e.text, "int main(void) {");
 }
+
+test "generated C for a function body compiles with cc -c" {
+    var e = try emitSource(
+        \\pub fn add(shared a: Int, shared b: Int) -> Int {
+        \\  return a + b
+        \\}
+        \\pub fn print_int(copy value: Int);
+        \\pub fn main() {
+        \\  let copy n = add(shared 40, shared 2)
+        \\  print_int(n)
+        \\}
+    );
+    defer e.deinit();
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.c", .data = e.text });
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{cwd_buf[0..cwd_len]});
+    defer gpa.free(include);
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{ "cc", "-std=c11", "-Wall", "-Wextra", "-c", "body.c", "-I", include, "-o", "body.o" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    if (!result.term.success()) {
+        std.debug.print("cc rejected emitted C:\n{s}\n--- source ---\n{s}\n", .{ result.stderr, e.text });
+        return error.CcRejectedEmittedC;
+    }
+}
