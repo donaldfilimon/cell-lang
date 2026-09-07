@@ -5,8 +5,7 @@ the layout: a green `zig build` proves the compiler builds, and proves nothing
 whatsoever about whether these programs work. The directories below are what
 turns "it parses" into something a reader can trust.
 
-Verified against commit `9fb12af` with a binary built by
-`~/.zvm/bin/zig build -Dswift=false`.
+Verified with a binary built by `~/.zvm/bin/zig build -Dswift=false`.
 
 ## The four directories
 
@@ -51,22 +50,18 @@ for f in examples/rejected/*.cell; do
 done
 ```
 
-## What passes is not what works
+## What `cell check` covers
 
-`cell check` parses and runs one check. It does not typecheck, and there is no
-borrow checker. A file in `examples/` passing means the parser accepted it,
-nothing more. Two measured facts keep that honest:
+`cell check` parses, typechecks, and borrow-checks. A file in `examples/`
+passing means those three stages accepted it. Body-bearing emit compiles for
+`hello.cell`, `control_flow.cell`, and `ownership.cell`: `cell emit
+examples/hello.cell` compiles with `cc -c`, and linked against
+`runtime/cell_rt.c` it prints `42`. `examples/arc.cell` does not compile until
+arc boxing exists. `if` / `match` / blocks / struct and list literals lower
+to C, not placeholder comments.
 
-- **Emitted C compiles only for declaration-only files.** `cc -c` on the output
-  of `cell emit examples/declarations.cell` and `examples/primitives.cell`
-  gives 0 errors. On `examples/hello.cell` it gives 3, and on
-  `examples/ownership.cell` it gives 6. The pattern is exact: any file with a
-  function body emits C that does not compile, because call sites are not
-  name-mangled, struct and list literals are emitted as comments, and struct
-  parameters are `void*`.
-- **`if` and `match` generate nothing.** Codegen emits `/*if*/` and
-  `/*match*/`. `examples/control_flow.cell` and `examples/pattern_matching.cell`
-  both pass `cell check` and neither produces working code.
+Still not implemented: loops, generics, `Result<T,E>`, enum payloads, hex /
+underscore / exponent literals, stem pairing, and `arc` retain/release.
 
 ## The top-level examples
 
@@ -80,7 +75,7 @@ nothing more. Two measured facts keep that honest:
 | `pattern_matching.cell` | `match` and every pattern form that exists |
 | `structs_enums.cell` | struct layout emission and per-field ownership |
 | `declarations.cell` | bodyless declarations, the C-ABI-first form |
-| `ownership.cell` | all five ownership modes, none of them enforced |
+| `ownership.cell` | all five ownership modes; R2/R3/R5/R8/R14 enforced |
 | `arc.cell` | the `arc` mode and what the runtime already provides |
 
 ## The future corpus
@@ -98,20 +93,24 @@ the `docs/SPEC.md` section that specifies it.
 
 ## The rejected corpus
 
-Programs a conforming Cell implementation must reject. This is the borrow
-checker's first test suite: seven of the twelve pass `cell check` today and
-must stop passing.
+Programs a conforming Cell implementation must reject. Each file declares
+`// EXPECT: currently-accepted` or `currently-rejected`. R2, R3, R5, R8, and
+R14 files are rejected. Call-site mismatch (R15) is still accepted because
+the parser discards argument ownership prefixes.
 
-Three of them are not ownership bugs at all, and they are the ones most worth
-reading, because each is a case where the compiler accepts a program that means
-something other than what it says:
+Three of them are not ownership bugs at all. Two are currently-rejected for
+the wrong reason (unknown identifier); only `unknown_type.cell` is still
+accepted:
 
-- `while_is_not_a_loop.cell`: `while` is not a keyword, so a loop-shaped
-  program parses as a function call plus a discarded block, and does nothing.
-- `silent_literals.cell`: `0x1F`, `1_000`, and `1e9` each lex as two tokens and
-  emit a different number than the one written.
-- `unknown_type.cell`: any type name outside the eleven primitives silently
-  becomes `void*`.
+- `while_is_not_a_loop.cell`: currently-rejected. `while` is not a keyword, so
+  a loop-shaped program would parse as a call plus a discarded block. Today
+  `cell check` reports `unknown identifier 'while'`. If a function named
+  `while` existed, this would compile and silently not loop.
+- `silent_literals.cell`: currently-rejected. `0x1F`, `1_000`, and `1e9` each
+  lex as two tokens. Today the checker reports `unknown identifier 'x1F'`;
+  the lexer still splits the literal.
+- `unknown_type.cell`: currently-accepted. Any type name outside the eleven
+  primitives silently becomes `void*`.
 
 ## The pairing demo
 

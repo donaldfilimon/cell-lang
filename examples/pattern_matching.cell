@@ -1,8 +1,8 @@
 // Pattern matching.
 //
-// Status: parses and passes `cell check`. The emitted C is WRONG: every
-// `match` becomes the literal text `/*match*/`, so a match computes nothing.
-// Nothing checks exhaustiveness. See docs/SPEC.md section 9.
+// Status: parses, passes `cell check`, and `match` lowers to a scrutinee
+// temporary plus an if/else chain. Exhaustiveness is not checked; a missing
+// catch-all arm becomes `cell_panic`. See docs/SPEC.md section 9.
 
 pub enum Color { Red, Green, Blue }
 

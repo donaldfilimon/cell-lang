@@ -51,7 +51,7 @@ pub fn check(
     if (tc.diagnostics.hasErrors() or bc.diagnostics.hasErrors()) return error.TypeError;
 }
 
-/// Emit C ABI sketch from a checked module.
+/// Emit C from a checked module, targeting the runtime ABI in `cell_rt.h`.
 pub fn emit(allocator: std.mem.Allocator, module: *const ast.Module, writer: *Io.Writer) !void {
     var gen = codegen.Generator.init(allocator, writer);
     try gen.emitModule(module);

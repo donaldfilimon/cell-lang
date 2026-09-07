@@ -499,8 +499,10 @@ the same check applies to those, and those two *do* survive into the AST as
 **Still blocked on the parser, and this is the one place where it is.**
 `parsePrimary` consumes the ownership keyword, parses the operand, and returns
 the operand's kind with only the span widened; the ownership itself is
-discarded. Measured: `grow(exclusive buf, shared 16)` emits `grow(buf, 16)`.
-The argument node must carry an optional ownership before R15 can be
+discarded. The prefix never reaches the checker, which is why R15 is still
+blocked. Measured C is `cell_grow(&buf, 16)`: mangling and the exclusive
+parameter's address-of come from the callee signature, not from the written
+prefix. The argument node must carry an optional ownership before R15 can be
 implemented at all. That is a small AST change (`Expr.Kind` gains an
 `annotated` case, or `call.args` becomes a slice of `{ ownership: ?Ownership,
 value: Expr }`) and it is the highest-value front-end change left for

@@ -1,9 +1,8 @@
 // Conditionals.
 //
-// Status: parses and passes `cell check`. The emitted C is WRONG: every `if`
-// becomes the literal text `/*if*/;`, because codegen has no lowering for
-// branches. See docs/SPEC.md section 6.9. Do not read this file as evidence
-// that Cell has working control flow. It does not.
+// Status: parses, passes `cell check`, and statement-position `if` / `else`
+// lowers to real C `if`. Expression-position `if` lowers to a GNU statement
+// expression. See docs/SPEC.md section 6.9.
 //
 // The parser is complete here. `if cond { }`, `else`, and `else if` chains all
 // parse, and a bare identifier condition works because the parser implements

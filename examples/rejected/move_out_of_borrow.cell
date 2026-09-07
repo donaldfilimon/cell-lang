@@ -1,8 +1,8 @@
-// EXPECT: currently-accepted
+// EXPECT: currently-rejected
 // Violates: docs/OWNERSHIP.md R3 (cannot move out of a borrow).
 //
 // `b` is an exclusive borrow, so the callee does not own it and cannot hand
-// ownership back to its own caller.
+// ownership back to its own caller. `cell check` reports the move at `return b`.
 
 pub struct Buffer { copy len: Int }
 

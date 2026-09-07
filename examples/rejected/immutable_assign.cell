@@ -1,10 +1,8 @@
 // EXPECT: currently-rejected
 // Violates: docs/OWNERSHIP.md R14 (assignment requires a mutable place).
 //
-// This is the ONE rule the compiler enforces today. It reports:
-//   examples/rejected/immutable_assign.cell:11:5: error: cannot assign to immutable binding
-// and exits 1. The message should name the binding and carry a note at the
-// `let`; it does neither yet.
+// Reports `cannot assign to immutable binding 'x'` at the assignment, with a
+// note at the `let`.
 
 pub fn main() {
     let copy x = 1

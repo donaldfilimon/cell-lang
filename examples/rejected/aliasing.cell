@@ -1,4 +1,4 @@
-// EXPECT: currently-accepted
+// EXPECT: currently-rejected
 // Violates: docs/OWNERSHIP.md R5 (shared XOR exclusive).
 //
 // `e` holds an exclusive loan of `buf` that lives to the end of the block, so

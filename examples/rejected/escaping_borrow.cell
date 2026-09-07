@@ -1,4 +1,4 @@
-// EXPECT: currently-accepted
+// EXPECT: currently-rejected
 // Violates: docs/OWNERSHIP.md R8 (a borrow may not outlive its referent).
 //
 // Cell has no lifetime parameters, so a returned borrow cannot be proven to

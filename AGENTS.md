@@ -60,31 +60,27 @@ run of the binary. This has already produced one false green here.
 
 Build scratch belongs under `/private/tmp`, never in an iCloud path.
 
-## A green gate is weak evidence here
+## A green gate is only as strong as the tests
 
-As of the import there were **four test blocks in the whole tree**:
-`root.zig` (`refAllDecls`), `main.zig` (`"cli smoke"`, which asserts `true`),
-`parser.zig` (`"parse fn"`), and `lexer.zig` (`"lex hello"`). `typecheck.zig`,
-`codegen.zig`, `ast.zig`, and `diag.zig` had none. `zig build test` passing
-therefore says almost nothing about correctness. Check the test count before
-citing a green run as evidence, and add tests with the code you write.
+`zig test src/root.zig` currently runs the typechecker, borrow checker, and
+codegen tests (including a `cc -c` of emitted C). `zig build test -Dswift=false`
+is the package gate. Check the test count before citing a green run, and add
+tests with the code you write. `main.zig`'s `"cli smoke"` still asserts `true`
+and is not evidence.
 
 ## Status honesty
 
 State what is implemented, what is parsed but not enforced, and what is only
-designed. Measured at import:
+designed.
 
-- **Ownership is the headline feature and is parsed, never enforced.** The five
-  annotations reach the AST and no rule acts on them: no move checking, no
-  use-after-move, no shared-XOR-exclusive aliasing, no ARC insertion.
-- The typechecker walks the AST without a type representation. `Symbol.ty_name`
-  is a string, and `symbols` is one flat map with no scopes, so parameters leak
-  between functions.
-- Codegen emits `/*block*/`, `/*if*/`, and `/*match*/` placeholders, so `if` and
-  `match` parse and typecheck completely and then generate no control flow.
-- Emitted C compiles for declaration-only files and for nothing else.
-- There is no path from `.cell` to an executable. `emit` prints C text and
-  nothing compiles it.
+- **Ownership.** R2, R3, R5, R8, and R14 are enforced by `src/cell/borrowck.zig`
+  through `cell check`. Call-site prefixes (R15) are still discarded. `arc`
+  retain/release is not inserted.
+- **Types.** `src/cell/types.zig` is a real type representation. Scopes do not
+  leak parameters between functions.
+- **Codegen.** `if` / `else`, `match`, blocks, struct literals, list literals,
+  and mangled calls lower to C. `cell emit examples/hello.cell` compiles with
+  `cc -c`; linked against `runtime/cell_rt.c` it prints `42`.
 - The module and body file system (`.cell`/`.cel` declare, `.body`/`.bod`
   implement) is specified and absent. The compiler inspects no extension at all:
   `cell check` accepts `.txt` and a file with no extension identically.
@@ -101,7 +97,7 @@ Syntax parsing is not implementation. Verify a claim by running the compiler.
 `src/main.zig` is the CLI (`check`, `dump`, `emit`, `version`, `help`) and
 declares the C runtime symbols as `extern`, since this tree deliberately avoids
 `@cImport`. The compiler stages live in `src/cell/`: `lexer`, `parser`, `ast`,
-`typecheck`, `codegen`, `diag`.
+`typecheck`, `borrowck`, `codegen`, `diag`.
 
 `runtime/cell_rt.h` is the ABI contract that generated C targets. Change it and
 `codegen.zig` together, or emitted code stops linking.

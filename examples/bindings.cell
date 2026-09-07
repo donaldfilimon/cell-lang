@@ -29,4 +29,4 @@ pub fn bindings() {
 // The enforced rule, demonstrated in examples/rejected/immutable_assign.cell:
 //     let copy x = 1
 //     x = 2
-// gives `err: cannot assign to immutable binding` and exit 1.
+// gives `err: cannot assign to immutable binding 'x'` and exit 1.

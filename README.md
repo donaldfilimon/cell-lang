@@ -53,7 +53,8 @@ copy T         // value / trivial copy (Swift struct default)
 ```
 
 Ownership defaults to `owned` when omitted, in every position, so a bare
-`f(x)` is a move. **None of the five is enforced today**; see *Status* below.
+`f(x)` is a move. Move, aliasing, escape, and immutable-assignment rules are
+enforced; call-site prefixes and `arc` retain/release are not. See *Status*.
 
 ## Source file extensions
 
@@ -104,43 +105,33 @@ Two notes on the build, both worth knowing before you trust a green result:
 - `-Dswift=false` is the configuration this tree's documentation was verified
   against. The default Swift path hardcodes `/Applications/Xcode-beta.app`
   library paths in `build.zig`, so it is machine-specific.
-- `zig build test` is not a meaningful gate for the *language*. It exercises
-  the lexer, the AST helpers, the parser, the diagnostic renderer, and the C
-  runtime. It does not check that any example program behaves correctly,
-  because no example program can be executed: see *Status*.
+- Always pass `-Dswift=false` unless you are deliberately testing the Swift
+  bridge. `zig build test -Dswift=false` now covers typecheck, borrow check,
+  and emit, including a `cc -c` of generated C.
 
 ## Status
 
-**The front end is real and the back end is a sketch.** As of commit
-`9fb12af`, `docs/SPEC.md` counts 60 constructs implemented, 12 parsed but not
-enforced, and 77 designed but not implemented.
+The parsed surface is enforced and executable. `cell check` typechecks and
+borrow-checks. `cell emit` produces C that `cc -c` accepts for
+`examples/hello.cell`, `examples/control_flow.cell`, and
+`examples/ownership.cell`; `examples/hello.cell` linked against
+`runtime/cell_rt.c` prints `42`. `examples/arc.cell` does not compile until
+arc boxing exists.
 
-What works: the lexer, the parser, the AST with source spans on every node,
-structured match patterns, and the diagnostic machinery. What does not exist: a
-type representation, a borrow checker, and code generation for control flow.
+Ownership rules R2 (use-after-move), R3 (move-out-of-borrow), R5 (shared XOR
+exclusive), R8 (escaping borrow), and R14 (immutable assignment, including
+fields) are enforced. Call-site ownership prefixes are still discarded (R15).
+Retain/release for `arc`, loops, generics, `Result<T,E>`, enum payloads, and
+`.cell`/`.body` stem pairing are still designed. See `docs/SPEC.md` section 12
+and `docs/OWNERSHIP.md`.
 
-Three consequences, all measured rather than assumed:
+There are no loops of any kind. `while` is not a keyword, so a loop-shaped
+program is a call plus a discarded block; today `cell check` rejects
+`examples/rejected/while_is_not_a_loop.cell` as `unknown identifier 'while'`.
 
-- **Ownership is not enforced.** The five annotations parse, reach the AST, and
-  are printed into the generated C as comments. There is no move checking, no
-  aliasing check, and no retain or release for `arc`. The only rule the
-  compiler enforces anywhere is assignment to an immutable binding.
-- **Emitted C compiles only for declaration-only files.** `cc -c` on the output
-  of `cell emit examples/declarations.cell` gives 0 errors; on
-  `examples/hello.cell` it gives 3, and on `examples/ownership.cell` it gives
-  6. Call sites are not name-mangled, struct and list literals are emitted as
-  comments, and struct parameters are `void*`.
-- **`if` and `match` generate nothing.** Both parse completely and codegen
-  emits `/*if*/` and `/*match*/`. Cell produces no control flow.
-
-There are also no loops of any kind, and because `while` is not a keyword and a
-block is an expression, a loop-shaped program parses cleanly and does nothing.
-See `examples/rejected/while_is_not_a_loop.cell`.
-
-Cell has no measured performance characteristics and provides no memory-safety
-guarantee. The safety properties `docs/SPEC.md` and `docs/OWNERSHIP.md`
-describe are properties of the specified language, to be delivered by a checker
-that does not exist yet.
+Cell has no measured performance characteristics and no ABI-stability
+guarantee. Memory-safety claims cover only the rules the checker actually
+enforces.
 
 ## License
 

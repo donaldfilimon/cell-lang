@@ -1,13 +1,10 @@
 // Ownership model demo (Rust and Swift and Zig blend).
 //
-// Status: parses and passes `cell check`. NONE of the ownership annotations
-// below are enforced. There is no borrow checker. See docs/OWNERSHIP.md for
-// the numbered rules a checker must enforce, and docs/SPEC.md section 4 for
-// what each annotation means.
-//
-// The emitted C for this file does not compile: 5 errors from `cc -c`,
-// including `buf.len` on a void* parameter and unmangled calls to `grow` and
-// `take`. Measured. See SPEC 6.3 and 10.2.
+// Status: parses and passes `cell check`. Move, aliasing, escape, and
+// immutable-assignment rules are enforced (OWNERSHIP.md R2, R3, R5, R8, R14).
+// Call-site ownership prefixes are still discarded by the parser (R15), so
+// `grow(exclusive buf, ...)` is checked from the callee signature, not the
+// written prefix. Retain/release for `arc` is not inserted. See docs/OWNERSHIP.md.
 
 pub struct Buffer {
     owned data: [Byte]
@@ -21,11 +18,10 @@ pub struct Buffer {
 /// copy      = value semantics, duplicated not moved (Rust Copy, Swift struct)
 
 pub fn grow(exclusive buf: Buffer, shared extra: Int) {
-    // An exclusive borrow allows mutation of the caller's buffer.
-    //
-    // NOT CHECKED: the mutability check keys on the joined path "buf.len",
-    // which never matches the symbol "buf", so field assignment is never
-    // checked at all. This passes for the wrong reason. OWNERSHIP.md R14.
+    // An exclusive borrow allows mutation of the caller's buffer, including
+    // field writes (OWNERSHIP.md R14). The same write through a `shared`
+    // or immutable `let` is rejected; see
+    // examples/rejected/field_assign_immutable.cell.
     let copy new_len = buf.len + extra
     buf.len = new_len
 }
@@ -37,8 +33,7 @@ pub fn share_name(arc name: String) -> arc String {
 
 pub fn take(owned b: Buffer) {
     // b is moved in. The caller may not use it afterward (OWNERSHIP.md R2).
-    // NOT CHECKED: examples/rejected/use_after_move.cell shows the violation
-    // being accepted today.
+    // Enforced: examples/rejected/use_after_move.cell is currently-rejected.
 }
 
 pub fn read_only(shared b: Buffer) -> Int {
@@ -49,12 +44,14 @@ pub fn main() {
     let owned buf = Buffer { data: [], len: 0 }
 
     // Call-site ownership prefixes parse and are then DISCARDED before the AST
-    // is built, so nothing can check them against the parameter. Measured:
-    // this line emits `grow(buf, 16)`. See SPEC 4.2 and OWNERSHIP.md R15.
+    // is built, so nothing can check them against the parameter (R15). Measured
+    // C is `cell_grow(&buf, 16)`: mangling and the exclusive address-of come
+    // from the callee signature, not the written prefix. See SPEC 4.2.
     grow(exclusive buf, shared 16)
 
     let copy n = read_only(shared buf)
 
-    // After this, `buf` is dead under rule R2. Nothing enforces that.
+    // After this, `buf` is dead under rule R2. A second use is rejected; see
+    // examples/rejected/use_after_move.cell.
     take(owned buf)
 }

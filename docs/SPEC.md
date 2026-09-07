@@ -121,12 +121,14 @@ Measured against a binary built from `8dd5673`:
 | the symbol table is module-wide and unscoped (7.3 bullet 3, OWNERSHIP.md 0.4) | **fixed**, measured: a `let x` in `a()` is no longer visible in `b()`, which now reports `unknown identifier 'x'` |
 | parse diagnostics do not reach the CLI (11) | check diagnostics now render with the source line and a caret |
 
-Three claims above were re-tested against that binary and **still hold**:
-unknown type names are still accepted silently as `void*`, `if` and `match`
-still lower to `/*if*/` and `/*match*/`, and no ownership rule is enforced. The
-whole of `examples/rejected/` was re-run: seven of the thirteen files still
-pass, including every use-after-move, aliasing, escaping-borrow, and
-call-site-mismatch case.
+Three claims above were re-tested against that `8dd5673` binary and still held
+then: unknown type names were still accepted silently as `void*`, `if` and
+`match` still lowered to `/*if*/` and `/*match*/`, and no ownership rule was
+enforced. The whole of `examples/rejected/` was re-run: seven of the thirteen
+files still passed, including every use-after-move, aliasing, escaping-borrow,
+and call-site-mismatch case. Section 0.6 records what later work changed:
+`if` / `match` now lower to C, and R2/R3/R5/R8/R14 are enforced. Unknown type
+names remain accepted as `void*`.
 
 ### 0.6 Delta: ownership enforcement and body-bearing emit
 
@@ -486,7 +488,7 @@ table is normative and exhaustive:
 | `Float64` | `double` | same C type as `Float` |
 | `Float32` | `float` | |
 | `Bool` | `bool` | `<stdbool.h>` |
-| `String` | `const char*` | **superseded, see section 10.3** |
+| `String` | `cell_str_t` | length-prefixed view; see section 10.3 |
 | `Byte` | `uint8_t` | |
 
 There are exactly eleven primitive names. `Int` and `Int64` are
@@ -494,10 +496,9 @@ indistinguishable at the ABI, as are `UInt`/`UInt64` and `Float`/`Float64`;
 whether they are distinct *types* in the source language is **designed, not
 implemented**, because there is no type representation to distinguish them in.
 
-The `String` row is the one place where codegen and the runtime now disagree.
-`runtime/cell_rt.h` specifies `String` as a length-prefixed slice, and codegen
-still emits `const char*`. Section 10.3 states which one this specification
-follows and why.
+`String` is a length-prefixed `cell_str_t`, matching `runtime/cell_rt.h`.
+Section 10.3 is the ABI table. The remaining string gap is `arc`: a literal
+stays `cell_str_t` and is not boxed.
 
 **Any other type name silently becomes `void*` with no diagnostic.** `Int8`,
 `UInt32`, `Char`, a misspelled `Strng`, and every user-defined struct or enum
@@ -752,8 +753,9 @@ take(owned buf)
 operand's kind with only the *span* widened to cover the keyword. **The
 ownership is thrown away** before the argument node is built, so nothing
 records that the caller asked for an exclusive borrow and nothing can check it
-against the parameter. Measured: `grow(exclusive buf, shared 16)` emits
-`grow(buf, 16)`.
+against the parameter. Measured: the prefix is dropped from the AST, and the
+call emits `cell_grow(&buf, 16)` from the callee signature (mangling plus the
+exclusive address-of).
 
 This specification keeps the call-site annotation and makes it meaningful: an
 explicit annotation must match the parameter's annotation (OWNERSHIP.md R15),
@@ -1023,8 +1025,10 @@ var count = 0
   error; that is **designed, not implemented**.
 - Ownership defaults to `owned` when omitted.
 - The type annotation is optional. Type **inference is designed, not
-  implemented**: an unannotated binding is emitted as `int64_t` no matter what
-  it is bound to. Measured: `let owned xs = [1, 2, 3]` emits `int64_t xs`.
+  implemented** in the typechecker: an unannotated `3.5` is still accepted as
+  if it were an integer. Codegen picks the C type from the initializer when it
+  can. Measured: `let owned xs = [1, 2, 3]` emits `cell_slice_t`. An
+  unannotated binding with no typed initializer still emits `int64_t`.
 - The initializer is optional. A `let` with no initializer emits an
   uninitialized C declaration; definite-assignment analysis is **designed, not
   implemented**.
@@ -1051,7 +1055,7 @@ string.
 R14 lives in `src/cell/borrowck.zig`. It names the place and notes the `let`:
 
 ```
-examples/rejected/immutable_assign.cell:6:5: error: cannot assign to immutable binding 'x'
+examples/rejected/immutable_assign.cell:9:5: error: cannot assign to immutable binding 'x'
 ```
 
 Typecheck does **not** also report R14; a same-type write to an immutable
@@ -1227,8 +1231,9 @@ for non-`pub` items, are **designed, not implemented**.
 
 ## 9. Pattern matching
 
-**Status: parsed, not enforced.** The parser is real; codegen emits nothing and
-nothing checks exhaustiveness.
+**Status: implemented (parse and emit).** The parser is real; codegen lowers
+`match` to a scrutinee temporary plus an if/else chain. Exhaustiveness is not
+checked; a missing catch-all arm becomes `cell_panic`.
 
 ```cell
 match value {
@@ -1465,32 +1470,33 @@ of work the C-ABI-first claim actually requires.
 
 ### 10.7 Host intrinsics
 
-**Status: partly implemented in the runtime, not reachable from generated
-code.**
+**Status: implemented for the symbols codegen knows.**
 
-The runtime provides `cell_print`, `cell_println`, `cell_assert`,
-`cell_assert_msg`, and `cell_panic`, plus the arena, slice, string, optional,
-and arc helpers. `stdlib/prelude.cell` declares Cell names that mangle onto
-several of them.
+The runtime provides `cell_print`, `cell_println`, `cell_print_int`,
+`cell_assert`, `cell_assert_msg`, and `cell_panic`, plus the arena, slice,
+string, optional, and arc helpers. `stdlib/prelude.cell` declares Cell names
+that mangle onto several of them.
 
-The join does not yet work, for one reason: the intrinsics take `cell_str_t`
-while codegen emits `const char*` for `String` (section 10.3). A prelude
-declaration of `print` therefore emits a prototype that conflicts with the real
-symbol. `stdlib/prelude.cell` marks which declarations are affected.
+Generated code can call them. `String` is `cell_str_t` (section 10.3), so a
+call to `print("hi")` emits `cell_print(cell_str_from_parts("hi", 2))`.
+`examples/hello.cell` reaches `cell_print_int`. Arena, slice, and arc helpers
+are still not inserted automatically.
 
 ### 10.8 Panics
 
-**Status: designed, not implemented** at the language level. `cell_panic` exists
-and aborts after writing to stderr. No generated code calls it. There is no
-`panic` keyword, no assertion lowering, and no unwinding.
+**Status: implemented for match lowering.** There is no `panic` keyword and no
+unwinding. `cell_panic` exists and aborts after writing to stderr. A `match`
+without a catch-all arm emits `cell_panic("non-exhaustive match in <fn>")`.
+There is no assertion lowering beyond a direct call to the `assert` intrinsic.
 
 ---
 
 ## 11. Diagnostics
 
-**Status: implemented in the machinery, not wired to the CLI.**
+**Status: implemented for check diagnostics. Parser diagnostics are recorded
+but not wired to the CLI.**
 
-`src/cell/diag.zig` is now a real diagnostic system. `Bag.init` takes the path
+`src/cell/diag.zig` is a real diagnostic system. `Bag.init` takes the path
 and an optional source buffer; `err`, `warning`, and `note` push a `Diagnostic`
 carrying an `ast.Span`; and `render` prints the standard shape plus the source
 line and a caret:
@@ -1507,18 +1513,15 @@ other.
 
 Three gaps remain, and the first is the one a user actually hits:
 
-1. **The CLI does not surface parse diagnostics.** `src/root.zig` and
-   `src/main.zig` are unchanged since `a65a586` (verified: the diff is empty),
-   so `compile` returns the bare `error.UnexpectedToken` and `main` lets it
-   escape. Measured: a syntax error prints the Zig error name and a Zig stack
-   trace pointing into `parser.zig`, with no source location and no caret. The
-   recorded message and span exist and nothing reads them. Wiring `reportInto`
-   into `root.compile` is a small change and is the highest-value remaining
-   diagnostic work.
-2. **Check diagnostics do reach the user**, with path, line, and column.
-   Measured. They are printed through `std.debug.print` in `Checker.checkModule`
-   rather than through `Bag.render`, so they lack the source line and caret the
-   renderer can produce.
+1. **The CLI does not surface parse diagnostics.** `root.compile` returns the
+   bare `error.UnexpectedToken` and `main` lets it escape. Measured: a syntax
+   error prints the Zig error name and a Zig stack trace pointing into
+   `parser.zig`, with no source location and no caret. The recorded message and
+   span exist and nothing reads them. Wiring `reportInto` into `root.compile`
+   is a small change and is the highest-value remaining diagnostic work.
+2. **Check diagnostics do reach the user**, with path, line, column, the source
+   line, and a caret. Measured. They are printed through `Bag.printAll` /
+   `Bag.render` from `root.check`.
 3. **There is no recovery.** The first parse error aborts. Reporting several
    errors from one file needs a resynchronization strategy that does not exist.
 
