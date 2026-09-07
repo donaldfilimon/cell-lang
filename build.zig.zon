@@ -2,7 +2,7 @@
     .name = .cell_lang,
     .version = "0.1.0",
     .fingerprint = 0x82c2edc405c45fcb,
-    .minimum_zig_version = "0.17.0-dev.1252+e4b325c19",
+    .minimum_zig_version = "0.17.0-dev.2018+ab30a0b9a",
     .dependencies = .{},
     .paths = .{
         "build.zig",
