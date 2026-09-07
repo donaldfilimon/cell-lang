@@ -315,10 +315,13 @@ pub const Parser = struct {
     fn parsePrimary(self: *Parser) ParseError!ast.Expr {
         const start = self.current();
         // Ownership keywords are allowed as expression prefixes in call
-        // arguments: `add(shared 40, shared 2)`.
-        if (self.parseOwnership() != null) {
+        // arguments: `add(shared 40, shared 2)`. The written keyword is kept
+        // on `.annotated` so later stages can recover it.
+        if (self.parseOwnership()) |own| {
             const inner = try self.parseUnary();
-            return .{ .kind = inner.kind, .span = Span.merge(tokenSpan(start), inner.span) };
+            const p = try self.allocator.create(ast.Expr);
+            p.* = inner;
+            return self.expr(.{ .annotated = .{ .ownership = own, .value = p } }, start);
         }
         if (self.match(.int)) {
             const v = std.fmt.parseInt(i64, self.prev().lexeme, 10) catch return error.InvalidLiteral;
@@ -924,6 +927,36 @@ test "call on a field chain parses as a postfix chain" {
     try std.testing.expectEqual(@as(usize, 1), call.args.len);
     try std.testing.expectEqualStrings("print", call.callee.kind.field.name);
     try std.testing.expectEqualStrings("io", call.callee.kind.field.base.kind.ident);
+}
+
+test "call-argument ownership prefixes stay on the AST" {
+    var shared_tp = try parseForTest(
+        \\pub fn take(owned b: Buffer) {}
+        \\pub fn main() {
+        \\  take(shared buf)
+        \\}
+    );
+    defer shared_tp.deinit();
+
+    const shared_call = shared_tp.module.items[1].kind.fn_def.body.?[0].kind.expr.kind.call;
+    try std.testing.expectEqual(@as(usize, 1), shared_call.args.len);
+    const shared_arg = shared_call.args[0];
+    try std.testing.expect(shared_arg.kind == .annotated);
+    try std.testing.expectEqual(ast.Ownership.shared, shared_arg.kind.annotated.ownership);
+    try std.testing.expectEqualStrings("buf", shared_arg.kind.annotated.value.kind.ident);
+
+    var owned_tp = try parseForTest(
+        \\pub fn take(owned b: Buffer) {}
+        \\pub fn main() {
+        \\  take(owned buf)
+        \\}
+    );
+    defer owned_tp.deinit();
+
+    const owned_arg = owned_tp.module.items[1].kind.fn_def.body.?[0].kind.expr.kind.call.args[0];
+    try std.testing.expect(owned_arg.kind == .annotated);
+    try std.testing.expectEqual(ast.Ownership.owned, owned_arg.kind.annotated.ownership);
+    try std.testing.expectEqualStrings("buf", owned_arg.kind.annotated.value.kind.ident);
 }
 
 test "a parse failure records its position and message" {

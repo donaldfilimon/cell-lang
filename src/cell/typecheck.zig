@@ -261,6 +261,7 @@ pub const Checker = struct {
                 const els = i.else_body orelse break :blk false;
                 break :blk exprAlwaysReturns(i.then_body) and exprAlwaysReturns(els);
             },
+            .annotated => |a| exprAlwaysReturns(a.value),
             else => false,
         };
     }
@@ -386,6 +387,8 @@ pub const Checker = struct {
                 }
                 return result orelse types.t_unit;
             },
+
+            .annotated => |a| return try self.checkExpr(a.value),
         }
     }
 
@@ -726,6 +729,7 @@ fn literalFits(expected: Type, value: *const ast.Expr) bool {
             else => false,
         },
         .unary => |u| u.op == .neg and literalFits(expected, u.operand),
+        .annotated => |a| literalFits(expected, a.value),
         else => false,
     };
 }

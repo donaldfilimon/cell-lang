@@ -415,6 +415,7 @@ pub const Generator = struct {
                     try self.writeIndent(indent);
                     try out.writeAll("}\n");
                 },
+                .annotated => |a| try self.emitEffect(a.value, indent),
                 else => {
                     try self.writeIndent(indent);
                     try self.emitExpr(&e, indent);
@@ -479,6 +480,7 @@ pub const Generator = struct {
                     try self.emitBranchStmt(eb, indent);
                 }
             },
+            .annotated => |a| try self.emitBranchStmt(a.value, indent),
             else => {
                 try out.writeAll("{\n");
                 try self.writeIndent(indent + 1);
@@ -588,6 +590,7 @@ pub const Generator = struct {
             .block => |stmts| try self.emitStmts(stmts, indent),
             .if_expr => |i| try self.emitIfStmt(i, indent),
             .match_expr => |m| try self.emitMatchStmt(m, indent),
+            .annotated => |a| try self.emitEffect(a.value, indent),
             else => {
                 try self.writeIndent(indent);
                 try self.emitExpr(e, indent);
@@ -698,6 +701,7 @@ pub const Generator = struct {
                 try out.writeAll("}\n");
             },
             .match_expr => |m| try self.emitMatch(m, dest, indent),
+            .annotated => |a| try self.emitValueInto(a.value, dest, indent),
             else => {
                 try self.writeIndent(indent);
                 try out.print("{s} = ", .{dest});
@@ -755,6 +759,7 @@ pub const Generator = struct {
             .struct_lit => |sl| try self.emitStructLit(sl, indent),
             .list_lit => |items| try self.emitListLit(items, indent),
             .block, .if_expr, .match_expr => try self.emitValueExpr(e, indent),
+            .annotated => |a| try self.emitExpr(a.value, indent),
         }
     }
 
@@ -1136,6 +1141,7 @@ pub const Generator = struct {
                 if (m.arms.len == 0) return CType.void_type;
                 return try self.inferExpr(m.arms[0].body);
             },
+            .annotated => |a| return try self.inferExpr(a.value),
         }
     }
 
@@ -1277,6 +1283,7 @@ fn isDefaultPattern(p: ast.Pattern) bool {
 fn isPlace(e: *const ast.Expr) bool {
     return switch (e.kind) {
         .ident, .field => true,
+        .annotated => |a| isPlace(a.value),
         else => false,
     };
 }
@@ -1323,6 +1330,7 @@ fn exprUses(e: *const ast.Expr, name: []const u8) bool {
             }
             break :blk false;
         },
+        .annotated => |a| exprUses(a.value, name),
     };
 }
 
@@ -1349,6 +1357,7 @@ fn stmtUses(s: *const ast.Stmt, name: []const u8) bool {
 fn targetReads(e: *const ast.Expr, name: []const u8) bool {
     return switch (e.kind) {
         .ident => false,
+        .annotated => |a| targetReads(a.value, name),
         else => exprUses(e, name),
     };
 }

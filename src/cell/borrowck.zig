@@ -496,6 +496,7 @@ pub const Checker = struct {
             .block => |stmts| try self.checkBlockStmts(stmts),
             .if_expr => |*i| try self.checkIf(i),
             .match_expr => |*m| try self.checkMatch(m),
+            .annotated => |a| try self.checkExpr(a.value),
         }
     }
 
@@ -977,6 +978,9 @@ pub const Checker = struct {
         var cursor = e;
         while (true) {
             switch (cursor.kind) {
+                .annotated => |a| {
+                    cursor = a.value;
+                },
                 .field => |f| {
                     try segments.append(self.allocator, f.name);
                     cursor = f.base;
@@ -1121,6 +1125,7 @@ fn exprUsesName(e: *const ast.Expr, name: []const u8) bool {
             }
             break :blk false;
         },
+        .annotated => |a| exprUsesName(a.value, name),
     };
 }
 

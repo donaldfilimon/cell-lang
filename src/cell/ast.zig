@@ -77,6 +77,8 @@ pub const Expr = struct {
         call: struct { callee: *Expr, args: []Expr },
         binary: struct { op: BinaryOp, left: *Expr, right: *Expr },
         unary: struct { op: UnaryOp, operand: *Expr },
+        /// Written ownership prefix: `shared buf`, `owned x`, `exclusive y`.
+        annotated: struct { ownership: Ownership, value: *Expr },
         /// `base.name`
         field: struct { base: *Expr, name: []const u8 },
         /// `Name { a: 1, b: 2 }`
@@ -153,6 +155,7 @@ pub fn rootName(expr: *const Expr) ?[]const u8 {
     return switch (expr.kind) {
         .ident => |n| n,
         .field => |f| rootName(f.base),
+        .annotated => |a| rootName(a.value),
         else => null,
     };
 }
