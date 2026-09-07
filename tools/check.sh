@@ -89,6 +89,7 @@ fi
 # --------------------------------------------------------------- 3. corpus --
 # The four contracts declared in examples/README.md.
 printf '\n== corpus ==\n'
+corpus_before=$fails
 
 for f in examples/*.cell; do
     if ! $CELL check "$f" > /dev/null 2>&1; then
@@ -116,7 +117,10 @@ for f in examples/pairing/*; do
     fi
 done
 
-[ $fails -eq 0 ] && pass "all four corpus contracts hold"
+# Against the corpus's OWN failures, not the global counter. Gating this on
+# $fails meant an earlier stage failing printed NOTHING here: the loops above
+# still ran and still passed, but the section went silent and read as skipped.
+[ $fails -eq $corpus_before ] && pass "all four corpus contracts hold"
 
 # ------------------------------------------------------------ 4. agreement --
 # The two newer backends share an IR, so a disagreement means one of them is
