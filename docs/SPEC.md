@@ -1417,6 +1417,38 @@ match value {
 structured `Pattern` and a body expression. The scrutinee is parsed with the
 struct-literal restriction on (section 6.7), so `match c { ... }` works.
 
+### 9.0 Match guards
+
+**Status: implemented, except on a binding pattern.**
+
+```
+arm = pattern [ "if" expr ] "=>" expr
+```
+
+```cell
+match c {
+    Color.Green if n > 5 => 7,
+    Color.Green => 1,
+    _ => 0,
+}
+```
+
+A guard is an extra condition the arm must satisfy on top of matching its
+pattern. It reuses `if` and `=>` and needs no new token. The guard must be
+`Bool`, and it is evaluated **only when the pattern matched**, so a guard may
+call a function without that call happening on every arm.
+
+**A guarded arm is never a catch-all**, however catch-all its pattern looks.
+`_ if c` can fail, so a `match` whose only wildcard arm is guarded still emits
+the non-exhaustive panic (section 11) rather than falling through with a
+made-up result.
+
+**A guard on a binding pattern (`m if m > 3`) is rejected**, with
+`a guard on a binding pattern is not implemented yet`. The C backend declares
+the arm's binding inside the arm body, where a guard in the condition cannot
+see it. Refusing is deliberate: the alternative would emit C that either fails
+to compile or silently reads a different variable.
+
 ### 9.1 The implemented pattern grammar
 
 ```ebnf

@@ -531,7 +531,11 @@ pub const Generator = struct {
         var tested: usize = 0;
         var default_arm: ?ast.MatchArm = null;
         for (m.arms) |arm| {
-            if (isDefaultPattern(arm.pattern)) {
+            // A GUARDED arm is never a default, however catch-all its pattern
+            // looks: `_ if c` can fail. Treating it as one would drop the
+            // panic and let an unmatched value fall through with a made-up
+            // result, which is the exact failure the panic exists to prevent.
+            if (isDefaultArm(arm)) {
                 default_arm = arm;
                 break;
             }
@@ -541,7 +545,17 @@ pub const Generator = struct {
             } else {
                 try out.writeAll("} else if (");
             }
-            try self.emitPatternTest(arm.pattern, temp, scrut_ty);
+            if (isDefaultPattern(arm.pattern)) {
+                // The pattern matches everything, so the guard IS the test.
+                try self.emitExpr(arm.guard.?, indent + 1);
+            } else {
+                try self.emitPatternTest(arm.pattern, temp, scrut_ty);
+                if (arm.guard) |g| {
+                    try out.writeAll(" && (");
+                    try self.emitExpr(g, indent + 1);
+                    try out.writeAll(")");
+                }
+            }
             try out.writeAll(") {\n");
             try self.emitArmBody(arm, temp, scrut_ty, dest, indent + 2);
             tested += 1;
@@ -1290,6 +1304,12 @@ fn intrinsicSymbol(name: []const u8, arity: usize) ?[]const u8 {
 }
 
 /// A pattern that matches everything, so it closes an if/else chain.
+/// Whether an arm closes the chain. A pattern that matches everything only
+/// does so when no guard can reject it.
+fn isDefaultArm(arm: ast.MatchArm) bool {
+    return arm.guard == null and isDefaultPattern(arm.pattern);
+}
+
 fn isDefaultPattern(p: ast.Pattern) bool {
     return switch (p.kind) {
         .wildcard, .binding => true,
@@ -1879,5 +1899,42 @@ test "generated C for a function body compiles with cc -c" {
     if (!result.term.success()) {
         std.debug.print("cc rejected emitted C:\n{s}\n--- source ---\n{s}\n", .{ result.stderr, e.text });
         return error.CcRejectedEmittedC;
+    }
+}
+
+test "a match guard is ANDed into the arm's test" {
+    var e = try emitSource(
+        \\pub enum Color { Red, Green }
+        \\pub fn f(copy c: Color, copy n: Int) -> Int {
+        \\  return match c { Color.Green if n > 5 => 7, _ => 0, }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "== cell_Color_Green && (");
+}
+
+test "a guarded catch-all arm still leaves the non-exhaustive panic in place" {
+    // `_ if c` can fail, so dropping the panic would let an unmatched value
+    // fall through with a made-up result. This is the whole reason a guarded
+    // arm is not treated as a default.
+    var e = try emitSource(
+        \\pub fn f(copy n: Int) -> Int {
+        \\  return match n { _ if n > 5 => 7, }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_panic(\"non-exhaustive match in f\")");
+}
+
+test "an unguarded catch-all still removes the panic" {
+    var e = try emitSource(
+        \\pub fn f(copy n: Int) -> Int {
+        \\  return match n { 1 => 1, _ => 0, }
+        \\}
+    );
+    defer e.deinit();
+    if (std.mem.indexOf(u8, e.text, "non-exhaustive") != null) {
+        std.debug.print("unexpected panic:\n{s}\n", .{e.text});
+        return error.UnexpectedPanic;
     }
 }

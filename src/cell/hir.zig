@@ -170,6 +170,9 @@ pub const ArgMode = struct {
 
 pub const Arm = struct {
     pattern: Pattern,
+    /// `pattern if cond => body`. A guarded arm is never a catch-all, however
+    /// catch-all its pattern looks.
+    guard: ?*Expr,
     body: *Expr,
     span: Span,
 };
@@ -713,9 +716,11 @@ const Lowerer = struct {
                 for (me.arms, 0..) |arm, i| {
                     self.pushScope();
                     const pat = try self.lowerPattern(&arm.pattern, scrutinee.ty);
+                    var guard: ?*Expr = null;
+                    if (arm.guard) |g| guard = try self.box(try self.lowerExpr(g));
                     const body = try self.box(try self.lowerExpr(arm.body));
                     self.popScope();
-                    arms[i] = .{ .pattern = pat, .body = body, .span = arm.span };
+                    arms[i] = .{ .pattern = pat, .guard = guard, .body = body, .span = arm.span };
                     if (i == 0) result_ty = body.ty;
                 }
                 return .{

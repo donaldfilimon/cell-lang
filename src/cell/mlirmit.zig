@@ -614,13 +614,22 @@ const Emitter = struct {
             const body_b = self.nextBlock();
             const next_b = self.nextBlock();
 
-            const catch_all = switch (arm.pattern.kind) {
+            // A guarded arm is never a catch-all: `_ if c` can fail.
+            const catch_all = arm.guard == null and switch (arm.pattern.kind) {
+                .wildcard, .binding => true,
+                else => false,
+            };
+            const pattern_matches_all = switch (arm.pattern.kind) {
                 .wildcard, .binding => true,
                 else => false,
             };
 
             if (catch_all) {
                 try self.line("cf.br {s}", .{body_b});
+            } else if (pattern_matches_all) {
+                const g = try self.emitExpr(arm.guard.?);
+                if (g.isNone()) return Value.none;
+                try self.line("cf.cond_br {s}, {s}, {s}", .{ g.text, body_b, next_b });
             } else {
                 const test_text: ?[]const u8 = switch (arm.pattern.kind) {
                     .int => |v| try std.fmt.allocPrint(self.arena, "{d}", .{v}),
@@ -639,7 +648,18 @@ const Emitter = struct {
                 try self.line("{s} = arith.cmpi eq, {s}, {s} : {s}", .{
                     cmp, scrutinee.text, konst, scrutinee.ty,
                 });
-                try self.line("cf.cond_br {s}, {s}, {s}", .{ cmp, body_b, next_b });
+                if (arm.guard) |g_expr| {
+                    // Its own block, so the guard runs only when the pattern
+                    // matched. A guard may call a function.
+                    const guard_b = self.nextBlock();
+                    try self.line("cf.cond_br {s}, {s}, {s}", .{ cmp, guard_b, next_b });
+                    try self.block_label(guard_b);
+                    const g = try self.emitExpr(g_expr);
+                    if (g.isNone()) return Value.none;
+                    try self.line("cf.cond_br {s}, {s}, {s}", .{ g.text, body_b, next_b });
+                } else {
+                    try self.line("cf.cond_br {s}, {s}, {s}", .{ cmp, body_b, next_b });
+                }
             }
 
             try self.block_label(body_b);

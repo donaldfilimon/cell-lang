@@ -697,13 +697,27 @@ const Emitter = struct {
             const body_label = try self.nextLabel("match.arm");
             const next_label = try self.nextLabel("match.next");
 
-            const catch_all = switch (arm.pattern.kind) {
+            // A guarded arm is never a catch-all: `_ if c` can fail, and
+            // treating it as unconditional would drop the panic.
+            const catch_all = arm.guard == null and switch (arm.pattern.kind) {
+                .wildcard, .binding => true,
+                else => false,
+            };
+            const pattern_matches_all = switch (arm.pattern.kind) {
                 .wildcard, .binding => true,
                 else => false,
             };
 
             if (catch_all) {
                 try self.out.print("  br label %{s}\n", .{body_label});
+            } else if (pattern_matches_all) {
+                // The pattern matches everything, so the guard is the test.
+                const g = try self.emitExpr(arm.guard.?);
+                if (g.isVoid()) return Value.void_value;
+                try self.out.print(
+                    "  br i1 {s}, label %{s}, label %{s}\n",
+                    .{ g.text, body_label, next_label },
+                );
             } else {
                 const test_val: ?Value = switch (arm.pattern.kind) {
                     .int => |v| Value{
@@ -727,10 +741,30 @@ const Emitter = struct {
                     "  {s} = icmp eq {s} {s}, {s}\n",
                     .{ cmp, scrutinee.ty, scrutinee.text, tv.text },
                 );
-                try self.out.print(
-                    "  br i1 {s}, label %{s}, label %{s}\n",
-                    .{ cmp, body_label, next_label },
-                );
+                if (arm.guard) |g_expr| {
+                    // The guard gets its own block, because it must be
+                    // evaluated ONLY when the pattern matched. Folding it into
+                    // one condition would evaluate it unconditionally, and a
+                    // guard may call a function.
+                    const guard_label = try self.nextLabel("match.guard");
+                    try self.out.print(
+                        "  br i1 {s}, label %{s}, label %{s}\n",
+                        .{ cmp, guard_label, next_label },
+                    );
+                    try self.out.print("{s}:\n", .{guard_label});
+                    self.terminated = false;
+                    const g = try self.emitExpr(g_expr);
+                    if (g.isVoid()) return Value.void_value;
+                    try self.out.print(
+                        "  br i1 {s}, label %{s}, label %{s}\n",
+                        .{ g.text, body_label, next_label },
+                    );
+                } else {
+                    try self.out.print(
+                        "  br i1 {s}, label %{s}, label %{s}\n",
+                        .{ cmp, body_label, next_label },
+                    );
+                }
             }
 
             try self.out.print("{s}:\n", .{body_label});

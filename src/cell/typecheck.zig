@@ -402,6 +402,28 @@ pub const Checker = struct {
                         }),
                         else => {},
                     }
+                    if (arm.guard) |g| {
+                        // A guard on a BINDING pattern would have to reference
+                        // a name the arm body declares, and the C backend
+                        // declares that name inside the arm rather than before
+                        // the if-chain, so the guard could not see it. Rejected
+                        // explicitly rather than emitted wrongly.
+                        if (arm.pattern.kind == .binding) {
+                            try self.errf(
+                                g.span,
+                                "a guard on a binding pattern is not implemented yet",
+                                .{},
+                            );
+                        }
+                        const gt = try self.checkExpr(g);
+                        if (!gt.isUnknown() and gt.tag() != .boolean) {
+                            try self.errf(
+                                g.span,
+                                "a match guard must be Bool, found {s}",
+                                .{try self.typeName(gt)},
+                            );
+                        }
+                    }
                     const body = try self.checkExpr(arm.body);
                     if (result) |want| {
                         if (!types.compatible(want, body)) {

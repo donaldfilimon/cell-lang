@@ -113,6 +113,14 @@ pub const Pattern = struct {
 
 pub const MatchArm = struct {
     pattern: Pattern,
+    /// `pattern if cond => body`. An extra condition the arm must satisfy on
+    /// top of matching the pattern. Null when no guard was written.
+    ///
+    /// A guard makes an arm conditional, so an arm that WOULD have been a
+    /// catch-all stops being one: `_ if c => ...` can fail. Exhaustiveness has
+    /// to account for that or a match with only guarded arms would lose its
+    /// panic.
+    guard: ?*Expr = null,
     body: *Expr,
     span: Span,
 };

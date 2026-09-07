@@ -61,3 +61,22 @@ pub fn booleans(copy b: Bool) -> Int {
 //   range patterns     0..9
 // Exhaustiveness is not checked either: `booleans` above happens to be
 // exhaustive and nothing verified that.
+
+/// A match GUARD: an extra condition an arm must satisfy on top of matching
+/// its pattern. Reuses `if` and needs no new token.
+///
+/// A guarded arm is NEVER a catch-all, however catch-all its pattern looks:
+/// `_ if c` can fail, so a match whose only wildcard arm is guarded still
+/// panics on an unmatched value rather than falling through with a made-up
+/// result.
+///
+/// A guard on a BINDING pattern (`m if m > 3`) is rejected today, because the
+/// C backend declares the binding inside the arm body where the guard cannot
+/// see it. Refused explicitly rather than emitted wrongly.
+pub fn guarded(copy c: Color, copy n: Int) -> Int {
+    return match c {
+        Color.Green if n > 5 => 7,
+        Color.Green => 1,
+        _ => 0,
+    }
+}

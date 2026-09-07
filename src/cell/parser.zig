@@ -487,12 +487,24 @@ pub const Parser = struct {
         while (!self.check(.r_brace) and !self.check(.eof)) {
             const arm_start = self.current();
             const arm_pattern = try self.parsePattern();
+            // `pattern if cond => body`. Reuses kw_if and needs no new token.
+            // The guard is a normal expression: a `{` after it would be a
+            // struct literal, not a body, because the body is introduced by
+            // `=>` rather than by a brace.
+            var guard_ptr: ?*ast.Expr = null;
+            if (self.match(.kw_if)) {
+                const guard = try self.parseExpr();
+                const g = try self.allocator.create(ast.Expr);
+                g.* = guard;
+                guard_ptr = g;
+            }
             try self.expect(.fat_arrow);
             const body = try self.parseExpr();
             const body_ptr = try self.allocator.create(ast.Expr);
             body_ptr.* = body;
             try arms.append(self.allocator, .{
                 .pattern = arm_pattern,
+                .guard = guard_ptr,
                 .body = body_ptr,
                 .span = self.spanFrom(arm_start),
             });
