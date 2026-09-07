@@ -234,8 +234,24 @@ void cell_print(cell_str_t msg) {
     fputc('\n', stdout);
 }
 
+void cell_println(cell_str_t msg) {
+    cell_print(msg);
+}
+
 void cell_assert(bool cond) {
     if (!cond) cell_panic("assertion failed");
+}
+
+void cell_assert_msg(bool cond, cell_str_t msg) {
+    if (cond) return;
+
+    /* cell_panic takes a C string, so the view needs a NUL-terminated copy.
+       Fall back to the bare message if that allocation fails. */
+    cell_string_t owned = cell_string_from_str(msg);
+    if (owned.ptr == NULL) cell_panic("assertion failed");
+    fprintf(stderr, "cell panic: assertion failed: %s\n", owned.ptr);
+    cell_string_free(&owned);
+    abort();
 }
 
 void cell_panic(const char *msg) {

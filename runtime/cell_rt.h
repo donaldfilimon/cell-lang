@@ -419,10 +419,25 @@ size_t cell_arc_strong_count(cell_arc_t arc);
 void cell_print(cell_str_t msg);
 
 /**
+ * `pub fn println(shared msg: String)`.
+ * Identical to cell_print. Both are provided because the prelude declares
+ * both names, and codegen should not have to know they coincide.
+ */
+void cell_println(cell_str_t msg);
+
+/**
  * `pub fn assert(shared cond: Bool)`.
  * No-op when true; calls cell_panic and aborts when false.
  */
 void cell_assert(bool cond);
+
+/**
+ * `pub fn assert(shared cond: Bool, shared msg: String)`.
+ * The message-carrying form. Aborts with `msg` in the panic text when false.
+ * Kept separate from cell_assert rather than replacing it, because a C ABI
+ * has no overloading and the one-argument form is already in use.
+ */
+void cell_assert_msg(bool cond, cell_str_t msg);
 
 /** Panic with message (aborts). */
 void cell_panic(const char *msg) __attribute__((noreturn));

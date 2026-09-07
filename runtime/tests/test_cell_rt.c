@@ -455,7 +455,9 @@ static void test_intrinsics(void) {
      */
     cell_print(cell_str_from_cstr("cell_rt self test"));
     cell_print(cell_str_empty());
+    cell_println(cell_str_from_cstr("cell_rt self test (println)"));
     cell_assert(true);
+    cell_assert_msg(true, cell_str_from_cstr("not reached"));
     CHECK(true);
 }
 
