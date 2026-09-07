@@ -1508,14 +1508,40 @@ pub const Generator = struct {
     ) Alloc!void {
         const id = self.next_binding_id;
         self.next_binding_id += 1;
-        // Fault-injection note (task 3 report): breaking the lockstep on
-        // purpose here -- e.g. skipping this assert while also skipping one
-        // borrowck `declare()` call -- makes this fire on the very first
-        // test that declares two locals in one function, which is most of
-        // them. It costs nothing in a release build.
-        if (self.checker) |c| {
-            if (c.bindingName(id)) |declared| {
-                std.debug.assert(eq(declared, name));
+
+        // Confirm this id still names this binding on borrowck's side, and
+        // let the ANSWER decide whether this local may be dropped at all.
+        //
+        // An assert alone was not enough, for three reasons. It is compiled
+        // out entirely in ReleaseFast and ReleaseSmall (it survives Debug
+        // and ReleaseSafe, so tests do catch drift). The earlier
+        // `if (bindingName(id)) |declared|` form skipped the check in
+        // SILENCE whenever the lookup returned null, which is exactly what
+        // drift PAST borrowck's highest id produces. And an assert only
+        // DETECTS: `pendingDrops` went on to trust `wasMoved(id)` either
+        // way. A `wasMoved` answer about the wrong binding is the one
+        // failure this design cannot absorb -- "not moved" about some other
+        // place frees a place that really was moved, the double free the
+        // whole conservative approach exists to prevent.
+        //
+        // So require POSITIVE confirmation, in every build mode. Without it
+        // we do not know whether this binding was moved, and the module doc
+        // comment's asymmetry dictates the answer: not dropping a live
+        // place leaks, dropping a moved one corrupts. Choose the leak.
+        //
+        // Residual, stated rather than hidden: drift that lands on a
+        // DIFFERENT binding sharing this name still passes, which shadowing
+        // makes possible. That is strictly narrower than the hole it
+        // replaces, not a closed door.
+        var may_drop = droppable;
+        if (droppable) {
+            const declared = if (self.checker) |c| c.bindingName(id) else null;
+            if (declared) |d| {
+                const agrees = eq(d, name);
+                std.debug.assert(agrees); // loud in Debug and ReleaseSafe
+                if (!agrees) may_drop = false; // safe in ReleaseFast/Small
+            } else {
+                may_drop = false;
             }
         }
         try self.locals.append(self.arena, .{
@@ -1523,7 +1549,7 @@ pub const Generator = struct {
             .ty = ty,
             .ownership = ownership,
             .id = id,
-            .droppable = droppable,
+            .droppable = may_drop,
         });
     }
 
@@ -2234,6 +2260,44 @@ test "a value moved in one branch of an if is not dropped" {
     );
     defer e.deinit();
     try expectAbsent(e.text, "cell_string_free");
+}
+
+test "a value moved by being returned is not dropped" {
+    // The third of borrowck's four move sites (`movePlace` is called from
+    // the `return` arm), and until now the only one with no test. It is the
+    // site where a wrong drop is worst: emitting a free here would lower to
+    // `tmp = s; cell_string_free(&s); return tmp;`, handing every caller a
+    // struct whose buffer this function already released -- a use after
+    // free at the CALL site, where nothing in this file would see it.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f() -> String {
+        \\  let owned s = make()
+        \\  return s
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "cell_string_free");
+}
+
+test "a value moved into another let binding is not dropped, but its new owner is" {
+    // The last untested move site: `let owned b = a` moves `a` into `b`.
+    // This pins both halves of the transfer in one program, which neither
+    // safety test above does: the source must NOT be freed (it no longer
+    // owns anything) and the destination MUST be (it now does). A single
+    // `expectAbsent` on "cell_string_free" would pass vacuously if drops
+    // stopped firing altogether, so the positive half is what keeps this
+    // test honest.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  let owned a = make()
+        \\  let owned b = a
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_string_free(&b);");
+    try expectAbsent(e.text, "cell_string_free(&a);");
 }
 
 test "an unmoved owned String local is freed at scope end" {
