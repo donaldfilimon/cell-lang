@@ -222,6 +222,34 @@ size_t cell_arc_strong_count(cell_arc_t arc) {
     return atomic_load_explicit(&arc.refcount->count, memory_order_acquire);
 }
 
+void cell_string_drop_glue(void *p) {
+    if (p == NULL) return;
+    cell_string_t *box = (cell_string_t *)p;
+    cell_string_free(box);
+    free(box);
+}
+
+void cell_slice_drop_glue(void *p) {
+    if (p == NULL) return;
+    cell_slice_t *box = (cell_slice_t *)p;
+    cell_slice_free(box);
+    free(box);
+}
+
+cell_arc_t cell_arc_from_string(cell_string_t s) {
+    cell_string_t *box = (cell_string_t *)malloc(sizeof(*box));
+    if (box == NULL) cell_panic("cell_arc_from_string: out of memory");
+    *box = s; /* move: box now owns the buffer, s must not be freed */
+    return cell_arc_new(box, cell_string_drop_glue);
+}
+
+cell_arc_t cell_arc_from_slice(cell_slice_t s) {
+    cell_slice_t *box = (cell_slice_t *)malloc(sizeof(*box));
+    if (box == NULL) cell_panic("cell_arc_from_slice: out of memory");
+    *box = s; /* move: box now owns the buffer, s must not be freed */
+    return cell_arc_new(box, cell_slice_drop_glue);
+}
+
 /* ------------------------------------------------------------------------ */
 /* Host intrinsics declared by stdlib/prelude.cell                           */
 /* ------------------------------------------------------------------------ */

@@ -405,6 +405,35 @@ void cell_arc_drop(cell_arc_t arc);
 /** Current strong count, or 0 for a null handle. For tests and diagnostics. */
 size_t cell_arc_strong_count(cell_arc_t arc);
 
+/**
+ * Drop glue for an arc whose pointee is a heap-boxed cell_string_t: releases
+ * the string's own buffer and then frees the box. `p == NULL` is a no-op,
+ * matching cell_arc_new's own tolerance for a null pointee.
+ */
+void cell_string_drop_glue(void *p);
+
+/**
+ * Drop glue for an arc whose pointee is a heap-boxed cell_slice_t: releases
+ * the slice's own buffer and then frees the box. `p == NULL` is a no-op.
+ */
+void cell_slice_drop_glue(void *p);
+
+/**
+ * Move `s` into a fresh heap box and return an arc owning it, strong count 1.
+ * `s` is moved, not copied: ownership of its buffer transfers into the box,
+ * and the caller must not read or free `s` afterward. Calls cell_panic on
+ * allocation failure, matching cell_arc_new.
+ */
+cell_arc_t cell_arc_from_string(cell_string_t s);
+
+/**
+ * Move `s` into a fresh heap box and return an arc owning it, strong count 1.
+ * `s` is moved, not copied: ownership of its buffer transfers into the box,
+ * and the caller must not read or free `s` afterward. Calls cell_panic on
+ * allocation failure, matching cell_arc_new.
+ */
+cell_arc_t cell_arc_from_slice(cell_slice_t s);
+
 /* ------------------------------------------------------------------------ */
 /* Host intrinsics declared by stdlib/prelude.cell                           */
 /* ------------------------------------------------------------------------ */

@@ -11,6 +11,7 @@
 #include "cell_rt.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 
 /*
  * The concurrent retain/release test needs real threads. POSIX threads are
@@ -225,6 +226,138 @@ static void test_arc_is_atomic(void) {
     fprintf(stderr, "note: concurrent arc test skipped (no pthreads)\n");
 }
 #endif
+
+/* ------------------------------------------------------------------------ */
+/* ARC-boxed aggregates: cell_arc_from_string / cell_arc_from_slice          */
+/* ------------------------------------------------------------------------ */
+
+static void test_arc_from_string_roundtrip(void) {
+    cell_string_t s = cell_string_from_cstr("glue-me");
+    CHECK(s.ptr != NULL);
+
+    cell_arc_t a = cell_arc_from_string(s);
+    CHECK(a.ptr != NULL);
+    CHECK(a.drop == cell_string_drop_glue);
+    CHECK(cell_arc_strong_count(a) == 1);
+
+    /* `s` was moved, not copied: this is the very buffer allocated above,
+       read back through the box. */
+    const cell_string_t *boxed = (const cell_string_t *)a.ptr;
+    CHECK(boxed->len == 7);
+    CHECK(cell_str_eq(cell_string_as_str(boxed), cell_str_from_cstr("glue-me")));
+
+    cell_arc_drop(a);
+}
+
+static void test_arc_from_slice_roundtrip(void) {
+    const size_t esz = sizeof(int64_t);
+    cell_slice_t s = cell_slice_alloc(esz, 4);
+    for (int64_t i = 0; i < 4; ++i) {
+        CHECK(cell_slice_push(&s, esz, &i));
+    }
+
+    cell_arc_t a = cell_arc_from_slice(s);
+    CHECK(a.ptr != NULL);
+    CHECK(a.drop == cell_slice_drop_glue);
+    CHECK(cell_arc_strong_count(a) == 1);
+
+    const cell_slice_t *boxed = (const cell_slice_t *)a.ptr;
+    CHECK(boxed->len == 4);
+    for (size_t i = 0; i < boxed->len; ++i) {
+        const int64_t *slot = (const int64_t *)cell_slice_at(boxed, esz, i);
+        CHECK(slot != NULL);
+        if (slot != NULL) CHECK(*slot == (int64_t)i);
+    }
+
+    cell_arc_drop(a);
+}
+
+/*
+ * "The strong count reached zero" is not evidence the glue actually freed
+ * anything: a glue that frees only the box, or only the payload, still
+ * drives the count to zero and never crashes on its own. These two tests
+ * prove BOTH halves were really released by asking the allocator for blocks
+ * of the exact sizes just freed, immediately afterward and in the same order
+ * the glue itself frees things (payload buffer first, then box), with no
+ * other allocation in between.
+ *
+ * This harness links plain libc malloc/free, no interposition and no
+ * sanitizer, so a freshly freed small block is handed straight back to the
+ * very next request for a matching size on this toolchain, as long as
+ * nothing else allocates in between. A glue that leaks either half leaves
+ * that address still live, so the allocator is forced to hand out fresh
+ * memory instead of the address that was just supposedly freed, and the
+ * comparison below fails. Verified empirically, and by deliberately
+ * breaking each half in turn: see task-4a-report.md.
+ */
+static void test_arc_string_glue_frees_both_halves(void) {
+    cell_string_t s = cell_string_from_cstr("dropme!");
+    char *buf_addr = s.ptr;
+    size_t buf_cap = s.cap;
+
+    cell_arc_t a = cell_arc_from_string(s);
+    void *box_addr = a.ptr;
+
+    cell_arc_t b = cell_arc_clone(a);
+    CHECK(cell_arc_strong_count(a) == 2);
+
+    cell_arc_drop(b);
+    CHECK(cell_arc_strong_count(a) == 1);
+
+    /* Pointee is still readable at count 1: the glue has not run yet. */
+    const cell_string_t *still = (const cell_string_t *)a.ptr;
+    CHECK(cell_str_eq(cell_string_as_str(still), cell_str_from_cstr("dropme!")));
+
+    cell_arc_drop(a); /* last release: cell_string_drop_glue runs here */
+
+    void *reuse_buf = malloc(buf_cap);
+    void *reuse_box = malloc(sizeof(cell_string_t));
+    CHECK(reuse_buf == buf_addr);
+    CHECK(reuse_box == box_addr);
+    free(reuse_buf);
+    free(reuse_box);
+}
+
+static void test_arc_slice_glue_frees_both_halves(void) {
+    const size_t esz = sizeof(int64_t);
+    /* cap 1 so the buffer (8 bytes) and the box (24 bytes) fall in different
+       allocator size classes and cannot be confused with one another. */
+    cell_slice_t s = cell_slice_alloc(esz, 1);
+    int64_t v = 99;
+    CHECK(cell_slice_push(&s, esz, &v));
+    void *buf_addr = s.ptr;
+    size_t buf_bytes = esz * s.cap;
+
+    cell_arc_t a = cell_arc_from_slice(s);
+    void *box_addr = a.ptr;
+
+    cell_arc_t b = cell_arc_clone(a);
+    CHECK(cell_arc_strong_count(a) == 2);
+
+    cell_arc_drop(b);
+    CHECK(cell_arc_strong_count(a) == 1);
+
+    const cell_slice_t *still = (const cell_slice_t *)a.ptr;
+    CHECK(still->len == 1);
+
+    cell_arc_drop(a); /* last release: cell_slice_drop_glue runs here */
+
+    void *reuse_buf = malloc(buf_bytes);
+    void *reuse_box = malloc(sizeof(cell_slice_t));
+    CHECK(reuse_buf == buf_addr);
+    CHECK(reuse_box == box_addr);
+    free(reuse_buf);
+    free(reuse_box);
+}
+
+static void test_drop_glue_null_is_noop(void) {
+    /* Must not crash. Reaching the CHECK below (and every test after it) is
+       the proof; a crash here would abort the whole harness instead of
+       failing one assertion. */
+    cell_string_drop_glue(NULL);
+    cell_slice_drop_glue(NULL);
+    CHECK(true);
+}
 
 /* ------------------------------------------------------------------------ */
 /* String                                                                    */
@@ -478,6 +611,11 @@ int main(void) {
     test_arc_retain_release();
     test_arc_null_cases();
     test_arc_is_atomic();
+    test_arc_from_string_roundtrip();
+    test_arc_from_slice_roundtrip();
+    test_arc_string_glue_frees_both_halves();
+    test_arc_slice_glue_frees_both_halves();
+    test_drop_glue_null_is_noop();
     test_str_views();
     test_owned_string();
     test_slice();
