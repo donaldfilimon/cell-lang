@@ -53,6 +53,11 @@ command's, which has manufactured false green claims here before:
 zig build test -Dswift=false > /private/tmp/cell-test.log 2>&1; echo "EXIT: $?"
 ```
 
+**A failed `zig build` leaves the previous binary in `zig-out/bin/cell`.** Run
+that stale binary after a failed build and you are testing code that no longer
+exists, which reads as a pass. Check the build's exit code before trusting any
+run of the binary. This has already produced one false green here.
+
 Build scratch belongs under `/private/tmp`, never in an iCloud path.
 
 ## A green gate is weak evidence here
@@ -75,10 +80,18 @@ designed. Measured at import:
 - The typechecker walks the AST without a type representation. `Symbol.ty_name`
   is a string, and `symbols` is one flat map with no scopes, so parameters leak
   between functions.
-- `ast.Span` exists and is attached to no node, so diagnostics report `:0:0`.
-- Codegen emits `/*block*/`, `/*if*/`, and `/*match*/` placeholders.
+- Codegen emits `/*block*/`, `/*if*/`, and `/*match*/` placeholders, so `if` and
+  `match` parse and typecheck completely and then generate no control flow.
+- Emitted C compiles for declaration-only files and for nothing else.
 - There is no path from `.cell` to an executable. `emit` prints C text and
   nothing compiles it.
+- The module and body file system (`.cell`/`.cel` declare, `.body`/`.bod`
+  implement) is specified and absent. The compiler inspects no extension at all:
+  `cell check` accepts `.txt` and a file with no extension identically.
+
+`docs/SPEC.md` section 12 is a construct-by-construct status index, counted
+rather than estimated. Cite it instead of guessing, and update it when you
+change what is true.
 
 Syntax parsing is not implementation. Verify a claim by running the compiler.
 
