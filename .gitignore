@@ -1,3 +1,4 @@
 .cell-cache/
 zig-out/
 .zig-cache/
+.remember/
