@@ -123,6 +123,33 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
+    // ── C runtime ABI tests (pure C harness, warnings are errors) ────────
+    // cell_rt.cpp is deliberately not linked here, so the weak-symbol
+    // fallbacks for cell_cxx_probe / cell_swift_probe are exercised.
+    const rt_test_flags = [_][]const u8{ "-std=c11", "-Wall", "-Wextra", "-Werror" };
+    const rt_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    rt_test_mod.addIncludePath(b.path("runtime"));
+    rt_test_mod.addCSourceFile(.{
+        .file = b.path("runtime/cell_rt.c"),
+        .flags = &rt_test_flags,
+    });
+    rt_test_mod.addCSourceFile(.{
+        .file = b.path("runtime/tests/test_cell_rt.c"),
+        .flags = &rt_test_flags,
+    });
+    const rt_tests = b.addExecutable(.{
+        .name = "cell-rt-tests",
+        .root_module = rt_test_mod,
+    });
+    const run_rt_tests = b.addRunArtifact(rt_tests);
+    const rt_test_step = b.step("test-runtime", "Run the C runtime ABI tests");
+    rt_test_step.dependOn(&run_rt_tests.step);
+    test_step.dependOn(&run_rt_tests.step);
+
     // ── Examples ────────────────────────────────────────────────────────
     const examples_step = b.step("examples", "Typecheck example .cell files");
     const run_examples = b.addRunArtifact(exe);
