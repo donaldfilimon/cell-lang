@@ -82,8 +82,8 @@ pub fn emit(allocator: std.mem.Allocator, module: *const ast.Module, writer: *Io
 ///
 /// Returns `error.TypeError` when a backend refused part of the program, so a
 /// caller exits non-zero without re-inspecting the bag, matching what `check`
-/// does. Nothing is written to `writer` in that case beyond what had already
-/// been emitted before the refusal.
+/// does. NOTHING is written to `writer` in that case: a partial emit on stdout
+/// becomes a truncated file that a later tool reads as if it were complete.
 pub fn emitFor(
     allocator: std.mem.Allocator,
     module: *const ast.Module,
@@ -97,15 +97,28 @@ pub fn emitFor(
     var bag: diag.Bag = .init(module.path, source);
     defer bag.deinit(allocator);
 
+    // Emit into a buffer, not straight to `writer`. A backend that refuses
+    // part of a program has usually already emitted the part before it, and
+    // writing that out would leave a TRUNCATED file on disk with no marker in
+    // it. `cell emit --target=mlir f.cell > out.mlir` followed by a separate
+    // `mlir-opt out.mlir` would then run against a file that looks complete
+    // and is not. Nothing reaches `writer` unless the whole module emitted.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    var collector = Io.Writer.Allocating.fromArrayList(allocator, &buf);
+
     var lowered = try hir.lower(allocator, module, &bag);
     switch (target) {
         .c => unreachable,
-        .llvm => try llvmemit.emitModule(allocator, &lowered, writer, &bag),
-        .mlir => try mlirmit.emitModule(allocator, &lowered, writer, &bag),
+        .llvm => try llvmemit.emitModule(allocator, &lowered, &collector.writer, &bag),
+        .mlir => try mlirmit.emitModule(allocator, &lowered, &collector.writer, &bag),
     }
+    buf = collector.toArrayList();
 
     try bag.printAll(diag_writer);
     if (bag.hasErrors()) return error.TypeError;
+
+    try writer.writeAll(buf.items);
 }
 
 /// Load `path` relative to `dir` (pairing a body with its stem-mate) and run
@@ -445,4 +458,55 @@ test "shipped load+check allows a private body function with no module declarati
         std.debug.print("private fn should not need a declaration:\n{s}\n", .{result.text});
         return error.TestUnexpectedDiagnostic;
     }
+}
+
+test "a backend refusal writes no partial output" {
+    // A truncated emit on stdout becomes a file a later tool reads as if it
+    // were complete. `cell emit --target=mlir f.cell > out.mlir` followed by a
+    // separate `mlir-opt out.mlir` is the exact shape that goes wrong, so the
+    // guarantee is that a refused module writes nothing at all.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const source =
+        \\pub struct Point { copy x: Float }
+        \\pub fn main() { let owned p = Point { x: 1.0 } }
+    ;
+    var module = try compile(a, source, "t.cell");
+
+    var out_buf: [8192]u8 = undefined;
+    var out = Io.Writer.fixed(&out_buf);
+    var err_buf: [8192]u8 = undefined;
+    var errw = Io.Writer.fixed(&err_buf);
+
+    // MLIR refuses structs, so this module cannot emit.
+    try std.testing.expectError(
+        error.TypeError,
+        emitFor(a, &module, source, &out, .mlir, &errw),
+    );
+    try std.testing.expectEqual(@as(usize, 0), out.buffered().len);
+    // The diagnostic still reaches the error stream, so the failure is loud.
+    try std.testing.expect(std.mem.indexOf(u8, errw.buffered(), "cannot lower to MLIR") != null);
+}
+
+test "a bodyless two-argument assert takes the runtime's own symbol" {
+    // codegen.symbolFor renames it to cell_assert_msg because C has no
+    // overloading. The HIR must agree, or the backends built on it emit a call
+    // to a symbol that does not exist and the failure is at link time.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var module = try compile(a,
+        \\pub fn assert(copy cond: Bool, shared msg: String);
+        \\pub fn assert1(copy cond: Bool);
+    , "t.cell");
+
+    var bag: diag.Bag = .init("t.cell", null);
+    defer bag.deinit(a);
+    const lowered = try hir.lower(a, &module, &bag);
+
+    try std.testing.expectEqualStrings("cell_assert_msg", lowered.fns[0].symbol);
+    try std.testing.expectEqualStrings("cell_assert1", lowered.fns[1].symbol);
 }

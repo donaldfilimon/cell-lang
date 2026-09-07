@@ -309,7 +309,7 @@ const Lowerer = struct {
     depth: u32 = 0,
 
     const ScopeEntry = struct { name: []const u8, slot: u32, depth: u32 };
-    const Sig = struct { name: []const u8, params: []ast.Param, ret: Ty };
+    const Sig = struct { name: []const u8, symbol: []const u8, params: []ast.Param, ret: Ty };
 
     fn run(self: *Lowerer) LowerError!Module {
         // Pass one: named types and signatures, so order of declaration in the
@@ -338,6 +338,7 @@ const Lowerer = struct {
                 }),
                 .fn_def => |f| try self.sigs.append(self.arena, .{
                     .name = f.name,
+                    .symbol = try self.symbolFor(f),
                     .params = f.params,
                     .ret = if (f.return_type) |*rt| self.resolve(rt) else types.t_unit,
                 }),
@@ -389,7 +390,7 @@ const Lowerer = struct {
 
         try self.fns.append(self.arena, .{
             .name = f.name,
-            .symbol = try std.fmt.allocPrint(self.arena, "cell_{s}", .{f.name}),
+            .symbol = try self.symbolFor(f),
             .param_count = param_count,
             .bindings = try self.arena.dupe(Binding, self.bindings.items),
             .ret = ret,
@@ -397,6 +398,20 @@ const Lowerer = struct {
             .is_public = f.is_public,
             .span = span,
         });
+    }
+
+    /// The C ABI symbol for a function. Mirrors `codegen.symbolFor`: a
+    /// BODYLESS declaration of a runtime intrinsic takes the runtime's own
+    /// spelling, and a function with a body is never renamed, because that
+    /// would define over a runtime symbol. Only `assert` needs this, and only
+    /// at arity 2, because C has no overloading and the message-carrying form
+    /// is a separate symbol. Getting this wrong is a link error, not a
+    /// compile error, so the two must agree.
+    fn symbolFor(self: *Lowerer, f: ast.FnDef) LowerError![]const u8 {
+        if (f.body == null and std.mem.eql(u8, f.name, "assert") and f.params.len == 2) {
+            return "cell_assert_msg";
+        }
+        return std.fmt.allocPrint(self.arena, "cell_{s}", .{f.name});
     }
 
     fn lowerStmts(self: *Lowerer, stmts: []const ast.Stmt) LowerError![]Stmt {
@@ -707,7 +722,7 @@ const Lowerer = struct {
                 for (self.sigs.items) |s| {
                     if (std.mem.eql(u8, s.name, name)) {
                         sig = s;
-                        symbol = try std.fmt.allocPrint(self.arena, "cell_{s}", .{name});
+                        symbol = s.symbol;
                         break;
                     }
                 }
