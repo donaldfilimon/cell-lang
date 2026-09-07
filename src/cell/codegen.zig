@@ -22,7 +22,7 @@ pub const Generator = struct {
         try out.writeAll("#include <stdint.h>\n#include <stdbool.h>\n\n");
 
         for (module.items) |item| {
-            switch (item) {
+            switch (item.kind) {
                 .fn_def => |f| try emitFn(out, f),
                 .struct_def => |s| try emitStruct(out, s),
                 .enum_def => |e| try emitEnum(out, e),
@@ -53,7 +53,7 @@ pub const Generator = struct {
 
     fn emitStmt(out: *Io.Writer, stmt: ast.Stmt, indent: usize) !void {
         try writeIndent(out, indent);
-        switch (stmt) {
+        switch (stmt.kind) {
             .let => |l| {
                 const ty = if (l.ty) |t| cType(&t) else "int64_t";
                 try out.print("{s} {s}", .{ ty, l.name });
@@ -76,7 +76,8 @@ pub const Generator = struct {
                 try out.writeAll(";\n");
             },
             .assign => |a| {
-                try out.print("{s} = ", .{a.name});
+                try emitExpr(out, a.target);
+                try out.writeAll(" = ");
                 try emitExpr(out, a.value);
                 try out.writeAll(";\n");
             },
@@ -84,7 +85,7 @@ pub const Generator = struct {
     }
 
     fn emitExpr(out: *Io.Writer, expr: ast.Expr) !void {
-        switch (expr) {
+        switch (expr.kind) {
             .ident => |n| try out.writeAll(n),
             .int => |v| try out.print("{d}", .{v}),
             .float => |v| try out.print("{d}", .{v}),
@@ -128,6 +129,12 @@ pub const Generator = struct {
                 });
                 try emitExpr(out, u.operand.*);
             },
+            .field => |f| {
+                try emitExpr(out, f.base.*);
+                try out.print(".{s}", .{f.name});
+            },
+            .struct_lit => |sl| try out.print("/*struct literal {s} with {d} fields*/", .{ sl.name, sl.fields.len }),
+            .list_lit => |items| try out.print("/*list literal with {d} items*/", .{items.len}),
             .block => try out.writeAll("/*block*/"),
             .if_expr => try out.writeAll("/*if*/"),
             .match_expr => try out.writeAll("/*match*/"),

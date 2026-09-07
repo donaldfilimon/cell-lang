@@ -1,11 +1,34 @@
 const std = @import("std");
 const Io = std.Io;
 
+/// A half-open byte range in a single source buffer, plus the 1-based
+/// line/column of its first byte so a diagnostic can be printed without
+/// rescanning the file.
+///
+/// Every `Expr`, `Stmt`, `Item` and `Pattern` is a `{ kind, span }` wrapper
+/// rather than a bare union. The alternative was a side table keyed by node
+/// index, which is cheaper per node but requires an index-based arena AST;
+/// this tree is pointer-based, so a side table would need a stable key that
+/// does not exist. The wrapper costs 16 bytes per node and makes `node.span`
+/// available everywhere without threading a table through every function.
 pub const Span = struct {
     start: u32,
     end: u32,
     line: u32,
     column: u32,
+
+    /// A span that points nowhere. Use only for synthesized nodes.
+    pub const none: Span = .{ .start = 0, .end = 0, .line = 0, .column = 0 };
+
+    /// Cover both spans, keeping the start position of `a`.
+    pub fn merge(a: Span, b: Span) Span {
+        return .{
+            .start = a.start,
+            .end = @max(a.end, b.end),
+            .line = a.line,
+            .column = a.column,
+        };
+    }
 };
 
 /// Ownership / lifetime annotation inspired by Rust + Swift.
@@ -31,47 +54,108 @@ pub const TypeExpr = union(enum) {
     unit,
 };
 
-pub const Expr = union(enum) {
-    ident: []const u8,
-    int: i64,
-    float: f64,
-    string: []const u8,
-    bool: bool,
-    call: struct { callee: *Expr, args: []Expr },
-    binary: struct { op: BinaryOp, left: *Expr, right: *Expr },
-    unary: struct { op: UnaryOp, operand: *Expr },
-    block: []Stmt,
-    if_expr: struct { cond: *Expr, then_body: *Expr, else_body: ?*Expr },
-    match_expr: struct { scrutinee: *Expr, arms: []MatchArm },
-};
-
 pub const BinaryOp = enum { add, sub, mul, div, eq, ne, lt, le, gt, ge, and_op, or_op };
 pub const UnaryOp = enum { neg, not, ref_shared, ref_exclusive };
 
+/// One `name: value` initializer inside a struct literal.
+pub const FieldInit = struct {
+    name: []const u8,
+    value: Expr,
+    span: Span,
+};
+
+pub const Expr = struct {
+    kind: Kind,
+    span: Span,
+
+    pub const Kind = union(enum) {
+        ident: []const u8,
+        int: i64,
+        float: f64,
+        string: []const u8,
+        bool: bool,
+        call: struct { callee: *Expr, args: []Expr },
+        binary: struct { op: BinaryOp, left: *Expr, right: *Expr },
+        unary: struct { op: UnaryOp, operand: *Expr },
+        /// `base.name`
+        field: struct { base: *Expr, name: []const u8 },
+        /// `Name { a: 1, b: 2 }`
+        struct_lit: struct { name: []const u8, fields: []FieldInit },
+        /// `[a, b, c]` or `[]`
+        list_lit: []Expr,
+        block: []Stmt,
+        if_expr: struct { cond: *Expr, then_body: *Expr, else_body: ?*Expr },
+        match_expr: struct { scrutinee: *Expr, arms: []MatchArm },
+    };
+};
+
+/// A structured match pattern. Enum variants carry no payload in this
+/// grammar, so there are no subpatterns to nest.
+pub const Pattern = struct {
+    kind: Kind,
+    span: Span,
+
+    pub const Kind = union(enum) {
+        /// `_`
+        wildcard,
+        /// `name`, binds the scrutinee
+        binding: []const u8,
+        /// `Red` or `Color.Red`
+        enum_variant: struct { enum_name: ?[]const u8, variant: []const u8 },
+        int: i64,
+        float: f64,
+        string: []const u8,
+        bool: bool,
+    };
+};
+
 pub const MatchArm = struct {
-    pattern: []const u8,
+    pattern: Pattern,
     body: *Expr,
+    span: Span,
 };
 
-pub const Stmt = union(enum) {
-    let: struct {
-        name: []const u8,
-        ownership: Ownership,
-        mutable: bool,
-        ty: ?TypeExpr,
-        value: ?Expr,
-    },
-    expr: Expr,
-    return_stmt: ?Expr,
-    assign: struct { name: []const u8, value: Expr },
+pub const Stmt = struct {
+    kind: Kind,
+    span: Span,
+
+    pub const Kind = union(enum) {
+        let: struct {
+            name: []const u8,
+            ownership: Ownership,
+            mutable: bool,
+            ty: ?TypeExpr,
+            value: ?Expr,
+        },
+        expr: Expr,
+        return_stmt: ?Expr,
+        /// `target = value`, where `target` is an ident or a field chain.
+        assign: struct { target: Expr, value: Expr },
+    };
 };
 
-pub const Item = union(enum) {
-    fn_def: FnDef,
-    struct_def: StructDef,
-    enum_def: EnumDef,
-    use_decl: []const u8,
+pub const Item = struct {
+    kind: Kind,
+    span: Span,
+
+    pub const Kind = union(enum) {
+        fn_def: FnDef,
+        struct_def: StructDef,
+        enum_def: EnumDef,
+        use_decl: []const u8,
+    };
 };
+
+/// The name of the binding an expression is rooted at, if any:
+/// `buf` for `buf`, `buf` for `buf.len.bytes`, null for anything else.
+/// Assignment checking needs the root binding, not the whole path.
+pub fn rootName(expr: *const Expr) ?[]const u8 {
+    return switch (expr.kind) {
+        .ident => |n| n,
+        .field => |f| rootName(f.base),
+        else => null,
+    };
+}
 
 pub const FnDef = struct {
     name: []const u8,
@@ -118,12 +202,35 @@ pub const Module = struct {
     pub fn dump(self: *const Module, writer: *Io.Writer) !void {
         try writer.print("module {s}\n", .{self.path});
         for (self.items) |item| {
-            switch (item) {
-                .fn_def => |f| try writer.print("  fn {s}({d} params) public={}\n", .{ f.name, f.params.len, f.is_public }),
-                .struct_def => |s| try writer.print("  struct {s} ({d} fields)\n", .{ s.name, s.fields.len }),
-                .enum_def => |e| try writer.print("  enum {s} ({d} variants)\n", .{ e.name, e.variants.len }),
-                .use_decl => |u| try writer.print("  use {s}\n", .{u}),
+            try writer.print("  {d}:{d} ", .{ item.span.line, item.span.column });
+            switch (item.kind) {
+                .fn_def => |f| try writer.print("fn {s}({d} params) public={}\n", .{ f.name, f.params.len, f.is_public }),
+                .struct_def => |s| try writer.print("struct {s} ({d} fields)\n", .{ s.name, s.fields.len }),
+                .enum_def => |e| try writer.print("enum {s} ({d} variants)\n", .{ e.name, e.variants.len }),
+                .use_decl => |u| try writer.print("use {s}\n", .{u}),
             }
         }
     }
 };
+
+test "Span.merge covers both operands and keeps the left start" {
+    const a: Span = .{ .start = 4, .end = 8, .line = 2, .column = 3 };
+    const b: Span = .{ .start = 11, .end = 20, .line = 3, .column = 1 };
+    const m = Span.merge(a, b);
+    try std.testing.expectEqual(@as(u32, 4), m.start);
+    try std.testing.expectEqual(@as(u32, 20), m.end);
+    try std.testing.expectEqual(@as(u32, 2), m.line);
+    try std.testing.expectEqual(@as(u32, 3), m.column);
+}
+
+test "rootName walks a field chain down to its base binding" {
+    var base: Expr = .{ .kind = .{ .ident = "buf" }, .span = .none };
+    var mid: Expr = .{ .kind = .{ .field = .{ .base = &base, .name = "len" } }, .span = .none };
+    const outer: Expr = .{ .kind = .{ .field = .{ .base = &mid, .name = "bytes" } }, .span = .none };
+
+    try std.testing.expectEqualStrings("buf", rootName(&outer).?);
+    try std.testing.expectEqualStrings("buf", rootName(&base).?);
+
+    const lit: Expr = .{ .kind = .{ .int = 7 }, .span = .none };
+    try std.testing.expect(rootName(&lit) == null);
+}

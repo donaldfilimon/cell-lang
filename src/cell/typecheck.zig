@@ -26,16 +26,17 @@ pub const Checker = struct {
     }
 
     pub fn checkModule(self: *Checker, module: *ast.Module) !void {
+        self.diagnostics.path = module.path;
         for (module.items) |*item| {
             try self.checkItem(item);
         }
         if (self.diagnostics.hasErrors()) {
             for (self.diagnostics.list.items) |d| {
                 std.debug.print("{s}:{d}:{d}: {s}: {s}\n", .{
-                    d.path,
-                    d.line,
-                    d.column,
-                    @tagName(d.level),
+                    self.diagnostics.path,
+                    d.span.line,
+                    d.span.column,
+                    d.level.text(),
                     d.message,
                 });
             }
@@ -44,7 +45,7 @@ pub const Checker = struct {
     }
 
     fn checkItem(self: *Checker, item: *ast.Item) !void {
-        switch (item.*) {
+        switch (item.kind) {
             .fn_def => |*f| try self.checkFn(f),
             .struct_def => |*s| {
                 try self.symbols.put(s.name, .{
@@ -79,7 +80,7 @@ pub const Checker = struct {
     }
 
     fn checkStmt(self: *Checker, stmt: *ast.Stmt) CheckError!void {
-        switch (stmt.*) {
+        switch (stmt.kind) {
             .let => |*l| {
                 if (l.value) |*v| try self.checkExpr(v);
                 const ty_name = if (l.ty) |*t| typeName(t) else "Infer";
@@ -94,25 +95,25 @@ pub const Checker = struct {
                 if (opt.*) |*e| try self.checkExpr(e);
             },
             .assign => |*a| {
-                if (self.symbols.get(a.name)) |sym| {
-                    if (!sym.mutable) {
-                        try self.diagnostics.push(
-                            self.allocator,
-                            .err,
-                            "",
-                            0,
-                            0,
-                            "cannot assign to immutable binding",
-                        );
+                if (ast.rootName(&a.target)) |name| {
+                    if (self.symbols.get(name)) |sym| {
+                        if (!sym.mutable) {
+                            try self.diagnostics.err(
+                                self.allocator,
+                                a.target.span,
+                                "cannot assign to immutable binding",
+                            );
+                        }
                     }
                 }
+                try self.checkExpr(&a.target);
                 try self.checkExpr(&a.value);
             },
         }
     }
 
     fn checkExpr(self: *Checker, expr: *ast.Expr) CheckError!void {
-        switch (expr.*) {
+        switch (expr.kind) {
             .ident => {},
             .int, .float, .string, .bool => {},
             .call => |*c| {
@@ -124,6 +125,13 @@ pub const Checker = struct {
                 try self.checkExpr(b.right);
             },
             .unary => |*u| try self.checkExpr(u.operand),
+            .field => |*f| try self.checkExpr(f.base),
+            .struct_lit => |*sl| {
+                for (sl.fields) |*f| try self.checkExpr(&f.value);
+            },
+            .list_lit => |items| {
+                for (items) |*e| try self.checkExpr(e);
+            },
             .block => |stmts| {
                 for (stmts) |*s| try self.checkStmt(s);
             },

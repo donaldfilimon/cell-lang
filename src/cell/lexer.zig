@@ -64,7 +64,13 @@ pub const TokenKind = enum {
 pub const Token = struct {
     kind: TokenKind,
     lexeme: []const u8,
+    /// Byte offset of the first byte of the token in the source buffer.
+    start: u32,
+    /// Byte offset one past the last byte of the token.
+    end: u32,
+    /// 1-based line of the first byte.
     line: u32,
+    /// 1-based column of the first byte.
     column: u32,
 };
 
@@ -96,7 +102,8 @@ pub const Lexer = struct {
         const line = self.line;
         const column = self.column;
         if (self.index >= self.source.len) {
-            return .{ .kind = .eof, .lexeme = "", .line = line, .column = column };
+            const at: u32 = @intCast(self.source.len);
+            return .{ .kind = .eof, .lexeme = "", .start = at, .end = at, .line = line, .column = column };
         }
 
         const c = self.source[self.index];
@@ -216,9 +223,8 @@ pub const Lexer = struct {
         while (self.index < self.source.len and isIdentContinue(self.source[self.index])) {
             self.advance();
         }
-        const lexeme = self.source[start..self.index];
-        const kind = keyword(lexeme) orelse .ident;
-        return .{ .kind = kind, .lexeme = lexeme, .line = line, .column = column };
+        const kind = keyword(self.source[start..self.index]) orelse .ident;
+        return self.make(kind, start, line, column);
     }
 
     fn keyword(lexeme: []const u8) ?TokenKind {
@@ -296,6 +302,8 @@ pub const Lexer = struct {
         return .{
             .kind = kind,
             .lexeme = self.source[start..self.index],
+            .start = @intCast(start),
+            .end = @intCast(self.index),
             .line = line,
             .column = column,
         };
@@ -334,4 +342,66 @@ test "lex hello" {
     defer toks.deinit(std.testing.allocator);
     try std.testing.expect(toks.items.len > 5);
     try std.testing.expect(toks.items[0].kind == .kw_pub);
+}
+
+test "every token's byte range slices back to its own lexeme" {
+    const src =
+        \\pub fn add(shared a: Int) -> Int {
+        \\  return a + 1
+        \\}
+    ;
+    var lex = Lexer.init(src, "t.cell");
+    var toks = try lex.tokenizeAll(std.testing.allocator);
+    defer toks.deinit(std.testing.allocator);
+
+    for (toks.items) |t| {
+        try std.testing.expect(t.start <= t.end);
+        try std.testing.expect(t.end <= src.len);
+        try std.testing.expectEqualStrings(t.lexeme, src[t.start..t.end]);
+    }
+}
+
+test "line and column survive comments, newlines and strings" {
+    const src =
+        \\// a leading comment
+        \\pub fn f() {
+        \\  let owned s = "two words"
+        \\}
+    ;
+    var lex = Lexer.init(src, "t.cell");
+    var toks = try lex.tokenizeAll(std.testing.allocator);
+    defer toks.deinit(std.testing.allocator);
+
+    // `pub` is the first token, on line 2 column 1: the comment is trivia.
+    try std.testing.expectEqual(TokenKind.kw_pub, toks.items[0].kind);
+    try std.testing.expectEqual(@as(u32, 2), toks.items[0].line);
+    try std.testing.expectEqual(@as(u32, 1), toks.items[0].column);
+
+    // The string literal is on line 3; `let owned s = ` puts it at column 17.
+    var string_index: usize = 0;
+    for (toks.items, 0..) |t, i| {
+        if (t.kind == .string) string_index = i;
+    }
+    const s = toks.items[string_index];
+    try std.testing.expectEqual(@as(u32, 3), s.line);
+    try std.testing.expectEqual(@as(u32, 17), s.column);
+    try std.testing.expectEqualStrings("\"two words\"", s.lexeme);
+
+    // The closing brace is the last real token, on line 4 column 1.
+    const brace = toks.items[toks.items.len - 2];
+    try std.testing.expectEqual(TokenKind.r_brace, brace.kind);
+    try std.testing.expectEqual(@as(u32, 4), brace.line);
+    try std.testing.expectEqual(@as(u32, 1), brace.column);
+}
+
+test "the eof token sits at the end of the buffer" {
+    const src = "fn f()";
+    var lex = Lexer.init(src, "t.cell");
+    var toks = try lex.tokenizeAll(std.testing.allocator);
+    defer toks.deinit(std.testing.allocator);
+
+    const eof = toks.items[toks.items.len - 1];
+    try std.testing.expectEqual(TokenKind.eof, eof.kind);
+    try std.testing.expectEqual(@as(u32, src.len), eof.start);
+    try std.testing.expectEqual(@as(u32, src.len), eof.end);
 }
