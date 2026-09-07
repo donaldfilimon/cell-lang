@@ -123,9 +123,55 @@ designed.
   insertion and no NLL.
 - **Types.** `src/cell/types.zig` is a real type representation. Scopes do not
   leak parameters between functions.
-- **Codegen.** `if` / `else`, `match`, blocks, struct literals, list literals,
-  and mangled calls lower to C. `cell emit examples/hello.cell` compiles with
-  `cc -c`; linked against `runtime/cell_rt.c` it prints `42`.
+- **Codegen.** THREE backends, selected with `cell emit --target=c|llvm|mlir`.
+  - **C** (default) is the only one that lowers the whole language: `if`/`else`,
+    `match`, blocks, struct literals, list literals, mangled calls.
+    `cell emit examples/hello.cell` compiles with `cc -c`; linked against
+    `runtime/cell_rt.c` it prints `42`.
+  - **LLVM IR** and **MLIR** go through `src/cell/hir.zig` and are
+    **scalar-first**: scalars, payload-free enums, `if`, `match`, calls, and
+    (LLVM only) struct locals. `String`, `[T]`, `T?`, `Result` and `arc` are
+    refused with a `cannot lower` diagnostic at the offending span. They do not
+    emit plausible-looking wrong output, and that is the design, not a gap to
+    paper over.
+  - `examples/backends.cell` is scalar-only and all three backends carry it;
+    each one compiles, links and prints `24`. `examples/hello.cell` uses a
+    struct, so the MLIR backend **refuses** it. That refusal is correct.
+
+## The backend toolchain, and where it actually lives
+
+`llc`, `opt`, `mlir-opt` and `mlir-translate` are **not on PATH** on this
+machine. They are in the Homebrew LLVM keg:
+
+```bash
+/opt/homebrew/opt/llvm/bin/mlir-opt --version    # Homebrew LLVM 23.1.0
+```
+
+Two measured facts that will otherwise cost you an hour each:
+
+- **`zig cc -x ir` does not work.** It fails with `language not recognized: ir`.
+  Use `cc` for anything involving `.ll` files. The tests do.
+- **Do not put a `target triple` in emitted IR.** `clang -x ir` then warns
+  `-Woverride-module`. Let the driver supply the host's triple.
+
+The MLIR lowering pipeline is verified end to end, not quoted from docs.
+`mlirmit.lowering_passes` is the array the test and the file header both use,
+so they cannot drift:
+
+```bash
+mlir-opt out.mlir --verify-each
+mlir-opt out.mlir --expand-strided-metadata --finalize-memref-to-llvm \
+                  --convert-cf-to-llvm --convert-func-to-llvm \
+                  --convert-arith-to-llvm --reconcile-unrealized-casts -o low.mlir
+mlir-translate --mlir-to-llvmir low.mlir -o out.ll
+llc -filetype=obj out.ll -o out.o && cc out.o cell_rt.o drv.c -o prog
+```
+
+The MLIR backend uses the **`cf`** dialect, not `scf`, and that is load
+bearing. Cell has early `return`, and a `return` inside an `scf.if` region is
+invalid because the default dialect inside that region is not `func`;
+`mlir-opt` rejects it with the very unhelpful ``Dialect `' not found for custom
+op 'return'``. Do not "tidy" the branches back into `scf.if`. A test pins it.
 - Stem pairing is implemented: a `.body`/`.bod` file is checked with its
   same-directory `.cell`/`.cel` stem-mate. A body with no module is an error.
   `.txt` and extensionless paths still load as a standalone module.
@@ -137,6 +183,14 @@ change what is true.
 Syntax parsing is not implementation. Verify a claim by running the compiler.
 
 ## Layout
+
+There are now two paths below `check`, and only the newer one has an IR.
+`codegen.zig` still walks the AST directly; `hir.zig` sits between `check` and
+the two newer backends. That asymmetry is deliberate and temporary: re-seating
+the C emitter on the HIR is the risky half, because 27 codegen tests assert its
+exact output text, so the HIR and the new backends landed **purely additive**
+and left all of those tests untouched. Re-seating is a separate slice with its
+own differential harness.
 
 One compilation unit flows through the stages in this order. `load.zig`
 classifies the path by extension, finds a same-directory stem-mate when the
@@ -152,7 +206,8 @@ already failed. `codegen.Generator` lowers a checked module to C against
 `src/main.zig` is the CLI (`check`, `dump`, `emit`, `version`, `help`) and
 declares the C runtime symbols as `extern`, since this tree deliberately avoids
 `@cImport`. The compiler stages live in `src/cell/`: `lexer`, `parser`, `ast`,
-`typecheck`, `borrowck`, `codegen`, `diag`.
+`typecheck`, `borrowck`, `codegen`, `diag`, plus `hir` (the typed IR) and the
+two backends built on it, `llvmemit` and `mlirmit`.
 
 `runtime/cell_rt.h` is the ABI contract that generated C targets. Change it and
 `codegen.zig` together, or emitted code stops linking.

@@ -11,6 +11,9 @@ pub const borrowck = @import("cell/borrowck.zig");
 pub const codegen = @import("cell/codegen.zig");
 pub const diag = @import("cell/diag.zig");
 pub const load_file = @import("cell/load.zig");
+pub const hir = @import("cell/hir.zig");
+pub const llvmemit = @import("cell/llvmemit.zig");
+pub const mlirmit = @import("cell/mlirmit.zig");
 
 pub const load = load_file.load;
 pub const Loaded = load_file.Loaded;
@@ -56,10 +59,53 @@ pub fn check(
     if (tc.diagnostics.hasErrors() or bc.diagnostics.hasErrors()) return error.TypeError;
 }
 
+/// The code generators this compiler ships.
+///
+/// `c` is the original and the only one that lowers the whole language. The
+/// other two are newer, go through `hir`, and are deliberately scalar-first:
+/// see the module comments in `llvmemit.zig` and `mlirmit.zig` for what each
+/// refuses and why. A construct a backend cannot carry produces a diagnostic
+/// at its span, never plausible-looking wrong output.
+pub const Target = enum { c, llvm, mlir };
+
 /// Emit C from a checked module, targeting the runtime ABI in `cell_rt.h`.
+///
+/// Still lowers straight from the AST. The HIR path below is additive: it does
+/// not re-seat this emitter, so the tests that pin its exact output are
+/// untouched by the backends that came after it.
 pub fn emit(allocator: std.mem.Allocator, module: *const ast.Module, writer: *Io.Writer) !void {
     var gen = codegen.Generator.init(allocator, writer);
     try gen.emitModule(module);
+}
+
+/// Emit for `target`, rendering any lowering diagnostic to `diag_writer`.
+///
+/// Returns `error.TypeError` when a backend refused part of the program, so a
+/// caller exits non-zero without re-inspecting the bag, matching what `check`
+/// does. Nothing is written to `writer` in that case beyond what had already
+/// been emitted before the refusal.
+pub fn emitFor(
+    allocator: std.mem.Allocator,
+    module: *const ast.Module,
+    source: ?[]const u8,
+    writer: *Io.Writer,
+    target: Target,
+    diag_writer: *Io.Writer,
+) !void {
+    if (target == .c) return emit(allocator, module, writer);
+
+    var bag: diag.Bag = .init(module.path, source);
+    defer bag.deinit(allocator);
+
+    var lowered = try hir.lower(allocator, module, &bag);
+    switch (target) {
+        .c => unreachable,
+        .llvm => try llvmemit.emitModule(allocator, &lowered, writer, &bag),
+        .mlir => try mlirmit.emitModule(allocator, &lowered, writer, &bag),
+    }
+
+    try bag.printAll(diag_writer);
+    if (bag.hasErrors()) return error.TypeError;
 }
 
 /// Load `path` relative to `dir` (pairing a body with its stem-mate) and run

@@ -50,6 +50,37 @@ for f in examples/rejected/*.cell; do
 done
 ```
 
+## Checking a file through every backend
+
+`cell check` is one gate; agreement between the backends is another, and only
+`backends.cell` exercises it. All three must print `24`:
+
+```sh
+# C
+./zig-out/bin/cell emit examples/backends.cell > /tmp/b.c
+cc -I runtime /tmp/b.c runtime/cell_rt.c -o /tmp/b_c && /tmp/b_c
+
+# LLVM IR   (cc, NOT zig cc: `zig cc -x ir` fails outright)
+./zig-out/bin/cell emit --target=llvm examples/backends.cell > /tmp/b.ll
+cc -Wno-override-module -x ir /tmp/b.ll -c -o /tmp/b.o
+cc /tmp/b.o runtime/cell_rt.c -I runtime -o /tmp/b_llvm && /tmp/b_llvm
+
+# MLIR      (tools live in the Homebrew keg, not on PATH)
+L=/opt/homebrew/opt/llvm/bin
+./zig-out/bin/cell emit --target=mlir examples/backends.cell > /tmp/b.mlir
+$L/mlir-opt /tmp/b.mlir --expand-strided-metadata --finalize-memref-to-llvm \
+    --convert-cf-to-llvm --convert-func-to-llvm --convert-arith-to-llvm \
+    --reconcile-unrealized-casts -o /tmp/b_low.mlir
+$L/mlir-translate --mlir-to-llvmir /tmp/b_low.mlir -o /tmp/b_m.ll
+$L/llc -filetype=obj /tmp/b_m.ll -o /tmp/b_m.o
+printf 'extern void cell_main(void);\nint main(void){cell_main();return 0;}\n' > /tmp/drv.c
+cc /tmp/b_m.o /tmp/drv.c runtime/cell_rt.c -I runtime -o /tmp/b_mlir && /tmp/b_mlir
+```
+
+Note `hello.cell` is NOT in this set. It declares a struct, and the MLIR
+backend refuses structs with a `cannot lower` diagnostic. That refusal is the
+designed behavior, so do not "fix" it by weakening the backend.
+
 ## What `cell check` covers
 
 `cell check` parses, typechecks, and borrow-checks. A file in `examples/`
@@ -78,6 +109,7 @@ implemented.
 | `declarations.cell` | bodyless declarations, the C-ABI-first form |
 | `ownership.cell` | all five ownership modes; R2/R3/R5/R8/R14 enforced |
 | `arc.cell` | the `arc` mode and what the runtime already provides |
+| `backends.cell` | the cross-backend agreement case: scalar-only, carried by C, LLVM and MLIR alike, and all three print `24` |
 
 ## The future corpus
 

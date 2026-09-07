@@ -1,0 +1,53 @@
+// Every construct here is carried by ALL THREE backends, which is what this
+// file is for: it is the cross-backend agreement example.
+//
+//   cell emit               examples/backends.cell   -> C
+//   cell emit --target=llvm examples/backends.cell   -> LLVM IR
+//   cell emit --target=mlir examples/backends.cell   -> MLIR
+//
+// All three compile, link against runtime/cell_rt.c, run, and print 24.
+// That number is not decorative: choose(3) is 4 because 3 < 10, and
+// classify(Green) is 20, so the sum is 24. If a backend prints anything else
+// it has a bug, and the point of this file is that the bug is visible.
+//
+// It is deliberately SCALAR ONLY. No String, no [T], no T?, no struct, no arc.
+// The LLVM and MLIR backends refuse those with a `cannot lower` diagnostic
+// today, because an aggregate crossing the C boundary means choosing a calling
+// convention by hand, and every aggregate constructor in runtime/cell_rt.h is
+// `static inline` and therefore has no symbol to call. See the module comments
+// in src/cell/llvmemit.zig and src/cell/mlirmit.zig.
+//
+// examples/hello.cell is the C backend's flagship and uses a struct, so the
+// MLIR backend refuses it. That refusal is correct behavior, not a regression.
+
+pub fn print_int(copy value: Int);
+
+pub enum Color { Red, Green, Blue }
+
+/// A match over a payload-free enum. All three backends lower this to a
+/// compare chain against an int32; the C backend writes if/else, the other two
+/// write branches.
+pub fn classify(copy c: Color) -> Int {
+    return match c {
+        Color.Red => 10,
+        Color.Green => 20,
+        _ => 30,
+    }
+}
+
+/// Early return from both arms of an `if`. This is the construct that forced
+/// the MLIR backend onto the `cf` dialect: a `return` inside an `scf.if`
+/// region is invalid MLIR.
+pub fn choose(shared n: Int) -> Int {
+    if n < 10 {
+        return n + 1
+    } else {
+        return n * 2
+    }
+}
+
+pub fn main() {
+    let copy a = choose(shared 3)
+    let copy b = classify(copy Color.Green)
+    print_int(a + b)
+}

@@ -111,12 +111,28 @@ Two notes on the build, both worth knowing before you trust a green result:
 
 ## Status
 
-The parsed surface is enforced and executable. `cell check` typechecks and
-borrow-checks. `cell emit` produces C that `cc -c` accepts for
-`examples/hello.cell`, `examples/control_flow.cell`, and
+The parsed surface is enforced and executable, through **three backends**.
+
+`cell check` typechecks and borrow-checks. `cell emit` produces C that `cc -c`
+accepts for `examples/hello.cell`, `examples/control_flow.cell`, and
 `examples/ownership.cell`; `examples/hello.cell` linked against
 `runtime/cell_rt.c` prints `42`. `examples/arc.cell` does not compile until
 arc boxing exists.
+
+`cell emit --target=llvm` and `cell emit --target=mlir` produce textual LLVM IR
+and MLIR by way of a typed IR in `src/cell/hir.zig`. Both are verified by
+**running** their output, not by reading it: `examples/backends.cell` compiles,
+links against the runtime and prints `24` through all three backends, and the
+LLVM path also builds `examples/hello.cell` into a native executable that
+prints `42`.
+
+Both newer backends are deliberately **scalar-first**. `String`, `[T]`, `T?`,
+`Result` and `arc` are refused with a `cannot lower` diagnostic at the offending
+span rather than emitted as something that merely looks right. The reason is
+concrete: an aggregate crossing the C boundary means choosing a calling
+convention by hand on AArch64, and every aggregate constructor in
+`runtime/cell_rt.h` is `static inline` and so has no symbol to call. The MLIR
+backend also refuses structs, which is why it refuses `examples/hello.cell`.
 
 Ownership rules R2 (use-after-move), R3 (move-out-of-borrow), R5 (shared XOR
 exclusive), R8 (escaping borrow), and R14 (immutable assignment, including
