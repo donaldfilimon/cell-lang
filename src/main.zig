@@ -112,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
         var fw: Io.File.Writer = .init(.stderr(), io, &buf);
         var loaded = cell.load(arena, io, cwd, path, &fw.interface) catch |err| {
             try fw.interface.flush();
-            if (err == error.MissingModule or err == error.AmbiguousModule or err == error.PairingMismatch) std.process.exit(1);
+            if (err == error.MissingModule or err == error.AmbiguousModule or err == error.PairingMismatch or err == error.ParseFailed) std.process.exit(1);
             return err;
         };
         try loaded.module.dump(&fw.interface);
@@ -129,7 +129,8 @@ pub fn main(init: std.process.Init) !void {
         // offending line and a caret rather than a bare location.
         var loaded = cell.load(arena, io, cwd, path, &err_fw.interface) catch |err| {
             try err_fw.interface.flush();
-            if (err == error.MissingModule or err == error.AmbiguousModule or err == error.PairingMismatch)
+            if (err == error.MissingModule or err == error.AmbiguousModule or
+                err == error.PairingMismatch or err == error.ParseFailed)
                 std.process.exit(1);
             return err;
         };

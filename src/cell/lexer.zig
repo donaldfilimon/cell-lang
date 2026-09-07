@@ -51,6 +51,40 @@ pub const TokenKind = enum {
     kw_exclusive,
     kw_arc,
     kw_copy,
+    // Reserved words (SPEC 2.5). These lex as keywords but have NO parser
+    // rule yet, which is the point: a program using one as a name now fails
+    // with "expected item" or "expected expression" instead of silently
+    // meaning something else. `while` is the case that proves it -- a block is
+    // a valid expression, so `while (c) { ... }` used to parse as a call to a
+    // function named `while` followed by a discarded block, and a program
+    // written believing Cell has loops compiled and did nothing.
+    //
+    // Of these only while/break/continue are scheduled to gain rules. The rest
+    // are reserved so that programs do not come to depend on them as names.
+    kw_while,
+    kw_for,
+    kw_loop,
+    kw_break,
+    kw_continue,
+    kw_in,
+    kw_impl,
+    kw_trait,
+    kw_where,
+    kw_type,
+    kw_const,
+    kw_static,
+    kw_self,
+    kw_Self,
+    kw_as,
+    kw_is,
+    kw_defer,
+    kw_async,
+    kw_await,
+    kw_yield,
+    kw_import,
+    kw_export,
+    kw_extern,
+    kw_unsafe,
     // literals / idents
     ident,
     int,
@@ -248,6 +282,33 @@ pub const Lexer = struct {
             .{ "exclusive", .kw_exclusive },
             .{ "arc", .kw_arc },
             .{ "copy", .kw_copy },
+            // SPEC 2.5, reserved. Keep this list and the enum above in the
+            // same order as the specification's block, so a reader can diff
+            // them by eye.
+            .{ "while", .kw_while },
+            .{ "for", .kw_for },
+            .{ "loop", .kw_loop },
+            .{ "break", .kw_break },
+            .{ "continue", .kw_continue },
+            .{ "in", .kw_in },
+            .{ "impl", .kw_impl },
+            .{ "trait", .kw_trait },
+            .{ "where", .kw_where },
+            .{ "type", .kw_type },
+            .{ "const", .kw_const },
+            .{ "static", .kw_static },
+            .{ "self", .kw_self },
+            .{ "Self", .kw_Self },
+            .{ "as", .kw_as },
+            .{ "is", .kw_is },
+            .{ "defer", .kw_defer },
+            .{ "async", .kw_async },
+            .{ "await", .kw_await },
+            .{ "yield", .kw_yield },
+            .{ "import", .kw_import },
+            .{ "export", .kw_export },
+            .{ "extern", .kw_extern },
+            .{ "unsafe", .kw_unsafe },
         };
         inline for (map) |pair| {
             if (std.mem.eql(u8, lexeme, pair[0])) return pair[1];
@@ -404,4 +465,34 @@ test "the eof token sits at the end of the buffer" {
     try std.testing.expectEqual(TokenKind.eof, eof.kind);
     try std.testing.expectEqual(@as(u32, src.len), eof.start);
     try std.testing.expectEqual(@as(u32, src.len), eof.end);
+}
+
+test "SPEC 2.5's reserved words lex as keywords, not identifiers" {
+    // The whole reservation is worthless if one of them silently stays an
+    // identifier, because that is exactly the failure mode it exists to stop.
+    const reserved = [_][]const u8{
+        "while",  "for",    "loop",  "break", "continue", "in",
+        "impl",   "trait",  "where", "type",  "const",    "static",
+        "self",   "Self",   "as",    "is",    "defer",    "async",
+        "await",  "yield",  "import", "export", "extern", "unsafe",
+    };
+    for (reserved) |word| {
+        var lex = Lexer.init(word, "t.cell");
+        var tokens = try lex.tokenizeAll(std.testing.allocator);
+        defer tokens.deinit(std.testing.allocator);
+        if (tokens.items[0].kind == .ident) {
+            std.debug.print("'{s}' still lexes as an identifier\n", .{word});
+            return error.ReservedWordLexedAsIdent;
+        }
+    }
+}
+
+test "Self and self are distinct, and case still matters elsewhere" {
+    var lex = Lexer.init("self Self selfish", "t.cell");
+    var tokens = try lex.tokenizeAll(std.testing.allocator);
+    defer tokens.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TokenKind.kw_self, tokens.items[0].kind);
+    try std.testing.expectEqual(TokenKind.kw_Self, tokens.items[1].kind);
+    // A word merely starting with a reserved one is still an identifier.
+    try std.testing.expectEqual(TokenKind.ident, tokens.items[2].kind);
 }

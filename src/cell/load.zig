@@ -10,6 +10,7 @@ const Io = std.Io;
 const ast = @import("ast.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
+const diag = @import("diag.zig");
 
 const path_mod = Io.Dir.path;
 
@@ -39,7 +40,7 @@ pub fn load(
     writer: *Io.Writer,
 ) !Loaded {
     const source = try dir.readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
-    var compiled = try parse(allocator, source, path);
+    var compiled = try parse(allocator, source, path, writer);
 
     if (classify(path) != .body) {
         return .{ .module = compiled, .source = source };
@@ -68,17 +69,41 @@ pub fn load(
     };
 
     const mate_source = try dir.readFileAlloc(io, mate, allocator, .limited(16 * 1024 * 1024));
-    const mate_mod = try parse(allocator, mate_source, mate);
+    const mate_mod = try parse(allocator, mate_source, mate, writer);
     compiled = try merge(allocator, mate_mod, compiled, writer);
     return .{ .module = compiled, .source = source };
 }
 
-fn parse(allocator: std.mem.Allocator, source: []const u8, path: []const u8) !ast.Module {
+/// Parse one unit, rendering a parse failure as a diagnostic rather than
+/// letting `error.UnexpectedToken` escape to the CLI.
+///
+/// The parser already records the position and message of the failure that
+/// aborted it and can push that into a bag; nothing was calling it on this
+/// path, so a syntax error reached `main` as a raw Zig error and printed a
+/// STACK TRACE instead of a caret. That was invisible while every rejected
+/// example happened to fail in the typechecker instead. Promoting SPEC 2.5's
+/// reserved words to real keywords made `while (c) { }` a parse error and
+/// exposed it immediately.
+fn parse(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    path: []const u8,
+    writer: *Io.Writer,
+) !ast.Module {
     var lex = lexer.Lexer.init(source, path);
     var tokens = try lex.tokenizeAll(allocator);
     defer tokens.deinit(allocator);
     var p = parser.Parser.init(allocator, tokens.items, path);
-    return try p.parseModule();
+    return p.parseModule() catch |err| switch (err) {
+        error.UnexpectedToken, error.InvalidLiteral => {
+            var bag: diag.Bag = .init(path, source);
+            defer bag.deinit(allocator);
+            try p.reportInto(&bag, allocator);
+            try bag.printAll(writer);
+            return error.ParseFailed;
+        },
+        else => |e| return e,
+    };
 }
 
 fn findModuleMate(

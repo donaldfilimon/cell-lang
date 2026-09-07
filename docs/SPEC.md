@@ -224,6 +224,18 @@ implementation MUST treat `.bod` and `.body` as body files paired to a
 `.cell`/`.cel` module by filename stem, per section 1.2. The other reading is
 recorded here only so the conflict is visible rather than discovered.
 
+**Union stage 3 also landed:** SPEC 2.5's reserved words are real keywords.
+Measured safe before the change, by stripping comments from every file under
+`examples/` and `stdlib/` and grepping for all 24 words as identifiers: exactly
+one hit, in the file written to break there.
+
+That change exposed a defect it did not cause. `while (c) { }` became a PARSE
+error, and a parse error had never reached the CLI on this path before, so it
+escaped as a raw Zig error and printed a **stack trace** instead of a caret.
+The parser already recorded the failure and could push it into a bag; nothing
+called that. `load.zig` now renders it, and a syntax error reads like every
+other diagnostic.
+
 **Three backends.** `cell emit` now takes `--target=c|llvm|mlir`. C remains the
 only backend that lowers the whole language. The LLVM IR and MLIR backends go
 through a typed IR (`src/cell/hir.zig`) and are scalar-first: `String`, `[T]`,
@@ -410,11 +422,12 @@ be a variable name.
 
 ### 2.5 Reserved for future use
 
-**Status: designed, not implemented.**
+**Status: implemented.** These lex as keywords as of the union stage recorded
+in 0.8. None of them has a parser rule yet, which is the point: using one as a
+name is now a parse error rather than a silent misreading.
 
-The following are **not** keywords today and lex as ordinary identifiers. They
-are reserved by this specification so that programs do not come to depend on
-using them as names:
+The following are reserved by this specification so that programs do not come
+to depend on using them as names:
 
 ```
 while   for     loop    break   continue  in
@@ -425,13 +438,20 @@ await   yield   import  export  extern    unsafe
 
 **This is not a cosmetic reservation, and `while` shows why.** Since `9fb12af`
 a brace-delimited block is a valid expression (section 6.10), so
-`while (c) { total = total + 1 }` now **parses cleanly and passes `cell check`**:
-`while` is an identifier, `while (c)` is a call to a function named `while`,
-and the block that follows is a separate expression statement that is evaluated
-and discarded. Measured. A program written in the belief that Cell has loops
-compiles and does nothing. Reserving these words turns that silent acceptance
-into an error, which is why the reservation is listed as a language rule rather
-than a style note. See `examples/rejected/while_is_not_a_loop.cell`.
+`while (c) { total = total + 1 }` used to **parse cleanly and pass `cell check`**:
+`while` was an identifier, `while (c)` was a call to a function named `while`,
+and the block that followed was a separate expression statement, evaluated and
+discarded. A program written in the belief that Cell has loops compiled and did
+nothing.
+
+Measured now: `cell check examples/rejected/while_is_not_a_loop.cell` reports
+`error: expected expression` with the caret on `while`, and exits 1. That file
+records the whole sequence, including the middle state where it was rejected by
+name resolution rather than by this rule.
+
+**Reserving a word does not implement it.** Cell still has no loops of any kind
+(section 7.6). Only `while`, `break` and `continue` are scheduled to gain
+parser rules; the rest are reserved and nothing more.
 
 ### 2.6 Integer literals
 

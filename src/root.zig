@@ -131,7 +131,7 @@ pub fn loadAndCheck(
     writer: *Io.Writer,
 ) !ast.Module {
     var loaded = load(allocator, io, dir, path, writer) catch |err| switch (err) {
-        error.MissingModule, error.AmbiguousModule, error.PairingMismatch => return error.TypeError,
+        error.MissingModule, error.AmbiguousModule, error.PairingMismatch, error.ParseFailed => return error.TypeError,
         else => |e| return e,
     };
     try check(allocator, &loaded.module, loaded.source, writer);
