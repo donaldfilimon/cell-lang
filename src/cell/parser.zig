@@ -946,3 +946,34 @@ test "a parse failure records its position and message" {
     try std.testing.expectEqual(@as(u32, 2), f.span.line);
     try std.testing.expectEqual(@as(u32, 17), f.span.column);
 }
+
+test "a recorded parse failure renders as a diagnostic with a caret" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const src =
+        \\pub fn f() {
+        \\  let owned x = *
+        \\}
+    ;
+    var lex = lexer.Lexer.init(src, "t.cell");
+    const toks = try lex.tokenizeAll(alloc);
+    var p = Parser.init(alloc, toks.items, "t.cell");
+    try std.testing.expectError(error.UnexpectedToken, p.parseModule());
+
+    var bag: diag.Bag = .init("t.cell", src);
+    defer bag.deinit(alloc);
+    try p.reportInto(&bag, alloc);
+    try std.testing.expectEqual(@as(usize, 1), bag.count(.err));
+
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try bag.printAll(&w);
+    try std.testing.expectEqualStrings(
+        \\t.cell:2:17: error: expected expression
+        \\      let owned x = *
+        \\                    ^
+        \\
+    , w.buffered());
+}
