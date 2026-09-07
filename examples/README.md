@@ -78,8 +78,9 @@ cc /tmp/b_m.o /tmp/drv.c runtime/cell_rt.c -I runtime -o /tmp/b_mlir && /tmp/b_m
 ```
 
 Note `hello.cell` is NOT in this set. It declares a struct, and the MLIR
-backend refuses structs with a `cannot lower` diagnostic. That refusal is the
-designed behavior, so do not "fix" it by weakening the backend.
+backend carried no structs. It does now (`!llvm.struct`), so `hello.cell`
+runs through all three and prints `42` from each. What all three still refuse
+is `[T]`, which SPEC 3.3 says has no representation at all.
 
 ## What `cell check` covers
 

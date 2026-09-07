@@ -10,15 +10,16 @@
 // classify(Green) is 20, so the sum is 24. If a backend prints anything else
 // it has a bug, and the point of this file is that the bug is visible.
 //
-// It is deliberately SCALAR ONLY. No String, no [T], no T?, no struct, no arc.
-// The LLVM and MLIR backends refuse those with a `cannot lower` diagnostic
-// today, because an aggregate crossing the C boundary means choosing a calling
-// convention by hand, and every aggregate constructor in runtime/cell_rt.h is
-// `static inline` and therefore has no symbol to call. See the module comments
-// in src/cell/llvmemit.zig and src/cell/mlirmit.zig.
+// It is deliberately SCALAR ONLY, and it stays that way on purpose: it is the
+// file that proves the three backends agree on the SIMPLEST shared subset, so
+// a disagreement here is never about aggregates.
 //
-// examples/hello.cell is the C backend's flagship and uses a struct, so the
-// MLIR backend refuses it. That refusal is correct behavior, not a regression.
+// The picture has moved since it was written. Structs, String, optionals and
+// sret returns now lower in the LLVM backend, and structs lower in MLIR too,
+// so examples/hello.cell runs through all three and prints 42 from each. What
+// all three still refuse is `[T]`, which SPEC 3.3 says has no representation
+// at all rather than merely no backend placement, plus `arc`, which has no
+// retain/release insertion yet (OWNERSHIP R11).
 
 pub fn print_int(copy value: Int);
 

@@ -136,7 +136,8 @@ designed.
     paper over.
   - `examples/backends.cell` is scalar-only and all three backends carry it;
     each one compiles, links and prints `24`. `examples/hello.cell` uses a
-    struct, so the MLIR backend **refuses** it. That refusal is correct.
+    struct, and as of the MLIR struct work all three backends carry it: it
+    prints `42` through C, LLVM and MLIR alike.
 
 ## The backend toolchain, and where it actually lives
 

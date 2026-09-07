@@ -132,7 +132,8 @@ span rather than emitted as something that merely looks right. The reason is
 concrete: an aggregate crossing the C boundary means choosing a calling
 convention by hand on AArch64, and every aggregate constructor in
 `runtime/cell_rt.h` is `static inline` and so has no symbol to call. The MLIR
-backend also refuses structs, which is why it refuses `examples/hello.cell`.
+MLIR backend carries structs too, as `!llvm.struct`, so `examples/hello.cell`
+now runs through all three backends and prints `42` from each.
 
 Ownership rules R2 (use-after-move), R3 (move-out-of-borrow), R5 (shared XOR
 exclusive), R8 (escaping borrow), and R14 (immutable assignment, including

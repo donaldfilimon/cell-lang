@@ -470,9 +470,11 @@ test "a backend refusal writes no partial output" {
     defer arena.deinit();
     const a = arena.allocator();
 
+    // [Byte] is the trigger, not a struct: MLIR lowers structs now, so a
+    // struct no longer refuses anything. SPEC 3.3 says [T] has no
+    // representation at all, which makes it the durable choice here.
     const source =
-        \\pub struct Point { copy x: Float }
-        \\pub fn main() { let owned p = Point { x: 1.0 } }
+        \\pub fn f(shared xs: [Byte]) -> Int;
     ;
     var module = try compile(a, source, "t.cell");
 
@@ -481,7 +483,7 @@ test "a backend refusal writes no partial output" {
     var err_buf: [8192]u8 = undefined;
     var errw = Io.Writer.fixed(&err_buf);
 
-    // MLIR refuses structs, so this module cannot emit.
+    // MLIR cannot represent [T], so this module cannot emit.
     try std.testing.expectError(
         error.TypeError,
         emitFor(a, &module, source, &out, .mlir, &errw),
