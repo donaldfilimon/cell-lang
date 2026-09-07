@@ -203,8 +203,10 @@ four spellings.
 `.cel` stem-mate before check. `cell check examples/pairing/geometry.body`
 resolves `Point` and `Quadrant` from `geometry.cell` and exits 0. A body with
 no stem-mate is an error naming the body and the missing module. A module file
-with no body remains legal. Declaration/definition signature matching (rules
-8, 10, 11) is still designed.
+with no body remains legal. A `pub` definition in the body must have a matching
+module declaration (rule 8), must not duplicate a module-side body (rule 10),
+and must agree on arity, parameter ownership, parameter types, and return type
+(rule 11).
 
 1. A **module file** (`.cell`/`.cel`) may contain declarations, definitions, or
    both. Every example under `examples/` is a module file that does both, and

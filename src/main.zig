@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
         var fw: Io.File.Writer = .init(.stderr(), io, &buf);
         var loaded = cell.load(arena, io, cwd, path, &fw.interface) catch |err| {
             try fw.interface.flush();
-            if (err == error.MissingModule or err == error.AmbiguousModule) std.process.exit(1);
+            if (err == error.MissingModule or err == error.AmbiguousModule or err == error.PairingMismatch) std.process.exit(1);
             return err;
         };
         try loaded.module.dump(&fw.interface);

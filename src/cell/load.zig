@@ -69,7 +69,7 @@ pub fn load(
 
     const mate_source = try dir.readFileAlloc(io, mate, allocator, .limited(16 * 1024 * 1024));
     const mate_mod = try parse(allocator, mate_source, mate);
-    compiled = try merge(allocator, mate_mod, compiled);
+    compiled = try merge(allocator, mate_mod, compiled, writer);
     return .{ .module = compiled, .source = source };
 }
 
@@ -118,7 +118,47 @@ fn fileExists(dir: Io.Dir, io: Io, sub: []const u8) bool {
 
 /// Module declarations first, then body items. A function the body defines
 /// is omitted from the module side so collectItems does not see two signatures.
-fn merge(allocator: std.mem.Allocator, module_side: ast.Module, body_side: ast.Module) !ast.Module {
+/// SPEC 1.2 rules 8, 10, and 11 are checked here, at the body definition.
+fn merge(
+    allocator: std.mem.Allocator,
+    module_side: ast.Module,
+    body_side: ast.Module,
+    writer: *Io.Writer,
+) !ast.Module {
+    var failed = false;
+    const module_base = path_mod.basename(module_side.path);
+    const body_base = path_mod.basename(body_side.path);
+
+    for (body_side.items) |item| {
+        switch (item.kind) {
+            .fn_def => |f| {
+                const decl = findFn(module_side, f.name);
+                if (f.is_public and decl == null) {
+                    try writer.print(
+                        "{s}:{d}:{d}: error: '{s}' is defined in {s} but not declared in {s}\n",
+                        .{ body_side.path, item.span.line, item.span.column, f.name, body_base, module_base },
+                    );
+                    failed = true;
+                    continue;
+                }
+                if (decl) |d| {
+                    if (d.body != null and f.body != null) {
+                        try writer.print(
+                            "{s}:{d}:{d}: error: '{s}' already has a body in {s}\n",
+                            .{ body_side.path, item.span.line, item.span.column, f.name, module_base },
+                        );
+                        failed = true;
+                        continue;
+                    }
+                    if (try reportSignatureMismatch(writer, body_side.path, item.span, f, d, module_base)) {
+                        failed = true;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
     var items: std.ArrayList(ast.Item) = .empty;
     errdefer items.deinit(allocator);
 
@@ -132,11 +172,161 @@ fn merge(allocator: std.mem.Allocator, module_side: ast.Module, body_side: ast.M
         try items.append(allocator, item);
     }
 
+    if (failed) return error.PairingMismatch;
+
     return .{
         .path = body_side.path,
         .items = try items.toOwnedSlice(allocator),
         .allocator = allocator,
     };
+}
+
+const FnDecl = ast.FnDef;
+
+fn findFn(module_side: ast.Module, name: []const u8) ?FnDecl {
+    for (module_side.items) |item| {
+        switch (item.kind) {
+            .fn_def => |f| {
+                if (eql(f.name, name)) return f;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn reportSignatureMismatch(
+    writer: *Io.Writer,
+    path: []const u8,
+    span: ast.Span,
+    defined: ast.FnDef,
+    declared: ast.FnDef,
+    module_base: []const u8,
+) !bool {
+    _ = module_base;
+    if (declared.params.len != defined.params.len) {
+        try writer.print(
+            "{s}:{d}:{d}: error: '{s}' body does not match its declaration: expected {d} parameters, found {d}\n",
+            .{ path, span.line, span.column, defined.name, declared.params.len, defined.params.len },
+        );
+        return true;
+    }
+    for (declared.params, defined.params, 0..) |want, have, i| {
+        if (want.ownership != have.ownership or !typeEq(&want.ty, &have.ty)) {
+            var want_buf: [128]u8 = undefined;
+            var have_buf: [128]u8 = undefined;
+            try writer.print(
+                "{s}:{d}:{d}: error: '{s}' body does not match its declaration: parameter {d} is declared '{s} {s}' but defined '{s} {s}'\n",
+                .{
+                    path,
+                    span.line,
+                    span.column,
+                    defined.name,
+                    i + 1,
+                    ownName(want.ownership),
+                    typeStr(&want.ty, &want_buf),
+                    ownName(have.ownership),
+                    typeStr(&have.ty, &have_buf),
+                },
+            );
+            return true;
+        }
+    }
+    if (!optionalTypeEq(declared.return_type, defined.return_type)) {
+        var want_buf: [128]u8 = undefined;
+        var have_buf: [128]u8 = undefined;
+        try writer.print(
+            "{s}:{d}:{d}: error: '{s}' body does not match its declaration: return type is declared '{s}' but defined '{s}'\n",
+            .{
+                path,
+                span.line,
+                span.column,
+                defined.name,
+                optionalTypeStr(declared.return_type, &want_buf),
+                optionalTypeStr(defined.return_type, &have_buf),
+            },
+        );
+        return true;
+    }
+    return false;
+}
+
+fn ownName(o: ast.Ownership) []const u8 {
+    return switch (o) {
+        .owned => "owned",
+        .shared => "shared",
+        .exclusive => "exclusive",
+        .arc => "arc",
+        .copy => "copy",
+    };
+}
+
+fn typeEq(a: *const ast.TypeExpr, b: *const ast.TypeExpr) bool {
+    return switch (a.*) {
+        .unit => b.* == .unit,
+        .name => |n| switch (b.*) {
+            .name => |m| eql(n, m),
+            else => false,
+        },
+        .optional => |inner| switch (b.*) {
+            .optional => |other| typeEq(inner, other),
+            else => false,
+        },
+        .list => |inner| switch (b.*) {
+            .list => |other| typeEq(inner, other),
+            else => false,
+        },
+        .result => |r| switch (b.*) {
+            .result => |s| typeEq(r.ok, s.ok) and typeEq(r.err, s.err),
+            else => false,
+        },
+        .ref => |r| switch (b.*) {
+            .ref => |s| r.ownership == s.ownership and typeEq(r.inner, s.inner),
+            else => false,
+        },
+    };
+}
+
+fn optionalTypeEq(a: ?ast.TypeExpr, b: ?ast.TypeExpr) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return typeEq(&a.?, &b.?);
+}
+
+fn typeStr(ty: *const ast.TypeExpr, buf: *[128]u8) []const u8 {
+    var w = Io.Writer.fixed(buf);
+    writeType(&w, ty) catch return "?";
+    return w.buffered();
+}
+
+fn optionalTypeStr(ty: ?ast.TypeExpr, buf: *[128]u8) []const u8 {
+    if (ty) |t| return typeStr(&t, buf);
+    return "()";
+}
+
+fn writeType(w: *Io.Writer, ty: *const ast.TypeExpr) !void {
+    switch (ty.*) {
+        .name => |n| try w.writeAll(n),
+        .unit => try w.writeAll("()"),
+        .optional => |inner| {
+            try writeType(w, inner);
+            try w.writeByte('?');
+        },
+        .list => |inner| {
+            try w.writeAll("[");
+            try writeType(w, inner);
+            try w.writeAll("]");
+        },
+        .result => |r| {
+            try writeType(w, r.ok);
+            try w.writeAll(", ");
+            try writeType(w, r.err);
+        },
+        .ref => |r| {
+            try w.print("{s} ", .{ownName(r.ownership)});
+            try writeType(w, r.inner);
+        },
+    }
 }
 
 fn fnName(item: ast.Item) ?[]const u8 {

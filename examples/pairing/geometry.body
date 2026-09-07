@@ -2,8 +2,8 @@
 //
 // Status: implemented. `cell check` on this file pairs it with geometry.cell
 // by stem and resolves Point / Quadrant. A body with no stem-mate still fails
-// naming the missing module. Signature matching (SPEC 1.2 rules 8, 10, 11)
-// is still designed.
+// naming the missing module. A `pub` definition must match its module
+// declaration (SPEC 1.2 rules 8, 10, 11).
 //
 // Under SPEC 1.2 the rules a compiler must enforce here are:
 //   - every `pub` definition must match a declaration in geometry.cell by

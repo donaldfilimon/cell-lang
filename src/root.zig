@@ -72,7 +72,7 @@ pub fn loadAndCheck(
     writer: *Io.Writer,
 ) !ast.Module {
     var loaded = load(allocator, io, dir, path, writer) catch |err| switch (err) {
-        error.MissingModule, error.AmbiguousModule => return error.TypeError,
+        error.MissingModule, error.AmbiguousModule, error.PairingMismatch => return error.TypeError,
         else => |e| return e,
     };
     try check(allocator, &loaded.module, loaded.source, writer);
@@ -222,6 +222,7 @@ test "shipped load+check pairs a body with its module so a module-only name reso
             \\pub struct Point { copy x: Float64 copy y: Float64 }
             \\pub enum Quadrant { First, Second, Third, Fourth }
             \\pub fn origin() -> Point;
+            \\pub fn q() -> Quadrant;
         ,
     });
     try tmp.dir.writeFile(io, .{
@@ -304,6 +305,98 @@ test "shipped load+check pairs a .body with a .cel stem-mate" {
     defer result.arena.deinit();
     if (result.failed) {
         std.debug.print(".cel stem-mate failed:\n{s}\n", .{result.text});
+        return error.TestUnexpectedDiagnostic;
+    }
+}
+
+test "shipped load+check rejects a pub body definition with no module declaration" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "g.cell",
+        .data = "pub struct Buffer { copy len: Int }\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "g.body",
+        .data = "pub fn grow(exclusive buf: Buffer) { }\n",
+    });
+    var result = try loadCheckPath(tmp.dir, "g.body");
+    defer std.testing.allocator.free(result.buf);
+    defer result.arena.deinit();
+    try std.testing.expect(result.failed);
+    if (std.mem.indexOf(u8, result.text, "'grow' is defined in g.body but not declared in g.cell") == null) {
+        std.debug.print("wanted rule 8, got:\n{s}\n", .{result.text});
+        return error.TestExpectedDiagnostic;
+    }
+}
+
+test "shipped load+check rejects a function that has a body in both files" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "g.cell",
+        .data = "pub fn grow() { }\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "g.body",
+        .data = "pub fn grow() { }\n",
+    });
+    var result = try loadCheckPath(tmp.dir, "g.body");
+    defer std.testing.allocator.free(result.buf);
+    defer result.arena.deinit();
+    try std.testing.expect(result.failed);
+    if (std.mem.indexOf(u8, result.text, "'grow' already has a body in g.cell") == null) {
+        std.debug.print("wanted rule 10, got:\n{s}\n", .{result.text});
+        return error.TestExpectedDiagnostic;
+    }
+}
+
+test "shipped load+check rejects a pub definition whose parameter ownership disagrees" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "g.cell",
+        .data =
+            \\pub struct Buffer { copy len: Int }
+            \\pub fn grow(exclusive buf: Buffer, shared extra: Int);
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "g.body",
+        .data =
+            \\pub fn grow(owned buf: Buffer, shared extra: Int) { }
+        ,
+    });
+    var result = try loadCheckPath(tmp.dir, "g.body");
+    defer std.testing.allocator.free(result.buf);
+    defer result.arena.deinit();
+    try std.testing.expect(result.failed);
+    if (std.mem.indexOf(u8, result.text, "parameter 1 is declared 'exclusive Buffer' but defined 'owned Buffer'") == null) {
+        std.debug.print("wanted rule 11, got:\n{s}\n", .{result.text});
+        return error.TestExpectedDiagnostic;
+    }
+}
+
+test "shipped load+check allows a private body function with no module declaration" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "g.cell",
+        .data = "pub struct Point { copy x: Int }\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "g.body",
+        .data = "fn origin() -> Point { return Point { x: 0 } }\n",
+    });
+    var result = try loadCheckPath(tmp.dir, "g.body");
+    defer std.testing.allocator.free(result.buf);
+    defer result.arena.deinit();
+    if (result.failed) {
+        std.debug.print("private fn should not need a declaration:\n{s}\n", .{result.text});
         return error.TestUnexpectedDiagnostic;
     }
 }
