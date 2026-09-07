@@ -290,6 +290,64 @@ pub const Checker = struct {
 
     // ── statements ──────────────────────────────────────────────────────
 
+    /// `while cond { ... }`, and OWNERSHIP.md R2.a with it.
+    ///
+    /// THE PROBLEM A LOOP CREATES. `docs/OWNERSHIP.md` section 0.3 chose
+    /// lexical loans on the stated ground that they are decidable in a single
+    /// pass with a scope stack and need no control-flow graph. A loop is a
+    /// back edge, which breaks that assumption directly:
+    ///
+    ///     var owned buf = make()
+    ///     while c {
+    ///         take(owned buf)     // fine on iteration 1
+    ///     }                       // use-after-move on iteration 2
+    ///
+    /// The single pass marks `buf` dead once and never revisits it, so nothing
+    /// catches the second iteration.
+    ///
+    /// THE RULE, AND WHY THIS SHAPE. A place declared OUTSIDE the loop that is
+    /// moved INSIDE it and is still dead when the body ends would be read
+    /// dead on the next iteration. `dead` already tracks exactly that, and
+    /// R3a already REMOVES a place from `dead` when it is reassigned, so
+    /// "still dead at the end of the body" is precisely "moved and not
+    /// revived". No new machinery, and revival keeps working for free.
+    ///
+    /// WHERE IT IS CONSERVATIVE, STATED RATHER THAN HIDDEN. A body that always
+    /// `break`s before reaching the move is rejected anyway, because this does
+    /// not track which paths reach the end. That is the same trade section 0.3
+    /// already made, and the same guarantee applies: every program accepted
+    /// under this rule is still accepted under a real control-flow analysis,
+    /// so tightening now and relaxing later never breaks source compatibility.
+    fn checkWhile(self: *Checker, w: anytype, span: Span) Error!void {
+        try self.checkExpr(@constCast(&w.cond));
+
+        const first_inner_id = self.next_binding_id;
+        const dead_before = self.dead.items.len;
+
+        // checkBlockStmts pushes the scope and the open-block entry, so a
+        // binding declared in the body dies with it and a named loan created
+        // there is truncated on the way out, exactly as in an `if` body.
+        try self.checkBlockStmts(w.body);
+
+        // Anything still dead that was declared before the loop was moved in
+        // the body and never revived.
+        var i = dead_before;
+        while (i < self.dead.items.len) : (i += 1) {
+            const d = self.dead.items[i];
+            if (d.binding >= first_inner_id) continue;
+            try self.diagnostics.err(self.arena.allocator(), d.span, try std.fmt.allocPrint(
+                self.arena.allocator(),
+                "'{s}' is moved inside a loop, so the next iteration would use it after the move",
+                .{d.display},
+            ));
+            try self.diagnostics.note(self.arena.allocator(), span, try std.fmt.allocPrint(
+                self.arena.allocator(),
+                "'{s}' is declared outside this loop; assign to it before the end of the body to revive it",
+                .{d.display},
+            ));
+        }
+    }
+
     fn checkStmt(self: *Checker, stmt: *const ast.Stmt) Error!void {
         // R0.3 exception 1: every loan created inside a statement and not
         // bound to a name ends when the statement completes.
@@ -297,6 +355,11 @@ pub const Checker = struct {
         defer self.temp_loans.shrinkRetainingCapacity(region);
 
         switch (stmt.kind) {
+            .while_stmt => |*w| try self.checkWhile(w, stmt.span),
+            // A `break` or `continue` moves nothing and borrows nothing. It
+            // does change which paths reach the end of the body, which R2.a
+            // below deliberately ignores; see the note there.
+            .break_stmt, .continue_stmt => {},
             .let => |*l| try self.checkLet(l, stmt.span),
             .expr => |*e| try self.checkExpr(e),
             .return_stmt => |*opt| {
@@ -1085,6 +1148,14 @@ fn stmtUsesName(s: *const ast.Stmt, name: []const u8) bool {
         .expr => |e| exprUsesName(&e, name),
         .return_stmt => |opt| if (opt) |e| exprUsesName(&e, name) else false,
         .assign => |a| exprUsesName(&a.target, name) or exprUsesName(&a.value, name),
+        .while_stmt => |w| blk: {
+            if (exprUsesName(&w.cond, name)) break :blk true;
+            for (w.body) |*b| {
+                if (stmtUsesName(b, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .break_stmt, .continue_stmt => false,
     };
 }
 
@@ -1855,5 +1926,54 @@ test "R3: a let-bound exclusive borrow cannot be moved into an owned parameter" 
     ,
         \\t.cell:12:10: error: cannot move out of 'e': it is an exclusive borrow, not an owner
         \\
+    );
+}
+
+test "R2.a: a move inside a loop is rejected, because iteration 2 uses it dead" {
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    var owned buf = Buffer { data: [], len: 0 }
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        take(owned buf)
+        \\        i = i + 1
+        \\    }
+        \\}
+    ,
+        \\t.cell:13:20: error: 'buf' is moved inside a loop, so the next iteration would use it after the move
+        \\t.cell:12:5: note: 'buf' is declared outside this loop; assign to it before the end of the body to revive it
+        \\
+    );
+}
+
+test "R2.a: reassigning before the body ends revives the place and the loop is legal" {
+    // R3a already removes a place from the dead list on assignment, so R2.a
+    // gets revival for free rather than needing a second rule.
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    var owned buf = Buffer { data: [], len: 0 }
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        take(owned buf)
+        \\        buf = Buffer { data: [], len: 1 }
+        \\        i = i + 1
+        \\    }
+        \\}
+    );
+}
+
+test "R2.a does not fire for a place declared inside the loop body" {
+    // A binding created fresh each iteration is not moved across the back
+    // edge, so there is nothing to catch. Getting this wrong would reject
+    // every loop that owns anything.
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        let owned tmp = Buffer { data: [], len: 0 }
+        \\        take(owned tmp)
+        \\        i = i + 1
+        \\    }
+        \\}
     );
 }

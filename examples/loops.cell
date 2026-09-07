@@ -1,0 +1,52 @@
+// Cell has loops. This is the file that says so, and until union stage 4 it
+// did not exist because the language had no iteration of any kind.
+//
+// All three backends carry everything here, and all three print 55:
+//   cell emit               examples/loops.cell   -> C
+//   cell emit --target=llvm examples/loops.cell   -> LLVM IR
+//   cell emit --target=mlir examples/loops.cell   -> MLIR
+//
+// 55 is the sum 1..10. If a backend prints something else it has a bug.
+
+pub fn print_int(copy value: Int);
+
+/// The plain form. `while cond { ... }`, no parentheses needed.
+pub fn sum_to(copy n: Int) -> Int {
+    var total = 0
+    var i = 0
+    while i < n {
+        i = i + 1
+        total = total + i
+    }
+    return total
+}
+
+/// The parenthesized form costs nothing extra: a parenthesized expression is
+/// already an expression, so `while (c)` falls out of the same rule. That is
+/// the CELL v2.0 spelling and it is accepted rather than specially handled.
+pub fn count_down(copy n: Int) -> Int {
+    var i = n
+    while (i > 0) {
+        i = i - 1
+    }
+    return i
+}
+
+/// `break` and `continue`. Both are rejected outside a loop, by the
+/// typechecker rather than by the C compiler, so the diagnostic points at Cell
+/// source instead of at emitted code.
+pub fn first_multiple(copy limit: Int) -> Int {
+    var i = 0
+    while i < limit {
+        i = i + 1
+        if i < 3 {
+            continue
+        }
+        break
+    }
+    return i
+}
+
+pub fn main() {
+    print_int(sum_to(copy 10))
+}

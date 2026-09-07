@@ -92,6 +92,10 @@ const Emitter = struct {
     /// has to follow the bodies, because that is when this is known, and
     /// bodies are buffered for exactly this reason.
     uses_panic: bool = false,
+    /// Where a `break` and a `continue` jump, for the innermost enclosing
+    /// loop. Null outside a loop, which the typechecker already rejects.
+    break_label: ?[]const u8 = null,
+    continue_label: ?[]const u8 = null,
 
     const StringGlobal = struct { name: []const u8, bytes: []const u8 };
 
@@ -284,6 +288,47 @@ const Emitter = struct {
                 }
             },
             .expr => |e| _ = try self.emitExpr(&e),
+            .while_loop => |w| {
+                const cond_b = try self.nextLabel("loop.cond");
+                const body_b = try self.nextLabel("loop.body");
+                const end_b = try self.nextLabel("loop.end");
+
+                // The condition needs its own block, because a back edge has
+                // to branch somewhere and LLVM blocks are single-entry.
+                try self.out.print("  br label %{s}\n", .{cond_b});
+                try self.out.print("{s}:\n", .{cond_b});
+                self.terminated = false;
+                const cond = try self.emitExpr(&w.cond);
+                if (cond.isVoid()) return;
+                try self.out.print(
+                    "  br i1 {s}, label %{s}, label %{s}\n",
+                    .{ cond.text, body_b, end_b },
+                );
+
+                try self.out.print("{s}:\n", .{body_b});
+                self.terminated = false;
+                const saved_break = self.break_label;
+                const saved_continue = self.continue_label;
+                self.break_label = end_b;
+                self.continue_label = cond_b;
+                for (w.body) |s2| try self.emitStmt(&s2);
+                self.break_label = saved_break;
+                self.continue_label = saved_continue;
+                if (!self.terminated) try self.out.print("  br label %{s}\n", .{cond_b});
+
+                try self.out.print("{s}:\n", .{end_b});
+                self.terminated = false;
+            },
+            .brk => {
+                const target = self.break_label orelse return;
+                try self.out.print("  br label %{s}\n", .{target});
+                self.terminated = true;
+            },
+            .cont => {
+                const target = self.continue_label orelse return;
+                try self.out.print("  br label %{s}\n", .{target});
+                self.terminated = true;
+            },
             .ret => |maybe| {
                 if (maybe) |e| {
                     const val = try self.emitExpr(&e);

@@ -380,6 +380,23 @@ pub const Generator = struct {
     fn emitStmt(self: *Generator, stmt: *const ast.Stmt, rest: []const ast.Stmt, indent: usize) EmitError!void {
         const out = self.writer;
         switch (stmt.kind) {
+            .while_stmt => |w| {
+                try self.writeIndent(indent);
+                try out.writeAll("while (");
+                try self.emitExpr(&w.cond, indent);
+                try out.writeAll(") {\n");
+                try self.emitStmts(w.body, indent + 4);
+                try self.writeIndent(indent);
+                try out.writeAll("}\n");
+            },
+            .break_stmt => {
+                try self.writeIndent(indent);
+                try out.writeAll("break;\n");
+            },
+            .continue_stmt => {
+                try self.writeIndent(indent);
+                try out.writeAll("continue;\n");
+            },
             .let => |l| {
                 const ty = try self.letType(l.ty, l.value, l.ownership);
                 try self.writeIndent(indent);
@@ -1348,6 +1365,10 @@ fn stmtUses(s: *const ast.Stmt, name: []const u8) bool {
         .expr => |e| exprUses(&e, name),
         .return_stmt => |opt| if (opt) |v| exprUses(&v, name) else false,
         .assign => |a| targetReads(&a.target, name) or exprUses(&a.value, name),
+        // A loop's condition is re-read on every iteration, so a binding used
+        // only there is genuinely used and must not get a `(void)` cast.
+        .while_stmt => |w| exprUses(&w.cond, name) or stmtsUse(w.body, name),
+        .break_stmt, .continue_stmt => false,
     };
 }
 

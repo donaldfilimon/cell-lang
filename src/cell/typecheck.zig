@@ -49,6 +49,10 @@ pub const Checker = struct {
 
     /// Declared return type of the function whose body is being checked.
     fn_return: Type = types.t_unit,
+    /// How many `while` bodies enclose the statement being checked. `break`
+    /// and `continue` outside a loop have nothing to jump to and would emit C
+    /// that does not compile, so they are rejected here rather than there.
+    loop_depth: u32 = 0,
 
     pub const Symbol = struct {
         ownership: ast.Ownership,
@@ -179,6 +183,32 @@ pub const Checker = struct {
 
     fn checkStmt(self: *Checker, stmt: *ast.Stmt) CheckError!void {
         switch (stmt.kind) {
+            .while_stmt => |*w| {
+                const cond = try self.checkExpr(@constCast(&w.cond));
+                if (!cond.isUnknown() and cond.tag() != .boolean) {
+                    try self.errf(
+                        w.cond.span,
+                        "a while condition must be Bool, found {s}",
+                        .{try self.typeName(cond)},
+                    );
+                }
+                // The body is a scope of its own, so a binding declared in it
+                // does not leak past the loop.
+                self.pushScope();
+                defer self.popScope();
+                self.loop_depth += 1;
+                defer self.loop_depth -= 1;
+                for (w.body) |*s2| try self.checkStmt(@constCast(s2));
+            },
+            .break_stmt, .continue_stmt => {
+                if (self.loop_depth == 0) {
+                    try self.errf(
+                        stmt.span,
+                        "'{s}' is only valid inside a loop",
+                        .{if (stmt.kind == .break_stmt) "break" else "continue"},
+                    );
+                }
+            },
             .let => |*l| {
                 const annotated: ?Type = if (l.ty) |t| try self.resolveType(&t) else null;
                 var bound: Type = annotated orelse types.t_unknown;

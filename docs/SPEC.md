@@ -224,6 +224,22 @@ implementation MUST treat `.bod` and `.body` as body files paired to a
 `.cell`/`.cel` module by filename stem, per section 1.2. The other reading is
 recorded here only so the conflict is visible rather than discovered.
 
+**Union stage 4 landed too, and it is the one that changed the language rather
+than its surface: Cell has loops.** `while`, `break` and `continue` are
+implemented across all three backends; `examples/loops.cell` prints 55 through
+each. It came with `docs/OWNERSHIP.md` **R2.a**, because a loop is a back edge
+and section 0.3 of that document bought its simplicity by assuming there were
+none: a place declared outside a loop and moved inside it is now rejected,
+since the next iteration would use it after the move. Reassigning before the
+body ends revives it (R3a) and the loop is accepted.
+
+One corpus file moved as a result, and the move is the evidence.
+`examples/rejected/while_is_not_a_loop.cell` is now
+`examples/while_is_now_a_loop.cell`, unchanged as a program, having meant four
+different things: it passed and silently did nothing; then failed by name
+resolution; then failed as a parse error once `while` was reserved; and now
+passes and actually loops, returning 10 through C, LLVM and MLIR alike.
+
 **Union stage 3 also landed:** SPEC 2.5's reserved words are real keywords.
 Measured safe before the change, by stripping comments from every file under
 `examples/` and `stdlib/` and grepping for all 24 words as identifiers: exactly
@@ -1207,12 +1223,57 @@ unused-result diagnostic, which is half of the `while` trap in section 2.5.
 
 ### 7.6 Loops
 
-**Status: designed, not implemented.** There is no `while`, no `for`, no
-`loop`, no `break`, and no `continue`. Those words lex as identifiers, and a
-loop-shaped program silently parses as a call followed by a discarded block
-(section 2.5). Iteration is the largest single gap in the language.
+**Status: implemented (`while`). `for` and `loop` are designed, not
+implemented.**
 
----
+```
+while_stmt = "while" expr_no_struct_lit block
+```
+
+```cell
+var i = 0
+while i < n {
+    i = i + 1
+}
+```
+
+Both `while c { }` and `while (c) { }` are accepted, the second because a
+parenthesized expression is already an expression. The condition uses the
+no-struct-literal expression form for the same reason `if` and `match` do:
+otherwise `while c { ... }` would read `c { ... }` as a struct literal and
+swallow the body. The condition must be `Bool`.
+
+A `while` is a **statement, not an expression**, unlike `if`. An `if` produces
+a value from its branches; a loop produces nothing, and modelling it as an
+expression would force a unit value this language cannot name (section 3.5:
+`()` does not parse in type position).
+
+`for`, `loop`, and iteration over a collection remain designed. There is no
+iteration protocol, no range value, and no indexing operator (section 3.3), so
+`for` needs all three before it needs syntax.
+
+**Loops interact with ownership, and that interaction is a rule, not a
+detail.** See `docs/OWNERSHIP.md` R2.a: a place declared outside a loop and
+moved inside it is rejected, because the next iteration would use it after the
+move. `examples/rejected/move_in_loop.cell` is the worked case.
+
+### 7.7 `break` and `continue`
+
+**Status: implemented.**
+
+```
+break_stmt    = "break"
+continue_stmt = "continue"
+```
+
+Both apply to the innermost enclosing `while`. Using either outside a loop is
+an error reported by the typechecker, so the diagnostic points at Cell source
+rather than at emitted C:
+
+> `err: 'break' is only valid inside a loop`
+
+Neither carries a value and neither takes a label. Labelled loops are not
+designed.
 
 ## 8. Items
 

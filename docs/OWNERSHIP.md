@@ -16,7 +16,8 @@ exclusive), R8 (escaping borrow), R14 (assignment through an immutable place,
 including fields), and R15 (call-site annotation agreement). Diagnostics name
 the place and land at the use site. That file's header comment is the
 authoritative list and moves with the code; believe it over this paragraph.
-R10/R11 retain-release insertion and NLL are still designed. Stem pairing has
+R10/R11 retain-release insertion and NLL are still designed. **R2.a** (a move
+inside a loop) landed with `while`. Stem pairing has
 since landed (SPEC section 1.2).
 
 ---
@@ -154,6 +155,53 @@ pub fn steal(exclusive b: Buffer) -> Buffer {
 The same applies to `shared`, with `shared borrow` in the message. Returning a
 field of a borrow (`return b.data`) is the same error, reported on the field
 path. `ast.rootName(&expr)` gives the binding to name in the message.
+
+### R2.a. A move inside a loop is a use-after-move on the next iteration
+
+Moving out of a place declared **outside** a loop body, from **inside** that
+body, is an error unless the place is reassigned before the body ends.
+
+```cell
+var owned buf = make()
+var i = 0
+while i < 3 {
+    take(owned buf)
+    i = i + 1
+}
+```
+
+> `err: 'buf' is moved inside a loop, so the next iteration would use it after the move`
+> `note: 'buf' is declared outside this loop; assign to it before the end of the body to revive it`
+
+**Why this rule has to exist.** Section 0.3 chose lexical loans on the stated
+ground that they are decidable in one pass with a scope stack and need no
+control-flow graph. A loop is a back edge, which breaks that assumption
+directly: the single pass marks `buf` dead once and never revisits it, so
+nothing catches the second iteration.
+
+**How it is checked.** A place moved inside the body and still dead when the
+body ends would be read dead on the next iteration. The dead list already
+tracks exactly that, and R3a already REMOVES a place from it on assignment, so
+"still dead at the end of the body" is precisely "moved and not revived".
+Revival therefore works for free:
+
+```cell
+while i < 3 {
+    take(owned buf)
+    buf = make()        // R3a revives it; the loop is accepted
+    i = i + 1
+}
+```
+
+A place declared **inside** the body is fresh each iteration and is never
+subject to this rule.
+
+**Where it is conservative, stated plainly.** A body that always `break`s
+before reaching the move is rejected anyway, because this rule does not track
+which paths reach the end of the body. That is the same trade section 0.3
+already made, and it carries the same guarantee: every program accepted under
+this rule is still accepted under a real control-flow analysis, so tightening
+now and relaxing later never breaks source compatibility.
 
 ### R3a. A moved-from place may be revived by assignment
 

@@ -261,6 +261,11 @@ pub const Stmt = struct {
         assign: struct { place: Place, value: Expr },
         expr: Expr,
         ret: ?Expr,
+        /// `while cond { ... }`. A statement, not an expression: a loop
+        /// produces no value.
+        while_loop: struct { cond: Expr, body: []Stmt },
+        brk,
+        cont,
     };
 };
 
@@ -453,6 +458,15 @@ const Lowerer = struct {
                 return .{ .span = stmt.span, .kind = .{ .assign = .{ .place = place, .value = value } } };
             },
             .expr => |e| return .{ .span = stmt.span, .kind = .{ .expr = try self.lowerExpr(&e) } },
+            .while_stmt => |w| {
+                const cond = try self.lowerExpr(&w.cond);
+                self.pushScope();
+                const body = try self.lowerStmts(w.body);
+                self.popScope();
+                return .{ .span = stmt.span, .kind = .{ .while_loop = .{ .cond = cond, .body = body } } };
+            },
+            .break_stmt => return .{ .span = stmt.span, .kind = .brk },
+            .continue_stmt => return .{ .span = stmt.span, .kind = .cont },
             .return_stmt => |maybe| {
                 if (maybe) |e| {
                     return .{ .span = stmt.span, .kind = .{ .ret = try self.lowerExpr(&e) } };

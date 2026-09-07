@@ -1,0 +1,37 @@
+// This file used to live in examples/rejected/ and was named
+// while_is_not_a_loop.cell. It is kept, moved and renamed rather than deleted,
+// because the program is UNCHANGED and its meaning changed four times. That
+// sequence is the whole argument for why SPEC 2.5 is a language rule and not a
+// style note, and a deleted file argues nothing.
+//
+//   1. It PASSED `cell check` with exit 0 and DID NOTHING. A block is a valid
+//      expression, so `while (total < n)` parsed as a CALL to a function named
+//      `while`, and the block after it was a separate expression statement,
+//      evaluated and discarded. A program written in the belief that Cell had
+//      loops compiled clean and silently did not loop. This was the most
+//      dangerous file in the corpus.
+//   2. Name resolution landed. It began failing with
+//      `unknown identifier 'while'` -- rejected, but by luck. Declaring a
+//      function named `while` would have made it resolve, compile, and
+//      silently not loop again.
+//   3. `while` became a reserved word (SPEC 2.5). It became a parse error,
+//      `expected expression`, with the caret on `while`. Rejected by rule.
+//   4. Loops landed (SPEC 7.6). It now PASSES AND ACTUALLY LOOPS.
+//
+// So it has come back to exit 0, and the identical source now means what its
+// author intended. Verified rather than assumed: count_up(10) returns 10,
+// through the C, LLVM and MLIR backends alike.
+
+pub fn print_int(copy value: Int);
+
+pub fn count_up(copy n: Int) -> Int {
+    var total = 0
+    while (total < n) {
+        total = total + 1
+    }
+    return total
+}
+
+pub fn main() {
+    print_int(count_up(copy 10))
+}

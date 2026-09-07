@@ -92,8 +92,8 @@ arc boxing exists. `if` / `match` / blocks / struct and list literals lower
 to C, not placeholder comments.
 
 Still not implemented: loops, generics, `Result<T,E>`, enum payloads, hex /
-underscore / exponent literals, and `arc` retain/release. Stem pairing is
-implemented.
+underscore / exponent literals, and `arc` retain/release. Stem pairing and
+`while`/`break`/`continue` are implemented; `for` and `loop` are not.
 
 ## The top-level examples
 
@@ -111,6 +111,8 @@ implemented.
 | `arc.cell` | the `arc` mode and what the runtime already provides |
 | `backends.cell` | the cross-backend agreement case: scalar-only, carried by C, LLVM and MLIR alike, and all three print `24` |
 | `borrows.cell` | every borrow spelling (`shared`/`&`, `exclusive`/`&mut`/`&var`/`&exclusive`) and the keyword-wins rule for mixing |
+| `loops.cell` | `while`, both spellings, plus `break` and `continue`; prints 55 through all three backends |
+| `while_is_now_a_loop.cell` | the same program that once passed and silently did nothing, now looping correctly; its header records all four meanings it has had |
 
 ## The future corpus
 

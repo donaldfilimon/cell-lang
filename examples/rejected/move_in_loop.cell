@@ -1,0 +1,40 @@
+// EXPECT: currently-rejected
+// Violates: docs/OWNERSHIP.md R2.a (a move inside a loop is a use-after-move
+// on the next iteration).
+//
+// This is the file that pays for loops. docs/OWNERSHIP.md section 0.3 chose
+// lexical loans on the stated ground that they need no control-flow graph and
+// can be decided in one pass with a scope stack. A loop is a back edge, and it
+// breaks that assumption directly.
+//
+// `take(owned buf)` is fine the first time through. On the second iteration
+// `buf` has already been moved out of, so the same line is a use-after-move.
+// The single-pass checker marks `buf` dead once and never revisits it, so
+// without R2.a nothing catches it.
+//
+// Measured:
+//   error: 'buf' is moved inside a loop, so the next iteration would use it
+//          after the move
+//   note: 'buf' is declared outside this loop; assign to it before the end of
+//         the body to revive it
+//
+// The rule is deliberately CONSERVATIVE and the note says how to satisfy it:
+// reassigning `buf` before the body ends revives it (R3a) and the loop is
+// accepted. A body that always `break`s before reaching the move is still
+// rejected, because this rule does not track which paths reach the end. That
+// is the same trade section 0.3 already made, with the same guarantee:
+// everything accepted now stays accepted under a real control-flow analysis,
+// so tightening now and relaxing later never breaks source compatibility.
+
+pub struct Buffer { copy len: Int }
+
+pub fn take(owned b: Buffer) { }
+
+pub fn main() {
+    var owned buf = Buffer { len: 0 }
+    var i = 0
+    while i < 3 {
+        take(owned buf)
+        i = i + 1
+    }
+}

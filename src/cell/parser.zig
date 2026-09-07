@@ -189,6 +189,22 @@ pub const Parser = struct {
         return self.expr(.{ .block = stmts }, start);
     }
 
+    /// `while cond { ... }`. The condition uses the no-struct-literal
+    /// expression parser for the same reason `if` and `match` do: otherwise
+    /// `while c { ... }` reads `c { ... }` as a struct literal and swallows
+    /// the body. Both `while c { }` and `while (c) { }` fall out of this, the
+    /// second because a parenthesized expression is already an expression, so
+    /// the CELL v2.0 spelling costs nothing.
+    fn parseWhile(self: *Parser, start: Token) ParseError!ast.Stmt {
+        const cond = try self.parseNoStructLitExpr();
+        // parseBlockBody does not consume the opening brace; every caller
+        // does it, and forgetting silently swallows the enclosing function's
+        // closing brace instead of failing here.
+        try self.expect(.l_brace);
+        const body = try self.parseBlockBody();
+        return self.stmt(.{ .while_stmt = .{ .cond = cond, .body = body } }, start);
+    }
+
     fn parseStmt(self: *Parser) ParseError!ast.Stmt {
         const start = self.current();
         if (self.match(.kw_let) or self.match(.kw_var)) {
@@ -215,6 +231,15 @@ pub const Parser = struct {
             }
             _ = self.match(.semicolon);
             return self.stmt(.{ .return_stmt = value }, start);
+        }
+        if (self.match(.kw_while)) return self.parseWhile(start);
+        if (self.match(.kw_break)) {
+            _ = self.match(.semicolon);
+            return self.stmt(.break_stmt, start);
+        }
+        if (self.match(.kw_continue)) {
+            _ = self.match(.semicolon);
+            return self.stmt(.continue_stmt, start);
         }
 
         // Either an assignment or a bare expression statement. Parse the
