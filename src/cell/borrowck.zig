@@ -129,8 +129,9 @@ pub const Checker = struct {
     next_binding_id: u32 = 0,
     /// Set while checking a function whose return type is a `shared` or
     /// `exclusive` borrow (R8). Cell has no lifetime parameters, so such a
-    /// signature is always an error; the flag also stops the body from being
-    /// reported a second time as a move-out-of-borrow.
+    /// return is always an error. Bodyless declarations report at the
+    /// function; a body reports at each returned expression (the use) and
+    /// the flag stops that return from also being a move-out-of-borrow.
     fn_return_borrow: ?LoanKind = null,
 
     const ScopeMark = struct {
@@ -199,7 +200,10 @@ pub const Checker = struct {
         if (f.return_type) |*rt| {
             if (typeIsBorrow(rt)) |kind| {
                 self.fn_return_borrow = kind;
-                try self.reportEscapingReturn(span, kind);
+                // A bodyless `-> shared T` has no return expression to point
+                // at, so the function item is the use site. A body reports at
+                // each `return` instead (see checkStmt).
+                if (f.body == null) try self.reportEscapingReturn(span, kind);
             }
         }
         const body = f.body orelse return;
@@ -296,12 +300,15 @@ pub const Checker = struct {
             .let => |*l| try self.checkLet(l, stmt.span),
             .expr => |*e| try self.checkExpr(e),
             .return_stmt => |*opt| {
-                if (self.fn_return_borrow != null) {
-                    // R8 already rejected the signature. Do not also move the
-                    // returned place, which would be a second diagnostic for
-                    // the same escape.
+                if (self.fn_return_borrow) |kind| {
+                    // R8 lands at the returned expression, which is the use.
+                    // Do not also move the place: that would be a second
+                    // diagnostic for the same escape.
                     if (opt.*) |*e| {
+                        try self.reportEscapingReturn(e.span, kind);
                         if ((try self.placeOf(e)) == null) try self.checkExpr(e);
+                    } else {
+                        try self.reportEscapingReturn(stmt.span, kind);
                     }
                     return;
                 }
@@ -1694,8 +1701,8 @@ test "R8: a function may not return a shared borrow" {
         \\    return b
         \\}
     ,
-        \\t.cell:9:1: error: cannot return a shared borrow: Cell has no lifetime annotations, so the borrow cannot be proven to outlive the call
-        \\t.cell:9:1: note: return an 'owned' or 'arc' value instead
+        \\t.cell:10:12: error: cannot return a shared borrow: Cell has no lifetime annotations, so the borrow cannot be proven to outlive the call
+        \\t.cell:10:12: note: return an 'owned' or 'arc' value instead
         \\
     );
 }
@@ -1706,7 +1713,17 @@ test "R8: a function may not return an exclusive borrow" {
         \\    return b
         \\}
     ,
-        \\t.cell:9:1: error: cannot return an exclusive borrow: Cell has no lifetime annotations, so the borrow cannot be proven to outlive the call
+        \\t.cell:10:12: error: cannot return an exclusive borrow: Cell has no lifetime annotations, so the borrow cannot be proven to outlive the call
+        \\t.cell:10:12: note: return an 'owned' or 'arc' value instead
+        \\
+    );
+}
+
+test "R8: a bodyless shared-borrow return still errors at the function" {
+    try expectDiagnostics(prelude ++
+        \\pub fn peek(shared b: Buffer) -> shared Buffer;
+    ,
+        \\t.cell:9:1: error: cannot return a shared borrow: Cell has no lifetime annotations, so the borrow cannot be proven to outlive the call
         \\t.cell:9:1: note: return an 'owned' or 'arc' value instead
         \\
     );

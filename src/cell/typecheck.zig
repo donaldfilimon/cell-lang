@@ -223,17 +223,8 @@ pub const Checker = struct {
             },
 
             .assign => |*a| {
-                if (ast.rootName(&a.target)) |name| {
-                    if (self.lookup(name)) |sym| {
-                        if (!sym.mutable) {
-                            try self.diagnostics.err(
-                                self.allocator,
-                                a.target.span,
-                                "cannot assign to immutable binding",
-                            );
-                        }
-                    }
-                }
+                // R14 (immutable assignment) is borrowck's rule. Typecheck only
+                // checks that the value's type matches the target.
                 const target = try self.checkExpr(&a.target);
                 const value = try self.checkExpr(&a.value);
                 if (!accepts(target, value, &a.value)) {
@@ -1015,7 +1006,8 @@ test "an assignment whose value does not match the target is reported" {
     try t.expectDiag(0, .err, 3, 9, "cannot assign a value of type Bool to a target of type Int");
 }
 
-test "assignment to an immutable binding is still reported" {
+test "assignment of a matching type is typecheck-clean on an immutable binding" {
+    // R14 lives in borrowck; a same-type write to `let` is not a type error.
     var t: TestModule = .init();
     defer t.deinit();
     try t.check(
@@ -1024,8 +1016,20 @@ test "assignment to an immutable binding is still reported" {
         \\    x = 2
         \\}
     );
+    try t.expectCount(0);
+}
+
+test "a type mismatch on assignment is reported even when the binding is immutable" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f() {
+        \\    let copy x: Int = 1
+        \\    x = true
+        \\}
+    );
     try t.expectCount(1);
-    try t.expectDiag(0, .err, 3, 5, "cannot assign to immutable binding");
+    try t.expectDiag(0, .err, 3, 9, "cannot assign a value of type Bool to a target of type Int");
 }
 
 test "an initializer that does not match its annotation is reported" {

@@ -14,9 +14,9 @@ const Usage =
     \\  cell <command> [args]
     \\
     \\COMMANDS:
-    \\  check <file.cell>     Parse + typecheck
+    \\  check <file.cell>     Parse + typecheck + borrow-check
     \\  dump  <file.cell>     Parse and print AST
-    \\  emit  <file.cell>     Emit C ABI / IR sketch
+    \\  emit  <file.cell>     Emit C
     \\  version               Print version
     \\  help                  Show this help
     \\

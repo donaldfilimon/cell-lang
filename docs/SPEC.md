@@ -44,31 +44,31 @@ cases tested. Section 12 is the full construct-by-construct index and the
 counts in section 0.2 are derived from it.
 
 Note a distinction that recurs: a construct can be **implemented in the parser
-and not lowered by codegen**. `if` and `match` are both like this. Those are
-tagged **parsed, not enforced** with the reason stated, because a program that
-parses and then emits `/*if*/` is not a working feature.
+and not lowered by codegen**. Those are tagged **parsed, not enforced** with
+the reason stated. `if` and `match` used to be in that column (`/*if*/` /
+`/*match*/` placeholders); they now lower to C (section 0.6). The remaining
+parser-only cases include `T?`, `[T]` as a type, `use`, and call-site ownership
+prefixes.
 
 ### 0.2 Status summary
 
 | Status | Constructs |
 |---|---|
-| implemented | 60 |
-| parsed, not enforced | 12 |
-| designed, not implemented | 77 |
+| implemented | 86 |
+| parsed, not enforced | 8 |
+| designed, not implemented | 55 |
 | **total** | **149** |
 
 Counted from the section 12 index, not estimated.
 
-The headline consequence: **the front end is real and the back end is a
-sketch.** As of `9fb12af` the lexer, the parser, the AST, and the diagnostic
-machinery are substantially complete, with source spans on every node, real
-structured patterns, and Rust's struct-literal restriction correctly
-implemented. What does not exist is a type representation, a borrow checker,
-and code generation for control flow. (A type representation landed in the
-working tree while this was being finalized; see 0.5.) The ownership model,
-which is the point of the language, is entirely in the "parsed, not enforced"
-and "designed" columns. `docs/OWNERSHIP.md` specifies the rules a borrow checker must enforce
-so that one can be written.
+The headline consequence: **the front end, a typechecker, a borrow checker for
+R2/R3/R5/R8/R14, and C lowering for the flagship examples are real.** As of
+the working tree the lexer, parser, AST, diagnostics, typechecker, and
+borrowck are wired into `cell check`. `if` / `else`, `match`, blocks, struct
+literals, list literals, and mangled calls lower to C. What is still designed
+includes loops, generics, `Result<T,E>`, stem pairing, NLL, R15 call-site
+prefixes, and `arc` retain/release. `docs/OWNERSHIP.md` is the normative rule
+list; section 12 is the construct-by-construct index.
 
 ### 0.3 Verification method
 
@@ -127,6 +127,25 @@ still lower to `/*if*/` and `/*match*/`, and no ownership rule is enforced. The
 whole of `examples/rejected/` was re-run: seven of the thirteen files still
 pass, including every use-after-move, aliasing, escaping-borrow, and
 call-site-mismatch case.
+
+### 0.6 Delta: ownership enforcement and body-bearing emit
+
+Later work wired `src/cell/borrowck.zig` into `cell check` and replaced
+placeholder codegen. Measured against a binary built with `-Dswift=false`:
+
+- R2, R3, R5, R8, and R14 are enforced. `examples/rejected/use_after_move.cell`,
+  `move_out_of_borrow.cell`, `aliasing.cell`, `escaping_borrow.cell`,
+  `immutable_assign.cell`, and `field_assign_immutable.cell` are
+  `currently-rejected`. Call-site prefixes (R15) are still discarded, so
+  `callsite_mismatch.cell` remains `currently-accepted`.
+- `if` / `else`, `match`, blocks, struct literals, list literals, and calls
+  lower to real C. `cell emit examples/hello.cell` compiles with `cc -c`.
+  Linked against `runtime/cell_rt.c` it prints `42`.
+- Unknown type names, hex/underscore/exponent literals, loops, generics,
+  `Result<T,E>`, enum payloads, and stem pairing are unchanged.
+
+Section 12 rows that this delta moved are retagged below. Unshipped rows stay
+as they were.
 
 Two files in `examples/rejected/` are now rejected **for the wrong reason**, and
 that distinction is worth preserving rather than celebrating.
@@ -628,13 +647,10 @@ This is the point of the language. `docs/OWNERSHIP.md` is the normative
 statement of the rules a checker must enforce, written as numbered rules with
 violating examples and diagnostics. This section defines the vocabulary.
 
-**Status of the whole model: parsed, not enforced.** Every annotation below is
-accepted by the parser, recorded on the AST, printed into the emitted C as a
-comment, and then ignored. There is no move checking, no aliasing check, no
-lifetime analysis, no `arc` retain or release, and no drop insertion. The only
-*ownership* rule the compiler enforces anywhere is assignment to an immutable
-binding (section 7.3); see 0.5 for the non-ownership checks that landed in the
-working tree.
+**Status of the whole model: partially enforced.** Annotations are accepted by
+the parser and recorded on the AST. `cell check` enforces R2, R3, R5, R8, and
+R14. Call-site prefixes (R15) are still discarded. There is no `arc`
+retain/release, no drop insertion, and no NLL. See 0.6.
 
 ### 4.1 The five annotations
 
@@ -703,8 +719,9 @@ The runtime machinery is real and works: `cell_arc_new`, `cell_arc_clone`, and
 decrements and call a drop function at zero, and as of `562f116` **the
 refcounts are atomic**, with the `_Atomic` confined to the `.c` file behind an
 opaque `struct cell_rc_box` so the header still compiles as C++20. Codegen
-never calls any of them, and maps `arc T` to `void*` rather than to
-`cell_arc_t`.
+never calls any of them. `arc` parameters and returns lower to `cell_arc_t`,
+but a string literal stays `cell_str_t` and is not boxed, so `examples/arc.cell`
+emit fails `cc -c`. Retain/release insertion is **designed, not implemented**.
 
 #### 4.1.5 `copy`
 
@@ -745,15 +762,12 @@ and omitting it is allowed and inferred from the callee's signature. The
 
 ### 4.3 What ownership does today
 
-It reaches the generated C as a comment:
-
-```c
-void cell_grow(void* /*exclusive*/ buf, int64_t /*shared*/ extra)
-```
-
-That is the entire effect. A struct field's ownership becomes a trailing
-comment. No pointer indirection is introduced for `shared` or `exclusive`, no
-retain or release is emitted for `arc`, and no copy is emitted for `copy`.
+`cell check` enforces R2, R3, R5, R8, and R14 through `src/cell/borrowck.zig`.
+Call-site prefixes (R15) are still discarded. Codegen lowers `shared` aggregates
+to `const T *`, `exclusive` aggregates to `T *`, and `arc` parameters to
+`cell_arc_t`. It does **not** insert retain or release for `arc`, and it does
+not box a string literal into an arc, so `examples/arc.cell` emit does not
+compile.
 
 ---
 
@@ -840,7 +854,7 @@ exists, and no field type. Because a struct parameter maps to `void*`
 
 ### 6.4 Calls and postfix chains
 
-**Status: implemented (parse). Emission: partly broken, see 10.2.**
+**Status: implemented for named calls. Method dispatch: designed, not implemented.**
 
 ```cell
 add(40, 2)
@@ -852,10 +866,11 @@ a.b(c).d
 primary expression, so **method-call syntax parses** and chains arbitrarily.
 Measured: `xs.len()` parses, where an earlier revision rejected it.
 
-There is no method *dispatch*: `xs.len()` builds a call whose callee is the
-field expression `xs.len`, and codegen emits `xs.len(...)`, a call through a
-struct member. Methods, `impl` blocks, and receiver resolution are **designed,
-not implemented**.
+Named calls are mangled at the call site: `add(40, 2)` emits `cell_add(40, 2)`
+when `add` is a Cell function (section 10.2). There is no method *dispatch*:
+`xs.len()` builds a call whose callee is the field expression `xs.len`.
+Methods, `impl` blocks, and receiver resolution are **designed, not
+implemented**.
 
 Trailing commas in an argument list are not accepted.
 
@@ -892,7 +907,7 @@ not parse as an expression.
 
 ### 6.7 Struct literals
 
-**Status: implemented (parse). Emission: designed, not implemented.**
+**Status: implemented (parse and emit).**
 
 ```cell
 Point { x: 1.0, y: 2.0 }
@@ -903,9 +918,8 @@ Point { x, y }              // shorthand for { x: x, y: y }
 its own name, value expression, and span. Field shorthand is supported: a bare
 `x` with no `:` expands to `x: x`.
 
-**Codegen does not lower it.** It emits the placeholder comment
-`/*struct literal P with 1 fields*/`, so any function that constructs a struct
-produces C that does not compile. Measured.
+Codegen lowers a literal to a C compound literal, for example
+`(cell_Point){ .x = 1.0, .y = 2.0 }`. Measured on `examples/hello.cell`.
 
 **The struct-literal ambiguity is correctly resolved.** A parser flag,
 `no_struct_lit`, is set while parsing an `if` condition or a `match` scrutinee
@@ -917,21 +931,21 @@ literal really is wanted in a condition, parentheses restore it:
 
 ### 6.8 List literals
 
-**Status: implemented (parse). Emission: designed, not implemented.**
+**Status: implemented (parse and emit).**
 
 ```cell
 []
 [1, 2, 3]
 ```
 
-`Expr.list_lit` carries the element expressions. **Codegen does not lower it**:
-it emits `/*list literal with 3 items*/`. Measured. There is no element type,
-no length, and no indexing operator (section 6.11).
+`Expr.list_lit` carries the element expressions. An empty list emits
+`cell_slice_empty()`. A populated list lowers to a GNU statement expression
+that `cell_slice_alloc`s a buffer and `cell_slice_push`es each element.
+There is no indexing operator (section 6.11).
 
 ### 6.9 `if` expressions
 
-**Status: parsed, not enforced.** The parser is complete; codegen emits
-nothing.
+**Status: implemented.** The parser is complete; codegen emits C `if` / `else`.
 
 ```cell
 if cond { ... }
@@ -944,22 +958,19 @@ optional else, and recurses on `else if` so a chain is a nested `if_expr`. The
 condition is parsed with the struct-literal restriction on (section 6.7). All
 three forms parse. Measured.
 
-**Codegen emits `/*if*/` for every `if`, discarding both branches.** A function
-whose whole body is `if (c) { return 1 } else { return 2 }` emits `/*if*/;`.
-Measured. **Cell generates no control flow at all**, and no example in this
-repository should be read as evidence otherwise.
-
-`if` as an expression that *produces a value* is **designed, not implemented**:
-the AST supports it, and neither the checker nor codegen assigns it a type or a
-result.
+Statement-position `if` lowers to C `if` / `else`, including `else if` chains.
+A function whose whole body is `if (c) { return 1 } else { return 2 }` emits
+that control flow, not a placeholder. Value-producing `if` lowers by assigning
+both arms into a temporary. Measured on `examples/control_flow.cell`.
 
 ### 6.10 Block expressions
 
-**Status: implemented (parse). Emission: designed, not implemented.**
+**Status: implemented (parse and emit).**
 
 A brace-delimited block is a primary expression, so `{ ... }` may appear
-wherever an expression may. `Expr.block` carries the statements. Codegen emits
-`/*block*/`.
+wherever an expression may. `Expr.block` carries the statements. Codegen
+lowers a block to a braced C compound statement, or to a statement expression
+when the block is used as a value.
 
 This is what makes the `while` trap in section 2.5 possible, and it is worth
 restating: because a block is an expression statement, a syntactically
@@ -1020,7 +1031,8 @@ var count = 0
 
 ### 7.3 Assignment
 
-**Status: implemented, with one enforcement gap.**
+**Status: implemented.** Typecheck checks the value's type against the target.
+Borrowck owns R14 (immutable assignment).
 
 ```
 assign_stmt = expr "=" expr [";"]
@@ -1036,16 +1048,16 @@ which removes the backtracking an earlier revision needed and makes `x = e` and
 `x.y = e` one code path. `Stmt.assign.target` is therefore an `Expr`, not a
 string.
 
-This is the **only rule the compiler enforces**. `Checker.checkStmt` calls
-`ast.rootName` on the target to find the base binding, looks it up, and reports
-an error if the binding is not mutable:
+R14 lives in `src/cell/borrowck.zig`. It names the place and notes the `let`:
 
 ```
-examples/rejected/immutable_assign.cell:6:5: error: cannot assign to immutable binding
+examples/rejected/immutable_assign.cell:6:5: error: cannot assign to immutable binding 'x'
 ```
 
-Measured, with a real path, line, and column. Three behaviors worth stating
-precisely:
+Typecheck does **not** also report R14; a same-type write to an immutable
+binding is a typecheck-clean borrow error. A type mismatch on assignment is
+still a typecheck error. Measured, with a real path, line, and column. Three
+behaviors worth stating precisely:
 
 1. **Field assignment is checked**, through the root binding. Assigning to
    `b.len` where `b` is an immutable `let` is an error. Measured. An earlier
@@ -1057,9 +1069,7 @@ precisely:
 3. **The symbol table was module-wide and never scoped**, so a `let x` in one
    function was visible to an assignment in a *different* function. **Fixed in
    `8dd5673`** (see 0.5): the same probe now reports `unknown identifier 'x'`.
-   The section 12 row for block scoping still reads "designed, not
-   implemented" because the index is pinned to `9fb12af`; treat this bullet and
-   0.5 as the current statement.
+   Section 12 tags block scoping as implemented.
 
 There is no check that the target is assignable at all: assigning to a literal
 or a call result is accepted and emits nonsense C. Compound assignment (`+=`)
@@ -1074,12 +1084,12 @@ return
 return a + b
 ```
 
-The value is optional; the parser stops looking for one at `;` or `}`. There is
-**no check that a returning function returns**, and no check that the returned
-value matches the declared type. Measured: `fn share_name(arc name: String) ->
-arc String { return name }` emits a function returning `void*` with `return
-name;` where `name` is a `const char*`, which C accepts only with a qualifier
-warning. Return-type checking is **designed, not implemented**.
+The value is optional; the parser stops looking for one at `;` or `}`.
+Typecheck reports a missing return and a return-type mismatch. Borrowck reports
+R8 at the returned expression when the declared return is a `shared` or
+`exclusive` borrow. Codegen maps a declared `arc` return to `cell_arc_t`; a
+body that returns an unboxed string literal is still a lowering gap
+(section 10.4).
 
 ### 7.5 Expression statements
 
@@ -1285,8 +1295,10 @@ A negative numeric pattern is folded in the parser (`-1` becomes the literal
 - **Binding ownership.** A binding pattern should take the scrutinee's
   ownership, so matching on an `owned` value moves it into the arm
   (OWNERSHIP.md R7). Nothing enforces that.
-- **Code generation.** Codegen emits `/*match*/`. Measured. A `match` computes
-  nothing.
+- **Code generation.** Codegen lowers `match` to a scrutinee temporary plus an
+  if/else chain. An unmatched value calls `cell_panic`. Payload patterns and
+  exhaustiveness checking are still missing, so this is control-flow lowering,
+  not a complete match implementation.
 
 `if let` and `while let` are not part of this specification.
 
@@ -1302,32 +1314,27 @@ not an implementation detail.
 **Status: implemented (shape).**
 
 `cell emit <file>` writes one C translation unit to stdout: a provenance
-comment, `#include <stdint.h>` and `#include <stdbool.h>`, then one C
-declaration per item in source order.
+comment, `#include "cell_rt.h"`, then one C declaration per item in source
+order. That include is what makes `cell_str_t`, `cell_slice_t`, and
+`cell_arc_t` available to generated code.
 
-It does **not** emit `#include "cell_rt.h"`, so no output can currently
-reference `cell_str_t`, `cell_slice_t`, `cell_result_t`, or `cell_arc_t`. It
-does not emit a header, an include guard, or an `extern "C"` block. Splitting
-emission into a `.h` and a `.c`, which is what a header-shaped language needs,
-is **designed, not implemented**.
+It does not emit a header, an include guard, or an `extern "C"` block.
+Splitting emission into a `.h` and a `.c`, which is what a header-shaped
+language needs, is **designed, not implemented**.
 
-A zero-parameter function emits `f()` where the runtime header writes
-`f(void)`. Measured with clang: the two forms agree at `-std=c11` and
-`-std=c17` with no diagnostic, and the difference is reported only under
-`-Wstrict-prototypes`, as "a function declaration without a prototype is
-deprecated in all versions of C". Emitting `(void)` is **designed, not
-implemented**, and it is a portability wart rather than a miscompilation.
+A zero-parameter function emits `f(void)`, matching the runtime header.
+Measured.
 
 ### 10.2 Name mangling
 
-**Status: implemented for definitions. Broken for call sites.**
+**Status: implemented for definitions and named call sites.**
 
 The mangling scheme is `cell_<name>`, with no encoding of parameter types,
 arity, ownership, or module path. Consequences: **there is no overloading**, a
 Cell module cannot define two functions with the same name, and a Cell symbol
 collides with any C symbol literally named `cell_<name>`.
 
-Applied consistently to *definitions*:
+Applied consistently to definitions and to named calls:
 
 | Cell | C symbol |
 |---|---|
@@ -1336,53 +1343,52 @@ Applied consistently to *definitions*:
 | `enum Color` | `cell_Color` |
 | variant `Red` of `Color` | `cell_Color_Red` |
 
-**Call sites are not mangled**, and this is a defect, not a design.
-`emitExpr` writes the callee identifier verbatim, so a call to `add` emits
-`add(40, 2)` while its definition emitted `cell_add`. The generated C is not
-internally consistent.
+A call to `add` emits `cell_add(...)`. Bodyless declarations of runtime
+intrinsics (`print`, `print_int`, ...) keep the runtime's own symbol.
 
-**Measured, on a binary built from `9fb12af`:**
+**Measured, on a binary built with `-Dswift=false`:**
 
 | File | `cc -c` result |
 |---|---|
-| `examples/declarations.cell` | compiles, 0 errors |
-| `examples/primitives.cell` | compiles, 0 errors |
-| `examples/hello.cell` | 3 errors |
-| `examples/ownership.cell` | 6 errors |
+| `examples/declarations.cell` | compiles |
+| `examples/primitives.cell` | compiles |
+| `examples/hello.cell` | compiles |
+| `examples/control_flow.cell` | compiles |
+| `examples/ownership.cell` | compiles |
+| `examples/arc.cell` | fails: `let arc label = "session"` stays `cell_str_t` while `cell_observe` wants `cell_arc_t` |
 
-The pattern is exact and worth stating as a rule: **declaration-only files emit
-valid C, and any file with a function body does not.** The failures come from
-unmangled call sites, struct and list literals emitted as comments, and field
-access on a `void*` parameter. Emission is a sketch, and this specification
-says so plainly.
+Declaration-only files emit valid C. Body-bearing emit compiles for the
+flagship examples (hello, control_flow, ownership), not for every example.
+`arc` boxing is the remaining gap on that path, and retain/release insertion
+is a non-goal of this revision.
 
 A module-qualified mangling (`cell_<module>_<name>`) is **designed, not
 implemented**.
 
 ### 10.3 The value model
 
-**Status: designed, not implemented, and the runtime is ahead of codegen.**
+**Status: implemented for the types the compiler can name, with one arc gap.**
 
 `runtime/cell_rt.h` carries an authoritative reference block specifying how
 every Cell type lowers to C. **This specification adopts that block as the
-target ABI.** Codegen does not implement it: `mapPrimitive` still emits
-`const char*` for `String` and `void*` for every optional, list, ownership-
-qualified type, struct, and enum. Where the two disagree, the runtime is the
-specification and codegen is the gap.
+target ABI.** Codegen now emits `#include "cell_rt.h"` and follows that mapping
+for primitives, strings, slices, optionals, structs, and payload-free enums.
+The remaining gap is `arc`: a parameter or return of mode `arc` is `cell_arc_t`,
+but a string literal is still `cell_str_t` and is not boxed.
 
 | Cell | Specified C | What codegen emits today |
 |---|---|---|
-| primitives (section 3.1) | by value, in every ownership mode | matches, except `String` |
-| `shared String` | `cell_str_t` (borrowed `ptr`+`len` view) | `const char*` |
-| `owned String` | `cell_string_t` (heap `ptr`+`len`+`cap`, callee frees) | `const char*` |
-| `exclusive String` | `cell_string_t*` | `void*` |
-| `arc String` | `cell_arc_t` over a heap `cell_string_t` | `void*` |
-| `copy String` | `cell_string_t` from `cell_string_clone` | `const char*` |
-| `[T]` | `cell_slice_t { ptr, len, cap }`, type-erased, `elem_size` at each call site | `void*` |
-| `T?` | tagged `{ bool has_value; T value; }` | `void*` |
+| primitives (section 3.1) | by value, in every ownership mode | matches |
+| `shared String` | `cell_str_t` (borrowed `ptr`+`len` view) | `cell_str_t` |
+| `owned String` | `cell_string_t` (heap `ptr`+`len`+`cap`, callee frees) | `cell_string_t` |
+| `exclusive String` | `cell_string_t*` | `cell_string_t *` |
+| `arc String` | `cell_arc_t` over a heap `cell_string_t` | `cell_arc_t` on params/returns; a literal stays `cell_str_t` |
+| `copy String` | `cell_string_t` from `cell_string_clone` | `cell_string_t` (no clone call) |
+| `[T]` | `cell_slice_t { ptr, len, cap }`, type-erased, `elem_size` at each call site | `cell_slice_t` |
+| `T?` | tagged `{ bool has_value; T value; }` | `CELL_DEFINE_OPTIONAL` instance |
 | `Result<T, E>` | `cell_result_t { ok, error_code, cell_value_t value }` | does not parse |
-| struct | C struct, same field order, each field lowered by its own ownership | `void*` in type position |
-| payload-free enum | distinct integer type of width `int32_t` | bare `typedef enum`, implementation-defined width |
+| struct | C struct, same field order, each field lowered by its own ownership | `cell_<Name>` |
+| payload-free enum | distinct integer type of width `int32_t` | `typedef int32_t cell_<Name>` |
 
 Three consequences of that model that Cell must live with, all inherited from
 the runtime rather than chosen here:
@@ -1405,7 +1411,9 @@ the runtime rather than chosen here:
 
 ### 10.4 Ownership at the boundary
 
-**Status: designed, not implemented.**
+**Status: parsed, not enforced for all modes.** `shared` / `exclusive` /
+`owned` / `copy` lower as specified. `arc` parameters and returns are
+`cell_arc_t`, but literals are not boxed and retain/release is not inserted.
 
 `runtime/cell_rt.h` section 7 fixes the lowering for each mode, and this
 specification adopts it:
@@ -1424,10 +1432,11 @@ including `shared`. That is forced by the language itself, because
 body `a + b`, and a `shared` primitive lowered to a pointer would stop that
 expression compiling.
 
-Today, `shared T` and `exclusive T` in type position both become `void*`,
-`arc T` becomes `void*` rather than `cell_arc_t`, `owned T` in parameter
-position becomes the plain C type from section 3.1, and the `const` qualifier
-is never emitted for `shared`.
+Today, `shared` aggregates emit `const T *`, `exclusive` aggregates emit
+`T *`, and `owned` / `copy` emit the by-value C type from section 3.1.
+`arc` parameters emit `cell_arc_t`. A `let arc label = "session"` still
+types and emits as `cell_str_t`, so passing it to an `arc` parameter fails
+to compile. Retain/release calls are never inserted.
 
 ### 10.5 Return values
 
@@ -1567,7 +1576,7 @@ records the missing lowering.
 | Implicit unit from an omitted `->` | implemented |
 | Struct types in type position | parsed, not enforced |
 | Enum types | implemented |
-| Enum lowering at `int32_t` width | designed, not implemented |
+| Enum lowering at `int32_t` width | implemented |
 | Ownership-qualified types (`shared T`) | parsed, not enforced |
 | Canonical annotation position rule | designed, not implemented |
 
@@ -1575,15 +1584,15 @@ records the missing lowering.
 
 | Construct | Status |
 |---|---|
-| `owned` annotation | parsed, not enforced |
-| `shared` annotation | parsed, not enforced |
-| `exclusive` annotation | parsed, not enforced |
+| `owned` annotation | implemented |
+| `shared` annotation | implemented |
+| `exclusive` annotation | implemented |
 | `arc` annotation | parsed, not enforced |
-| `copy` annotation | parsed, not enforced |
+| `copy` annotation | implemented |
 | Default ownership is `owned` | implemented |
 | Call-site ownership prefix | designed, not implemented |
-| Move checking | designed, not implemented |
-| Shared-XOR-exclusive aliasing | designed, not implemented |
+| Move checking | implemented |
+| Shared-XOR-exclusive aliasing | implemented |
 | Retain / release insertion for `arc` | designed, not implemented |
 | Atomic refcounts in the runtime | implemented |
 | Drop insertion for `owned` | designed, not implemented |
@@ -1595,29 +1604,29 @@ records the missing lowering.
 |---|---|
 | Literal expressions | implemented |
 | Identifier expressions | implemented |
-| Name resolution | designed, not implemented |
+| Name resolution | implemented |
 | Field access `a.b` | implemented |
-| Field existence and type resolution | designed, not implemented |
+| Field existence and type resolution | implemented |
 | Direct call `f(x)` | implemented |
 | Postfix chaining `a.b(c).d` | implemented |
 | Method dispatch and `impl` blocks | designed, not implemented |
 | Binary operators (12) | implemented |
 | Precedence and left associativity | implemented |
 | Unary `-` and `!` | implemented |
-| `&x` shared borrow | parsed, not enforced |
-| `&mut x` / `&exclusive x` | parsed, not enforced |
+| `&x` shared borrow | implemented |
+| `&mut x` / `&exclusive x` | implemented |
 | Parenthesized grouping | implemented |
 | Tuples | designed, not implemented |
 | Struct literal parsing, with field shorthand | implemented |
 | Struct literal excluded from condition position | implemented |
-| Struct literal lowering | designed, not implemented |
+| Struct literal lowering | implemented |
 | List literal parsing | implemented |
-| List literal lowering | designed, not implemented |
+| List literal lowering | implemented |
 | `if` / `else` / `else if` parsing | implemented |
-| `if` lowering to C control flow | designed, not implemented |
-| `if` as a value-producing expression | designed, not implemented |
+| `if` lowering to C control flow | implemented |
+| `if` as a value-producing expression | implemented |
 | Block expression parsing | implemented |
-| Block expression lowering | designed, not implemented |
+| Block expression lowering | implemented |
 | Indexing `a[i]` | designed, not implemented |
 
 ### Statements
@@ -1636,10 +1645,10 @@ records the missing lowering.
 | Immutable-assignment check on the root binding | implemented |
 | Parameter mutability derived from the ownership mode | implemented |
 | Assignability check on the target | designed, not implemented |
-| Block-scoped symbol table | designed, not implemented |
+| Block-scoped symbol table | implemented |
 | Compound / indexed assignment | designed, not implemented |
 | `return` | implemented |
-| Return-type checking | designed, not implemented |
+| Return-type checking | implemented |
 | Expression statement | implemented |
 | Unused-result diagnostic | designed, not implemented |
 | Loops and `break` / `continue` | designed, not implemented |
@@ -1678,7 +1687,7 @@ records the missing lowering.
 | Range patterns | designed, not implemented |
 | Exhaustiveness and unreachable-arm checking | designed, not implemented |
 | Pattern binding ownership | designed, not implemented |
-| `match` lowering to C | designed, not implemented |
+| `match` lowering to C | implemented |
 
 ### C ABI
 
@@ -1687,19 +1696,19 @@ records the missing lowering.
 | Single-translation-unit emission | implemented |
 | Header emission and `extern "C"` | designed, not implemented |
 | `cell_<name>` mangling on definitions | implemented |
-| Mangling on call sites | designed, not implemented |
+| Mangling on call sites | implemented |
 | Primitive parameter mapping | implemented |
-| `String` as a length-prefixed slice | designed, not implemented |
-| Ownership lowering at the boundary | designed, not implemented |
-| `const` for `shared` aggregates | designed, not implemented |
-| `arc` as `cell_arc_t` | designed, not implemented |
+| `String` as a length-prefixed slice | implemented |
+| Ownership lowering at the boundary | parsed, not enforced |
+| `const` for `shared` aggregates | implemented |
+| `arc` as `cell_arc_t` | parsed, not enforced |
 | `cell_result_t` emission | designed, not implemented |
 | Return-value mapping | implemented |
 | Emitted C compiles for declaration-only files | implemented |
-| Emitted C compiles for files with bodies | designed, not implemented |
+| Emitted C compiles for hello / control_flow / ownership | implemented |
 | Runtime host intrinsics exist | implemented |
-| Generated code can call the host intrinsics | designed, not implemented |
-| Panic lowering | designed, not implemented |
+| Generated code can call the host intrinsics | implemented |
+| Panic lowering | implemented |
 
 ### Files and diagnostics
 
@@ -1713,7 +1722,7 @@ records the missing lowering.
 | Caret rendering with the source line | implemented |
 | Parser records a span and a message on failure | implemented |
 | CLI surfaces parser diagnostics | designed, not implemented |
-| Check diagnostics rendered through `Bag.render` | designed, not implemented |
+| Check diagnostics rendered through `Bag.render` | implemented |
 | Error recovery past the first failure | designed, not implemented |
 
 ---

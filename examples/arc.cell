@@ -1,15 +1,14 @@
 // The `arc` ownership mode.
 //
-// Status: parses and passes `cell check`. `arc` has NO runtime effect in the
-// emitted C: no retain, no release, and `arc T` maps to void* rather than to
-// the `cell_arc_t` that runtime/cell_rt.h defines. See SPEC 4.1.4 and 10.3.
+// Status: parses and passes `cell check`. Codegen maps `arc` parameters and
+// returns to `cell_arc_t`, but a string literal stays `cell_str_t` and is not
+// boxed into an arc. No retain or release is inserted, so `cell emit` of this
+// file does not compile (`cell_observe` wants `cell_arc_t`). See SPEC 4.1.4.
 //
-// The runtime machinery is real and works: cell_arc_new, cell_arc_clone, and
+// The runtime machinery is real: cell_arc_new, cell_arc_clone, and
 // cell_arc_drop in runtime/cell_rt.c do genuine refcount increments and
-// decrements and call a drop function at zero. Codegen never calls them.
-//
-// WARNING: those refcount operations are NON-ATOMIC plain increments and
-// decrements. `arc` values are not safe to share across threads.
+// decrements and call a drop function at zero. As of 562f116 those refcounts
+// are atomic (`_Atomic` in the .c file). Codegen never calls them.
 
 pub struct Session {
     arc name: String

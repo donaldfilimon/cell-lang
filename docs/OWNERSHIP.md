@@ -10,11 +10,11 @@ draft carried are now **unblocked**, because the parser gained field-access
 nodes, structured patterns, and source spans. If a note here disagrees with the
 source, believe the source.
 
-**Implementation status of every rule in this document: designed, not
-implemented, except R14.** There is no borrow checker in `src/`.
-`src/cell/typecheck.zig` is a symbol-table walk that enforces exactly one rule,
-R14, and enforces it with one known gap. Do not read any other rule as a
-description of current behavior.
+**Implementation status.** `src/cell/borrowck.zig` is wired into `cell check`
+and enforces R2 (use-after-move), R3 (move-out-of-borrow), R5 (shared XOR
+exclusive), R8 (escaping borrow), and R14 (assignment through an immutable
+place, including fields). Diagnostics name the place and land at the use site.
+R10/R11 retain-release insertion, NLL, and stem pairing are still designed.
 
 ---
 
@@ -444,7 +444,8 @@ documentation rather than implying `copy` is safe.
 
 ### R14. Assignment requires a mutable place
 
-This is the one rule that exists today, in `Checker.checkStmt`.
+Enforced by `src/cell/borrowck.zig`, not by the typechecker. Typecheck still
+rejects a type mismatch on assignment; it does not also report R14.
 
 ```cell
 pub fn main() {
@@ -453,31 +454,24 @@ pub fn main() {
 }
 ```
 
-> `err: cannot assign to immutable binding`
+> `err: cannot assign to immutable binding 'x'`
+> `note: 'x' is declared immutable here`
 
-Measured: this fires with a real path, line, and column, and exits 1.
+Measured: this fires with a real path, line, and column, names the place, notes
+the `let`, and exits 1. `cell check examples/rejected/immutable_assign.cell`
+prints the error once.
 
 What works, verified:
 
 - The target is an expression, and `ast.rootName` finds the base binding, so
   **field assignment is checked**: `b.len = 1` where `b` is an immutable `let`
-  is an error. An earlier revision missed this because the target was stored as
-  a joined string.
+  is an error.
 - Parameter mutability follows the ownership mode: `exclusive` and `owned` are
   mutable; `shared`, `arc`, and `copy` are not. Measured for all three
   immutable modes.
+- Diagnostics go through `Bag.render`, so they carry the source line and caret.
 
-Three things to fix:
-
-1. The message does not name the binding and there is no `note` at the `let`.
-   It should read `cannot assign to immutable binding 'x'` with a
-   `note: 'x' is declared immutable here`.
-2. The diagnostic is printed through `std.debug.print` in `checkModule` rather
-   than through `Bag.render`, so it loses the source line and caret the
-   renderer can produce.
-3. Scoping (R13.4).
-
-There is also no check that the target is *assignable* at all. Assigning to a
+There is still no check that the target is *assignable* at all. Assigning to a
 literal or a call result is accepted and emits nonsense C:
 
 > `err: cannot assign to this expression: only a binding or a field of one is assignable`
