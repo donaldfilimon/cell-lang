@@ -646,7 +646,7 @@ optionals (`T??`) also do not parse. Both are **designed, not implemented**.
 
 ### 3.3 List types
 
-**Status: parsed, not enforced.**
+**Status: implemented as a type; there is still no way to use a list value.**
 
 ```cell
 [Int]
@@ -655,13 +655,28 @@ optionals (`T??`) also do not parse. Both are **designed, not implemented**.
 ```
 
 `[T]` denotes a homogeneous sequence. Nesting works in the type grammar
-(`[[Int]]`, `[Int?]` both parse). Codegen maps every list to `void*`. There is
-no indexing operator and no iteration, so like optionals, a list can be named
-in a signature and constructed as a literal but not otherwise used.
+(`[[Int]]`, `[Int?]` both parse). There is no indexing operator and no
+iteration, so like optionals, a list can be named in a signature and
+constructed as an empty literal but not otherwise used.
 
-The runtime has chosen `cell_slice_t { void *ptr; size_t len; size_t cap; }`,
-one type-erased header for every element type with `elem_size` passed at each
-call site. Codegen does not emit it.
+**CORRECTED 2026-09-07.** This section previously said "Codegen maps every list
+to `void*`" and "Codegen does not emit it". Both were false and had been for
+some time. Codegen emits `cell_slice_t`
+`{ void *ptr; size_t len; size_t cap; }`, one type-erased header for every
+element type with `elem_size` passed at each call site, and
+`cell emit` produces `int64_t cell_f(cell_slice_t xs);` for
+`pub fn f(shared xs: [Byte]) -> Int;`. Measured.
+
+The stale text had a cost worth recording: it was read as saying `[T]` had no
+representation *at all*, which made it look like a language gap. It is not. The
+LLVM and MLIR backends refused lists only because each returned null for the
+type, and at 24 bytes a `cell_slice_t` takes the same indirect path
+`cell_string_t` already used. Three lines, not a feature.
+
+What remains genuinely missing is the *use* of a list: no indexing, no
+iteration, and only the empty literal `[]` is constructible, because a
+non-empty one needs a constant global for its elements that no backend emits
+yet.
 
 ### 3.4 Result
 

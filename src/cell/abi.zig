@@ -57,9 +57,15 @@ pub fn layoutOf(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) ?Layout {
             const al = @max(il.alignment, 1);
             break :blk .{ .size = alignUp(alignUp(1, al) + il.size, al), .alignment = al };
         },
-        // Still out of scope: [T] has no representation at all (SPEC 3.3), and
-        // Result's payload is a union this module does not model yet.
-        .list, .result, .func, .unknown => null,
+        // [T] is a cell_slice_t, `{ void *ptr; size_t len; size_t cap; }`:
+        // ONE type-erased header for every element type, with elem_size passed
+        // at each call site (cell_rt.h section 3). So its layout does not
+        // depend on the element, and at 24 bytes it takes the same indirect
+        // path cell_string_t already uses.
+        .list => .{ .size = 24, .alignment = 8 },
+        // Still out of scope: Result's payload is a union this module does not
+        // model yet.
+        .result, .func, .unknown => null,
     };
 }
 
@@ -497,14 +503,22 @@ test "a non-HFA over 16 bytes is indirect in both positions" {
 
 test "an out-of-scope type is unclassified, not guessed" {
     const m = emptyModule();
-    // [T] still has no representation at all (SPEC 3.3).
+    // [T] used to be the example here. It is now a cell_slice_t, so `arc` is
+    // what remains: retain and release are not inserted (OWNERSHIP R11), and
+    // placing a cell_arc_t without them would be lowering half a feature.
+    try std.testing.expect(classifyParam(&m, types.t_string, .arc) == .unclassified);
+}
+
+test "[T] is a cell_slice_t: one header for every element type" {
+    // cell_rt.h section 3: a single type-erased header with elem_size passed
+    // at each call site, so the layout does not depend on the element and 24
+    // bytes puts it on the same indirect path cell_string_t uses.
+    const m = emptyModule();
     const elem = types.t_byte;
     const list_ty: hir.Ty = .{ .list = &elem };
-    try std.testing.expect(classifyParam(&m, list_ty, .shared) == .unclassified);
-    try std.testing.expect(classifyReturn(&m, list_ty) == .unclassified);
-    // arc String is refused too: arc has no retain/release insertion yet, so
-    // placing one correctly would be lowering half a feature.
-    try std.testing.expect(classifyParam(&m, types.t_string, .arc) == .unclassified);
+    try std.testing.expectEqual(@as(u32, 24), layoutOf(&m, list_ty, .shared).?.size);
+    try std.testing.expect(classifyParam(&m, list_ty, .shared) == .indirect);
+    try std.testing.expect(classifyReturn(&m, list_ty) == .indirect);
 }
 
 test "String's size depends on ownership, and only String's does" {

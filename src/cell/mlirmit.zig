@@ -514,9 +514,27 @@ const Emitter = struct {
                 try self.line("{s} = llvm.extractvalue {s}[{d}] : {s}", .{ out, base.text, fe.sel.index, base.ty });
                 return .{ .text = out, .ty = t };
             },
-            .list_lit => {
-                try self.unsupported(e.span, "[T] is not lowered to MLIR yet");
-                return Value.none;
+            .list_lit => |elems| {
+                if (elems.len != 0) {
+                    try self.unsupported(e.span, "a non-empty list literal is not lowered to MLIR yet");
+                    return Value.none;
+                }
+                // cell_slice_empty() is `static inline` and has no symbol, so
+                // the empty header is materialized here: null, 0, 0.
+                const t = "!llvm.struct<(ptr, i64, i64)>";
+                const nul = try self.nextSsa();
+                try self.line("{s} = llvm.mlir.zero : !llvm.ptr", .{nul});
+                const zero = try self.nextSsa();
+                try self.line("{s} = llvm.mlir.constant(0 : i64) : i64", .{zero});
+                const u = try self.nextSsa();
+                try self.line("{s} = llvm.mlir.undef : {s}", .{ u, t });
+                const v0 = try self.nextSsa();
+                try self.line("{s} = llvm.insertvalue {s}, {s}[0] : {s}", .{ v0, nul, u, t });
+                const v1 = try self.nextSsa();
+                try self.line("{s} = llvm.insertvalue {s}, {s}[1] : {s}", .{ v1, zero, v0, t });
+                const v2 = try self.nextSsa();
+                try self.line("{s} = llvm.insertvalue {s}, {s}[2] : {s}", .{ v2, zero, v1, t });
+                return .{ .text = v2, .ty = t };
             },
         }
     }
@@ -869,7 +887,7 @@ const Emitter = struct {
     /// is allocated, stored, loaded and projected.
     fn isAggregate(ty: hir.Ty) bool {
         return switch (ty.tag()) {
-            .struct_type, .string, .optional => true,
+            .struct_type, .string, .optional, .list => true,
             else => false,
         };
     }
@@ -927,7 +945,10 @@ const Emitter = struct {
                 const it = self.mlirType(inner.*) orelse break :blk null;
                 break :blk std.fmt.allocPrint(self.arena, "!llvm.struct<(i8, {s})>", .{it}) catch null;
             },
-            .list, .result, .func, .unknown => null,
+            // One type-erased header for every element type, per cell_rt.h
+            // section 3: elem_size travels at the call site, not in the type.
+            .list => "!llvm.struct<(ptr, i64, i64)>",
+            .result, .func, .unknown => null,
         };
     }
 
@@ -940,7 +961,11 @@ const Emitter = struct {
         buf.appendSlice(self.arena, "!llvm.struct<(") catch return null;
         for (decl.fields, 0..) |f, i| {
             if (i != 0) buf.appendSlice(self.arena, ", ") catch return null;
-            const t = self.mlirType(f.ty) orelse return null;
+            // Per-field OWNERSHIP, not just the field's type. abi.structLayout
+            // already sizes a struct this way, and rendering it without
+            // ownership let a struct with an `arc String` field be emitted
+            // here while abi called the same struct unclassified.
+            const t = self.mlirTypeOwned(f.ty, f.ownership) orelse return null;
             buf.appendSlice(self.arena, t) catch return null;
         }
         buf.appendSlice(self.arena, ")>") catch return null;
@@ -1148,10 +1173,12 @@ test "a field read uses llvm.extractvalue" {
     try expectContains(e.text, "llvm.extractvalue");
 }
 
-test "[T] is still refused, because it has no representation at all" {
-    // SPEC 3.3: [T] has no representation, not merely no MLIR placement.
+test "arc is still refused, because R11 is not implemented" {
+    // [T] used to be the example here and now lowers. `arc` is the durable
+    // one: retain and release are not inserted, so placing a cell_arc_t would
+    // be half a feature.
     var e = try emitSource(
-        \\pub fn f(shared xs: [Byte]) -> Int;
+        \\pub fn g(arc s: String) -> Int;
     );
     defer e.deinit();
     try std.testing.expect(e.bag.hasErrors());
@@ -1293,9 +1320,10 @@ test "an unused struct with an unrepresentable field is still refused" {
     // was never examined and this module was accepted here while the LLVM
     // backend refused it. Two backends disagreeing about one program is the
     // drift a shared IR exists to prevent, so declared structs are validated
-    // eagerly.
+    // eagerly. The unrepresentable field was [Byte] until lists landed; it is
+    // an arc field now, which lasts until OWNERSHIP R11.
     var e = try emitSource(
-        \\pub struct Holder { owned data: [Byte] }
+        \\pub struct Holder { arc name: String }
         \\pub fn unrelated() -> Int { return 1 }
     );
     defer e.deinit();

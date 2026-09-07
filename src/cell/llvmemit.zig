@@ -130,6 +130,7 @@ const Emitter = struct {
         try self.out.writeAll(
             \\%cell_str = type { ptr, i64 }
             \\%cell_string = type { ptr, i64, i64 }
+            \\%cell_slice = type { ptr, i64, i64 }
             \\%cell_opt_i64 = type { i8, i64 }
             \\%cell_opt_u64 = type { i8, i64 }
             \\%cell_opt_i32 = type { i8, i32 }
@@ -145,7 +146,10 @@ const Emitter = struct {
             try self.out.print("%cell_{s} = type {{ ", .{s.name});
             for (s.fields, 0..) |f, i| {
                 if (i != 0) try self.out.writeAll(", ");
-                const t = self.llType(f.ty) orelse {
+                // Per-field OWNERSHIP, matching abi.structLayout. Rendering a
+                // field by type alone let a struct with an `arc String` field
+                // be emitted while abi called the same struct unclassified.
+                const t = self.llTypeOwned(f.ty, f.ownership) orelse {
                     try self.unsupported(.none, "struct field type");
                     try self.out.writeAll("i8*");
                     continue;
@@ -579,9 +583,23 @@ const Emitter = struct {
                 return .{ .text = tmp, .ty = t };
             },
             .struct_lit => |sl| return self.emitStructLit(e, sl.name, sl.fields),
-            .list_lit => {
-                try self.unsupported(e.span, "[T] is not lowered to LLVM IR yet");
-                return Value.void_value;
+            .list_lit => |elems| {
+                if (elems.len != 0) {
+                    // A non-empty literal needs a constant global for its
+                    // elements. Nothing in the corpus has one, so it is
+                    // refused by name rather than half-built.
+                    try self.unsupported(e.span, "a non-empty list literal is not lowered to LLVM IR yet");
+                    return Value.void_value;
+                }
+                // cell_slice_empty() is `static inline` and has no symbol, so
+                // the empty header is materialized here: null, 0, 0.
+                const a = try self.nextTemp();
+                try self.out.print("  {s} = insertvalue %cell_slice undef, ptr null, 0\n", .{a});
+                const b = try self.nextTemp();
+                try self.out.print("  {s} = insertvalue %cell_slice {s}, i64 0, 1\n", .{ b, a });
+                const c = try self.nextTemp();
+                try self.out.print("  {s} = insertvalue %cell_slice {s}, i64 0, 2\n", .{ c, b });
+                return .{ .text = c, .ty = "%cell_slice" };
             },
             .block => |b| {
                 for (b.stmts) |s| try self.emitStmt(&s);
@@ -1072,11 +1090,14 @@ const Emitter = struct {
             // String may be owning instead, which is why slots and parameters
             // go through llTypeOwned below rather than here.
             .string => "%cell_str",
+            // One type-erased header for every element type, per cell_rt.h
+            // section 3: elem_size travels at the call site, not in the type.
+            .list => "%cell_slice",
             .optional => |inner| blk: {
                 const base = abi.optionalBase(inner.*) orelse break :blk null;
                 break :blk std.fmt.allocPrint(self.arena, "%{s}", .{base}) catch null;
             },
-            .list, .result, .func, .unknown => null,
+            .result, .func, .unknown => null,
         };
     }
 
@@ -1250,12 +1271,14 @@ test "unsigned division uses udiv, signed uses sdiv" {
     try expectContains(e.text, "udiv i64");
 }
 
-test "[T] is still refused with a diagnostic rather than emitted wrongly" {
-    // String USED to be here. It now lowers, so this test moved to the type
-    // that is still genuinely unrepresentable: SPEC 3.3 says [T] has no
-    // representation at all, not merely no LLVM placement.
+test "arc is still refused with a diagnostic rather than emitted wrongly" {
+    // [T] USED to be here and now lowers as a cell_slice_t, so this moved to
+    // the type that is still genuinely unplaceable: `arc` has no retain and
+    // release insertion (OWNERSHIP R11), so placing a cell_arc_t correctly
+    // would be lowering half a feature. When R11 lands this test should go red
+    // and become a capability test, the way its predecessors did.
     var e = try emitSource(
-        \\pub fn f(shared xs: [Byte]) -> Int;
+        \\pub fn g(arc s: String) -> Int;
     );
     defer e.deinit();
     try std.testing.expect(e.bag.hasErrors());

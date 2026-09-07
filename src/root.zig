@@ -470,11 +470,13 @@ test "a backend refusal writes no partial output" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // [Byte] is the trigger, not a struct: MLIR lowers structs now, so a
-    // struct no longer refuses anything. SPEC 3.3 says [T] has no
-    // representation at all, which makes it the durable choice here.
+    // `arc` is the trigger. It has been a struct, then [Byte], and both now
+    // lower; each time the capability landed this test stopped testing
+    // anything and had to move. `arc` lasts until OWNERSHIP R11 is
+    // implemented, and when that lands this should move again rather than be
+    // weakened.
     const source =
-        \\pub fn f(shared xs: [Byte]) -> Int;
+        \\pub fn g(arc s: String) -> Int;
     ;
     var module = try compile(a, source, "t.cell");
 
@@ -483,7 +485,7 @@ test "a backend refusal writes no partial output" {
     var err_buf: [8192]u8 = undefined;
     var errw = Io.Writer.fixed(&err_buf);
 
-    // MLIR cannot represent [T], so this module cannot emit.
+    // MLIR cannot place an arc value, so this module cannot emit.
     try std.testing.expectError(
         error.TypeError,
         emitFor(a, &module, source, &out, .mlir, &errw),
