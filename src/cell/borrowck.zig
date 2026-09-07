@@ -1040,27 +1040,21 @@ fn exprUsesName(e: *const ast.Expr, name: []const u8) bool {
     };
 }
 
-/// Borrow-check `module` and print any diagnostics, mirroring the shape of
-/// `typecheck.check`. Returns `error.BorrowError` when a rule was violated.
+/// Borrow-check `module`, rendering every diagnostic to `writer`. Deliberately
+/// the same shape as `root.check`, so wiring it into the CLI is one call.
+/// Returns `error.BorrowError` once the bag has been written, so a caller can
+/// exit non-zero without re-inspecting it.
 pub fn check(
     allocator: std.mem.Allocator,
     module: *const ast.Module,
     source: ?[]const u8,
-) (Error || BorrowError)!void {
+    writer: *std.Io.Writer,
+) !void {
     var checker: Checker = .init(allocator, module.path, source);
     defer checker.deinit();
     try checker.checkModule(module);
-    if (!checker.hasErrors()) return;
-    for (checker.diagnostics.list.items) |d| {
-        std.debug.print("{s}:{d}:{d}: {s}: {s}\n", .{
-            checker.diagnostics.path,
-            d.span.line,
-            d.span.column,
-            d.level.text(),
-            d.message,
-        });
-    }
-    return error.BorrowError;
+    try checker.diagnostics.printAll(writer);
+    if (checker.hasErrors()) return error.BorrowError;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────
