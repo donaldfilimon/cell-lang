@@ -210,6 +210,55 @@ fn wordsFor(size: u32) u32 {
     return (size + 7) / 8;
 }
 
+/// Render a parameter's LLVM type, or null when this module cannot place it.
+///
+/// Lives here rather than in the backend so that the backend and the
+/// clang-comparison test below use the SAME renderer. If the test formatted
+/// its own prediction, the two could drift: the test would keep passing
+/// against clang while the backend emitted something else, which is the exact
+/// failure this whole file exists to prevent.
+pub fn renderParam(
+    arena: std.mem.Allocator,
+    m: *const hir.Module,
+    ty: hir.Ty,
+    own: hir.Ownership,
+) ?[]const u8 {
+    return renderClass(arena, classifyParam(m, ty, own), ty, false);
+}
+
+/// Render a return's LLVM type, or null when this module cannot place it.
+/// An `.indirect` return renders as "void"; the caller adds the `sret`
+/// parameter, because that changes the signature rather than the type.
+pub fn renderReturn(arena: std.mem.Allocator, m: *const hir.Module, ty: hir.Ty) ?[]const u8 {
+    return renderClass(arena, classifyReturn(m, ty), ty, true);
+}
+
+fn renderClass(
+    arena: std.mem.Allocator,
+    class: Class,
+    ty: hir.Ty,
+    is_return: bool,
+) ?[]const u8 {
+    return switch (class) {
+        .direct => |s| blk: {
+            // classifyReturn hands back a struct's bare name for an HFA
+            // return. The `%cell_` prefix is ours to add.
+            if (is_return and ty.tag() == .struct_type) {
+                break :blk std.fmt.allocPrint(arena, "%cell_{s}", .{s}) catch null;
+            }
+            break :blk s;
+        },
+        .coerce_int => |n| std.fmt.allocPrint(arena, "[{d} x i64]", .{n}) catch null,
+        .coerce_float => |f| std.fmt.allocPrint(
+            arena,
+            "[{d} x {s}]",
+            .{ f.count, f.elem },
+        ) catch null,
+        .indirect => if (is_return) "void" else "ptr",
+        .unclassified => null,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -399,4 +448,151 @@ test "an out-of-scope type is unclassified, not guessed" {
     const m = emptyModule();
     try std.testing.expect(classifyParam(&m, types.t_string, .shared) == .unclassified);
     try std.testing.expect(classifyReturn(&m, types.t_string) == .unclassified);
+}
+
+// ---------------------------------------------------------------------------
+// The clang-comparison test
+//
+// This is the load-bearing test of this module. A hand-written ABI that
+// nothing checks rots silently, and the rot surfaces as a wrong answer in a
+// linked program rather than as a build failure.
+//
+// For each shape it builds BOTH a C declaration and the equivalent Cell type,
+// runs clang on the C, runs this module on the Cell, and asserts they agree.
+// It is a live comparison against the compiler that owns the ABI, not a golden
+// file: a golden file records what clang did once, this records what clang
+// does now.
+// ---------------------------------------------------------------------------
+
+/// One shape, expressed twice: once for clang and once for us.
+const ProbeCase = struct {
+    name: []const u8,
+    /// The body of a C struct, e.g. "double x, y;".
+    c_body: []const u8,
+    /// The equivalent Cell field types, in order.
+    fields: []const hir.Ty,
+};
+
+test "the classifier predicts what clang actually does" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Skip rather than pass vacuously when the toolchain is absent, following
+    // the precedent set by the MLIR execution test in mlirmit.zig. A test that
+    // silently succeeds when its subject is missing is worse than no test.
+    const have_cc = std.process.run(gpa, io, .{ .argv = &.{ "cc", "--version" } }) catch
+        return error.SkipZigTest;
+    gpa.free(have_cc.stdout);
+    gpa.free(have_cc.stderr);
+    if (!have_cc.term.success()) return error.SkipZigTest;
+
+    const f = types.t_float;
+    const i = types.t_int;
+    const b = types.t_byte;
+
+    const cases = [_]ProbeCase{
+        .{ .name = "Hfa2", .c_body = "double x; double y;", .fields = &.{ f, f } },
+        .{ .name = "Hfa4", .c_body = "double a; double b; double c; double d;", .fields = &.{ f, f, f, f } },
+        .{ .name = "Int2", .c_body = "long long a; long long b;", .fields = &.{ i, i } },
+        .{ .name = "Int3", .c_body = "long long a; long long b; long long c;", .fields = &.{ i, i, i } },
+        .{ .name = "Mixed", .c_body = "long long a; double b;", .fields = &.{ i, f } },
+        .{ .name = "Padded", .c_body = "char c; long long a;", .fields = &.{ b, i } },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    for (cases, 0..) |case, idx| {
+        // Build the Cell side.
+        var fields = try arena.alloc(hir.Field, case.fields.len);
+        for (case.fields, 0..) |ty, k| {
+            fields[k] = .{
+                .name = try std.fmt.allocPrint(arena, "f{d}", .{k}),
+                .ty = ty,
+                .ownership = .copy,
+            };
+        }
+        var structs = [_]hir.Struct{
+            .{ .name = case.name, .fields = fields, .is_public = true },
+        };
+        const m = testModule(&structs);
+        const ty: hir.Ty = .{ .struct_type = case.name };
+
+        const want_param = renderParam(arena, &m, ty, .owned).?;
+        const want_return = renderReturn(arena, &m, ty).?;
+
+        // Build the C side and ask clang.
+        const src = try std.fmt.allocPrint(arena,
+            \\typedef struct {{ {s} }} T;
+            \\long long p_in(T v);
+            \\long long p_in(T v) {{ (void)v; return 0; }}
+            \\T r_out(void);
+            \\T r_out(void) {{ T t; __builtin_memset(&t, 0, sizeof t); return t; }}
+        , .{case.c_body});
+
+        const file = try std.fmt.allocPrint(arena, "probe{d}.c", .{idx});
+        try tmp.dir.writeFile(io, .{ .sub_path = file, .data = src });
+
+        const run = try std.process.run(gpa, io, .{
+            .argv = &.{ "cc", "-S", "-emit-llvm", "-O0", file, "-o", "-" },
+            .cwd = .{ .dir = tmp.dir },
+        });
+        defer gpa.free(run.stdout);
+        defer gpa.free(run.stderr);
+        if (!run.term.success()) {
+            std.debug.print("cc failed on {s}:\n{s}\n", .{ case.name, run.stderr });
+            return error.ProbeFailed;
+        }
+
+        const param_line = lineContaining(run.stdout, "@p_in(") orelse return error.NoParamDefine;
+        const return_line = lineContaining(run.stdout, "@r_out(") orelse return error.NoReturnDefine;
+
+        // The parameter form must appear literally in clang's signature.
+        if (std.mem.indexOf(u8, param_line, want_param) == null) {
+            std.debug.print(
+                "{s}: we predict parameter '{s}', clang emitted:\n  {s}\n",
+                .{ case.name, want_param, param_line },
+            );
+            return error.ParamClassDisagrees;
+        }
+
+        // Returns need one translation: we say "%cell_Name" where clang says
+        // "%struct.T", and we say "void" where clang says "void" plus sret.
+        if (std.mem.startsWith(u8, want_return, "%cell_")) {
+            if (std.mem.indexOf(u8, return_line, "%struct.T") == null) {
+                std.debug.print(
+                    "{s}: we predict a direct struct return, clang emitted:\n  {s}\n",
+                    .{ case.name, return_line },
+                );
+                return error.ReturnClassDisagrees;
+            }
+        } else if (std.mem.eql(u8, want_return, "void")) {
+            if (std.mem.indexOf(u8, return_line, "sret") == null) {
+                std.debug.print(
+                    "{s}: we predict an sret return, clang emitted:\n  {s}\n",
+                    .{ case.name, return_line },
+                );
+                return error.ReturnClassDisagrees;
+            }
+        } else if (std.mem.indexOf(u8, return_line, want_return) == null) {
+            std.debug.print(
+                "{s}: we predict return '{s}', clang emitted:\n  {s}\n",
+                .{ case.name, want_return, return_line },
+            );
+            return error.ReturnClassDisagrees;
+        }
+    }
+}
+
+fn lineContaining(haystack: []const u8, needle: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, haystack, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, needle) != null and
+            std.mem.startsWith(u8, line, "define")) return line;
+    }
+    return null;
 }
