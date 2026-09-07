@@ -20,15 +20,15 @@
  * ---------------------------------------------------------------------------
  * 1. Primitives
  * ---------------------------------------------------------------------------
- *   Cell         C type      note
- *   Int, Int64   int64_t
- *   Int32        int32_t
- *   UInt, UInt64 uint64_t
- *   Float, F64   double
- *   Float32      float
- *   Bool         bool        C11 stdbool, 1 byte
- *   Byte         uint8_t
- *   Unit         void        only as a return type
+ *   Cell            C type      note
+ *   Int, Int64      int64_t
+ *   Int32           int32_t
+ *   UInt, UInt64    uint64_t
+ *   Float, Float64  double
+ *   Float32         float
+ *   Bool            bool        C11 stdbool, 1 byte
+ *   Byte            uint8_t
+ *   Unit            void        only as a return type
  *
  * Primitives are always passed and returned by value, in every ownership mode.
  * That is forced by the language itself: examples/hello.cell declares
