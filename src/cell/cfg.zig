@@ -42,10 +42,12 @@
 //! or `false` condition still produces a real two-successor branch; this
 //! module has no opinion about which paths are reachable, only about what
 //! the source's control-flow keywords imply structurally. It does not
-//! deduplicate or eliminate unreachable blocks (a join after two arms that
-//! both diverge is still allocated, with zero predecessors and its own
-//! terminator) -- a shape a later pass may find and prune, not a defect
-//! this one introduces.
+//! eliminate an `if`/`match` join that ends up unreachable (every arm
+//! diverged) -- the block is still allocated -- but it does seal that join
+//! `.unreachable_` and refuses to hand it back as a live continuation
+//! (`Builder.deadJoinOrLive`), specifically so a `while` wrapped around it
+//! cannot mistake a block nothing can enter for the reachable end of its
+//! body and wire a phantom back edge into its condition block from it.
 
 const std = @import("std");
 const hir = @import("hir.zig");
@@ -181,6 +183,28 @@ const Builder = struct {
     fn seal(self: *Builder, block: u32, term: Terminator) void {
         std.debug.assert(self.blocks.items[block].term == null);
         self.blocks.items[block].term = term;
+    }
+
+    /// A join block (the merge point after an `if`/`match`) ends up with no
+    /// real predecessor exactly when every arm that could reach it
+    /// diverged first. That join must not be handed back as a live `cur`:
+    /// a caller such as `lowerWhile`'s back-edge check tests only whether
+    /// `cur` is non-null, not whether it is reachable, and would otherwise
+    /// wire a phantom edge from a block nothing can ever enter into a real,
+    /// live block (the loop's condition), corrupting its predecessor set.
+    ///
+    /// Sealing it `.unreachable_` here, rather than leaving it open for
+    /// whatever runs next to seal, keeps rule 1 (every block terminates
+    /// once) satisfied without ever exposing the dead block as `cur`. It is
+    /// excluded from `exits` for the same reason the match-panic block is:
+    /// nothing ever runs it, so it is not a real function exit a drop pass
+    /// should visit.
+    fn deadJoinOrLive(self: *Builder, join_id: u32) ?u32 {
+        if (self.blocks.items[join_id].preds.items.len == 0) {
+            self.seal(join_id, .unreachable_);
+            return null;
+        }
+        return join_id;
     }
 
     // -- statements -----------------------------------------------------
@@ -350,7 +374,7 @@ const Builder = struct {
             }
         }
 
-        self.cur = join_id;
+        self.cur = self.deadJoinOrLive(join_id);
     }
 
     fn lowerMatch(self: *Builder, me: anytype) CfgError!void {
@@ -364,13 +388,16 @@ const Builder = struct {
         var saw_catch_all = false;
 
         for (me.arms) |arm| {
-            // A guarded arm is never a catch-all: `_ if c` can still fail.
-            // This is the same rule `codegen.isDefaultArm` and both the LLVM
-            // and MLIR emitters already use to decide the same question.
-            const catch_all = arm.guard == null and switch (arm.pattern.kind) {
+            // The pattern alone matching everything is not the same fact as
+            // the arm being a catch-all: a guard can still reject it. Both
+            // booleans are needed, and both come straight from
+            // `codegen.isDefaultArm` / `llvmemit.zig` / `mlirmit.zig`, which
+            // compute exactly this pair for exactly this reason.
+            const pattern_matches_all = switch (arm.pattern.kind) {
                 .wildcard, .binding => true,
                 else => false,
             };
+            const catch_all = arm.guard == null and pattern_matches_all;
 
             const body_id = try self.newBlock();
 
@@ -378,6 +405,27 @@ const Builder = struct {
                 try self.addEdge(test_block, body_id);
                 self.seal(test_block, .goto);
                 saw_catch_all = true;
+            } else if (pattern_matches_all) {
+                // `_ if c => ...` (or a guarded binding): the pattern itself
+                // can never fail, so testing it would add a
+                // `test_block -> next_id` edge that no runtime value could
+                // ever take. The guard is the ONLY decision point here,
+                // exactly as the three existing backends emit it (their
+                // `pattern_matches_all` branch skips the comparison and
+                // branches on the guard alone).
+                const guard_id = try self.newBlock();
+                const next_id = try self.newBlock();
+                try self.addEdge(test_block, guard_id);
+                self.seal(test_block, .goto);
+
+                self.cur = guard_id;
+                try self.lowerExprValue(arm.guard.?);
+                if (self.cur) |gc| {
+                    try self.addEdge(gc, body_id);
+                    try self.addEdge(gc, next_id);
+                    self.seal(gc, .branch);
+                }
+                test_block = next_id;
             } else {
                 const next_id = try self.newBlock();
                 if (arm.guard) |g| {
@@ -422,7 +470,7 @@ const Builder = struct {
         // after a call that never returns.
         if (!saw_catch_all) self.seal(test_block, .unreachable_);
 
-        self.cur = join_id;
+        self.cur = self.deadJoinOrLive(join_id);
     }
 };
 
@@ -708,6 +756,56 @@ test "break targets the loop exit, continue targets the condition" {
     try std.testing.expectEqual(cond_b.id, else_b.succs[0]);
 }
 
+test "a fully-diverging if/else inside a loop leaves the condition block's preds free of the dead join" {
+    // Both arms break, so the if's own join is reachable from nowhere: the
+    // if never falls through to it. Before `deadJoinOrLive`, `lowerIf`
+    // still handed that dead join back as `cur`, and `lowerWhile`'s
+    // back-edge check (which only asks "is cur non-null", not "is cur
+    // reachable") wired a phantom back edge from it into the condition
+    // block, on top of the real edge from the loop's entry.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var brk1 = hir.Stmt{ .span = test_span, .kind = .brk };
+    var brk2 = hir.Stmt{ .span = test_span, .kind = .brk };
+    var then_body = oneStmtBlock(&brk1);
+    var else_body = oneStmtBlock(&brk2);
+    var if_cond = boolExpr(true);
+    const if_e = unitExpr(.{ .if_expr = .{
+        .cond = &if_cond,
+        .then_body = &then_body,
+        .else_body = &else_body,
+    } });
+    var loop_body = [_]hir.Stmt{exprStmt(if_e)};
+    var loop_cond = boolExpr(true);
+    var stmts = [_]hir.Stmt{
+        .{ .span = test_span, .kind = .{ .while_loop = .{ .cond = loop_cond, .body = &loop_body } } },
+    };
+    const f = testFn(&stmts);
+    _ = &loop_cond;
+
+    const g = (try build(a, &f)).?;
+    try assertPredsSuccsAgree(g);
+
+    const entry = findBlock(g, g.entry);
+    const cond_b = findBlock(g, entry.succs[0]);
+
+    // Every path through the body breaks; nothing loops back. Exactly one
+    // predecessor (the loop's one-time entry), never the dead join.
+    try std.testing.expectEqual(@as(usize, 1), cond_b.preds.len);
+    try std.testing.expectEqual(entry.id, cond_b.preds[0]);
+
+    // The dead join itself: allocated, sealed, unreachable, and excluded
+    // from exits, not silently dropped.
+    var dead_join: ?Block = null;
+    for (g.blocks) |b| {
+        if (b.term == .unreachable_ and b.preds.len == 0) dead_join = b;
+    }
+    try std.testing.expect(dead_join != null);
+    try std.testing.expect(!contains(g.exits, dead_join.?.id));
+}
+
 test "an early return inside a loop appears in exits" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -810,6 +908,54 @@ test "a guarded catch-all-looking arm still panics on fallthrough" {
         found_unreachable = true;
     };
     try std.testing.expect(found_unreachable);
+}
+
+test "a guarded catch-all-looking arm is a single decision point, not a phantom pattern-test edge" {
+    // `_ if c => ...`: the pattern can never fail, so a naive
+    // implementation that still tests it produces a
+    // `test_block -> panic_block` edge no runtime value can ever take, on
+    // top of the real `guard_block -> panic_block` edge. This checks the
+    // test block itself: it must `.goto` straight into the guard, not
+    // `.branch` around it.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var guard = boolExpr(false);
+    var arm_body = intExpr(1);
+    var arms = [_]hir.Arm{
+        .{
+            .pattern = .{ .kind = .wildcard, .span = test_span },
+            .guard = &guard,
+            .body = &arm_body,
+            .span = test_span,
+        },
+    };
+    var scrutinee = intExpr(0);
+    const match_e = unitExpr(.{ .match_expr = .{ .scrutinee = &scrutinee, .arms = &arms } });
+    var stmts = [_]hir.Stmt{exprStmt(match_e)};
+    const f = testFn(&stmts);
+
+    const g = (try build(a, &f)).?;
+    try assertPredsSuccsAgree(g);
+
+    // This match is the only statement, so the test block is the entry.
+    const test_b = findBlock(g, g.entry);
+    try std.testing.expectEqual(Terminator.goto, test_b.term);
+    try std.testing.expectEqual(@as(usize, 1), test_b.succs.len);
+
+    const guard_b = findBlock(g, test_b.succs[0]);
+    try std.testing.expectEqual(Terminator.branch, guard_b.term);
+
+    var panic: ?Block = null;
+    for (g.blocks) |b| if (b.term == .unreachable_) {
+        panic = b;
+    };
+    // The panic block's only predecessor is the guard. A direct edge from
+    // the test block (skipping the guard entirely) is exactly the phantom
+    // edge this test exists to rule out.
+    try std.testing.expectEqual(@as(usize, 1), panic.?.preds.len);
+    try std.testing.expectEqual(guard_b.id, panic.?.preds[0]);
 }
 
 test "an unguarded catch-all arm removes the panic block entirely" {
