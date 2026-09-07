@@ -1,7 +1,7 @@
 //! Borrow and move checker for Cell.
 //!
-//! Implements `docs/OWNERSHIP.md` rules R1, R2, R3, R3a, R4, R5, R6, R14 and
-//! the part of R15 the AST can still see. It is deliberately independent of
+//! Implements `docs/OWNERSHIP.md` rules R1, R2, R3, R3a, R4, R5, R6, R8, R14
+//! and the part of R15 the AST can still see. It is deliberately independent of
 //! `typecheck.zig`: it carries its own scope stack, its own signature table,
 //! and imports only `ast.zig` and `diag.zig`, so it neither depends on nor
 //! disturbs the type checker.
@@ -127,6 +127,11 @@ pub const Checker = struct {
     temp_loans: std.ArrayList(Loan) = .empty,
     open_blocks: std.ArrayList(OpenBlock) = .empty,
     next_binding_id: u32 = 0,
+    /// Set while checking a function whose return type is a `shared` or
+    /// `exclusive` borrow (R8). Cell has no lifetime parameters, so such a
+    /// signature is always an error; the flag also stops the body from being
+    /// reported a second time as a move-out-of-borrow.
+    fn_return_borrow: ?LoanKind = null,
 
     const ScopeMark = struct {
         bindings: usize,
@@ -182,13 +187,21 @@ pub const Checker = struct {
         }
         for (module.items) |*item| {
             switch (item.kind) {
-                .fn_def => |*f| try self.checkFn(f),
+                .fn_def => |*f| try self.checkFn(item.span, f),
+                .struct_def => |s| try self.checkStructFields(item.span, s),
                 else => {},
             }
         }
     }
 
-    fn checkFn(self: *Checker, f: *const ast.FnDef) Error!void {
+    fn checkFn(self: *Checker, span: Span, f: *const ast.FnDef) Error!void {
+        self.fn_return_borrow = null;
+        if (f.return_type) |*rt| {
+            if (typeIsBorrow(rt)) |kind| {
+                self.fn_return_borrow = kind;
+                try self.reportEscapingReturn(span, kind);
+            }
+        }
         const body = f.body orelse return;
 
         // A fresh scope per function. This is what keeps a parameter of one
@@ -283,6 +296,15 @@ pub const Checker = struct {
             .let => |*l| try self.checkLet(l, stmt.span),
             .expr => |*e| try self.checkExpr(e),
             .return_stmt => |*opt| {
+                if (self.fn_return_borrow != null) {
+                    // R8 already rejected the signature. Do not also move the
+                    // returned place, which would be a second diagnostic for
+                    // the same escape.
+                    if (opt.*) |*e| {
+                        if ((try self.placeOf(e)) == null) try self.checkExpr(e);
+                    }
+                    return;
+                }
                 if (opt.*) |*e| {
                     if (try self.placeOf(e)) |place| {
                         const note = try self.msg("'{s}' was moved here by returning it", .{place.display});
@@ -836,6 +858,48 @@ pub const Checker = struct {
 
     // ── diagnostics helpers ─────────────────────────────────────────────
 
+    fn reportEscapingReturn(self: *Checker, at: Span, kind: LoanKind) Error!void {
+        try self.diagnostics.err(
+            self.allocator,
+            at,
+            try self.msg(
+                "cannot return {s} {s} borrow: Cell has no lifetime annotations, so the borrow cannot be proven to outlive the call",
+                .{ if (kind == .exclusive) "an" else "a", kind.word() },
+            ),
+        );
+        try self.diagnostics.note(
+            self.allocator,
+            at,
+            "return an 'owned' or 'arc' value instead",
+        );
+    }
+
+    fn checkStructFields(self: *Checker, span: Span, s: ast.StructDef) Error!void {
+        for (s.fields) |f| {
+            const from_ann: ?LoanKind = switch (f.ownership) {
+                .shared => .shared,
+                .exclusive => .exclusive,
+                else => null,
+            };
+            const kind = from_ann orelse typeIsBorrow(&f.ty);
+            if (kind) |k| {
+                try self.diagnostics.err(
+                    self.allocator,
+                    span,
+                    try self.msg(
+                        "cannot store a {s} borrow in field '{s}': Cell has no lifetime annotations, so the borrow cannot be proven to outlive the value",
+                        .{ k.word(), f.name },
+                    ),
+                );
+                try self.diagnostics.note(
+                    self.allocator,
+                    span,
+                    "store an 'owned' or 'arc' value instead",
+                );
+            }
+        }
+    }
+
     fn reportUseAfterMove(self: *Checker, d: Dead, at: Span) Error!void {
         try self.diagnostics.err(
             self.allocator,
@@ -935,6 +999,19 @@ pub const Checker = struct {
 // ── free functions ──────────────────────────────────────────────────────
 
 const Ref = struct { kind: LoanKind, operand: *const ast.Expr };
+
+/// A `shared T` or `exclusive T` written in type position. `arc T` and
+/// `owned T` are not borrows, so they are not R8.
+fn typeIsBorrow(ty: *const ast.TypeExpr) ?LoanKind {
+    return switch (ty.*) {
+        .ref => |r| switch (r.ownership) {
+            .shared => .shared,
+            .exclusive => .exclusive,
+            else => null,
+        },
+        else => null,
+    };
+}
 
 /// `&x` and `&mut x`, the two call-site annotations the parser preserves.
 fn refKind(e: *const ast.Expr) ?Ref {
@@ -1609,4 +1686,96 @@ test "pathPrefix compares whole segments, not bytes" {
     try std.testing.expect(!pathPrefix("a", "ab"));
     try std.testing.expect(!pathPrefix("a.b", "a"));
     try std.testing.expect(!pathPrefix("le", "len"));
+}
+
+test "R8: a function may not return a shared borrow" {
+    try expectDiagnostics(prelude ++
+        \\pub fn peek(shared b: Buffer) -> shared Buffer {
+        \\    return b
+        \\}
+    ,
+        \\t.cell:9:1: error: cannot return a shared borrow: Cell has no lifetime annotations, so the borrow cannot be proven to outlive the call
+        \\t.cell:9:1: note: return an 'owned' or 'arc' value instead
+        \\
+    );
+}
+
+test "R8: a function may not return an exclusive borrow" {
+    try expectDiagnostics(prelude ++
+        \\pub fn leak(exclusive b: Buffer) -> exclusive Buffer {
+        \\    return b
+        \\}
+    ,
+        \\t.cell:9:1: error: cannot return an exclusive borrow: Cell has no lifetime annotations, so the borrow cannot be proven to outlive the call
+        \\t.cell:9:1: note: return an 'owned' or 'arc' value instead
+        \\
+    );
+}
+
+test "R8: a struct field may not store a shared borrow" {
+    try expectDiagnostics(
+        \\pub struct View {
+        \\    shared buf: Buffer
+        \\}
+    ,
+        \\t.cell:1:1: error: cannot store a shared borrow in field 'buf': Cell has no lifetime annotations, so the borrow cannot be proven to outlive the value
+        \\t.cell:1:1: note: store an 'owned' or 'arc' value instead
+        \\
+    );
+}
+
+test "R8 accepts returning an arc, which is not a borrow" {
+    try expectAccepted(
+        \\pub fn share_name(arc name: String) -> arc String {
+        \\    return name
+        \\}
+    );
+}
+
+// The three cases below pin decisions OWNERSHIP.md leaves open for a binding
+// that holds a borrow rather than a value. They are separated from the
+// parameter cases above because a `let exclusive e = &mut buf` is a local, so
+// it takes the `mutable` path in `checkAssign` that a parameter never reaches.
+
+test "a write through a let-bound exclusive borrow is allowed" {
+    // The borrow kind grants mutability of the referent, so the `let` being
+    // immutable does not block a write through it.
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    e.len = 1
+        \\    use_it(e)
+        \\}
+    );
+}
+
+test "rebinding a let-bound exclusive borrow still needs var" {
+    // Mutability of the referent is not mutability of the binding: pointing
+    // `e` at something else is an ordinary R14 immutable assignment.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let owned other = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    e = &mut other
+        \\}
+    ,
+        \\t.cell:13:5: error: cannot assign to immutable binding 'e'
+        \\t.cell:12:5: note: 'e' is declared immutable here
+        \\
+    );
+}
+
+test "R3: a let-bound exclusive borrow cannot be moved into an owned parameter" {
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    take(e)
+        \\}
+    ,
+        \\t.cell:12:10: error: cannot move out of 'e': it is an exclusive borrow, not an owner
+        \\
+    );
 }
