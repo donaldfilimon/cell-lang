@@ -12,6 +12,7 @@ pub const codegen = @import("cell/codegen.zig");
 pub const diag = @import("cell/diag.zig");
 pub const load_file = @import("cell/load.zig");
 pub const hir = @import("cell/hir.zig");
+pub const abi = @import("cell/abi.zig");
 pub const llvmemit = @import("cell/llvmemit.zig");
 pub const mlirmit = @import("cell/mlirmit.zig");
 
