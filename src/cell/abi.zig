@@ -64,6 +64,66 @@ fn alignUp(value: u32, alignment: u32) u32 {
     return (value + alignment - 1) / alignment * alignment;
 }
 
+/// A homogeneous float aggregate: every leaf is the same float type and there
+/// are at most four of them.
+pub const Hfa = struct {
+    count: u32,
+    /// The LLVM spelling of the leaf type: "double" or "float".
+    elem: []const u8,
+};
+
+/// AAPCS64's HFA rule, which is the part of this file most likely to be got
+/// wrong, and the part the reference implementation explicitly punted on and
+/// tagged a hazard.
+///
+/// Two things make it unlike every other rule here:
+///
+///   1. It IGNORES the 16-byte cutoff. A 32-byte four-double aggregate still
+///      goes in registers, as `[4 x double]`. Measured.
+///   2. Leaves are counted through nesting. Two structs of two doubles is an
+///      HFA of four, not of two. Counting top-level members instead would let
+///      a five-leaf aggregate be wrongly register-passed.
+///
+/// Only aggregates can be HFAs; a bare `double` is a scalar and is classified
+/// as one.
+pub fn hfaOf(m: *const hir.Module, ty: hir.Ty) ?Hfa {
+    const name = switch (ty) {
+        .struct_type => |n| n,
+        else => return null,
+    };
+    var elem: ?[]const u8 = null;
+    var count: u32 = 0;
+    if (!collectHfa(m, name, &elem, &count)) return null;
+    if (count == 0 or count > 4) return null;
+    return .{ .count = count, .elem = elem.? };
+}
+
+/// Walk the leaves. Returns false as soon as the aggregate cannot be an HFA,
+/// so a large non-HFA struct costs no more than its first disagreeing field.
+fn collectHfa(m: *const hir.Module, name: []const u8, elem: *?[]const u8, count: *u32) bool {
+    const s = m.findStruct(name) orelse return false;
+    if (s.fields.len == 0) return false;
+    for (s.fields) |f| {
+        switch (f.ty) {
+            .float, .float32 => {
+                const spelling: []const u8 = if (f.ty.tag() == .float) "double" else "float";
+                if (elem.*) |have| {
+                    if (!std.mem.eql(u8, have, spelling)) return false;
+                } else {
+                    elem.* = spelling;
+                }
+                count.* += 1;
+                if (count.* > 4) return false;
+            },
+            .struct_type => |inner| {
+                if (!collectHfa(m, inner, elem, count)) return false;
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -112,4 +172,66 @@ test "a struct is laid out with C padding rules" {
 test "an out-of-scope type has no layout yet" {
     const m = emptyModule();
     try std.testing.expect(layoutOf(&m, types.t_string) == null);
+}
+
+test "two doubles are an HFA of two" {
+    var fields = [_]hir.Field{
+        .{ .name = "x", .ty = types.t_float, .ownership = .copy },
+        .{ .name = "y", .ty = types.t_float, .ownership = .copy },
+    };
+    var structs = [_]hir.Struct{.{ .name = "Point", .fields = &fields, .is_public = true }};
+    const m = testModule(&structs);
+    const h = hfaOf(&m, .{ .struct_type = "Point" }).?;
+    try std.testing.expectEqual(@as(u32, 2), h.count);
+    try std.testing.expectEqualStrings("double", h.elem);
+}
+
+test "a mixed aggregate is not an HFA even at 16 bytes" {
+    // Measured: clang passes {i64, double} as [2 x i64], not [2 x double].
+    var fields = [_]hir.Field{
+        .{ .name = "a", .ty = types.t_int, .ownership = .copy },
+        .{ .name = "b", .ty = types.t_float, .ownership = .copy },
+    };
+    var structs = [_]hir.Struct{.{ .name = "Mixed", .fields = &fields, .is_public = true }};
+    const m = testModule(&structs);
+    try std.testing.expect(hfaOf(&m, .{ .struct_type = "Mixed" }) == null);
+}
+
+test "HFA leaf members are counted through nesting, not at the top level" {
+    // Two structs of two doubles each is an HFA of FOUR, not of two. Counting
+    // top-level members would misclassify this, and a five-leaf aggregate
+    // would then be wrongly register-passed.
+    var inner_fields = [_]hir.Field{
+        .{ .name = "x", .ty = types.t_float, .ownership = .copy },
+        .{ .name = "y", .ty = types.t_float, .ownership = .copy },
+    };
+    var outer_fields = [_]hir.Field{
+        .{ .name = "a", .ty = .{ .struct_type = "Pair" }, .ownership = .copy },
+        .{ .name = "b", .ty = .{ .struct_type = "Pair" }, .ownership = .copy },
+    };
+    var structs = [_]hir.Struct{
+        .{ .name = "Pair", .fields = &inner_fields, .is_public = true },
+        .{ .name = "Quad", .fields = &outer_fields, .is_public = true },
+    };
+    const m = testModule(&structs);
+    const h = hfaOf(&m, .{ .struct_type = "Quad" }).?;
+    try std.testing.expectEqual(@as(u32, 4), h.count);
+}
+
+test "more than four leaf members is not an HFA" {
+    var fields = [_]hir.Field{
+        .{ .name = "a", .ty = types.t_float, .ownership = .copy },
+        .{ .name = "b", .ty = types.t_float, .ownership = .copy },
+        .{ .name = "c", .ty = types.t_float, .ownership = .copy },
+        .{ .name = "d", .ty = types.t_float, .ownership = .copy },
+        .{ .name = "e", .ty = types.t_float, .ownership = .copy },
+    };
+    var structs = [_]hir.Struct{.{ .name = "Five", .fields = &fields, .is_public = true }};
+    const m = testModule(&structs);
+    try std.testing.expect(hfaOf(&m, .{ .struct_type = "Five" }) == null);
+}
+
+test "a bare float is not an HFA; only aggregates are" {
+    const m = emptyModule();
+    try std.testing.expect(hfaOf(&m, types.t_float) == null);
 }
