@@ -400,7 +400,13 @@ pub const Checker = struct {
 
     fn checkCall(self: *Checker, span: ast.Span, c: *const CallExpr) CheckError!Type {
         const callee = try self.checkExpr(c.callee);
-        for (c.args) |*a| _ = try self.checkExpr(a);
+
+        // Each argument is walked exactly once and its type kept. Recomputing
+        // it later from the node would have to reimplement `checkExpr` without
+        // its diagnostics, and every shape that reimplementation missed would
+        // silently become `unknown`, which is compatible with any parameter.
+        const arg_types = try self.arena().alloc(Type, c.args.len);
+        for (c.args, 0..) |*a, i| arg_types[i] = try self.checkExpr(a);
 
         if (callee.isUnknown()) return types.t_unknown;
         const f = switch (callee) {
@@ -418,11 +424,7 @@ pub const Checker = struct {
             return f.ret.*;
         }
 
-        for (f.params, c.args, 0..) |want, *arg, i| {
-            // The argument was already walked above, which is where its own
-            // diagnostics came from. `exprType` recovers its type without
-            // emitting them a second time.
-            const actual = try self.exprType(arg);
+        for (f.params, c.args, arg_types, 0..) |want, *arg, actual, i| {
             if (!accepts(want, actual, arg)) {
                 try self.errf(arg.span, "argument {d} has type {s}, expected {s}", .{
                     i + 1,
@@ -571,50 +573,6 @@ pub const Checker = struct {
             }
         }
         return .{ .struct_type = def.name };
-    }
-
-    /// The type of an already-walked expression, recovered without emitting its
-    /// diagnostics again. Only the shapes an argument commonly takes are
-    /// handled; anything else falls back to `unknown`, which is compatible with
-    /// every parameter and so never invents an argument-type error.
-    fn exprType(self: *Checker, expr: *const ast.Expr) CheckError!Type {
-        return switch (expr.kind) {
-            .ident => |name| if (self.lookup(name)) |sym| sym.ty else types.t_unknown,
-            .int => types.t_int,
-            .float => types.t_float,
-            .string => types.t_string,
-            .bool => types.t_bool,
-            .unary => |u| switch (u.op) {
-                .ref_shared, .ref_exclusive, .neg => try self.exprType(u.operand),
-                .not => types.t_bool,
-            },
-            .struct_lit => |sl| if (self.structs.contains(sl.name))
-                Type{ .struct_type = sl.name }
-            else
-                types.t_unknown,
-            .call => |c| blk: {
-                const callee = try self.exprType(c.callee);
-                break :blk switch (callee) {
-                    .func => |f| f.ret.*,
-                    else => types.t_unknown,
-                };
-            },
-            .field => |f| blk: {
-                const base = try self.exprType(f.base);
-                const struct_name = switch (base) {
-                    .struct_type => |n| n,
-                    else => break :blk types.t_unknown,
-                };
-                const def = self.structs.get(struct_name) orelse break :blk types.t_unknown;
-                for (def.fields) |field| {
-                    if (std.mem.eql(u8, field.name, f.name)) {
-                        break :blk try self.resolveType(&field.ty);
-                    }
-                }
-                break :blk types.t_unknown;
-            },
-            else => types.t_unknown,
-        };
     }
 
     fn listOf(self: *Checker, elem: Type) CheckError!Type {
@@ -1322,4 +1280,32 @@ test "one unresolved name does not cascade into its uses" {
     );
     try t.expectCount(1);
     try t.expectDiag(0, .err, 2, 12, "unknown identifier 'missing'");
+}
+
+test "a compound argument expression is type checked, not skipped" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn takes(copy a: Int) -> Int {
+        \\    return a
+        \\}
+        \\pub fn f(copy x: Float, copy y: Float) -> Int {
+        \\    return takes(x + y)
+        \\}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 5, 18, "argument 1 has type Float, expected Int");
+}
+
+test "a list literal argument is type checked against the parameter" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn takes(shared xs: [Byte]) -> Int;
+        \\pub fn f() -> Int {
+        \\    return takes([true])
+        \\}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 3, 18, "argument 1 has type [Bool], expected [Byte]");
 }
