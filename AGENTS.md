@@ -81,9 +81,9 @@ designed.
 - **Codegen.** `if` / `else`, `match`, blocks, struct literals, list literals,
   and mangled calls lower to C. `cell emit examples/hello.cell` compiles with
   `cc -c`; linked against `runtime/cell_rt.c` it prints `42`.
-- The module and body file system (`.cell`/`.cel` declare, `.body`/`.bod`
-  implement) is specified and absent. The compiler inspects no extension at all:
-  `cell check` accepts `.txt` and a file with no extension identically.
+- Stem pairing is implemented: a `.body`/`.bod` file is checked with its
+  same-directory `.cell`/`.cel` stem-mate. A body with no module is an error.
+  `.txt` and extensionless paths still load as a standalone module.
 
 `docs/SPEC.md` section 12 is a construct-by-construct status index, counted
 rather than estimated. Cite it instead of guessing, and update it when you

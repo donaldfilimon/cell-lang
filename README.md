@@ -63,9 +63,9 @@ files, `.body` and `.bod` are body files, and a body is paired to its module by
 filename stem. `docs/SPEC.md` section 1.2 is normative, and
 `examples/pairing/` is a worked example.
 
-This is **designed, not implemented**. The compiler has no notion of a file
-extension at all: `cell check` accepts `.txt` and a file with no extension just
-as readily, and treats every input as one standalone module.
+Stem pairing is implemented: `cell check examples/pairing/geometry.body`
+resolves names from `geometry.cell`. A body with no stem-mate is an error.
+`.txt` and extensionless paths still load as a standalone module.
 
 ## Requirements
 
@@ -121,9 +121,9 @@ arc boxing exists.
 Ownership rules R2 (use-after-move), R3 (move-out-of-borrow), R5 (shared XOR
 exclusive), R8 (escaping borrow), and R14 (immutable assignment, including
 fields) are enforced. Call-site ownership prefixes are still discarded (R15).
-Retain/release for `arc`, loops, generics, `Result<T,E>`, enum payloads, and
-`.cell`/`.body` stem pairing are still designed. See `docs/SPEC.md` section 12
-and `docs/OWNERSHIP.md`.
+Retain/release for `arc`, loops, generics, `Result<T,E>`, and enum payloads
+are still designed. `.cell`/`.cel` modules pair with `.body`/`.bod` by stem.
+See `docs/SPEC.md` section 12 and `docs/OWNERSHIP.md`.
 
 There are no loops of any kind. `while` is not a keyword, so a loop-shaped
 program is a call plus a discarded block; today `cell check` rejects

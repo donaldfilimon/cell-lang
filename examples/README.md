@@ -118,10 +118,8 @@ accepted:
 that `docs/SPEC.md` section 1.2 specifies for the four recognized extensions
 (`.cell`, `.cel`, `.body`, `.bod`).
 
-`geometry.cell` passes. **`geometry.body` fails**, with
-`unknown identifier 'Quadrant'`, and that failure is the point: every name it
-needs is declared in its stem-mate and nothing brings them into scope, because
-there is no pairing and no module resolution. The compiler has no notion of a
-file extension at all, so `cell check` accepts `.txt` and a file with no
-extension just as readily. `geometry.body` starting to pass is the signal that
-stem pairing has been implemented.
+Both `geometry.cell` and `geometry.body` pass `cell check`. The body is paired
+with the module by filename stem in the same directory, so `Point` and
+`Quadrant` resolve. A `.body` file with no `.cell`/`.cel` stem-mate is an
+error that names the body and the missing module. `.cel` is an alias of
+`.cell`. `.txt` and extensionless paths still load as a standalone module.

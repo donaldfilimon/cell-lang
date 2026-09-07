@@ -10,6 +10,11 @@ pub const typecheck = @import("cell/typecheck.zig");
 pub const borrowck = @import("cell/borrowck.zig");
 pub const codegen = @import("cell/codegen.zig");
 pub const diag = @import("cell/diag.zig");
+pub const load_file = @import("cell/load.zig");
+
+pub const load = load_file.load;
+pub const Loaded = load_file.Loaded;
+pub const classify = load_file.classify;
 
 pub const Version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 0 };
 
@@ -55,6 +60,23 @@ pub fn check(
 pub fn emit(allocator: std.mem.Allocator, module: *const ast.Module, writer: *Io.Writer) !void {
     var gen = codegen.Generator.init(allocator, writer);
     try gen.emitModule(module);
+}
+
+/// Load `path` relative to `dir` (pairing a body with its stem-mate) and run
+/// the shipped checker. This is the function the CLI uses after it has a path.
+pub fn loadAndCheck(
+    allocator: std.mem.Allocator,
+    io: Io,
+    dir: Io.Dir,
+    path: []const u8,
+    writer: *Io.Writer,
+) !ast.Module {
+    var loaded = load(allocator, io, dir, path, writer) catch |err| switch (err) {
+        error.MissingModule, error.AmbiguousModule => return error.TypeError,
+        else => |e| return e,
+    };
+    try check(allocator, &loaded.module, loaded.source, writer);
+    return loaded.module;
 }
 
 test {
@@ -174,4 +196,114 @@ test "shipped check rejects assignment through an immutable field" {
         \\    b.len = 1
         \\}
     , "cannot assign to immutable binding 'b'");
+}
+
+fn loadCheckPath(dir: Io.Dir, path: []const u8) !struct { text: []u8, failed: bool, buf: []u8, arena: std.heap.ArenaAllocator } {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    errdefer arena.deinit();
+    const buf = try std.testing.allocator.alloc(u8, 16 * 1024);
+    errdefer std.testing.allocator.free(buf);
+    var w = Io.Writer.fixed(buf);
+    var failed = false;
+    _ = loadAndCheck(arena.allocator(), std.testing.io, dir, path, &w) catch |err| switch (err) {
+        error.TypeError => failed = true,
+        else => return err,
+    };
+    return .{ .text = w.buffered(), .failed = failed, .buf = buf, .arena = arena };
+}
+
+test "shipped load+check pairs a body with its module so a module-only name resolves" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "geometry.cell",
+        .data =
+            \\pub struct Point { copy x: Float64 copy y: Float64 }
+            \\pub enum Quadrant { First, Second, Third, Fourth }
+            \\pub fn origin() -> Point;
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "geometry.body",
+        .data =
+            \\pub fn origin() -> Point {
+            \\    return Point { x: 0.0, y: 0.0 }
+            \\}
+            \\pub fn q() -> Quadrant {
+            \\    return Quadrant.First
+            \\}
+        ,
+    });
+    var result = try loadCheckPath(tmp.dir, "geometry.body");
+    defer std.testing.allocator.free(result.buf);
+    defer result.arena.deinit();
+    if (result.failed) {
+        std.debug.print("paired body failed check:\n{s}\n", .{result.text});
+        return error.TestUnexpectedDiagnostic;
+    }
+}
+
+test "shipped load+check rejects a body with no module file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "orphan.body",
+        .data = "pub fn f() { }\n",
+    });
+    var result = try loadCheckPath(tmp.dir, "orphan.body");
+    defer std.testing.allocator.free(result.buf);
+    defer result.arena.deinit();
+    try std.testing.expect(result.failed);
+    if (std.mem.indexOf(u8, result.text, "body file 'orphan.body' has no module file") == null) {
+        std.debug.print("wanted missing-module diagnostic, got:\n{s}\n", .{result.text});
+        return error.TestExpectedDiagnostic;
+    }
+    if (std.mem.indexOf(u8, result.text, "expected orphan.cell or orphan.cel") == null) {
+        std.debug.print("wanted expected module names, got:\n{s}\n", .{result.text});
+        return error.TestExpectedDiagnostic;
+    }
+}
+
+test "shipped load+check accepts a .cel module alias" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "hello.cel",
+        .data =
+            \\pub fn add(shared a: Int, shared b: Int) -> Int {
+            \\    return a + b
+            \\}
+        ,
+    });
+    var result = try loadCheckPath(tmp.dir, "hello.cel");
+    defer std.testing.allocator.free(result.buf);
+    defer result.arena.deinit();
+    if (result.failed) {
+        std.debug.print(".cel module failed check:\n{s}\n", .{result.text});
+        return error.TestUnexpectedDiagnostic;
+    }
+}
+
+test "shipped load+check pairs a .body with a .cel stem-mate" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pair.cel",
+        .data = "pub struct Box { copy n: Int }\npub fn make() -> Box;\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pair.body",
+        .data = "pub fn make() -> Box { return Box { n: 1 } }\n",
+    });
+    var result = try loadCheckPath(tmp.dir, "pair.body");
+    defer std.testing.allocator.free(result.buf);
+    defer result.arena.deinit();
+    if (result.failed) {
+        std.debug.print(".cel stem-mate failed:\n{s}\n", .{result.text});
+        return error.TestUnexpectedDiagnostic;
+    }
 }

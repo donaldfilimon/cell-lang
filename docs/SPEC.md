@@ -144,7 +144,8 @@ placeholder codegen. Measured against a binary built with `-Dswift=false`:
   lower to real C. `cell emit examples/hello.cell` compiles with `cc -c`.
   Linked against `runtime/cell_rt.c` it prints `42`.
 - Unknown type names, hex/underscore/exponent literals, loops, generics,
-  `Result<T,E>`, enum payloads, and stem pairing are unchanged.
+  `Result<T,E>`, enum payloads are unchanged. Stem pairing of `.cell`/`.cel`
+  with `.body`/`.bod` is implemented (section 1.2).
 
 Section 12 rows that this delta moved are retagged below. Unshipped rows stay
 as they were.
@@ -198,7 +199,12 @@ four spellings.
 
 ### 1.2 Module and body pairing
 
-**Status: designed, not implemented.**
+**Status: implemented.** A body file is paired with a same-directory `.cell` or
+`.cel` stem-mate before check. `cell check examples/pairing/geometry.body`
+resolves `Point` and `Quadrant` from `geometry.cell` and exits 0. A body with
+no stem-mate is an error naming the body and the missing module. A module file
+with no body remains legal. Declaration/definition signature matching (rules
+8, 10, 11) is still designed.
 
 1. A **module file** (`.cell`/`.cel`) may contain declarations, definitions, or
    both. Every example under `examples/` is a module file that does both, and
@@ -249,18 +255,10 @@ four spellings.
     above. The split is a filing convention the compiler enforces, not a
     restriction on what one file may say.
 
-**What the compiler does today: nothing, and there is nothing to retrofit.**
-`src/main.zig` reads `args[2]` and passes it to `Io.Dir.cwd().readFileAlloc`
-with no extension inspection anywhere. Measured: `cell check` accepts `.bod`,
-`.cel`, `.txt`, and a file with no extension at all, and treats every one of
-them identically as a single standalone module. The only places the string
-`.cell` appears outside test fixtures are the usage text in `src/main.zig` and
-the `examples` step in `build.zig`. Neither the lexer nor the parser has any
-notion of a file extension, so this section describes work to add, not
-assumptions to unwind.
-
-`examples/pairing/` holds a worked declaration-and-body pair. Both files parse
-individually today; nothing links them.
+`src/cell/load.zig` classifies the path, finds the stem-mate, and merges
+module declarations into the body unit. `cell check` / `dump` / `emit` all go
+through that load. `.txt` and extensionless paths still load as a standalone
+module. `examples/pairing/` is the worked pair.
 
 ### 1.3 Compilation unit
 
@@ -1718,9 +1716,9 @@ records the missing lowering.
 | Construct | Status |
 |---|---|
 | Single-file compilation | implemented |
-| `.cell` / `.cel` module files | designed, not implemented |
-| `.body` / `.bod` body files | designed, not implemented |
-| Stem-based module/body pairing | designed, not implemented |
+| `.cell` / `.cel` module files | implemented |
+| `.body` / `.bod` body files | implemented |
+| Stem-based module/body pairing | implemented |
 | Diagnostic record, bag, levels and spans | implemented |
 | Caret rendering with the source line | implemented |
 | Parser records a span and a message on failure | implemented |

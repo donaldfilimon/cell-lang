@@ -1,10 +1,8 @@
 // MODULE FILE. Pairs with geometry.body by filename stem.
 //
-// Status: DESIGNED, NOT IMPLEMENTED. This file and geometry.body each parse
-// individually and each pass `cell check`, but NOTHING LINKS THEM. The
-// compiler has no notion of a file extension at all: `cell check` accepts
-// `.bod`, `.cel`, `.txt`, and a file with no extension, and treats every one
-// as a standalone module. Measured. See docs/SPEC.md section 1.2.
+// Status: implemented. `cell check` on this file passes as a standalone
+// module. `cell check examples/pairing/geometry.body` pairs by stem and
+// resolves Point / Quadrant / the function declarations from here.
 //
 // A module file may declare, define, or both. This one only declares, which is
 // the header-shaped use the split exists for.

@@ -55,30 +55,41 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
     const path = args[2];
-    const source = try readFile(arena, io, path);
+    const cwd = Io.Dir.cwd();
 
     if (std.mem.eql(u8, cmd, "check")) {
-        var module = try cell.compile(arena, source, path);
+        var buf: [4096]u8 = undefined;
+        var fw: Io.File.Writer = .init(.stderr(), io, &buf);
+        var module = loadAndReport(arena, io, cwd, path, &fw) catch |err| {
+            if (err == error.TypeError) std.process.exit(1);
+            return err;
+        };
         defer module.deinit(arena);
-        try checkAndReport(arena, io, &module, source);
         std.debug.print("ok: {s} ({d} items)\n", .{ path, module.items.len });
         return;
     }
 
     if (std.mem.eql(u8, cmd, "dump")) {
-        var module = try cell.compile(arena, source, path);
-        defer module.deinit(arena);
         var buf: [4096]u8 = undefined;
         var fw: Io.File.Writer = .init(.stderr(), io, &buf);
-        try module.dump(&fw.interface);
+        var loaded = cell.load(arena, io, cwd, path, &fw.interface) catch |err| {
+            try fw.interface.flush();
+            if (err == error.MissingModule or err == error.AmbiguousModule) std.process.exit(1);
+            return err;
+        };
+        try loaded.module.dump(&fw.interface);
         try fw.interface.flush();
         return;
     }
 
     if (std.mem.eql(u8, cmd, "emit")) {
-        var module = try cell.compile(arena, source, path);
+        var err_buf: [4096]u8 = undefined;
+        var err_fw: Io.File.Writer = .init(.stderr(), io, &err_buf);
+        var module = loadAndReport(arena, io, cwd, path, &err_fw) catch |err| {
+            if (err == error.TypeError) std.process.exit(1);
+            return err;
+        };
         defer module.deinit(arena);
-        try checkAndReport(arena, io, &module, source);
         var buf: [8192]u8 = undefined;
         var fw: Io.File.Writer = .init(.stdout(), io, &buf);
         try cell.emit(arena, &module, &fw.interface);
@@ -91,23 +102,22 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(1);
 }
 
-/// Typecheck and render the diagnostics to stderr, exiting 1 when any of them
-/// is an error. Exiting here rather than propagating keeps the rendered caret
-/// as the last thing the user sees, instead of a Zig error trace after it.
-fn checkAndReport(
+/// Load (including stem pairing) and typecheck, rendering diagnostics to
+/// `fw`. Returns `error.TypeError` when the bag has errors or pairing fails,
+/// so the caller can exit 1 without a Zig stack trace after the caret.
+fn loadAndReport(
     allocator: std.mem.Allocator,
     io: Io,
-    module: *cell.ast.Module,
-    source: []const u8,
-) !void {
-    var buf: [4096]u8 = undefined;
-    var fw: Io.File.Writer = .init(.stderr(), io, &buf);
-    cell.check(allocator, module, source, &fw.interface) catch |err| {
+    dir: Io.Dir,
+    path: []const u8,
+    fw: *Io.File.Writer,
+) !cell.ast.Module {
+    const module = cell.loadAndCheck(allocator, io, dir, path, &fw.interface) catch |err| {
         try fw.interface.flush();
-        if (err == error.TypeError) std.process.exit(1);
         return err;
     };
     try fw.interface.flush();
+    return module;
 }
 
 fn printUsage(io: Io) !void {
@@ -115,10 +125,6 @@ fn printUsage(io: Io) !void {
     var fw: Io.File.Writer = .init(.stderr(), io, &buf);
     try fw.interface.writeAll(Usage);
     try fw.interface.flush();
-}
-
-fn readFile(allocator: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
-    return try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
 }
 
 test "cli smoke" {
