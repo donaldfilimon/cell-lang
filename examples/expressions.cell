@@ -16,9 +16,9 @@
 // There is no %, no bitwise operator, no shift, and no compound assignment.
 // See docs/SPEC.md section 5.
 
-pub fn mixed(shared a: Int, shared b: Int, shared c: Int) -> Bool {
-    // Emits: (((((a + (b * c)) - (a / b)) == c) && (a < b)) || !c)
-    return a + b * c - a / b == c && a < b || !c
+pub fn mixed(shared a: Int, shared b: Int, shared c: Int, shared f: Bool) -> Bool {
+    // Emits: (((((a + (b * c)) - (a / b)) == c) && (a < b)) || !f)
+    return a + b * c - a / b == c && a < b || !f
 }
 
 pub fn left_associative(shared a: Int, shared b: Int) -> Int {
@@ -38,9 +38,7 @@ pub fn logical_not(shared a: Bool) -> Bool {
     return !a
 }
 
-// Comparison operators are all one level and left associative, so this parses
-// as ((a < b) < c) rather than being rejected. Chained comparison is specified
-// as an error in SPEC 5.1 and is not implemented.
-pub fn chained(shared a: Int, shared b: Int, shared c: Int) -> Bool {
-    return a < b < c
-}
+// Comparison operators are all one level and left associative, so `a < b < c`
+// parses as `((a < b) < c)`. It is now REJECTED, by the type checker rather
+// than the parser: `<` cannot be applied to Bool and Int. See
+// examples/rejected/chained_comparison.cell.

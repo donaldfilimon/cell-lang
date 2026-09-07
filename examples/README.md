@@ -15,7 +15,7 @@ Verified against commit `9fb12af` with a binary built by
 | `examples/*.cell` | must **pass** `cell check` (exit 0) | a regression in the parser or checker |
 | `examples/future/` | must **fail** `cell check` | the parser grew a feature: move the file up and rewrite its header |
 | `examples/rejected/` | each file declares `// EXPECT: currently-accepted` or `// EXPECT: currently-rejected` | a checker rule landed, or one regressed |
-| `examples/pairing/` | each file must **pass** individually; the pairing itself is unimplemented | see `docs/SPEC.md` section 1.2 |
+| `examples/pairing/` | `geometry.cell` must **pass**; `geometry.body` must **fail** until stem pairing exists | `geometry.body` passing means the pairing landed |
 
 ## Running the checks
 
@@ -117,6 +117,12 @@ something other than what it says:
 
 `geometry.cell` and `geometry.body` show the declaration/implementation split
 that `docs/SPEC.md` section 1.2 specifies for the four recognized extensions
-(`.cell`, `.cel`, `.body`, `.bod`). Both files parse individually. Nothing
-links them, and the compiler has no notion of a file extension: `cell check`
-accepts `.txt` and a file with no extension just as readily.
+(`.cell`, `.cel`, `.body`, `.bod`).
+
+`geometry.cell` passes. **`geometry.body` fails**, with
+`unknown identifier 'Quadrant'`, and that failure is the point: every name it
+needs is declared in its stem-mate and nothing brings them into scope, because
+there is no pairing and no module resolution. The compiler has no notion of a
+file extension at all, so `cell check` accepts `.txt` and a file with no
+extension just as readily. `geometry.body` starting to pass is the signal that
+stem pairing has been implemented.

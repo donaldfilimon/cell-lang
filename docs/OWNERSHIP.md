@@ -3,7 +3,7 @@
 Normative rules for the Cell borrow checker, written to be implemented directly
 from this file.
 
-**Snapshot: commit `9fb12af`, 2026-09-06.** The compiler is under active
+**Snapshot: commit `9fb12af`, 2026-09-06, with corrections through `8dd5673`.** The compiler is under active
 rewrite; `src/` moved twice while this was being written. Every "blocked on"
 note below was re-verified against `9fb12af`, and several notes that an earlier
 draft carried are now **unblocked**, because the parser gained field-access
@@ -77,12 +77,16 @@ not their bug.
 
 ### 0.4 What the checker walks
 
-The checker needs a scope stack that `Checker` does not have. It uses a single
-module-wide `std.StringHashMap` and never pushes or pops, so a `let x` in one
-function is visible in every later function. Measured: a file where `a()`
-declares an immutable `x` and `b()` assigns to an otherwise undeclared `x`
-reports the immutability error, which is the right diagnostic for the wrong
-reason. R13.4 makes fixing this a prerequisite for every rule here.
+**This prerequisite is now met.** As of commit `8dd5673` the checker has a
+scope stack. Re-measured: a file where `a()` declares an immutable `x` and
+`b()` assigns to an otherwise undeclared `x` now reports
+`unknown identifier 'x'`, where before `8dd5673` it reported the immutability
+error, which was the right diagnostic for the wrong reason.
+
+Everything below was written against the older, module-wide symbol table, and
+R13.4 named fixing it as the blocking prerequisite. It no longer blocks. Verify
+the scope stack's shape against `src/cell/typecheck.zig` before building on it,
+rather than against this paragraph.
 
 ---
 
@@ -433,11 +437,10 @@ documentation rather than implying `copy` is safe.
 
    > `err: 'grow' body does not match its declaration: parameter 1 is declared 'exclusive Buffer' but defined 'owned Buffer'`
 
-4. **Prerequisite: scope the symbol table.** The checker must push a scope per
-   function and per block. Today one map is shared across the whole module
-   (0.4), so every rule in this file would produce false positives and false
-   negatives across function boundaries. **Fix scoping before implementing any
-   other rule here.**
+4. **Prerequisite: scope the symbol table. DONE as of `8dd5673`.** The checker
+   must push a scope per function and per block, because a module-wide map
+   produces false positives and false negatives across function boundaries.
+   Measured as fixed in 0.4. This no longer blocks the rules below.
 
 ### R14. Assignment requires a mutable place
 
@@ -540,10 +543,9 @@ of any kind**, and no document in this repository should say otherwise.
 Ordered so each step is testable and none depends on a later one. Steps marked
 *(front end)* need a change under `src/cell/` outside the checker.
 
-1. **Prerequisites.** Scope the symbol table per function and per block
-   (R13.4). Fix R14's message, note, and rendering. Wire `Parser.reportInto`
-   into `root.compile` so parse errors reach the user at all (SPEC 11).
-   None of these change the language.
+1. **Prerequisites.** Scoping (R13.4) is **done** as of `8dd5673`. What remains:
+   fix R14's message, note, and rendering, and confirm parse errors reach the
+   user (SPEC 11 and 0.5). None of these change the language.
 2. **R1, R2, R3, R3a**: moves and use-after-move for whole bindings. Highest
    value, and needs only a per-place live/dead flag plus the spans that already
    exist. `examples/rejected/use_after_move.cell` is the first test.

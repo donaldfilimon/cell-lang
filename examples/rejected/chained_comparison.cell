@@ -1,0 +1,15 @@
+// EXPECT: currently-rejected
+// Violates: docs/SPEC.md section 5.1 (chained comparison).
+//
+// All six comparison operators sit at one precedence level and associate left,
+// so `a < b < c` parses as `((a < b) < c)`. The parser accepts it. The type
+// checker rejects it:
+//   error: operator '<' cannot be applied to Bool and Int
+//
+// That is the right outcome by the right mechanism: the specification calls for
+// chained comparison to be an error, and a type rule delivers it without the
+// parser needing a special case.
+
+pub fn chained(shared a: Int, shared b: Int, shared c: Int) -> Bool {
+    return a < b < c
+}

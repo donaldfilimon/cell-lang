@@ -1,4 +1,4 @@
-// EXPECT: currently-accepted
+// EXPECT: currently-rejected
 // Violates: docs/SPEC.md sections 2.6 and 2.7 (literal forms).
 //
 // The lexer reads decimal digits and stops. So:
@@ -6,12 +6,17 @@
 //   1_000  lexes as the integer 1 followed by the identifier _000
 //   1e9    lexes as the integer 1 followed by the identifier e9
 //
-// Every one of these passes `cell check` with exit 0 and emits a DIFFERENT
-// NUMBER than the one written. Measured: `let copy a = 0x1F` emits
-// `int64_t a = 0; x1F;`.
+// These are now REJECTED, and it is worth being precise about why, because it
+// is not the rule this file was written to test. The checker reports
+//   error: unknown identifier 'x1F'
+// It caught the second token, not the malformed literal. The lexer still splits
+// `0x1F` into two tokens and still assigns `a` the value 0; nothing yet knows
+// that `0x1F` was meant to be one number. Before name resolution landed, every
+// line here passed with exit 0 and emitted `int64_t a = 0; x1F;`.
 //
-// A conforming implementation must either support these forms or reject them.
-// Silently producing a different number is not an option.
+// So the diagnostic is accidental cover, not the rule. A conforming
+// implementation must either support these literal forms or reject them AS
+// literals, with a message that names the real problem.
 
 pub fn f() {
     let copy a = 0x1F

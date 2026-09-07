@@ -55,9 +55,12 @@ pub fn swift_probe() -> Int32;
 /// Runtime:  void cell_assert(bool cond)
 pub fn assert(copy cond: Bool);
 
-// Caveat on all five: Cell emits `f()` where C wants `f(void)`. In C17 an empty
-// parameter list is an unprototyped declaration, not a zero-argument one. That
-// is a real defect in codegen, recorded in SPEC section 10.1.
+// Caveat on all five: Cell emits `f()` where the runtime header writes
+// `f(void)`. Measured with clang: this COMPILES, at -std=c11 and -std=c17,
+// with no diagnostic, and the mismatch is only reported under
+// `-Wstrict-prototypes`, as "a function declaration without a prototype is
+// deprecated in all versions of C". So it is a portability wart rather than
+// the hard error an older note here claimed. SPEC section 10.1 records it.
 
 // ---------------------------------------------------------------------------
 // Group 2: the runtime symbol exists, the emitted prototype does not match it

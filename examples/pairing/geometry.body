@@ -1,7 +1,15 @@
 // BODY FILE. Implements geometry.cell.
 //
-// Status: DESIGNED, NOT IMPLEMENTED. Nothing pairs this with geometry.cell.
-// It parses on its own because the CLI ignores extensions entirely.
+// Status: DESIGNED, NOT IMPLEMENTED, and this file now FAILS `cell check`,
+// which is the clearest evidence there is that the pairing does not exist:
+//   examples/pairing/geometry.body:22:31: error: unknown identifier 'Quadrant'
+// Every name it needs is declared in geometry.cell, and nothing brings them
+// into scope, because the compiler has no notion of a file extension and no
+// module resolution. It parses fine; it does not resolve.
+//
+// It should start passing on the day stem pairing is implemented. That is the
+// expectation to check, and it is why this file lives outside examples/, whose
+// contract is that everything passes today.
 //
 // Under SPEC 1.2 the rules a compiler must enforce here are:
 //   - every `pub` definition must match a declaration in geometry.cell by

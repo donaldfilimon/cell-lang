@@ -1,8 +1,14 @@
-// EXPECT: currently-accepted
+// EXPECT: currently-rejected
 // Violates: docs/SPEC.md section 2.5 (reserved words) and 7.5.
 //
-// THIS IS THE MOST DANGEROUS FILE IN THE CORPUS, because it looks like working
-// code and compiles clean.
+// This file was the most dangerous in the corpus until name resolution landed:
+// it looked like working code and passed `cell check` with exit 0.
+//
+// It is now rejected, but NOT by the rule it was written to test. The checker
+// reports `error: unknown identifier 'while'`, which is a name-resolution
+// failure that happens to fall on the right line. The language-level problem is
+// unchanged: `while` is not reserved, and if a function named `while` were ever
+// declared, this program would resolve, compile, and silently not loop.
 //
 // `while` is not a keyword: it lexes as an ordinary identifier. So
 // `while (total < n)` is a CALL to a function named `while`, and the block

@@ -64,9 +64,10 @@ sketch.** As of `9fb12af` the lexer, the parser, the AST, and the diagnostic
 machinery are substantially complete, with source spans on every node, real
 structured patterns, and Rust's struct-literal restriction correctly
 implemented. What does not exist is a type representation, a borrow checker,
-and code generation for control flow. The ownership model, which is the point
-of the language, is entirely in the "parsed, not enforced" and "designed"
-columns. `docs/OWNERSHIP.md` specifies the rules a borrow checker must enforce
+and code generation for control flow. (A type representation landed in the
+working tree while this was being finalized; see 0.5.) The ownership model,
+which is the point of the language, is entirely in the "parsed, not enforced"
+and "designed" columns. `docs/OWNERSHIP.md` specifies the rules a borrow checker must enforce
 so that one can be written.
 
 ### 0.3 Verification method
@@ -98,6 +99,46 @@ fact: `cell_arc_t` refcounts in `runtime/cell_rt.c` are atomic as of `562f116`.
 Nothing else in the runtime is thread safe, and `cell_arena_t` explicitly is
 not. Any safety property this document describes is a property of the
 *specified* language, to be delivered by a checker that does not exist yet.
+
+### 0.5 Delta since the snapshot: commit `8dd5673`
+
+The section 12 index is pinned to `src/` as of `9fb12af`. While this document
+was being finalized, `8dd5673` ("a real typechecker with scopes, types, and
+span-carrying errors") landed: a rewrite of `src/cell/typecheck.zig` of roughly
+780 lines with new entry points in `src/root.zig` and `src/main.zig`. The index
+was not re-derived for it, because doing so would mean re-verifying 149 rows
+against a tree that moved four times in one evening. Pretending it does not
+exist would be worse, so this section records the measured delta instead.
+
+Measured against a binary built from `8dd5673`:
+
+| Claim above | Working-tree reality |
+|---|---|
+| "there is no type representation" (0.2) | there is one: `!c` on an `Int` is rejected with `operator '!' requires a Bool operand, found Int` |
+| name resolution is designed, not implemented (6.2) | implemented: `print(n)` with no declaration gives `unknown identifier 'print'` |
+| chained comparison is not rejected (5.1) | rejected, by a type rule: `operator '<' cannot be applied to Bool and Int` |
+| "the only rule the compiler enforces is immutable assignment" (section 4) | no longer true; operator typing and name resolution are enforced too |
+| the symbol table is module-wide and unscoped (7.3 bullet 3, OWNERSHIP.md 0.4) | **fixed**, measured: a `let x` in `a()` is no longer visible in `b()`, which now reports `unknown identifier 'x'` |
+| parse diagnostics do not reach the CLI (11) | check diagnostics now render with the source line and a caret |
+
+Three claims above were re-tested against that binary and **still hold**:
+unknown type names are still accepted silently as `void*`, `if` and `match`
+still lower to `/*if*/` and `/*match*/`, and no ownership rule is enforced. The
+whole of `examples/rejected/` was re-run: seven of the thirteen files still
+pass, including every use-after-move, aliasing, escaping-borrow, and
+call-site-mismatch case.
+
+Two files in `examples/rejected/` are now rejected **for the wrong reason**, and
+that distinction is worth preserving rather than celebrating.
+`silent_literals.cell` fails with `unknown identifier 'x1F'`, which catches the
+second token rather than the malformed literal, and `while_is_not_a_loop.cell`
+fails with `unknown identifier 'while'`, which is name resolution landing on
+the right line by luck. Neither underlying language defect is fixed. Each file
+says so in its header.
+
+Re-derive the index from the source before trusting the counts in 0.2 if
+`git log` shows further commits after `8dd5673` touching `src/`. The counts are
+a measurement with a date on it, not a standing property of the language.
 
 ---
 
@@ -591,8 +632,9 @@ violating examples and diagnostics. This section defines the vocabulary.
 accepted by the parser, recorded on the AST, printed into the emitted C as a
 comment, and then ignored. There is no move checking, no aliasing check, no
 lifetime analysis, no `arc` retain or release, and no drop insertion. The only
-rule the compiler enforces anywhere is assignment to an immutable binding
-(section 7.3).
+*ownership* rule the compiler enforces anywhere is assignment to an immutable
+binding (section 7.3); see 0.5 for the non-ownership checks that landed in the
+working tree.
 
 ### 4.1 The five annotations
 
@@ -744,8 +786,11 @@ Measured: `a + b * c - a / b == c && a < b || !c` emits
 and `a - b - a` emits `((a - b) - a)`, confirming left associativity.
 
 All comparison operators are at the same level and left-associative, so
-`a < b < c` parses as `(a < b) < c` rather than being rejected. Making chained
-comparison an error is **designed, not implemented**.
+`a < b < c` parses as `(a < b) < c` rather than being rejected by the parser.
+The working-tree type checker now rejects it with `operator '<' cannot be
+applied to Bool and Int`, which is the specified outcome delivered by a type
+rule rather than a parser special case (see 0.5 and
+`examples/rejected/chained_comparison.cell`).
 
 Codegen writes fully parenthesized C for every binary expression, so C's own
 precedence never changes the meaning of an emitted expression.
@@ -769,8 +814,10 @@ primary expressions (sections 2.6 to 2.9).
 ### 6.2 Identifiers
 
 **Status: implemented.** A bare identifier is a primary expression. Name
-resolution is **designed, not implemented**: an undefined identifier is emitted
-into C verbatim and becomes a C error, or worse, an implicit declaration.
+resolution is **designed, not implemented** in committed `src/`: an undefined
+identifier is emitted into C verbatim and becomes a C error, or worse, an
+implicit declaration. It is implemented in the working tree, which reports
+`unknown identifier 'print'`; see 0.5.
 
 ### 6.3 Field access
 
@@ -1007,14 +1054,12 @@ precisely:
    parameters are mutable, and `shared`, `arc`, and `copy` parameters are not.
    Measured for all three of the immutable modes. For `arc` this agrees with
    OWNERSHIP.md R9, though by derivation rather than by an explicit rule.
-3. **The symbol table is module-wide and never scoped.** `Checker` uses one
-   `StringHashMap` for the whole module and never pushes or pops a scope, so a
-   `let x` in one function is visible to an assignment in a *different*
-   function. Measured: a file where `a()` declares an immutable `x` and `b()`
-   assigns to an otherwise undeclared `x` reports the immutability error, which
-   is the right diagnostic for the wrong reason. Block and function scoping is
-   **designed, not implemented**, and OWNERSHIP.md R13.4 makes fixing it a
-   prerequisite for every other rule.
+3. **The symbol table was module-wide and never scoped**, so a `let x` in one
+   function was visible to an assignment in a *different* function. **Fixed in
+   `8dd5673`** (see 0.5): the same probe now reports `unknown identifier 'x'`.
+   The section 12 row for block scoping still reads "designed, not
+   implemented" because the index is pinned to `9fb12af`; treat this bullet and
+   0.5 as the current statement.
 
 There is no check that the target is assignable at all: assigning to a literal
 or a call result is accepted and emits nonsense C. Compound assignment (`+=`)
@@ -1265,6 +1310,13 @@ reference `cell_str_t`, `cell_slice_t`, `cell_result_t`, or `cell_arc_t`. It
 does not emit a header, an include guard, or an `extern "C"` block. Splitting
 emission into a `.h` and a `.c`, which is what a header-shaped language needs,
 is **designed, not implemented**.
+
+A zero-parameter function emits `f()` where the runtime header writes
+`f(void)`. Measured with clang: the two forms agree at `-std=c11` and
+`-std=c17` with no diagnostic, and the difference is reported only under
+`-Wstrict-prototypes`, as "a function declaration without a prototype is
+deprecated in all versions of C". Emitting `(void)` is **designed, not
+implemented**, and it is a portability wart rather than a miscompilation.
 
 ### 10.2 Name mangling
 
