@@ -127,6 +127,40 @@ pub const Checker = struct {
     temp_loans: std.ArrayList(Loan) = .empty,
     open_blocks: std.ArrayList(OpenBlock) = .empty,
     next_binding_id: u32 = 0,
+    /// Every binding id that was moved at least once, anywhere in the
+    /// function that declared it (task 3: conservative drop insertion).
+    ///
+    /// This is a DIFFERENT question from `dead`. `dead` is a lexical,
+    /// revivable snapshot: R3a removes an entry when the place is assigned a
+    /// fresh value, because a later READ needs to know the place is live
+    /// again. A drop pass asks a coarser question -- "did this binding's
+    /// value ever get handed to someone else on some path through this
+    /// function" -- and revival must NOT clear that, because dropping is a
+    /// property of the whole function body, not of one program point: this
+    /// set only ever grows.
+    ///
+    /// Populated by `movePlace`'s one success path (the same call that
+    /// appends to `dead`), so it inherits the same conservatism `dead`
+    /// does: a move on only one branch of an `if` still marks the binding
+    /// here, because `movePlace` is called from inside that branch
+    /// regardless of what the other branch does. See `wasMoved`.
+    ///
+    /// Never cleared, including across functions, unlike `dead`
+    /// (`checkFn` resets `dead` per function but not this). That is safe
+    /// rather than a leak between functions: `next_binding_id` is also
+    /// never reset, so ids are unique for the lifetime of one `Checker`,
+    /// and a query by id can never cross a function boundary by accident.
+    moved: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Every binding's name, keyed by id, permanent for the checker's whole
+    /// life -- unlike `bindings`, which is truncated when its scope pops,
+    /// so it cannot answer this once a function has finished checking.
+    /// Exists only so a consumer that reconstructs ids independently
+    /// (codegen.zig, task 3, whose own counter has to allocate ids in the
+    /// same order as `declare` below without sharing its state) can assert
+    /// its name for id N still matches what N was declared under here,
+    /// turning a silent numbering drift between the two files into a loud
+    /// crash instead of a wrong free. See codegen.zig's module doc comment.
+    names: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
     /// Set while checking a function whose return type is a `shared` or
     /// `exclusive` borrow (R8). Cell has no lifetime parameters, so such a
     /// return is always an error. Bodyless declarations report at the
@@ -157,6 +191,8 @@ pub const Checker = struct {
         self.bindings.deinit(self.allocator);
         self.scopes.deinit(self.allocator);
         self.dead.deinit(self.allocator);
+        self.moved.deinit(self.allocator);
+        self.names.deinit(self.allocator);
         self.block_loans.deinit(self.allocator);
         self.temp_loans.deinit(self.allocator);
         self.open_blocks.deinit(self.allocator);
@@ -254,6 +290,7 @@ pub const Checker = struct {
         b.id = self.next_binding_id;
         self.next_binding_id += 1;
         try self.bindings.append(self.allocator, b);
+        try self.names.put(self.allocator, b.id, b.name);
         return b.id;
     }
 
@@ -274,6 +311,32 @@ pub const Checker = struct {
             if (b.id == id) return b;
         }
         return null;
+    }
+
+    /// Whether `binding` was moved anywhere in the function that declared
+    /// it. Conservative in the same direction `dead` already is: a move on
+    /// only one branch of an `if` answers true for the whole rest of the
+    /// function (see the doc comment on `moved`), so this is "maybe
+    /// moved", never "definitely moved right here". A caller deciding
+    /// whether to destroy a place MUST treat "maybe" as "yes": not
+    /// destroying a place that is actually still live only leaks it: task
+    /// 3's whole design rests on that asymmetry, spelled out in
+    /// codegen.zig's module doc comment.
+    ///
+    /// This reads `moved`, not `bindings`, so it still answers correctly
+    /// after the binding's own scope has popped and after the whole module
+    /// has finished checking -- exactly the state codegen queries it in
+    /// (see codegen.zig's module doc comment: it runs `checkModule` once,
+    /// up front, then emits).
+    pub fn wasMoved(self: *const Checker, binding: u32) bool {
+        return self.moved.contains(binding);
+    }
+
+    /// The name `binding` was declared under. See the doc comment on
+    /// `names` for why this exists: a numbering cross-check, not a feature
+    /// borrowck itself needs.
+    pub fn bindingName(self: *const Checker, binding: u32) ?[]const u8 {
+        return self.names.get(binding);
     }
 
     /// Walk `stmts` as a block: one scope, one entry on the open-block stack.
@@ -805,6 +868,10 @@ pub const Checker = struct {
             .span = place.span,
             .note = note,
         });
+        // See the doc comment on `moved`: every real move is recorded here
+        // too, and unlike `dead` this record is permanent for the binding's
+        // whole function, surviving a later R3a revival.
+        try self.moved.put(self.allocator, place.binding, {});
     }
 
     /// R4, R5 and R6. `lexical` selects the loan's scope: true for a loan

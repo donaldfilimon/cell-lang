@@ -25,9 +25,59 @@
 //! from parameter and field declarations, `let` annotations, literals, and
 //! callee return types. An expression whose type cannot be recovered lowers to
 //! `void*`, which is visible in the output rather than silently wrong.
+//!
+//! ## Drop insertion (task 3), and the id-numbering agreement it depends on
+//!
+//! `docs/OWNERSHIP.md` R16 says an `owned` place is destroyed at the end of
+//! its scope. This backend makes that true for the two cases that are safe
+//! to do conservatively: an unmoved `owned`/`arc` `let`/`var` local gets
+//! `cell_string_free(&x)`, `cell_slice_free(&x)`, or `cell_arc_drop(x)` (the
+//! only three symbols in `runtime/cell_rt.h` that are real functions rather
+//! than `static inline`) at the end of its function's body and before every
+//! `return`. "Unmoved" is answered by `borrowck.zig`, not re-derived here:
+//! `emitModule` runs one `borrowck.Checker` over the whole module before
+//! emitting anything, and every `Local` records the id `Checker.declare`
+//! assigned to the SAME source declaration, so `Checker.wasMoved` can be
+//! asked directly. A parameter is never dropped (its owner is the caller
+//! that made this call, and the CALLEE it was moved into is a different
+//! function's problem -- see `Local.droppable`); neither is a match-arm
+//! binding (its C value is a bitwise copy of the scrutinee temporary, and
+//! dropping it risks freeing whatever the scrutinee itself still owns); nor
+//! is a `record` (struct) shape (recursive field drops need a generated
+//! per-struct function, which is a separate task).
+//!
+//! Borrowck's move tracking is deliberately conservative -- a move on only
+//! one branch of an `if` marks the place moved for the rest of the function
+//! -- and that direction is exactly what a safe drop pass needs: skipping
+//! the drop of a place that is still live only leaks it, while dropping a
+//! place that might already be gone is a double free. This backend always
+//! picks the leak. Known gaps left on purpose: a value moved on only one
+//! path still leaks on every path that did not move it; a struct with
+//! owning fields is never destroyed at all; and `wasMoved` answers "moved
+//! ANYWHERE in the function", so a `var` that is moved and later reassigned
+//! (R3a revival) is never dropped either, even though it holds a fresh,
+//! unmoved value at the function's end -- the revived value leaks too.
+//!
+//! THE ID-NUMBERING AGREEMENT THIS RELIES ON. Codegen does not reuse
+//! borrowck's `Binding`s; it keeps its own `next_binding_id` counter and
+//! assigns an id to a `Local` at exactly the three points borrowck's own
+//! `declare` runs (a function's parameters, a `let`, a match-arm binding),
+//! in the same relative order, because both walk the same AST the same way:
+//! parameters first, then each statement left to right, entering a block,
+//! an `if`'s branches, a `match`'s arms, or a `while` body exactly where
+//! borrowck does. Neither counter is ever reset except once per whole
+//! module. This is why `emitModule` cannot check a module incrementally,
+//! function by function, interleaved with emission: the numbering has to
+//! come from ONE full pass so a later function's ids do not collide with an
+//! earlier one's, exactly as borrowck's own `next_binding_id` already never
+//! resets between functions. `pushLocal` double-checks this agreement with
+//! a `std.debug.assert` against `Checker.bindingName` on every call (a
+//! no-op in release builds), so a future edit that breaks the lockstep
+//! fails loudly in tests instead of silently mis-dropping a binding.
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const borrowck = @import("borrowck.zig");
 const Io = std.Io;
 
 /// Anything an emit step can fail with: a writer failure or an arena failure.
@@ -99,6 +149,22 @@ pub const CType = struct {
 const Local = struct {
     name: []const u8,
     ty: CType,
+    /// The declared annotation, read straight off the AST node exactly as
+    /// borrowck's own `Binding.ownership` is. Used, not `ty.shape`, to
+    /// decide drop eligibility: a `shared`/`copy` local can end up with the
+    /// same shape as an `owned` one when its initializer is a call (whose
+    /// result type always lowers as owned; see `letType`), so shape alone
+    /// cannot tell an owner from a borrow here.
+    ownership: ast.Ownership,
+    /// The id borrowck assigned to this exact declaration. See the module
+    /// doc comment's id-numbering agreement.
+    id: u32,
+    /// True only for a `let`/`var` local. False for a parameter and for a
+    /// match-arm binding, both of which are excluded from dropping for
+    /// reasons the module doc comment gives; kept separate from the
+    /// `ownership` check because a parameter can itself be `owned` and
+    /// must still never be dropped.
+    droppable: bool,
 };
 
 /// A resolved call target. `symbol` is null when the callee is a computed
@@ -131,6 +197,21 @@ pub const Generator = struct {
     temp_counter: usize = 0,
     /// Name of the function being emitted, used in panic messages.
     current_fn: []const u8 = "",
+    /// The current function's declared return type, lowered exactly as
+    /// `writeSignature` lowers it (always `.owned`). Set once per `emitFn`
+    /// call and read by the `return` handler, which needs it to materialize
+    /// a return value into a temporary before running drops -- see
+    /// `emitReturnStmt`.
+    current_ret_ty: CType = CType.void_type,
+    /// Borrow-check results for the module being emitted, valid only for
+    /// the duration of one `emitModule` call. See the module doc comment's
+    /// id-numbering agreement for what this is used for and why it is safe
+    /// to run once, up front, rather than per function.
+    checker: ?*borrowck.Checker = null,
+    /// Mirrors `borrowck.Checker.next_binding_id`: incremented at exactly
+    /// the three places `declare` runs there (see `pushLocal`), and, like
+    /// that counter, reset only once per module, never per function.
+    next_binding_id: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, writer: *Io.Writer) Generator {
         return .{
@@ -149,6 +230,21 @@ pub const Generator = struct {
         self.module = module;
         self.locals = .empty;
         self.temp_counter = 0;
+        self.next_binding_id = 0;
+
+        // One borrow-check pass over the whole module, up front, so its
+        // binding ids never reset mid-module -- see the module doc
+        // comment's id-numbering agreement. `checker.hasErrors()` is
+        // deliberately not consulted: this backend has never validated its
+        // input (there is no type checker feeding it either, per the
+        // module doc comment above), and codegen still emits best-effort C
+        // for a module borrowck rejects, same as before this task. Only
+        // `wasMoved` is read from it.
+        var checker = borrowck.Checker.init(self.allocator, module.path, null);
+        defer checker.deinit();
+        try checker.checkModule(module);
+        self.checker = &checker;
+        defer self.checker = null;
 
         const out = self.writer;
         try out.writeAll("// Generated by cell.\n");
@@ -318,8 +414,11 @@ pub const Generator = struct {
 
         self.locals.clearRetainingCapacity();
         self.current_fn = f.name;
+        self.current_ret_ty = if (f.return_type) |rt| try self.lowerType(&rt, .owned) else CType.void_type;
         for (f.params) |p| {
-            try self.pushLocal(p.name, try self.lowerType(&p.ty, p.ownership));
+            // Decision: a parameter is never dropped (see the module doc
+            // comment), regardless of its own ownership annotation.
+            try self.pushLocal(p.name, try self.lowerType(&p.ty, p.ownership), p.ownership, false);
         }
 
         try self.writeSignature(f);
@@ -332,7 +431,16 @@ pub const Generator = struct {
             try out.print("  (void){s};\n", .{p.name});
         }
 
-        try self.emitStmts(body, 1);
+        // Not `self.emitStmts(body, 1)`: that helper pops every local it
+        // sees back off `self.locals` in its own `defer` before returning,
+        // which would erase the function's own top-level `let`s before
+        // `emitScopeDrops` ever got to look at them. Inlined here so the
+        // drop pass runs while they are still visible; `self.locals` is
+        // cleared in full below regardless, so no scope actually leaks.
+        for (body, 0..) |_, i| {
+            try self.emitStmt(&body[i], body[i + 1 ..], 1);
+        }
+        try self.emitScopeDrops(1);
         try out.writeAll("}\n\n");
         self.locals.clearRetainingCapacity();
     }
@@ -406,22 +514,14 @@ pub const Generator = struct {
                     try self.emitArgLike(&v, ty, indent);
                 }
                 try out.writeAll(";\n");
-                try self.pushLocal(l.name, ty);
+                try self.pushLocal(l.name, ty, l.ownership, true);
                 // -Wunused-variable is part of -Wall.
                 if (!stmtsUse(rest, l.name)) {
                     try self.writeIndent(indent);
                     try out.print("(void){s};\n", .{l.name});
                 }
             },
-            .return_stmt => |opt| {
-                try self.writeIndent(indent);
-                try out.writeAll("return");
-                if (opt) |v| {
-                    try out.writeAll(" ");
-                    try self.emitExpr(&v, indent);
-                }
-                try out.writeAll(";\n");
-            },
+            .return_stmt => |opt| try self.emitReturnStmt(opt, indent),
             .expr => |e| switch (e.kind) {
                 .if_expr => |i| try self.emitIfStmt(i, indent),
                 .match_expr => |m| try self.emitMatchStmt(m, indent),
@@ -447,6 +547,119 @@ pub const Generator = struct {
                 try self.emitArgLike(&a.value, want, indent);
                 try out.writeAll(";\n");
             },
+        }
+    }
+
+    // ── drop insertion (task 3) ────────────────────────────────────────
+
+    /// The drop vocabulary in runtime/cell_rt.h: a `record` (struct) case is
+    /// deliberately absent, since a struct with owning fields needs a
+    /// generated per-struct drop function this task does not build (see the
+    /// module doc comment).
+    fn hasDropCall(shape: Shape) bool {
+        return switch (shape) {
+            .string, .slice, .arc => true,
+            else => false,
+        };
+    }
+
+    /// One of the three drop calls, chosen by shape alone: `local.ownership`
+    /// has already been checked by the caller (`pendingDrops`), so this only
+    /// needs to pick the C spelling. `cell_string_free` and `cell_slice_free`
+    /// take a pointer (`cell_rt.h`'s signatures); `cell_arc_drop` takes the
+    /// handle by value, matching `applyOwnership`, which never makes an
+    /// `arc` a pointer.
+    fn emitDropFor(self: *Generator, indent: usize, local: Local) EmitError!void {
+        try self.writeIndent(indent);
+        switch (local.ty.shape) {
+            .string => try self.writer.print("cell_string_free(&{s});\n", .{local.name}),
+            .slice => try self.writer.print("cell_slice_free(&{s});\n", .{local.name}),
+            .arc => try self.writer.print("cell_arc_drop({s});\n", .{local.name}),
+            else => unreachable, // hasDropCall already filtered these out.
+        }
+    }
+
+    /// Every local a scope exit at THIS exact point in the walk must drop,
+    /// in reverse declaration order (later bindings may reference earlier
+    /// ones, so they are torn down first -- what C++ and Rust both do).
+    /// `self.locals.items` already holds exactly the bindings still visible
+    /// here: a nested block's own locals are gone from it by the time its
+    /// `emitStmts` call returns (see that function's `defer`), so nothing
+    /// extra needs to be excluded.
+    ///
+    /// Three checks gate a local in, matching the brief's rule exactly:
+    /// `droppable` (not a parameter, not a match-arm binding -- see
+    /// `Local.droppable`), an `owned` or `arc` ownership annotation (never
+    /// `shared`, `exclusive`, or `copy`), and `!checker.wasMoved(id)` (never
+    /// a place borrowck considers moved, maybe-moved included). A struct
+    /// (`record` shape) is excluded by `hasDropCall`, not by an ownership
+    /// check, because a struct can be `owned` too.
+    fn pendingDrops(self: *Generator) Alloc![]const Local {
+        const checker = self.checker orelse return &.{};
+        var out: std.ArrayList(Local) = .empty;
+        var i = self.locals.items.len;
+        while (i > 0) {
+            i -= 1;
+            const local = self.locals.items[i];
+            if (!local.droppable) continue;
+            if (local.ownership != .owned and local.ownership != .arc) continue;
+            if (!hasDropCall(local.ty.shape)) continue;
+            if (checker.wasMoved(local.id)) continue;
+            try out.append(self.arena, local);
+        }
+        return out.items;
+    }
+
+    /// The end-of-function-body drop point. Nested block/if/match/while
+    /// exits do NOT call this: the brief's design is function-scoped, not
+    /// block-scoped (see the module doc comment's "known gaps").
+    fn emitScopeDrops(self: *Generator, indent: usize) EmitError!void {
+        for (try self.pendingDrops()) |local| try self.emitDropFor(indent, local);
+    }
+
+    /// The other drop point: before every `return`. When nothing needs
+    /// dropping this emits exactly the C this backend always emitted for a
+    /// `return`, byte for byte, so the common case (no owned/arc locals in
+    /// scope, which is most of this file's existing tests) is untouched.
+    ///
+    /// When something DOES need dropping and the return carries a value,
+    /// the value is evaluated into a temporary FIRST, before any drop runs,
+    /// then the drops run, then the temporary is returned. This ordering is
+    /// load-bearing: the returned expression may itself read a local this
+    /// function is about to drop (an unmoved `owned` local passed to a
+    /// `shared` parameter of some other call, for instance -- borrowck
+    /// never moves it, so it is exactly the kind of place this function IS
+    /// scheduled to drop), and dropping before evaluating would free memory
+    /// the return expression still needs. Emitting straight into `return
+    /// <expr>;` and running drops after would be worse: unreachable code
+    /// after a `return` never executes.
+    fn emitReturnStmt(self: *Generator, opt: ?ast.Expr, indent: usize) EmitError!void {
+        const out = self.writer;
+        const to_drop = try self.pendingDrops();
+        if (to_drop.len == 0) {
+            try self.writeIndent(indent);
+            try out.writeAll("return");
+            if (opt) |v| {
+                try out.writeAll(" ");
+                try self.emitExpr(&v, indent);
+            }
+            try out.writeAll(";\n");
+            return;
+        }
+        if (opt) |v| {
+            const temp = try self.nextTemp();
+            try self.writeIndent(indent);
+            try self.writeDecl(self.current_ret_ty, temp);
+            try out.writeAll(" = ");
+            try self.emitExpr(&v, indent);
+            try out.writeAll(";\n");
+            for (to_drop) |local| try self.emitDropFor(indent, local);
+            try self.writeIndent(indent);
+            try out.print("return {s};\n", .{temp});
+        } else {
+            for (to_drop) |local| try self.emitDropFor(indent, local);
+            try self.writeIndent(indent);
+            try out.writeAll("return;\n");
         }
     }
 
@@ -601,7 +814,14 @@ pub const Generator = struct {
             try self.writeIndent(indent);
             try self.writeDecl(scrut_ty, name);
             try self.writer.print(" = {s};\n", .{temp});
-            try self.pushLocal(name, scrut_ty);
+            // Never droppable (`false`): this binding's C value is a
+            // bitwise copy of the scrutinee temporary, so dropping it here
+            // risks double-freeing whatever the scrutinee itself owns. See
+            // the module doc comment. `.owned` is passed only to match
+            // borrowck's own hardcoded assumption for this binding (R7 is
+            // not implemented there either); it has no effect while
+            // `droppable` is false.
+            try self.pushLocal(name, scrut_ty, .owned, false);
             if (!exprUses(arm.body, name)) {
                 try self.writeIndent(indent);
                 try self.writer.print("(void){s};\n", .{name});
@@ -1274,8 +1494,37 @@ pub const Generator = struct {
         return null;
     }
 
-    fn pushLocal(self: *Generator, name: []const u8, ty: CType) Alloc!void {
-        try self.locals.append(self.arena, .{ .name = name, .ty = ty });
+    /// `droppable` is true only from the `let`/`var` call site; see
+    /// `Local.droppable`. Assigns the next id from `next_binding_id`,
+    /// which must be incremented here and only here, at exactly the three
+    /// call sites that mirror borrowck's own `declare` (see the module doc
+    /// comment).
+    fn pushLocal(
+        self: *Generator,
+        name: []const u8,
+        ty: CType,
+        ownership: ast.Ownership,
+        droppable: bool,
+    ) Alloc!void {
+        const id = self.next_binding_id;
+        self.next_binding_id += 1;
+        // Fault-injection note (task 3 report): breaking the lockstep on
+        // purpose here -- e.g. skipping this assert while also skipping one
+        // borrowck `declare()` call -- makes this fire on the very first
+        // test that declares two locals in one function, which is most of
+        // them. It costs nothing in a release build.
+        if (self.checker) |c| {
+            if (c.bindingName(id)) |declared| {
+                std.debug.assert(eq(declared, name));
+            }
+        }
+        try self.locals.append(self.arena, .{
+            .name = name,
+            .ty = ty,
+            .ownership = ownership,
+            .id = id,
+            .droppable = droppable,
+        });
     }
 
     fn nextTemp(self: *Generator) Alloc![]const u8 {
@@ -1937,4 +2186,231 @@ test "an unguarded catch-all still removes the panic" {
         std.debug.print("unexpected panic:\n{s}\n", .{e.text});
         return error.UnexpectedPanic;
     }
+}
+
+// ── drop insertion (task 3) ───────────────────────────────────────────────
+//
+// The first two are the safety tests, and come first on purpose: they pin
+// the double-free guard before anything else pins the feature working at
+// all. Every scenario here was probed against the real `cell emit` output
+// before being written down, and the first two were also verified by fault
+// injection -- see the task report -- by temporarily deleting the
+// `wasMoved` check in `pendingDrops` and confirming a real double free (a
+// `main()` that assigns one owned local's value onto another, then lets
+// both reach scope exit) aborts, then restoring the check and confirming
+// the same program exits clean.
+
+test "a moved value is not dropped" {
+    // The double-free guard: `s` is moved into `take` (borrowck's call-site
+    // move, R1/R2), so it must never reach `cell_string_free`.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn take(owned s: String) { }
+        \\pub fn f() {
+        \\  let owned s = make()
+        \\  take(owned s)
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "cell_string_free");
+}
+
+test "a value moved in one branch of an if is not dropped" {
+    // The conservative case: borrowck marks `s` moved for the rest of the
+    // function once ANY branch moves it (see borrowck.zig's module doc
+    // comment and the `moved` field), even though the `if` here has no
+    // `else` and the move might not have happened. Not dropping is the
+    // safe direction: a real move here would make dropping a double free,
+    // so this must also stay free of `cell_string_free`.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(shared c: Bool) {
+        \\  let owned s = make()
+        \\  if (c) {
+        \\    take(owned s)
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "cell_string_free");
+}
+
+test "an unmoved owned String local is freed at scope end" {
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  let owned s = make()
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_string_free(&s);");
+}
+
+test "an unmoved arc local gets cell_arc_drop, by value with no ampersand" {
+    var e = try emitSource(
+        \\pub fn f(arc p: String) {
+        \\  let arc s = p
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_arc_drop(s);");
+    try expectAbsent(e.text, "cell_arc_drop(&s)");
+}
+
+test "an unmoved owned [Byte] local gets cell_slice_free" {
+    var e = try emitSource(
+        \\pub fn f() {
+        \\  let owned xs = [1, 2]
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_slice_free(&xs);");
+}
+
+test "drops happen before an early return, not only at the end of the body" {
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f(shared c: Bool) -> Int {
+        \\  let owned s = make()
+        \\  if (c) {
+        \\    return 1
+        \\  }
+        \\  return 2
+        \\}
+    );
+    defer e.deinit();
+    // The early return, nested inside the `if`, one indent level deeper.
+    try expectContains(e.text,
+        \\    cell_string_free(&s);
+        \\    return _cell_t0;
+    );
+    // The end-of-body return, back at the function's own indent level. A
+    // plain literal return still needs the return-value temporary: the
+    // drop has to run between computing the value and returning it (see
+    // `emitReturnStmt`), and that ordering does not depend on whether this
+    // particular return expression happens to read `s`.
+    try expectContains(e.text,
+        \\  cell_string_free(&s);
+        \\  return _cell_t1;
+    );
+}
+
+test "drops run in reverse declaration order" {
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  let owned a = make()
+        \\  let owned b = make()
+        \\  let owned c = make()
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text,
+        \\  cell_string_free(&c);
+        \\  cell_string_free(&b);
+        \\  cell_string_free(&a);
+    );
+}
+
+test "a shared or copy local is never dropped" {
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  let shared a = make()
+        \\  let copy b = make()
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "cell_string_free");
+    try expectAbsent(e.text, "cell_slice_free");
+    try expectAbsent(e.text, "cell_arc_drop");
+}
+
+test "a parameter is never dropped" {
+    var e = try emitSource(
+        \\pub fn f(owned s: String) {
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "cell_string_free");
+}
+
+test "a program that allocates and frees an owned local runs clean under cc" {
+    // Owned `String` locals cannot appear in this test: constructing one
+    // from a string literal hits a pre-existing, unrelated codegen gap
+    // (there is no coercion from the literal's `cell_str_t` view into an
+    // owned `cell_string_t` -- see examples/arc.cell's own header comment,
+    // "a string literal stays cell_str_t and is not boxed"), so `cc` would
+    // reject the emitted C for a reason that has nothing to do with drops.
+    // `[Int]` sidesteps it: every ownership mode of a list lowers to the
+    // same `cell_slice_t`, so there is no literal-to-owned coercion to be
+    // missing.
+    //
+    // `kept` is unmoved and must be freed once. `given` is moved into
+    // `sink` (an `owned` parameter), so it must NOT be freed here -- `sink`
+    // itself does not free it either (decision: a parameter is never
+    // dropped), so it leaks, which is the accepted gap this task documents,
+    // not a bug this test is checking for. What this test actually proves
+    // is that the emitted drop compiles and runs without corrupting the
+    // heap: a real double free of `kept`'s buffer would either abort
+    // (verified directly, by fault injection, on a smaller program in the
+    // task report) or corrupt allocator state in a way `cc`'s own leak/
+    // sanitizer-free build would not necessarily catch, so the clean exit
+    // and the expected `println` output are the actual assertions.
+    var e = try emitSource(
+        \\pub fn make_list() -> [Int] {
+        \\  return [1, 2, 3]
+        \\}
+        \\pub fn sink(owned xs: [Int]) {
+        \\}
+        \\pub fn main() {
+        \\  let owned kept = make_list()
+        \\  let owned given = make_list()
+        \\  sink(owned given)
+        \\  println("ok")
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_slice_free(&kept);");
+    try expectAbsent(e.text, "cell_slice_free(&given)");
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.c", .data = e.text });
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{cwd_buf[0..cwd_len]});
+    defer gpa.free(include);
+    const rt_c = try std.fmt.allocPrint(gpa, "{s}/runtime/cell_rt.c", .{cwd_buf[0..cwd_len]});
+    defer gpa.free(rt_c);
+
+    const cc_result = try std.process.run(gpa, io, .{
+        .argv = &.{ "cc", "-std=c11", "-Wall", "-Wextra", "body.c", rt_c, "-I", include, "-o", "body" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(cc_result.stdout);
+    defer gpa.free(cc_result.stderr);
+    if (!cc_result.term.success()) {
+        std.debug.print("cc rejected emitted C:\n{s}\n--- source ---\n{s}\n", .{ cc_result.stderr, e.text });
+        return error.CcRejectedEmittedC;
+    }
+
+    const run_result = try std.process.run(gpa, io, .{
+        .argv = &.{"./body"},
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(run_result.stdout);
+    defer gpa.free(run_result.stderr);
+    if (!run_result.term.success()) {
+        std.debug.print(
+            "emitted program did not exit cleanly (a double free typically aborts):\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ run_result.stdout, run_result.stderr },
+        );
+        return error.ProgramCrashed;
+    }
+    try std.testing.expectEqualStrings("ok\n", run_result.stdout);
 }

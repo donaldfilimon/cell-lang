@@ -577,15 +577,38 @@ about the call, not a lowering instruction.
 
 ### R16. An `owned` place is destroyed at the end of its scope
 
-Every `owned` binding still live at the end of its innermost block is destroyed
-there, in reverse declaration order. A binding that was moved out (dead by R2)
-is **not** destroyed: its new owner is responsible.
+**Partially implemented as of `codegen.zig`'s drop insertion (task 3).** The C
+backend now emits `cell_string_free`, `cell_slice_free`, or `cell_arc_drop`
+for an `owned` or `arc` `let`/`var` local that borrowck's move analysis never
+marks moved, at the end of its function's body and before every `return`, in
+reverse declaration order. This is **not** the rule as stated above, in three
+ways, and each is a real, documented gap rather than an oversight:
 
-At a `return`, every live `owned` binding except the returned one is destroyed
-first.
+- **Function-scoped, not block-scoped.** A local declared inside a nested
+  `if`/`match`/`while` block is dropped only if it is still live at the
+  function's own end or at a `return`; if its enclosing block ends normally
+  without either, it leaks. The rule above says "its innermost block";
+  this implementation drops at the innermost *function*.
+- **Conservative on moves, in the leak-safe direction.** Borrowck's move
+  tracking merges branches conservatively (a move in one arm of an `if`
+  marks the place moved for everything after it, whether or not that arm
+  ran), so a conditionally-moved value is never dropped on any path,
+  including the paths where it was not actually moved. That is a real leak,
+  and it is intentional: dropping a maybe-moved place risks a double free,
+  and leaking is the strictly safer failure.
+- **"Moved" means moved anywhere in the function, once, permanently.** A
+  `var` that is moved and later revived by a fresh assignment (R3a) is
+  never dropped either, even though it holds a fresh, unmoved value at the
+  function's end. The revived value leaks.
 
-There is no destructor syntax and no drop code generation. `owned` emits
-nothing today.
+Also out of scope: a `struct` with owning fields is never destroyed (its
+fields would need a generated per-struct drop function, a separate task),
+and a parameter is never dropped (its value's ownership already transferred
+to this function's *caller*'s intent, and only the function that consumed it
+by moving it further would be the one to drop it -- which nothing here does
+yet either, so a value moved into a function call also leaks today). R16 is
+therefore **not complete**: what changed is that Cell no longer leaks
+*every* `owned`/`arc` local unconditionally, not that it now leaks none.
 
 ### R17. Double free is prevented by R2, not by a runtime check
 
@@ -618,8 +641,13 @@ Ordered so each step is testable and none depends on a later one. Steps marked
 7. *(codegen)* **R10, R11**: `arc` semantics and retain/release insertion.
    Needs `arc T` to lower to `cell_arc_t` first.
 8. **R12**: `copy` checking. Needs a type representation.
-9. **R8, R16, R17**: escape checking and drop insertion. Needs a control-flow
-   graph, at which point revisiting 0.3 in favor of NLL is worthwhile.
+9. **R8, R17**: escape checking and the runtime side of the double-free
+   guarantee. **R16 (drop insertion) is partially done** without a
+   control-flow graph, by consuming borrowck's existing conservative move
+   tracking directly (function-scoped, `let`/`var` locals only, structs
+   excluded); see R16 above for exactly what landed and what did not.
+   Revisiting 0.3 in favor of NLL is still gated on a real control-flow
+   graph, which nothing here builds.
 
 Steps 1 through 3 would give Cell a real move checker. Everything after that is
 the harder half.

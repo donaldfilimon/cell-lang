@@ -772,8 +772,12 @@ violating examples and diagnostics. This section defines the vocabulary.
 
 **Status of the whole model: partially enforced.** Annotations are accepted by
 the parser and recorded on the AST. `cell check` enforces R2, R3, R5, R8, R14,
-and R15. There is no `arc` retain/release, no drop insertion, and no NLL. See
-0.6 and 0.7.
+and R15. There is no `arc` retain/release and no NLL. The C backend
+(`codegen.zig`) inserts drops for an unmoved `owned`/`arc` `let`/`var` local,
+function-scoped and conservative on moves; that is R16 partially done, not
+R16 complete -- see `docs/OWNERSHIP.md` R16 for exactly which cases still
+leak (a value moved on only one path, a struct with owning fields, a `var`
+revived after a move). See 0.6 and 0.7.
 
 ### 4.1 The five annotations
 
@@ -1811,7 +1815,7 @@ records the missing lowering.
 | Shared-XOR-exclusive aliasing | implemented |
 | Retain / release insertion for `arc` | designed, not implemented |
 | Atomic refcounts in the runtime | implemented |
-| Drop insertion for `owned` | designed, not implemented |
+| Drop insertion for `owned` | partially implemented: unmoved `owned`/`arc` `let`/`var` locals only, function-scoped, conservative on moves; not structs, not parameters, not a value revived after a move (see `docs/OWNERSHIP.md` R16) |
 | Copyability derivation | designed, not implemented |
 
 ### Expressions
