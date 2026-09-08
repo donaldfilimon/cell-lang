@@ -332,28 +332,40 @@ static void test_arc_string_glue_frees_both_halves(void) {
     bool box_freed = (reuse_box == box_addr);
 
     /*
-     * The buffer probe runs first (matching the order the glue itself frees
-     * things, per the comment above), so only ITS result is unconditionally
-     * trustworthy: if the buffer genuinely leaked, no allocator behavior can
-     * make `reuse_buf` come back equal to `buf_addr`, because that block is
-     * still live. Report that leak on its own merits.
+     * These two probes are not independent, and the interaction is not even
+     * confined to this one test. Measured directly: leaking only the buffer
+     * here makes BOTH `buf_freed` and `box_freed` come back false, even
+     * though the box was freed correctly, and leaking only the box here has
+     * been observed to also spuriously fail the BUFFER probe in the slice
+     * test below, with cell_slice_drop_glue completely untouched. Which
+     * probe gets falsely implicated depends on the allocator's accumulated
+     * state from everything freed and requested earlier in the process, not
+     * on anything intrinsic to either test, and it runs in both directions:
+     * a leaked buffer can make the box probe lie, and a leaked box can make
+     * some other buffer probe lie. An earlier version of this test made the
+     * box probe conditional on the buffer probe passing, reasoning that the
+     * buffer probe runs first and so cannot itself be a victim. That
+     * reasoning does not hold: it was falsified by a leaked-box injection
+     * that made the buffer probe fail too, which then suppressed the box
+     * probe entirely and reported only a wrong buffer failure, with no
+     * mention of the box at all. An absent signal is worse than an
+     * ambiguous one, so both probes are asserted unconditionally here.
      *
-     * The box probe runs second, and a leaked buffer can make it lie: when
-     * `malloc(buf_cap)` cannot satisfy the request from the buffer's own
-     * free list, it has to look elsewhere, and on this allocator that
-     * observably perturbs the box's size-class free list too (verified
-     * directly: temporarily making the glue leak only the buffer makes
-     * BOTH `buf_freed` and `box_freed` come back false, even though the box
-     * was freed correctly). So the box probe is asserted only once the
-     * buffer probe has proven the buffer side clean; at that point nothing
-     * has disturbed the box's free list and its probe is a clean
-     * discriminator. If the buffer leaked, the box probe is skipped rather
-     * than asserted, so a failure here never blames the box for damage the
-     * buffer's own leak caused; the buffer CHECK below already fails the
-     * suite on its own.
+     * What DOES hold in every allocator and every run: a probe can only
+     * fail because some block was not where it should have been; it can
+     * never pass by coincidence, because malloc can never hand back an
+     * address that is still live. So a PASSING check is a hard proof that
+     * half was freed correctly. A FAILING check is real evidence of a
+     * problem, but on its own it does not prove WHICH half leaked when its
+     * companion also fails: read a lone failure as strong evidence, read a
+     * passing companion as conclusive for that half, and do not assume a
+     * failing companion always confirms a second, independent leak.
+     * Detection itself is unconditional either way: a leak in either half
+     * always fails at least its own CHECK below, and no injected break
+     * passes.
      */
     CHECK(buf_freed);
-    if (buf_freed) CHECK(box_freed);
+    CHECK(box_freed);
 
     free(reuse_buf);
     free(reuse_box);
@@ -388,12 +400,13 @@ static void test_arc_slice_glue_frees_both_halves(void) {
     bool buf_freed = (reuse_buf == buf_addr);
     bool box_freed = (reuse_box == box_addr);
 
-    /* See the comment on the string version of this test above: the buffer
-       probe's result is unconditionally trustworthy, but a leaked buffer can
-       make the box probe lie, so the box probe is asserted only once the
-       buffer has been proven clean. */
+    /* See the comment on the string version of this test above: the two
+       probes are not independent (including across these two tests), so
+       both are asserted unconditionally rather than gating one on the
+       other. A passing check is still conclusive proof for its own half; a
+       failing one is not by itself proof of which half leaked. */
     CHECK(buf_freed);
-    if (buf_freed) CHECK(box_freed);
+    CHECK(box_freed);
 
     free(reuse_buf);
     free(reuse_box);
