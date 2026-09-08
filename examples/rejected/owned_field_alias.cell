@@ -1,0 +1,16 @@
+// EXPECT: currently-rejected
+// An owned resource field cannot shallow-copy a place while aggregate transfer
+// and partial-move drop state are absent. Before this fixture, both `source`
+// and `tag.name` retained the same String buffer; extracting the field into an
+// owned callee freed it once and `source`'s scope drop freed it again.
+
+pub struct Tag { owned name: String }
+
+pub fn make() -> String { return "ab" }
+pub fn take(owned value: String) { }
+
+pub fn main() {
+    let owned source = make()
+    let owned tag: Tag = Tag { name: source }
+    take(owned tag.name)
+}

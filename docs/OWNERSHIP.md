@@ -448,15 +448,15 @@ this rule named four and two of the ones it did not name were live:
 | `s2 = match ...`, writing into an `owned` place | ASan double free, exit 134 |
 | a call argument to an `owned` parameter | ASan double free, exit 134 |
 | a `return` whose declared return type is not `arc` | ASan double free, exit 134 |
-| an `owned` struct field in a literal | latent: a `record` shape is never dropped, so the field's buffer is freed once by the source's own scope drop |
+| an `owned` struct field in a literal | ASan double free, exit 134 after the copied field is moved out; now refused for resource-bearing destination types |
 | a list-literal ELEMENT | latent: slice elements are never released (R11) |
 
-The last two refuse `unknown` **only**. A plain place stored in a struct field
-or a list element stays a READ, exactly as R2's move list says, and widening
-that into a move would be the wrong repair: nothing drops a `record`, so moving
-`s1` out of `Box { s: s1 }` would LEAK the buffer rather than free it once.
-What decides those two positions is record drops and slice element release,
-both R11's gaps, not this rule.
+The struct-field position now classifies the declared destination type. A
+resource-bearing owned field permits only a fresh value; a place, borrow,
+match alias or unresolved source is refused because aggregate transfer and
+partial-move drop state are absent. Scalar and recursively resource-free fields
+retain the existing behavior. List elements remain a separate transfer and
+release gap.
 
 **What still compiles**, since "refused" has to be scoped to mean something:
 
@@ -464,7 +464,7 @@ both R11's gaps, not this rule.
 let owned s2: String = s1                                  // moves, R2 unchanged
 let owned s2: String = match c { 0 => mk(), _ => mk() }     // fresh on every path
 let owned n: Int = match c { 0 => 1, _ => 2 }               // scalar arms
-let owned b: Box = Box { s: s1 }                            // still a read
+let owned b: Box = Box { s: mk() }                          // fresh field value
 ```
 
 **The named over-refusal.** A `match` over `copy` places in an `owned` slot was
@@ -697,11 +697,9 @@ double free, which is the safe direction under the same asymmetry R11 uses, and
 they become double frees the day precise drops land. Whoever lands those drops
 must revisit `ArmOrigin.temp`.
 
-**A neighbouring defect this rule does NOT close, found while measuring it and
-reported rather than fixed.** R2.b leaves a plain place a READ at the
-struct-literal field position, on the argument that a `record` is never dropped
-so the field's buffer is freed once by the source's own drop. That argument
-holds only while nobody moves the field back out:
+**Resolved by conservative refusal.** R2.b formerly left a plain place as a
+READ at the struct-literal field position. That was unsafe whenever the copied
+field was later moved back out:
 
 ```cell
 let owned s1 = make()
@@ -709,12 +707,10 @@ let owned t: Tag = Tag { name: s1 }
 take(owned t.name)
 ```
 
-is **exit 134**, measured at `2b05a2a` and unchanged by R7. `t.name` is a
-bitwise copy of `s1` at a different place, so R2 sees no use-after-move, and
-both are freed. It predates R7 entirely, it is R2.b's decision plus R11's
-record-drop gap rather than this rule, and its repair is the record-drop
-question. It is recorded here so the next reader of that comment knows the
-argument in it is incomplete.
+was exit 134. `t.name` was a bitwise copy of `s1` at a different place, so R2
+saw no use-after-move and both were freed. The checker now refuses the field
+initializer without pretending to move `s1`; true transfer remains blocked on
+aggregate drop and partial-move state.
 
 Corpus: `examples/rejected/owned_move_through_match_binding.cell`.
 
@@ -896,7 +892,7 @@ one measured:
 | a call argument to an `owned` parameter | ASan double free, exit 134 |
 | `let owned ys: [Int] = xs` | ASan double free, exit 134 |
 | `ys = xs`, writing into an `owned` place | ASan double free, exit 134 |
-| an `owned` struct field in a literal | not a double free **yet**: this backend never drops a `record`, so the field's buffer is freed once by the box's glue and the record merely outlives it. It becomes a double free when struct drops land, so it is refused with the others |
+| an `owned` struct field in a literal | a plain owned place was a live double free when the field was later extracted; resource-bearing destinations now require a fresh value |
 | a list-literal ELEMENT, `let owned zss: [[Int]] = [xs, xs]` | accepted, and clean at `-Werror`. Not a use-after-free **yet**, only because slice elements are never released; closing that separately disclosed gap detonates it |
 | a `return` whose declared return type is not `arc` | a loud `cc` type error (`cell_slice_t x = cell_arc_clone(...)`), which is protection by a coincidence of two C types and is what this rule's own text objects to. `-> arc T` is untouched: it is the legal arc-to-arc case |
 
@@ -1302,15 +1298,17 @@ pub fn main() {
 `let` is still immutable, and assigning to it is still an error. Copyability
 and mutability are independent, and the current checker already treats them so.
 
-`copy` is an assertion by the programmer, not a derived property. A conforming
-implementation must eventually reject it on types that own a resource:
+`copy` is an assertion by the programmer, not yet a derived property for every
+position. Struct declarations now reject `copy` fields whose declared type is
+resource-bearing or cannot be resolved, including nested structs and optional
+or result wrappers:
 
 > `err: 'copy' is not valid for 'Buffer': it owns a field of type '[Byte]'`
 
-That check requires a type representation, which does not exist. Until it does,
-**`copy` on a resource-owning type is an unchecked correctness hole**: it will
-produce a shallow duplicate and then a double free. Say that plainly in user
-documentation rather than implying `copy` is safe.
+This declaration-time check fails closed and preserves scalar and recursively
+resource-free copy fields. Other `copy` positions still rely on the annotation
+without deriving copyability, so resource-owning copy bindings remain an
+unchecked correctness hole.
 
 ---
 
@@ -1561,7 +1559,9 @@ Ordered so each step is testable and none depends on a later one. Steps marked
 6. **R7**: pattern binding ownership, for the pattern forms that exist.
 7. *(codegen)* **R10, R11**: `arc` semantics and retain/release insertion.
    Needs `arc T` to lower to `cell_arc_t` first.
-8. **R12**: `copy` checking. Needs a type representation.
+8. **R12**: general `copy` checking. Struct fields now use a recursive,
+   fail-closed resource classifier; bindings and other positions still need a
+   complete type representation.
 9. **R8, R17**: escape checking and the runtime side of the double-free
    guarantee. **R16 (drop insertion) is partially done** without a
    control-flow graph, by consuming borrowck's existing conservative move

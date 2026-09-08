@@ -24,10 +24,10 @@
 //! read `s1`, `pendingDrops` kept both bindings, and one buffer was freed
 //! twice (exit 134, no `arc` anywhere in it). Enforced at the same six sites,
 //! by `ownedMoveSource`, whose `.unknown` is REFUSED and whose branch arms can
-//! never return a movable place. The struct-field and list-element sites
-//! refuse `.unknown` ONLY, leaving a plain place a READ; read the comments
-//! there before changing that, because the choice belongs to R11's record-drop
-//! and element-release gaps rather than to this rule.
+//! never return a movable place. A resource-bearing owned struct field now
+//! permits only a fresh value: copying a place into the field and later moving
+//! the field out was a live double free even before record drops existed.
+//! List elements remain a separate transfer/release boundary.
 //!
 //! **R7's consumption clause** closes what R2.b left open, and it is the fifth
 //! instance of this file's recurring defect rather than a new kind. The
@@ -128,6 +128,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const diag = @import("diag.zig");
+const types = @import("types.zig");
 
 const Span = ast.Span;
 const Ownership = ast.Ownership;
@@ -1182,13 +1183,10 @@ pub const Checker = struct {
             // R2's move list does not include struct or list literals, so
             // their elements are read rather than moved. See the report.
             .struct_lit => |*sl| {
-                // R10, the struct-field position. This one is not a double
-                // free TODAY, only because this backend never drops a
-                // `record` shape, so the field's buffer is freed once by the
-                // box's glue and the record simply outlives it. It is the
-                // same illegal conversion, and it becomes a double free the
-                // moment struct drops land, so it is refused with the others
-                // rather than left as a trap for that change.
+                // R10, the struct-field position. Arc-to-owned conversion is
+                // refused first. The resource-shape guard below separately
+                // refuses shallow copies and unresolved transfers into owned
+                // fields; moving such a field out was a live double free.
                 const def = self.structs.get(sl.name);
                 for (sl.fields) |*f| {
                     if (def) |d| {
@@ -1204,38 +1202,50 @@ pub const Checker = struct {
                                     "field",
                                     f.name,
                                 )) continue;
-                                // R2.b, the struct-field position. `.unknown`
-                                // ONLY. A plain place stays a READ here, which
-                                // is what R2's move list already says and what
-                                // the comment above this switch records.
-                                // Measured at `0e82266`: `Box { s: s1 }` runs
-                                // clean today, and it does so by coincidence,
-                                // because this backend never drops a `record`,
-                                // so the field's buffer is freed once by `s1`'s
-                                // own scope drop. Widening the READ into a MOVE
-                                // would make that a LEAK the moment nothing
-                                // drops `s1` either, which is the wrong repair
-                                // for a gap that belongs to record drops. The
-                                // value shape is refused because it is the same
-                                // undecidable question as everywhere else.
-                                switch (try self.ownedMoveSource(&f.value)) {
-                                    .unknown => |s| {
-                                        try self.refuseUnknownMove(s, "store", "in", "field", f.name);
+                                switch (try self.resourceShape(&fld.ty)) {
+                                    .no_resources => switch (try self.ownedMoveSource(&f.value)) {
+                                        .unknown => |s| {
+                                            try self.refuseUnknownMove(s, "store", "in", "field", f.name);
+                                            continue;
+                                        },
+                                        .aliases_place, .place, .no_owned_place => {},
+                                    },
+                                    .unknown => {
+                                        try self.refuseOwnedFieldTransfer(
+                                            .{ .display = "a value of unresolved resource shape", .span = f.value.span },
+                                            f.name,
+                                            "the destination field's resource shape cannot be resolved",
+                                        );
                                         continue;
                                     },
-                                    // R7, and it READS here, exactly as
-                                    // `.place` does. `Tag { name: x }` with
-                                    // an aliasing `x` and `Tag { name: s1 }`
-                                    // with the scrutinee itself are the SAME
-                                    // latent record-drop hazard, and neither
-                                    // is a double free today: measured at
-                                    // `4698dbc`, exit 0. Refusing one while
-                                    // reading the other would split a single
-                                    // R11 gap across two rules for no gain.
-                                    // A branch-reached alias is still refused,
-                                    // because `ownedMoveBranch` promotes it to
-                                    // `.unknown`.
-                                    .aliases_place, .place, .no_owned_place => {},
+                                    .resources => {
+                                        switch (try self.borrowSource(&f.value)) {
+                                            .not_borrow => {},
+                                            .borrow => |s| {
+                                                try self.refuseOwnedFieldTransfer(s, f.name, "a borrow does not transfer ownership");
+                                                continue;
+                                            },
+                                            .unresolved => |s| {
+                                                try self.refuseOwnedFieldTransfer(s, f.name, "the source cannot be proven to own a fresh value");
+                                                continue;
+                                            },
+                                        }
+                                        switch (try self.ownedMoveSource(&f.value)) {
+                                            .no_owned_place => {},
+                                            .place => |p| {
+                                                try self.refuseOwnedFieldTransfer(
+                                                    .{ .display = p.display, .span = p.span },
+                                                    f.name,
+                                                    "moving a place into an aggregate is not implemented",
+                                                );
+                                                continue;
+                                            },
+                                            .aliases_place, .unknown => |s| {
+                                                try self.refuseOwnedFieldTransfer(s, f.name, "the source is not a fresh owned value");
+                                                continue;
+                                            },
+                                        }
+                                    },
                                 }
                             }
                         }
@@ -2884,8 +2894,99 @@ pub const Checker = struct {
                     span,
                     "store an 'owned' or 'arc' value instead",
                 );
+                continue;
+            }
+            if (f.ownership == .copy) {
+                switch (try self.resourceShape(&f.ty)) {
+                    .no_resources => {},
+                    .resources, .unknown => {
+                        try self.diagnostics.err(
+                            self.allocator,
+                            span,
+                            try self.msg(
+                                "cannot declare copy field '{s}': its type may own resources and copying its header would create two owners",
+                                .{f.name},
+                            ),
+                        );
+                        try self.diagnostics.note(
+                            self.allocator,
+                            span,
+                            "use an 'owned' or 'arc' field; resource-bearing copy fields are unsupported",
+                        );
+                    },
+                }
             }
         }
+    }
+
+    const ResourceShape = enum { no_resources, resources, unknown };
+
+    fn resourceShape(self: *Checker, ty: *const ast.TypeExpr) Error!ResourceShape {
+        var visiting: std.StringHashMapUnmanaged(void) = .empty;
+        defer visiting.deinit(self.allocator);
+        return self.resourceShapeInner(ty, &visiting);
+    }
+
+    fn resourceShapeInner(
+        self: *Checker,
+        ty: *const ast.TypeExpr,
+        visiting: *std.StringHashMapUnmanaged(void),
+    ) Error!ResourceShape {
+        return switch (ty.*) {
+            .unit => .no_resources,
+            .list => .resources,
+            .optional => |inner| try self.resourceShapeInner(inner, visiting),
+            .result => |result| combineResourceShapes(
+                try self.resourceShapeInner(result.ok, visiting),
+                try self.resourceShapeInner(result.err, visiting),
+            ),
+            .ref => |ref| try self.resourceShapeInner(ref.inner, visiting),
+            .name => |name| blk: {
+                if (types.fromPrimitiveName(name)) |primitive| {
+                    break :blk if (primitive == .string) .resources else .no_resources;
+                }
+                if (self.enums.contains(name)) break :blk .no_resources;
+                const def = self.structs.get(name) orelse break :blk .unknown;
+                if (visiting.contains(name)) break :blk .unknown;
+                try visiting.put(self.allocator, name, {});
+                defer _ = visiting.remove(name);
+                var shape: ResourceShape = .no_resources;
+                for (def.fields) |field| {
+                    shape = combineResourceShapes(
+                        shape,
+                        try self.resourceShapeInner(&field.ty, visiting),
+                    );
+                }
+                break :blk shape;
+            },
+        };
+    }
+
+    fn combineResourceShapes(a: ResourceShape, b: ResourceShape) ResourceShape {
+        if (a == .resources or b == .resources) return .resources;
+        if (a == .unknown or b == .unknown) return .unknown;
+        return .no_resources;
+    }
+
+    fn refuseOwnedFieldTransfer(
+        self: *Checker,
+        source: ArcSource.Site,
+        field_name: []const u8,
+        reason: []const u8,
+    ) Error!void {
+        try self.diagnostics.err(
+            self.allocator,
+            source.span,
+            try self.msg(
+                "cannot store {s} in owned field '{s}': {s}",
+                .{ source.display, field_name, reason },
+            ),
+        );
+        try self.diagnostics.note(
+            self.allocator,
+            source.span,
+            "aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead",
+        );
     }
 
     fn reportUseAfterMove(self: *Checker, d: Dead, at: Span) Error!void {
@@ -5248,8 +5349,8 @@ test "R2.b is asked at all six owned consumption sites, four of which were live"
         \\    let owned b = Box { items: match c { 0 => xs, _ => xs } }
         \\}
     ,
-        \\t.cell:6:47: error: cannot store the place 'xs' reached through a branch in 'owned' field 'items': which owned place it gives up cannot be resolved here
-        \\t.cell:6:47: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
+        \\t.cell:6:47: error: cannot store the place 'xs' reached through a branch in owned field 'items': the source is not a fresh owned value
+        \\t.cell:6:47: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
         \\
     );
     try expectDiagnostics(
@@ -5316,7 +5417,7 @@ test "R2.b covers an if branch and a block tail, which typecheck alone would hid
     );
 }
 
-test "R2.b leaves a plain place moving, and a fresh value on every path accepted" {
+test "R2.b moves bindings but owning resource fields refuse place transfers" {
     // THE OVER-REFUSAL CONTROLS. The fix refuses; the risk of a refusal is
     // that it refuses everything, and the risk of routing a move decision
     // through a new classifier is that the move stops happening. This is what
@@ -5355,20 +5456,21 @@ test "R2.b leaves a plain place moving, and a fresh value on every path accepted
         \\    let owned n: Int = match c { 0 => 1, _ => 2 }
         \\}
     );
-    // A plain place stored in a struct field or a list element stays a READ,
-    // unchanged. R2's move list does not include either, and widening them
-    // would be the wrong repair: a `record` is never dropped, so moving `s1`
-    // out of `Box { s: s1 }` would LEAK the buffer instead of freeing it once.
-    // The gap that decides these two positions is record drops and slice
-    // element release, not this rule.
-    try expectAccepted(
+    // Aggregate partial-move/drop state is absent, so a resource-bearing
+    // owned field refuses a place rather than copying its owning header.
+    try expectDiagnostics(
         \\pub struct Box { owned s: String }
         \\pub fn mk() -> String;
         \\pub fn main() {
         \\    let owned s1 = mk()
         \\    let owned b: Box = Box { s: s1 }
         \\}
+    ,
+        \\t.cell:5:33: error: cannot store s1 in owned field 's': moving a place into an aggregate is not implemented
+        \\t.cell:5:33: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\
     );
+    // List-element transfer remains a separate disclosed boundary.
     try expectAccepted(
         \\pub fn fresh() -> [Int];
         \\pub fn main() {
@@ -6059,22 +6161,18 @@ test "a FIELD of a temp arm binding is refused, and R10 gets there first" {
     );
 }
 
-test "R7 reads, and does not refuse, at the two sites that already only read" {
-    // The struct-field and list-element positions leave a plain `.place` a
-    // READ, because a record is never dropped and a slice element is never
-    // released (R11). `Buffer { data: x }` with an aliasing `x` and
-    // `Buffer { data: buf.data }` with the scrutinee's own field are the SAME
-    // latent hazard and neither is a double free today; both were measured
-    // exit 0 before and after. Splitting one R11 gap across two rules would
-    // buy nothing. A branch-reached alias is still refused, because
-    // `ownedMoveBranch` promotes it.
-    try expectAccepted(prelude ++
+test "R7 aliases cannot enter owning resource fields" {
+    try expectDiagnostics(prelude ++
         \\pub fn main() {
         \\    let owned buf = Buffer { data: [], len: 0 }
         \\    match buf {
         \\        x => read(shared Buffer { data: x, len: 0 })
         \\    }
         \\}
+    ,
+        \\t.cell:12:41: error: cannot store the match binding 'x' aliasing 'buf' in owned field 'data': the source is not a fresh owned value
+        \\t.cell:12:41: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\
     );
 }
 
@@ -6126,6 +6224,184 @@ test "R7 closes an R10 escape: an arm binding launders an arc scrutinee" {
     ,
         \\t.cell:13:25: error: cannot pass the match binding 'x' aliasing 'a' to 'owned' parameter 'b': the scrutinee still owns the value
         \\t.cell:13:25: note: R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again
+        \\
+    );
+}
+
+test "resource shape is total across every declared type variant" {
+    var checker = Checker.init(std.testing.allocator, "t.cell", null);
+    defer checker.deinit();
+
+    var string_ty: ast.TypeExpr = .{ .name = "String" };
+    var int_ty: ast.TypeExpr = .{ .name = "Int" };
+    var float64_ty: ast.TypeExpr = .{ .name = "Float64" };
+    var unknown_ty: ast.TypeExpr = .{ .name = "Missing" };
+    var list_ty: ast.TypeExpr = .{ .list = &int_ty };
+    var optional_ty: ast.TypeExpr = .{ .optional = &string_ty };
+    var result_ty: ast.TypeExpr = .{ .result = .{ .ok = &int_ty, .err = &string_ty } };
+    var ref_ty: ast.TypeExpr = .{ .ref = .{ .ownership = .copy, .inner = &string_ty } };
+    var unit_ty: ast.TypeExpr = .unit;
+
+    try std.testing.expectEqual(Checker.ResourceShape.resources, try checker.resourceShape(&string_ty));
+    try std.testing.expectEqual(Checker.ResourceShape.no_resources, try checker.resourceShape(&int_ty));
+    try std.testing.expectEqual(Checker.ResourceShape.no_resources, try checker.resourceShape(&float64_ty));
+    try std.testing.expectEqual(Checker.ResourceShape.unknown, try checker.resourceShape(&unknown_ty));
+    try std.testing.expectEqual(Checker.ResourceShape.resources, try checker.resourceShape(&list_ty));
+    try std.testing.expectEqual(Checker.ResourceShape.resources, try checker.resourceShape(&optional_ty));
+    try std.testing.expectEqual(Checker.ResourceShape.resources, try checker.resourceShape(&result_ty));
+    try std.testing.expectEqual(Checker.ResourceShape.resources, try checker.resourceShape(&ref_ty));
+    try std.testing.expectEqual(Checker.ResourceShape.no_resources, try checker.resourceShape(&unit_ty));
+
+    var color_variants = [_][]const u8{"Red"};
+    const color = ast.EnumDef{ .name = "Color", .variants = &color_variants, .is_public = false };
+    try checker.enums.put(checker.allocator, color.name, color);
+    var color_ty: ast.TypeExpr = .{ .name = "Color" };
+    try std.testing.expectEqual(Checker.ResourceShape.no_resources, try checker.resourceShape(&color_ty));
+
+    var scalar_fields = [_]ast.Field{.{
+        .name = "n",
+        .ty = .{ .name = "Int" },
+        .ownership = .copy,
+    }};
+    var nested_fields = [_]ast.Field{.{
+        .name = "s",
+        .ty = .{ .name = "String" },
+        .ownership = .owned,
+    }};
+    var cycle_fields = [_]ast.Field{.{
+        .name = "next",
+        .ty = .{ .name = "Cycle" },
+        .ownership = .owned,
+    }};
+    const scalar = ast.StructDef{ .name = "Scalar", .fields = &scalar_fields, .is_public = false };
+    const nested = ast.StructDef{ .name = "Nested", .fields = &nested_fields, .is_public = false };
+    const cycle = ast.StructDef{ .name = "Cycle", .fields = &cycle_fields, .is_public = false };
+    try checker.structs.put(checker.allocator, scalar.name, scalar);
+    try checker.structs.put(checker.allocator, nested.name, nested);
+    try checker.structs.put(checker.allocator, cycle.name, cycle);
+    var scalar_ty: ast.TypeExpr = .{ .name = "Scalar" };
+    var nested_ty: ast.TypeExpr = .{ .name = "Nested" };
+    var cycle_ty: ast.TypeExpr = .{ .name = "Cycle" };
+    try std.testing.expectEqual(Checker.ResourceShape.no_resources, try checker.resourceShape(&scalar_ty));
+    try std.testing.expectEqual(Checker.ResourceShape.resources, try checker.resourceShape(&nested_ty));
+    try std.testing.expectEqual(Checker.ResourceShape.unknown, try checker.resourceShape(&cycle_ty));
+}
+
+test "copy fields reject resource and unknown shapes but preserve scalar records" {
+    try expectDiagnostics(
+        \\pub struct BadString { copy value: String }
+        \\pub struct BadList { copy value: [Int] }
+        \\pub struct Inner { owned value: String }
+        \\pub struct BadNested { copy value: Inner }
+        \\pub struct BadOptional { copy value: String? }
+        \\pub struct BadUnknown { copy value: Missing }
+    ,
+        \\t.cell:1:1: error: cannot declare copy field 'value': its type may own resources and copying its header would create two owners
+        \\t.cell:1:1: note: use an 'owned' or 'arc' field; resource-bearing copy fields are unsupported
+        \\t.cell:2:1: error: cannot declare copy field 'value': its type may own resources and copying its header would create two owners
+        \\t.cell:2:1: note: use an 'owned' or 'arc' field; resource-bearing copy fields are unsupported
+        \\t.cell:4:1: error: cannot declare copy field 'value': its type may own resources and copying its header would create two owners
+        \\t.cell:4:1: note: use an 'owned' or 'arc' field; resource-bearing copy fields are unsupported
+        \\t.cell:5:1: error: cannot declare copy field 'value': its type may own resources and copying its header would create two owners
+        \\t.cell:5:1: note: use an 'owned' or 'arc' field; resource-bearing copy fields are unsupported
+        \\t.cell:6:1: error: cannot declare copy field 'value': its type may own resources and copying its header would create two owners
+        \\t.cell:6:1: note: use an 'owned' or 'arc' field; resource-bearing copy fields are unsupported
+        \\
+    );
+    try expectAccepted(
+        \\pub enum Color { Red, Blue }
+        \\pub struct Point { copy x: Int copy color: Color }
+        \\pub struct Wrapper { copy point: Point }
+    );
+}
+
+test "owned resource fields accept fresh values and refuse every unsafe source class" {
+    try expectAccepted(
+        \\pub struct Tag { owned name: String }
+        \\pub fn make() -> String;
+        \\pub fn main() {
+        \\    let owned a = Tag { name: "literal" }
+        \\    let owned b = Tag { name: make() }
+        \\}
+    );
+    try expectDiagnostics(
+        \\pub struct Tag { owned name: String }
+        \\pub fn make() -> String;
+        \\pub fn main() {
+        \\    let owned source = make()
+        \\    let owned a = Tag { name: source }
+        \\    let owned b = Tag { name: owned source }
+        \\}
+    ,
+        \\t.cell:5:31: error: cannot store source in owned field 'name': moving a place into an aggregate is not implemented
+        \\t.cell:5:31: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:6:31: error: cannot store source in owned field 'name': moving a place into an aggregate is not implemented
+        \\t.cell:6:31: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\
+    );
+    try expectDiagnostics(
+        \\pub struct Tag { owned name: String }
+        \\pub fn inspect(shared s: String) -> shared String;
+        \\pub fn main(shared source: String) {
+        \\    let owned a = Tag { name: &source }
+        \\    let owned b = Tag { name: shared source }
+        \\    let owned c = Tag { name: inspect(shared source) }
+        \\}
+    ,
+        \\t.cell:2:1: error: cannot return a shared borrow: Cell has no lifetime annotations, so the borrow cannot be proven to outlive the call
+        \\t.cell:2:1: note: return an 'owned' or 'arc' value instead
+        \\t.cell:4:31: error: cannot store a borrow of 'source' in owned field 'name': a borrow does not transfer ownership
+        \\t.cell:4:31: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:5:31: error: cannot store a borrow of 'source' in owned field 'name': a borrow does not transfer ownership
+        \\t.cell:5:31: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:6:31: error: cannot store the borrow returned by 'inspect' in owned field 'name': a borrow does not transfer ownership
+        \\t.cell:6:31: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\
+    );
+}
+
+test "owning field guard follows field paths and recursive destination shapes" {
+    try expectDiagnostics(
+        \\pub struct Inner { owned name: String }
+        \\pub struct Outer { owned inner: Inner }
+        \\pub struct Maybe { owned name: String? }
+        \\pub struct Lists { owned items: [Int] }
+        \\pub fn make_string() -> String;
+        \\pub fn make_inner() -> Inner;
+        \\pub fn make_list() -> [Int];
+        \\pub fn main() {
+        \\    let owned source = make_string()
+        \\    let owned inner = Inner { name: make_string() }
+        \\    let owned a = Inner { name: inner.name }
+        \\    let owned b = Outer { inner: inner }
+        \\    let owned c = Maybe { name: source }
+        \\    let owned d = Lists { items: make_list() }
+        \\}
+    ,
+        \\t.cell:11:33: error: cannot store inner.name in owned field 'name': moving a place into an aggregate is not implemented
+        \\t.cell:11:33: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:12:34: error: cannot store inner in owned field 'inner': moving a place into an aggregate is not implemented
+        \\t.cell:12:34: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:13:33: error: cannot store source in owned field 'name': moving a place into an aggregate is not implemented
+        \\t.cell:13:33: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\
+    );
+}
+
+test "owning field guard fails closed for unknown and cyclic destination shapes" {
+    try expectDiagnostics(
+        \\pub struct Mystery { owned value: Missing }
+        \\pub struct Node { owned next: Node }
+        \\pub fn make_node() -> Node;
+        \\pub fn main() {
+        \\    let owned a = Mystery { value: 1 }
+        \\    let owned b = Node { next: make_node() }
+        \\}
+    ,
+        \\t.cell:5:36: error: cannot store a value of unresolved resource shape in owned field 'value': the destination field's resource shape cannot be resolved
+        \\t.cell:5:36: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:6:32: error: cannot store a value of unresolved resource shape in owned field 'next': the destination field's resource shape cannot be resolved
+        \\t.cell:6:32: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
         \\
     );
 }

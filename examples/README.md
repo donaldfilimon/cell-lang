@@ -268,6 +268,11 @@ fail for opposite reasons, so keep both:
   removed, and one neighbouring double free that is still live and belongs to
   R2.b rather than to R7. A refused program emits no C, so the ASan stage
   cannot pin either file; the `EXPECT` line is what does.
+- `owned_field_alias.cell`: a resource-bearing owned struct field formerly
+  shallow-copied an existing place. Moving the field out and dropping the
+  original produced an AddressSanitizer double free. It is refused until
+  aggregate transfer and partial-move drop state exist. Copy String/list fields
+  are rejected structurally at declaration time for the same two-owner hazard.
 
 Two other files are not ownership bugs at all. One is currently-rejected for
 the wrong reason (unknown identifier); the other, `unknown_type.cell`, is still
