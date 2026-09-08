@@ -41,6 +41,7 @@ printf '\n== declared signatures (C is the reference) ==\n'
 fi
 if [ "$scenario" = drift ] || [ "$scenario" = dirtydrift ]; then printf 'drift\n' >> tracked.txt; fi
 if [ "$scenario" = signal ]; then kill -TERM $$; fi
+if [ "$scenario" = truncated ]; then exit 0; fi
 printf '\n== verdict ==\n'
 printf '  clean\n'
 [ "$scenario" = nonzero ] && exit 7
@@ -141,6 +142,64 @@ class QualifyIntegrationTests(unittest.TestCase):
         result, report = self.run_qualify("missing")
         self.assertEqual(result.returncode, 1)
         self.assertIn("declared signatures (C is the reference)", report["missing_required_stages"])
+
+    def test_exit_zero_without_clean_verdict_fails(self):
+        result, report = self.run_qualify("truncated")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(report["gate"]["returncode"], 0)
+        self.assertIn("gate output ended without a clean verdict", report["errors"])
+        declared = next(stage for stage in report["stages"] if stage["name"].startswith("declared signatures"))
+        self.assertEqual(declared["outcome"], "incomplete")
+
+    def test_preexisting_tracked_deletion_is_measurable(self):
+        (self.root / "tracked.txt").unlink()
+        result, report = self.run_qualify("complete")
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(report["source"]["before"]["valid"])
+        self.assertTrue(report["source"]["before"]["dirty"])
+        self.assertFalse(report["source"]["drifted"])
+
+    def test_preexisting_tracked_rename_is_measurable(self):
+        subprocess.run(["git", "mv", "tracked.txt", "renamed tracked.txt"], cwd=self.root, check=True)
+        result, report = self.run_qualify("complete")
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(report["source"]["before"]["valid"])
+        self.assertTrue(report["source"]["before"]["dirty"])
+        self.assertFalse(report["source"]["drifted"])
+
+    def test_preexisting_staged_copy_is_measurable(self):
+        subprocess.run(["git", "config", "status.renames", "copies"], cwd=self.root, check=True)
+        shutil.copy2(self.root / "tracked.txt", self.root / "copied tracked.txt")
+        subprocess.run(["git", "add", "copied tracked.txt"], cwd=self.root, check=True)
+        result, report = self.run_qualify("complete")
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(report["source"]["before"]["valid"])
+        self.assertTrue(report["source"]["before"]["dirty"])
+        self.assertFalse(report["source"]["drifted"])
+
+    def test_rejects_tracked_and_colliding_artifact_paths(self):
+        qualify = str(self.root / "tools/qualify.py")
+        tracked_before = (self.root / "tracked.txt").read_text()
+        tracked_temporary = self.root / "reserved.json.tmp"
+        tracked_temporary.write_text("must survive\n")
+        subprocess.run(["git", "add", "reserved.json.tmp"], cwd=self.root, check=True)
+        cases = [
+            ["--report", str(self.root / "tracked.txt")],
+            ["--log", str(self.root / "tracked.txt")],
+            ["--report", str(self.root / "reserved.json")],
+            ["--report", str(self.root / "tracked"), "--log", str(self.root / "tracked.tmp")],
+            ["--report", str(self.root / "same"), "--log", str(self.root / "same")],
+        ]
+        alias = self.root / "tracked alias"
+        alias.symlink_to(self.root / "tracked.txt")
+        cases.append(["--report", str(alias)])
+        for options in cases:
+            with self.subTest(options=options):
+                result = subprocess.run([qualify, *options], cwd=self.root, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("error:", result.stderr)
+                self.assertEqual((self.root / "tracked.txt").read_text(), tracked_before)
+                self.assertEqual(tracked_temporary.read_text(), "must survive\n")
 
     def test_missing_tool_versions_are_null(self):
         absent = str(self.root / "does not exist")

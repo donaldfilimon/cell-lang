@@ -48,11 +48,56 @@ def stage_identities(gate: Path) -> list[str]:
     return stages
 
 
+def validate_artifact_paths(root: Path, report: Path, log: Path) -> None:
+    temporary = report.with_name(report.name + ".tmp")
+    artifacts = {"report": report, "log": log, "report temporary": temporary}
+    resolved = {name: path.resolve(strict=False) for name, path in artifacts.items()}
+    if len(set(resolved.values())) != len(resolved):
+        raise ValueError("report, log, and report temporary paths must be distinct")
+    for name, path in resolved.items():
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", os.fsdecode(relative)],
+            cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        if tracked.returncode == 0:
+            raise ValueError(f"{name} path resolves to tracked source: {path}")
+        if tracked.returncode not in (0, 1):
+            raise RuntimeError(f"could not validate {name} path against tracked source")
+
+
+def porcelain_entries(data: bytes) -> list[tuple[bytes, list[bytes]]]:
+    tokens = data.split(b"\0")
+    entries: list[tuple[bytes, list[bytes]]] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if not token:
+            continue
+        if len(token) < 3 or token[2:3] != b" ":
+            raise ValueError("malformed git status entry")
+        status = token[:2]
+        paths = [token[3:]]
+        if b"R" in status or b"C" in status:
+            if index >= len(tokens) or not tokens[index]:
+                raise ValueError("truncated git rename/copy entry")
+            paths.append(tokens[index])
+            index += 1
+        entries.append((status, paths))
+    return entries
+
+
 def source_identity(root: Path, ignored: set[Path]) -> dict[str, Any]:
     def git(*args: str) -> str:
         result = subprocess.run(["git", *args], cwd=root, text=True, capture_output=True, check=False)
         return result.stdout.strip() if result.returncode == 0 else ""
 
+    head = git("rev-parse", "HEAD")
+    branch = git("branch", "--show-current")
     listed = subprocess.run(
         ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
         cwd=root, capture_output=True, check=False,
@@ -62,15 +107,19 @@ def source_identity(root: Path, ignored: set[Path]) -> dict[str, Any]:
         ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
         cwd=root, capture_output=True, check=False,
     )
-    valid = listed.returncode == indexed.returncode == status.returncode == 0
+    valid = bool(head) and listed.returncode == indexed.returncode == status.returncode == 0
     dirty = False
     if valid:
-        for entry in status.stdout.split(b"\0"):
-            if not entry:
-                continue
-            raw_path = entry[3:] if len(entry) >= 3 and entry[2:3] == b" " else entry
-            candidate = (root / raw_path.decode(errors="surrogateescape")).absolute()
-            if candidate.resolve(strict=False) not in ignored:
+        try:
+            status_entries = porcelain_entries(status.stdout)
+        except ValueError:
+            valid = False
+            status_entries = []
+        for _, paths in status_entries:
+            if any(
+                (root / raw.decode(errors="surrogateescape")).absolute().resolve(strict=False) not in ignored
+                for raw in paths
+            ):
                 dirty = True
                 break
     digest = hashlib.sha256()
@@ -93,12 +142,14 @@ def source_identity(root: Path, ignored: set[Path]) -> dict[str, Any]:
                     with candidate.open("rb") as source:
                         for chunk in iter(lambda: source.read(1024 * 1024), b""):
                             digest.update(chunk)
+            except FileNotFoundError:
+                digest.update(b"absent")
             except OSError as error:
                 valid = False
                 digest.update(f"unreadable:{error.errno}".encode())
     return {
-        "head": git("rev-parse", "HEAD") or None,
-        "branch": git("branch", "--show-current") or None,
+        "head": head or None,
+        "branch": branch or None,
         "dirty": dirty if valid else None,
         "dirty_fingerprint": digest.hexdigest() if valid else None,
         "valid": valid,
@@ -181,6 +232,10 @@ def main(argv: list[str] | None = None) -> int:
     gate = root / "tools/check.sh"
     report_path = (args.report or root / ".cell-cache/qualification/report.json").resolve()
     log_path = (args.log or report_path.with_name("gate.log")).resolve()
+    try:
+        validate_artifact_paths(root, report_path, log_path)
+    except (ValueError, RuntimeError) as error:
+        parser.error(str(error))
     ignored = {report_path, log_path, report_path.with_name(report_path.name + ".tmp")}
     errors: list[str] = []
     try:
