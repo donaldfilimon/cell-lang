@@ -85,12 +85,21 @@ is `[T]`, which SPEC 3.3 says has no representation at all.
 ## What `cell check` covers
 
 `cell check` parses, typechecks, and borrow-checks. A file in `examples/`
-passing means those three stages accepted it. Body-bearing emit compiles for
-`hello.cell`, `control_flow.cell`, and `ownership.cell`: `cell emit
-examples/hello.cell` compiles with `cc -c`, and linked against
-`runtime/cell_rt.c` it prints `42`. `examples/arc.cell` compiles and runs too,
-but it needs one extra source: see the `arc.cell` section below. `if` / `match`
-/ blocks / struct and list literals lower to C, not placeholder comments.
+passing means those three stages accepted it. Emit is a separate claim, and
+both halves of it are measured over all fourteen files here rather than a
+chosen few:
+
+- **`cc -std=c11 -Wall -Wextra -c`: all fourteen compile.** `arc.cell` was
+  the last one that did not, and now does.
+- **Link and run: six**, namely `hello` (42), `backends` (24), `loops` (55),
+  `while_is_now_a_loop` (10), `ownership` and `borrows` (both silent, exit 0).
+  `arc.cell` links and runs too, printing 13, but needs `arc_host.c` as well:
+  see the `arc.cell` section below. The other seven do not link for one
+  reason and it is not a codegen defect: none declares a `pub fn main()` with
+  a body, so no C `main` is emitted and the link stops at `_main`.
+
+`if` / `match` / blocks / struct and list literals lower to C, not placeholder
+comments.
 
 Still not implemented: loops other than `while`, generics, `Result<T,E>`, enum
 payloads, and hex / underscore / exponent literals. `arc` retain/release is

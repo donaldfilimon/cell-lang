@@ -1589,21 +1589,25 @@ Applied consistently to definitions and to named calls:
 A call to `add` emits `cell_add(...)`. Bodyless declarations of runtime
 intrinsics (`print`, `print_int`, ...) keep the runtime's own symbol.
 
-**Measured, on a binary built with `-Dswift=false`:**
+**Measured, on a binary built with `-Dswift=false`, over all fourteen files in
+`examples/` rather than a chosen few.** Compilation and linking are separate
+claims and are reported separately, because a file that compiles may still
+have no `main` or may call a declaration nothing defines.
 
-| File | `cc -c` result |
-|---|---|
-| `examples/declarations.cell` | compiles |
-| `examples/primitives.cell` | compiles |
-| `examples/hello.cell` | compiles |
-| `examples/control_flow.cell` | compiles |
-| `examples/ownership.cell` | compiles |
-| `examples/arc.cell` | compiles, links against `examples/arc_host.c` and `runtime/cell_rt.c`, and runs, printing 13 |
+`cc -std=c11 -Wall -Wextra -c`: **all fourteen compile.** No exceptions, and
+that includes `arc.cell`, which was the last one that did not.
 
-Declaration-only files emit valid C. Body-bearing emit compiles for every
-example in `examples/`. `arc.cell` needs a hand-written C host for its two
-bodyless declarations, which `tools/check.sh` supplies through `run_c_host`;
-the others link against the runtime alone.
+Link against `runtime/cell_rt.c` and run: **six of the fourteen**, namely
+`hello` (42), `backends` (24), `loops` (55), `while_is_now_a_loop` (10),
+`ownership` and `borrows` (both silent, exit 0). `arc.cell` links and runs
+too, printing 13, but needs one extra source: `examples/arc_host.c` defines
+its two bodyless declarations, and `tools/check.sh` supplies it through
+`run_c_host`. The remaining seven (`bindings`, `control_flow`, `declarations`,
+`expressions`, `pattern_matching`, `primitives`, `structs_enums`) do not link,
+and all seven fail for the same single reason, measured rather than assumed:
+none declares a `pub fn main()` with a body, so `emitEntryPoint` writes no C
+`main` and the link stops at `undefined symbol: _main`. Nothing about their
+emitted code is rejected.
 
 A module-qualified mangling (`cell_<module>_<name>`) is **designed, not
 implemented**.
