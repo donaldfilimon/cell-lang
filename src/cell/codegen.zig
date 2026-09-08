@@ -647,11 +647,7 @@ pub const Generator = struct {
                     try out.writeAll("}\n");
                 },
                 .annotated => |a| try self.emitEffect(a.value, indent),
-                else => {
-                    try self.writeIndent(indent);
-                    try self.emitExpr(&e, indent);
-                    try out.writeAll(";\n");
-                },
+                else => try self.emitDiscarded(&e, indent),
             },
             .assign => |a| {
                 try self.writeIndent(indent);
@@ -1094,12 +1090,35 @@ pub const Generator = struct {
             .if_expr => |i| try self.emitIfStmt(i, indent),
             .match_expr => |m| try self.emitMatchStmt(m, indent),
             .annotated => |a| try self.emitEffect(a.value, indent),
-            else => {
-                try self.writeIndent(indent);
-                try self.emitExpr(e, indent);
-                try self.writer.writeAll(";\n");
-            },
+            else => try self.emitDiscarded(e, indent),
         }
+    }
+
+    /// The two leaves that emit an expression as a statement and throw its
+    /// value away. Both used to be a bare `emitExpr`, and both must now tell
+    /// `emitCall` that the value is discarded.
+    ///
+    /// `-Wunused-value` is part of `-Wall`, and it fires on the trailing
+    /// result expression of a GNU statement expression whose own value is
+    /// unused. So a hoisted call in bare statement position,
+    /// `pub fn main() { inspect(shared fresh()) }`, emitted
+    ///
+    ///     ({ ...; int64_t _t3 = cell_inspect(...); cell_arc_drop(_t2); _t3; });
+    ///
+    /// and `cc -Wall -Wextra -Werror` rejected `_t3;`. That is source which
+    /// compiled before the hoist existed and stopped compiling after it: a
+    /// regression the example corpus cannot see, because no corpus file
+    /// discards the result of an `arc`-taking call. Told the value is
+    /// discarded, `emitCall` omits the result slot entirely, the statement
+    /// expression ends on a void `cell_arc_drop` exactly as the void-callee
+    /// case already did, and the drops are unaffected.
+    fn emitDiscarded(self: *Generator, e: *const ast.Expr, indent: usize) EmitError!void {
+        try self.writeIndent(indent);
+        switch (unwrapAnnotated(e).kind) {
+            .call => |c| try self.emitCallValued(c, indent, false),
+            else => try self.emitExpr(e, indent),
+        }
+        try self.writer.writeAll(";\n");
     }
 
     fn emitPatternTest(self: *Generator, p: ast.Pattern, temp: []const u8, scrut_ty: CType) EmitError!void {
@@ -1386,6 +1405,13 @@ pub const Generator = struct {
     ///     drop there could run on a null handle. Those forms still leak and
     ///     are recorded as leaking rather than handled untested.
     fn emitCall(self: *Generator, c: anytype, indent: usize) EmitError!void {
+        try self.emitCallValued(c, indent, true);
+    }
+
+    /// `value_used` is false only from `emitDiscarded`, the two leaves
+    /// that emit an expression as a statement. See that function for why
+    /// the distinction has to exist.
+    fn emitCallValued(self: *Generator, c: anytype, indent: usize, value_used: bool) EmitError!void {
         const out = self.writer;
         const callee = try self.resolveCallee(c.callee, c.args.len);
 
@@ -1422,10 +1448,13 @@ pub const Generator = struct {
             try out.writeAll(";\n");
         }
 
-        // A void call leaves the statement expression's value as the last
-        // drop's, which is also void. Only a value-returning call needs a
-        // result slot, and it must be filled BEFORE any drop runs.
-        const result: ?[]const u8 = if (ret.shape == .unit) null else try self.nextTemp();
+        // A void call, and a call whose value is discarded, both leave the
+        // statement expression's value as the last drop's, which is also
+        // void. Only a value-returning call in a position that USES the
+        // value needs a result slot, and it must be filled BEFORE any drop
+        // runs. Emitting one where the value is discarded is what tripped
+        // -Wunused-value; see `emitDiscarded`.
+        const result: ?[]const u8 = if (ret.shape == .unit or !value_used) null else try self.nextTemp();
         try self.writeIndent(indent + 1);
         if (result) |name| {
             try self.writeDecl(ret, name);
@@ -3334,6 +3363,76 @@ test "two unbound arc call results in one call are both released, in reverse ord
         \\    cell_note(cell_string_as_str((const cell_string_t *)_cell_t1.ptr), cell_string_as_str((const cell_string_t *)_cell_t2.ptr));
         \\    cell_arc_drop(_cell_t2);
         \\    cell_arc_drop(_cell_t1);
+    );
+}
+
+test "a hoisted call whose value is DISCARDED emits no result slot" {
+    var e = try emitSource(
+        \\pub fn inspect(shared name: String) -> Int;
+        \\pub fn fresh() -> arc String {
+        \\  let arc s = "x"
+        \\  return s
+        \\}
+        \\pub fn bare() {
+        \\  inspect(shared fresh())
+        \\}
+    );
+    defer e.deinit();
+    // A regression the hoist itself introduced, caught by compiling a form
+    // the corpus does not contain rather than by any gate. `-Wunused-value`
+    // is part of `-Wall` and fires on a statement expression's trailing
+    // result when the statement expression's own value is discarded, so
+    // `int64_t _t = cell_inspect(...); ... _t;` made source that compiled
+    // before the hoist stop compiling at `-Wall -Wextra -Werror`.
+    //
+    // With the value discarded there is nothing to carry across the drops,
+    // so the result slot is omitted and this ends on a void `cell_arc_drop`
+    // exactly as the void-callee case already did. The release is unchanged,
+    // which is the part that must not regress.
+    try expectContains(e.text,
+        \\void cell_bare(void) {
+        \\  ({
+        \\    cell_arc_t _cell_t1 = cell_fresh();
+        \\    cell_inspect(cell_string_as_str((const cell_string_t *)_cell_t1.ptr));
+        \\    cell_arc_drop(_cell_t1);
+        \\  });
+        \\}
+    );
+}
+
+test "a hoist nested inside another hoist composes, inner released first" {
+    var e = try emitSource(
+        \\pub fn inspect(shared name: String) -> Int;
+        \\pub fn wrap(shared s: String) -> arc String {
+        \\  let arc b = s
+        \\  return b
+        \\}
+        \\pub fn fresh() -> arc String {
+        \\  let arc s = "x"
+        \\  return s
+        \\}
+        \\pub fn f() -> Int {
+        \\  return inspect(shared wrap(shared fresh()))
+        \\}
+    );
+    defer e.deinit();
+    // The other form the corpus does not contain: a hoisted argument whose
+    // own expression needs a hoist. It falls out of the recursion rather
+    // than being handled, and the nesting is what pins that the inner
+    // handle is released inside the initializer of the outer one, before
+    // the outer call runs, and that each release names its own temporary.
+    try expectContains(e.text,
+        \\  return ({
+        \\    cell_arc_t _cell_t2 = ({
+        \\      cell_arc_t _cell_t3 = cell_fresh();
+        \\      cell_arc_t _cell_t4 = cell_wrap(cell_string_as_str((const cell_string_t *)_cell_t3.ptr));
+        \\      cell_arc_drop(_cell_t3);
+        \\      _cell_t4;
+        \\    });
+        \\    int64_t _cell_t5 = cell_inspect(cell_string_as_str((const cell_string_t *)_cell_t2.ptr));
+        \\    cell_arc_drop(_cell_t2);
+        \\    _cell_t5;
+        \\  });
     );
 }
 
