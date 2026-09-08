@@ -1,41 +1,70 @@
 // The `arc` ownership mode.
 //
-// Status: parses and passes `cell check`. Codegen maps `arc` parameters and
-// returns to `cell_arc_t`, but a string literal stays `cell_str_t` and is not
-// boxed into an arc. No retain or release is inserted, so `cell emit` of this
-// file does not compile (`cell_observe` wants `cell_arc_t`). See SPEC 4.1.4.
+// Status: parses, passes `cell check`, and the emitted C compiles, links and
+// runs. It prints 13, and that number is a refcount measurement rather than
+// arithmetic: `observe` reports the strong count it was handed, so the two
+// 3s below are the retains this file's own call sites inserted. See
+// examples/arc_host.c for the two bodyless declarations' C side, and
+// tools/check.sh's execution section for the command that runs it.
+//
+// The C backend implements the retain half of docs/OWNERSHIP.md R11:
+// a literal bound as `arc` is boxed with cell_arc_from_string, an `arc` place
+// passed to an `arc` parameter is cloned at the call site, and an `arc` place
+// passed to a `shared` parameter is deliberately NOT cloned (R8 makes the
+// borrow safe). The release half is the drop pass, which emits cell_arc_drop
+// at scope exit and before every return.
 //
 // The runtime machinery is real: cell_arc_new, cell_arc_clone, and
 // cell_arc_drop in runtime/cell_rt.c do genuine refcount increments and
 // decrements and call a drop function at zero. As of 562f116 those refcounts
-// are atomic (`_Atomic` in the .c file). Codegen never calls them.
+// are atomic (`_Atomic` in the .c file).
+//
+// The LLVM and MLIR backends still refuse this file, deliberately and
+// identically: they are scalar-first and emit no drops at all.
 
 pub struct Session {
     arc name: String
     copy id: Int
 }
 
+pub fn print_int(copy value: Int);
+
 /// An `arc` argument is never made dead by passing it. Both the caller and the
 /// callee hold a live reference afterward. That is the whole point of the mode.
+/// The C side returns the strong count it observed, so the printed total below
+/// is evidence about retains rather than a hand-written constant.
 pub fn observe(arc name: String) -> Int;
 
 /// A returned `arc` is returned already retained: the caller owns that
 /// reference and must release it. See docs/OWNERSHIP.md R11.
+///
+/// This body returns its own parameter, so the caller's call-site retain is
+/// the reference handed back and nothing extra is emitted here. R11 rule 3
+/// holds by construction: a parameter is never dropped.
 pub fn share_name(arc name: String) -> arc String {
     return name
 }
 
 /// Passing an `arc` place to a `shared` parameter borrows the pointee for the
 /// call and does NOT retain. Safe because a borrow may not escape (R8).
+/// The C side returns the borrowed view's length, which is 7.
 pub fn inspect(shared name: String) -> Int;
 
 pub fn main() {
     let arc label = "session"
+    let arc alias = share_name(arc label)
     let copy first = observe(arc label)
-    let copy second = observe(arc label)
+    let copy second = observe(arc alias)
     let copy third = inspect(shared label)
+    print_int(first + second + third)
 }
 
 // `arc` grants shared access only in this revision. Mutating through `arc` is
 // an error (OWNERSHIP.md R9), because Cell has no interior mutability yet.
 // See examples/rejected/arc_mutation.cell.
+//
+// `Session` is declared and not constructed on purpose. Its `arc name` field
+// shows the struct lowering (`cell_arc_t name;`), but a struct is not dropped
+// by this backend at all, so building one here would leak the field's retain
+// and spoil the refcount arithmetic this file is measuring. The struct-field
+// retain of R11 rule 4 is covered by a codegen test instead.

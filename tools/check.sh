@@ -156,6 +156,20 @@ run_c() {
     [ "$got" = "$want" ] && pass "C    $ex -> $got" || fail "C    $ex -> $got, want $want"
 }
 
+# Same as run_c, plus a hand-written C host for the example's bodyless
+# declarations. examples/arc.cell needs one because its `observe` reads
+# cell_arc_strong_count, which no Cell body can reach: without that the run
+# would prove only that the program does not crash, not that the retains
+# balance. The host file is a `.c`, so none of the `*.cell` loops above see it.
+run_c_host() {
+    ex=$1; want=$2; host=$3
+    $CELL emit "examples/$ex.cell" > "$TMP/$ex.c" 2>/dev/null || { fail "C emit $ex"; return; }
+    cc -I runtime "$TMP/$ex.c" "$host" runtime/cell_rt.c -o "$TMP/${ex}_c" 2>/dev/null \
+        || { fail "C compile $ex"; return; }
+    got=$("$TMP/${ex}_c")
+    [ "$got" = "$want" ] && pass "C    $ex -> $got" || fail "C    $ex -> $got, want $want"
+}
+
 run_llvm() {
     ex=$1; want=$2
     $CELL emit --target=llvm "examples/$ex.cell" > "$TMP/$ex.ll" 2>/dev/null || { fail "llvm emit $ex"; return; }
@@ -193,6 +207,16 @@ for pair in "hello 42" "backends 24" "loops 55"; do
     run_llvm "$1" "$2"
     run_mlir "$1" "$2"
 done
+
+# arc is C only: the LLVM and MLIR backends refuse `arc` outright, which the
+# agreement section above already checks. 13 is a refcount measurement, not
+# arithmetic: `observe` returns the strong count it was handed (3 both times,
+# the original plus the `alias` handle plus that call's own retain), and
+# `inspect` returns the borrowed view's length, 7. A missing call-site retain
+# reads 2 and prints 11; a retain wrongly inserted for the `shared` call
+# would not change the number but would leak, so run this under `leaks` when
+# changing the retain rules, not only under this equality.
+run_c_host arc 13 examples/arc_host.c
 
 # ---------------------------------------------------------------- verdict --
 printf '\n== verdict ==\n'

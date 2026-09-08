@@ -651,7 +651,28 @@ pub const Generator = struct {
             try self.writeIndent(indent);
             try self.writeDecl(self.current_ret_ty, temp);
             try out.writeAll(" = ");
-            try self.emitExpr(&v, indent);
+            // The one retain outside `emitArcConversion` (task 4b). R11's
+            // release rule 2 excepts "the one being returned", and this pass
+            // has no such exception: borrowck never makes an `arc` place
+            // dead (`isDuplicable`, R10 by design), so a returned `arc`
+            // local is always still in `to_drop` and would be released
+            // between the temporary's initialization and the `return`,
+            // handing the caller a box whose count already reached zero.
+            // Retaining here is exactly balanced rather than a leak: the
+            // clone takes the count 1 -> 2 and the drop immediately below
+            // takes it back to 1, and that surviving reference is the one
+            // the caller now owns and must release. A returned `arc`
+            // PARAMETER never reaches this branch, because a parameter is
+            // not droppable and so a function returning only its parameter
+            // has an empty `to_drop` and takes the byte-for-byte path
+            // above. That is R11 rule 3, still holding by construction.
+            if (self.returnedArcNeedsRetain(&v, to_drop)) {
+                try out.writeAll("cell_arc_clone(");
+                try self.emitExpr(&v, indent);
+                try out.writeAll(")");
+            } else {
+                try self.emitExpr(&v, indent);
+            }
             try out.writeAll(";\n");
             for (to_drop) |local| try self.emitDropFor(indent, local);
             try self.writeIndent(indent);
@@ -663,14 +684,46 @@ pub const Generator = struct {
         }
     }
 
+    /// True when `v` names an `arc` local that this return is about to drop.
+    /// Only a bare identifier counts: a field path such as `s.name` roots in
+    /// a `record`, which `hasDropCall` excludes from dropping entirely, so
+    /// there is no release for a retain to balance.
+    fn returnedArcNeedsRetain(self: *Generator, v: *const ast.Expr, to_drop: []const Local) bool {
+        _ = self;
+        const name = switch (unwrapAnnotated(v).kind) {
+            .ident => |n| n,
+            else => return false,
+        };
+        for (to_drop) |local| {
+            if (local.ty.shape == .arc and eq(local.name, name)) return true;
+        }
+        return false;
+    }
+
     /// The declared type of a `let`. An annotation wins; otherwise the
     /// initializer decides; otherwise int64_t, matching the language's default
     /// integer.
+    ///
+    /// The un-annotated path consults `own` for `arc` ALONE, and that
+    /// asymmetry is deliberate. `arc` is the one mode whose C spelling is not
+    /// derivable from the initializer: `let arc label = "session"` must be a
+    /// `cell_arc_t` no matter that the literal infers as `cell_str_t`, and
+    /// before this consultation existed the binding kept the view's type and
+    /// the emitted C failed to compile the moment it reached an `arc`
+    /// parameter. The other modes stay initializer-driven on purpose, because
+    /// `Local.ownership`'s doc comment already records that a `shared`/`copy`
+    /// local initialized from a call keeps the call's owned result type, and
+    /// the drop pass reads the declared annotation rather than the shape
+    /// precisely so that it can tell those apart. `applyOwnership` returns a
+    /// primitive unchanged, so `arc Int` stays `int64_t` here for free.
     fn letType(self: *Generator, ann: ?ast.TypeExpr, value: ?ast.Expr, own: ast.Ownership) Alloc!CType {
         if (ann) |t| return try self.lowerType(&t, own);
         if (value) |v| {
             const inferred = try self.inferExpr(&v);
-            if (inferred.shape != .unknown and inferred.shape != .unit) return inferred;
+            if (inferred.shape != .unknown and inferred.shape != .unit) {
+                if (own == .arc) return try self.applyOwnership(inferred, .arc);
+                return inferred;
+            }
         }
         return CType.int64;
     }
@@ -1083,6 +1136,119 @@ pub const Generator = struct {
         try out.writeAll(")");
     }
 
+    // ── arc retain and boxing (task 4b) ─────────────────────────────────
+
+    /// The retain half of `docs/OWNERSHIP.md` R11, plus the unbox that makes
+    /// the deliberate NON-retain expressible. Returns true when it emitted
+    /// `arg` itself, false to let `emitArgLike` carry on.
+    ///
+    /// Every one of R11's four retain sites reaches this one function,
+    /// because `emitArgLike` is already the single place this backend lowers
+    /// a value into a position with a declared type: a `let` initializer
+    /// (rule 3), a call argument (rules 1 and 2), a struct literal field
+    /// (rule 4), a list element, and an assignment's right side. There is no
+    /// second place to keep in step.
+    ///
+    /// Three cases, in the order they are tested:
+    ///
+    ///   1. UNBOX, an arc value where a non-arc type is wanted. This is
+    ///      R11's one deliberate non-retain: `inspect(shared label)` borrows
+    ///      the pointee for the call and clones nothing, which R8 makes safe
+    ///      because the borrow cannot escape the call. The pointee's C type
+    ///      is recovered from `want`, not from the handle, because
+    ///      `applyOwnership` collapses every `arc T` to the same
+    ///      `cell_arc_t` and keeps no record of T.
+    ///   2. RETAIN, an arc place where an arc is wanted (R11 rules 2, 3, 4).
+    ///      Gated on `isPlace`: a call that returns `arc` hands back a
+    ///      reference that is ALREADY retained (R11 release rule 3 and
+    ///      cell_rt.h section 7), so cloning it too would leak one.
+    ///   3. BOX, a non-arc value where an arc is wanted (R11 rule 1). The
+    ///      box does not exist yet, so this is `cell_arc_new` by way of
+    ///      `cell_arc_from_string`/`cell_arc_from_slice`, not a clone.
+    ///
+    /// WHAT CASE 3 REFUSES TO DO, and why the refusal is the safe answer.
+    /// An `owned` String or list PLACE is not boxed. `cell_arc_from_string`
+    /// MOVES its argument into the box, and `borrowck.zig`'s `checkLet`
+    /// moves an initializer place only for `.owned`, while an `.arc`
+    /// argument merely `readPlace`s it (R10's move-into-arc is unimplemented
+    /// in the front end). So the source local is still unmoved, the drop
+    /// pass still schedules its `cell_string_free`, and boxing it here would
+    /// emit a silent double free. Falling through instead leaves a C type
+    /// error, which is loud, and which this backend's module comment already
+    /// prefers over plausible wrong code. A literal, a call result, and a
+    /// `shared` view are all boxed, because none of them is a local the drop
+    /// pass will also free: the view case copies through
+    /// `cell_string_from_str` and owns its characters outright.
+    fn emitArcConversion(
+        self: *Generator,
+        arg: *const ast.Expr,
+        want: CType,
+        have: CType,
+        indent: usize,
+    ) EmitError!bool {
+        const out = self.writer;
+
+        if (have.shape == .arc and want.shape != .arc) {
+            // `.ptr` is `void *`, so every cast below is a widening to the
+            // pointee's own type and needs no intermediate.
+            if (want.shape == .str) {
+                try out.writeAll("cell_string_as_str((const cell_string_t *)");
+                try self.emitExpr(arg, indent);
+                try out.writeAll(".ptr)");
+                return true;
+            }
+            if (want.shape == .slice and !want.pointer) {
+                try out.writeAll("(*(const cell_slice_t *)");
+                try self.emitExpr(arg, indent);
+                try out.writeAll(".ptr)");
+                return true;
+            }
+            if (want.pointer) {
+                try out.print("(({s})", .{want.text});
+                try self.emitExpr(arg, indent);
+                try out.writeAll(".ptr)");
+                return true;
+            }
+            // Anything else (an owned aggregate, say) would be a move out of
+            // a shared box, which R10 forbids anyway. Fall through loud.
+            return false;
+        }
+
+        if (want.shape != .arc) return false;
+
+        if (have.shape == .arc) {
+            if (!isPlace(arg)) return false;
+            try out.writeAll("cell_arc_clone(");
+            try self.emitExpr(arg, indent);
+            try out.writeAll(")");
+            return true;
+        }
+
+        switch (have.shape) {
+            .str => {
+                try out.writeAll("cell_arc_from_string(cell_string_from_str(");
+                try self.emitExpr(arg, indent);
+                try out.writeAll("))");
+                return true;
+            },
+            .string => {
+                if (have.pointer or isPlace(arg)) return false;
+                try out.writeAll("cell_arc_from_string(");
+                try self.emitExpr(arg, indent);
+                try out.writeAll(")");
+                return true;
+            },
+            .slice => {
+                if (have.pointer or isPlace(arg)) return false;
+                try out.writeAll("cell_arc_from_slice(");
+                try self.emitExpr(arg, indent);
+                try out.writeAll(")");
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     /// Emit `arg` where a value of type `want` is required, inserting the
     /// address-of, dereference, or view conversion the ABI needs. Call-site
     /// ownership prefixes are `.annotated` wrappers; this still lowers from
@@ -1091,6 +1257,14 @@ pub const Generator = struct {
     fn emitArgLike(self: *Generator, arg: *const ast.Expr, want: CType, indent: usize) EmitError!void {
         const out = self.writer;
         const have = try self.inferExpr(arg);
+
+        // Both arc directions are answered FIRST, before any of the
+        // address-of and dereference rules below. An arc handle is a struct
+        // by value, so `&x` and `*x` are never the conversion it needs, and
+        // letting the pointer rule see an `arc` place bound for a
+        // `shared Record` parameter would emit `&x` (the address of the
+        // handle) where the pointee is wanted.
+        if (try self.emitArcConversion(arg, want, have, indent)) return;
 
         if (want.pointer and !have.pointer and isPlace(arg)) {
             try out.writeAll("&");
@@ -1593,6 +1767,19 @@ fn isDefaultPattern(p: ast.Pattern) bool {
 }
 
 /// An addressable expression, the only kind `&` may be applied to.
+/// Strip every `.annotated` wrapper. A written ownership prefix is kept on
+/// the AST as one of these (see the module doc comment's rule 3), so
+/// `observe(arc label)` reaches here as a wrapper around the identifier.
+fn unwrapAnnotated(e: *const ast.Expr) *const ast.Expr {
+    var current = e;
+    while (true) {
+        switch (current.kind) {
+            .annotated => |a| current = a.value,
+            else => return current,
+        }
+    }
+}
+
 fn isPlace(e: *const ast.Expr) bool {
     return switch (e.kind) {
         .ident, .field => true,
@@ -2322,6 +2509,176 @@ test "an unmoved arc local gets cell_arc_drop, by value with no ampersand" {
     try expectAbsent(e.text, "cell_arc_drop(&s)");
 }
 
+// ── arc retain insertion, OWNERSHIP.md R11 (task 4b) ────────────────────
+
+test "an arc binding is a cell_arc_t and a literal initializer is boxed" {
+    var e = try emitSource(
+        \\pub fn f() {
+        \\  let arc s = "x"
+        \\}
+    );
+    defer e.deinit();
+    // R11 rule 1: the box does not exist yet, so this is cell_arc_new by way
+    // of the from_string helper, not a clone. cell_string_from_str copies the
+    // literal's characters onto the heap, so the box owns them outright.
+    try expectContains(
+        e.text,
+        \\  cell_arc_t s = cell_arc_from_string(cell_string_from_str(cell_str_from_parts("x", 1)));
+    );
+    try expectAbsent(e.text, "cell_arc_clone");
+}
+
+test "an arc place passed to an arc parameter is cloned at the call site" {
+    var e = try emitSource(
+        \\pub fn observe(arc name: String) -> Int;
+        \\pub fn f(arc n: String) -> Int {
+        \\  return observe(arc n)
+        \\}
+    );
+    defer e.deinit();
+    // Written with the `arc n` prefix on purpose: that reaches codegen as an
+    // `.annotated` wrapper, and a retain rule that failed to see through it
+    // would silently skip the clone at exactly the spelling examples/arc.cell
+    // uses. R11 rule 2.
+    try expectContains(e.text, "return cell_observe(cell_arc_clone(n));");
+}
+
+test "an arc place passed to a shared parameter is NOT cloned" {
+    var e = try emitSource(
+        \\pub fn inspect(shared name: String) -> Int;
+        \\pub fn f(arc n: String) -> Int {
+        \\  return inspect(shared n)
+        \\}
+    );
+    defer e.deinit();
+    // R11's one deliberate non-retain. The borrow cannot escape the call
+    // (R8), so the caller's own reference already covers it. This assertion
+    // is the one that catches over-retaining, which the safety asymmetry
+    // otherwise encourages, so the absence is asserted explicitly.
+    try expectAbsent(e.text, "cell_arc_clone");
+    try expectContains(
+        e.text,
+        "return cell_inspect(cell_string_as_str((const cell_string_t *)n.ptr));",
+    );
+}
+
+test "an arc place bound to a new arc binding is cloned, not re-boxed" {
+    var e = try emitSource(
+        \\pub fn f(arc p: String) {
+        \\  let arc s = p
+        \\}
+    );
+    defer e.deinit();
+    // R11 rule 3: both p and s are live afterward, so s needs its own
+    // reference. Re-boxing would build a second box over the same pointee and
+    // free it twice.
+    try expectContains(e.text, "cell_arc_t s = cell_arc_clone(p);");
+    try expectAbsent(e.text, "cell_arc_from_string");
+}
+
+test "an arc place stored in a struct field is cloned" {
+    var e = try emitSource(
+        \\pub struct Session {
+        \\  arc name: String
+        \\}
+        \\pub fn f(arc n: String) {
+        \\  let owned s = Session { name: n }
+        \\}
+    );
+    defer e.deinit();
+    // R11 rule 4. Note the struct itself is never dropped by this backend,
+    // so this retain leaks; that is the documented record-shape gap in the
+    // drop pass, not a defect in the retain.
+    try expectContains(e.text, "(cell_Session){ .name = cell_arc_clone(n) }");
+}
+
+test "a call that returns arc is bound without a second retain" {
+    var e = try emitSource(
+        \\pub fn fresh() -> arc String;
+        \\pub fn f() {
+        \\  let arc b = fresh()
+        \\}
+    );
+    defer e.deinit();
+    // A returned arc arrives ALREADY retained (R11 release rule 3, and
+    // cell_rt.h section 7), so cloning it here would leak one reference. The
+    // retain is gated on the argument being a place for exactly this reason.
+    try expectContains(e.text, "cell_arc_t b = cell_fresh();");
+    try expectAbsent(e.text, "cell_arc_clone");
+}
+
+test "a returned arc local is retained before the drop that would free it" {
+    var e = try emitSource(
+        \\pub fn f() -> arc String {
+        \\  let arc s = "x"
+        \\  return s
+        \\}
+    );
+    defer e.deinit();
+    // Borrowck never makes an arc place dead (isDuplicable, R10 by design),
+    // so a returned arc local is always still in pendingDrops and the drop
+    // runs between the return temporary's initialization and the return
+    // itself. Without the clone the count reaches zero and the caller
+    // receives a freed box: exactly the use-after-free direction the
+    // ownership rules forbid. R11 release rule 2's "except the one being
+    // returned", paid for on the retain side because the drop pass is not
+    // this task's to change.
+    try expectContains(e.text,
+        \\  cell_arc_t _cell_t0 = cell_arc_clone(s);
+        \\  cell_arc_drop(s);
+        \\  return _cell_t0;
+    );
+}
+
+test "a returned arc parameter is neither retained nor released" {
+    var e = try emitSource(
+        \\pub fn share(arc n: String) -> arc String {
+        \\  return n
+        \\}
+    );
+    defer e.deinit();
+    // R11 rule 3, still holding by construction: a parameter is not
+    // droppable, so this function's pendingDrops is empty and the return
+    // takes the byte-for-byte unchanged path. The caller's call-site retain
+    // IS the reference handed back.
+    try expectContains(e.text, "  return n;\n");
+    try expectAbsent(e.text, "cell_arc_clone");
+    try expectAbsent(e.text, "cell_arc_drop");
+}
+
+test "an owned String place bound as arc is left as a loud C type error" {
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  let owned a = make()
+        \\  let arc b = a
+        \\}
+    );
+    defer e.deinit();
+    // cell_arc_from_string MOVES its argument, and borrowck's checkLet moves
+    // an initializer place only for `.owned` (R10's move-into-arc is
+    // unimplemented in the front end), so `a` is still scheduled for its own
+    // cell_string_free. Boxing here would emit a silent double free. Not
+    // boxing leaves a type error the C compiler reports, which is this
+    // backend's stated preference over plausible wrong code.
+    try expectAbsent(e.text, "cell_arc_from_string");
+    try expectContains(e.text, "cell_arc_t b = a;");
+    try expectContains(e.text, "cell_string_free(&a);");
+}
+
+test "an owned String call result bound as arc IS boxed" {
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  let arc b = make()
+        \\}
+    );
+    defer e.deinit();
+    // The complement of the test above: a call result is not a local the drop
+    // pass will also free, so moving it into the box is safe and correct.
+    try expectContains(e.text, "cell_arc_t b = cell_arc_from_string(cell_make());");
+}
+
 test "an unmoved owned [Byte] local gets cell_slice_free" {
     var e = try emitSource(
         \\pub fn f() {
@@ -2477,4 +2834,96 @@ test "a program that allocates and frees an owned local runs clean under cc" {
         return error.ProgramCrashed;
     }
     try std.testing.expectEqualStrings("ok\n", run_result.stdout);
+}
+
+test "an arc program's retains and releases balance when compiled and run" {
+    // The assertion that matters most for R11. Emitted-text tests can only
+    // show that a clone appears where one was expected; this one links the
+    // emitted C against the REAL runtime and reads the strong count back out
+    // at run time, so an unbalanced retain shows up as a wrong number rather
+    // than as text that happens to look right.
+    //
+    // The printed 7 decomposes as 2 + 5 and both halves are measurements:
+    //
+    //   `fresh` boxes a literal (count 1), retains it for the return so the
+    //   scope drop cannot free it (1 -> 2 -> 1), and hands back that single
+    //   reference. `a` therefore holds count 1.
+    //
+    //   `observe(arc a)` clones at the call site, so the host sees 2 and
+    //   returns 2, then releases its own reference per cell_rt.h section 7,
+    //   taking the count back to 1. Drop the return retain in
+    //   `emitReturnStmt` and `fresh` frees the box before returning it: the
+    //   count read is then garbage and this program tends to abort rather
+    //   than print. Drop the call-site clone and the host reads 1, printing
+    //   6 instead of 7.
+    //
+    //   `inspect(shared a)` must NOT clone (R8), and returns the borrowed
+    //   view's length, 5. An unwanted retain here would leave the final
+    //   cell_arc_drop at count 1 and leak the box, which the number cannot
+    //   see; `tools/check.sh`'s note and a run under `leaks` cover that side.
+    //
+    // The two bodyless declarations are defined by examples/arc_host.c, the
+    // same host examples/arc.cell uses, because only a C definition can read
+    // cell_arc_strong_count.
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn observe(arc name: String) -> Int;
+        \\pub fn inspect(shared name: String) -> Int;
+        \\pub fn fresh() -> arc String {
+        \\  let arc s = "boxed"
+        \\  return s
+        \\}
+        \\pub fn main() {
+        \\  let arc a = fresh()
+        \\  let copy n = observe(arc a)
+        \\  let copy m = inspect(shared a)
+        \\  print_int(n + m)
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_arc_clone(s)");
+    try expectContains(e.text, "cell_observe(cell_arc_clone(a))");
+    try expectContains(e.text, "cell_arc_drop(a);");
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.c", .data = e.text });
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const root = cwd_buf[0..cwd_len];
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{root});
+    defer gpa.free(include);
+    const rt_c = try std.fmt.allocPrint(gpa, "{s}/runtime/cell_rt.c", .{root});
+    defer gpa.free(rt_c);
+    const host_c = try std.fmt.allocPrint(gpa, "{s}/examples/arc_host.c", .{root});
+    defer gpa.free(host_c);
+
+    const cc_result = try std.process.run(gpa, io, .{
+        .argv = &.{ "cc", "-std=c11", "-Wall", "-Wextra", "body.c", host_c, rt_c, "-I", include, "-o", "body" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(cc_result.stdout);
+    defer gpa.free(cc_result.stderr);
+    if (!cc_result.term.success()) {
+        std.debug.print("cc rejected emitted C:\n{s}\n--- source ---\n{s}\n", .{ cc_result.stderr, e.text });
+        return error.CcRejectedEmittedC;
+    }
+
+    const run_result = try std.process.run(gpa, io, .{
+        .argv = &.{"./body"},
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(run_result.stdout);
+    defer gpa.free(run_result.stderr);
+    if (!run_result.term.success()) {
+        std.debug.print(
+            "emitted arc program did not exit cleanly (a released-too-early box typically aborts):\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ run_result.stdout, run_result.stderr },
+        );
+        return error.ProgramCrashed;
+    }
+    try std.testing.expectEqualStrings("7\n", run_result.stdout);
 }
