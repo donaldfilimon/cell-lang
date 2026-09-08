@@ -778,7 +778,8 @@ violating examples and diagnostics. This section defines the vocabulary.
 
 **Status of the whole model: partially enforced.** Annotations are accepted by
 the parser and recorded on the AST. `cell check` enforces R2, R3, R5, R8, R14,
-and R15. There is no NLL, and R10's move-into-`arc` is not checked. The C
+R15, and one clause of R10 (an `arc` place may not be passed to an `owned`
+parameter). There is no NLL, and R10's move-into-`arc` is still not checked. The C
 backend (`codegen.zig`) inserts drops for an unmoved `owned`/`arc` `let`/`var`
 local, function-scoped and conservative on moves; that is R16 partially done,
 not R16 complete -- see `docs/OWNERSHIP.md` R16 for exactly which cases still
@@ -874,12 +875,19 @@ R10's move-into-`arc` is unimplemented in the checker and boxing an un-moved
 place would double free it.
 
 **Every one of those is a leak, and that is a measurement, not a category.**
-An earlier draft here called the gaps "leaks rather than use-after-free" while
-two use-after-frees were live in the same code: a returned `arc` field was
-handed out unretained, and a shadowed `arc` local was released twice. Both are
-fixed and both carry tests; R11 names them. Read that list as what running
-programs under `leaks` and AddressSanitizer has found, not as a proof that
-nothing dangles.
+Two earlier drafts here made the categorical claim and review falsified both:
+the first covered a returned `arc` field handed out unretained and a shadowed
+`arc` local released twice; the second, written after a re-derivation that
+searched only return-position PLACES, covered three more on VALUE paths (an
+`arc` place flowing out of an `if` branch or a `match` arm, and an `arc` place
+passed to an `owned` parameter). All five are fixed, four by a retain and the
+fifth by R10 refusing the conversion, and all five carry tests. R11 names them
+and records which positions the third search actually covered, places and
+values alike. Read the list as what running programs has found, not as a proof
+that nothing dangles.
+
+R10's `arc`-to-`owned` clause is now enforced by `borrowck.zig`, which makes it
+the first clause of R10 to land; move-into-`arc` is still designed only.
 
 The LLVM and MLIR backends refuse `arc` outright and emit nothing.
 
@@ -923,8 +931,8 @@ and omitting it is allowed and inferred from the callee's signature. The
 
 ### 4.3 What ownership does today
 
-`cell check` enforces R2, R3, R5, R8, R14, and R15 through
-`src/cell/borrowck.zig`. Codegen lowers `shared` aggregates
+`cell check` enforces R2, R3, R5, R8, R14, R15, and R10's `arc`-to-`owned`
+clause through `src/cell/borrowck.zig`. Codegen lowers `shared` aggregates
 to `const T *`, `exclusive` aggregates to `T *`, and `arc` parameters to
 `cell_arc_t`. It boxes a literal or call result bound as `arc`, inserts
 `cell_arc_clone` at OWNERSHIP.md R11's three retain-a-place sites, and emits
@@ -1861,7 +1869,7 @@ records the missing lowering.
 | Call-site ownership prefix | implemented (see 0.7; this row postdates the 0.2 count) |
 | Move checking | implemented |
 | Shared-XOR-exclusive aliasing | implemented |
-| Retain / release insertion for `arc` | partially implemented, C backend only: all four R11 retain sites, the `shared`-parameter non-retain, and a retain for every returned `arc` place except a parameter; release is the drop pass, function-scoped. **Six** leaks remain, and `docs/OWNERSHIP.md` R11 tables them with a `leaks` measurement each: an `arc` parameter is never released by a Cell body, a struct with an `arc` field is never dropped, an unbound `arc` temporary unboxed for a `shared` parameter drops its handle, a block-scoped `arc` local is never released (unbounded in a `while` body), reassigning an `arc` `var` leaks the previous box, and an `owned` place bound as `arc` is not boxed because R10's move-into-`arc` is unimplemented. Two use-after-frees were found by review under an earlier "leaks, never dangling" claim and fixed with tests: a returned `arc` FIELD handed out unretained, and a SHADOWED `arc` local released twice because drops are spelled by name. Do not restate the categorical |
+| Retain / release insertion for `arc` | partially implemented, C backend only: all four R11 retain sites, the `shared`-parameter non-retain, a retain for every returned `arc` place except a parameter, and a retain for an `arc` place flowing out of an `if` branch, a `match` arm, or a block's trailing expression; release is the drop pass, function-scoped. **Six** leaks remain, and `docs/OWNERSHIP.md` R11 tables them with a `leaks` measurement each: an `arc` parameter is never released by a Cell body, a struct with an `arc` field is never dropped, an unbound `arc` temporary unboxed for a `shared` parameter drops its handle, a block-scoped `arc` local is never released (unbounded in a `while` body), reassigning an `arc` `var` leaks the previous box, and an `owned` place bound as `arc` is not boxed because R10's move-into-`arc` is unimplemented. FIVE use-after-frees were found by review under earlier "leaks, never dangling" claims and are fixed with tests: a returned `arc` FIELD handed out unretained, a SHADOWED `arc` local released twice because drops are spelled by name, an `arc` place flowing out of an `if` branch, one flowing out of a `match` arm in return position, and an `arc` place passed to an `owned` parameter (refused by R10, since no retain can fix a double free of the buffer). Do not restate the categorical |
 | Atomic refcounts in the runtime | implemented |
 | Drop insertion for `owned` | partially implemented: unmoved `owned`/`arc` `let`/`var` locals only, function-scoped, conservative on moves; not structs, not parameters, not a value revived after a move (see `docs/OWNERSHIP.md` R16) |
 | Copyability derivation | designed, not implemented |

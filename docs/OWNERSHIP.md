@@ -382,12 +382,29 @@ revision can relax the rule without invalidating existing programs.
 | `arc` place to an `arc` parameter | yes | retains; both holders live afterward |
 | `arc` place to a `shared` parameter | yes | borrows the pointee for the call; no retain |
 | `arc` place to an `exclusive` parameter | no | R9 |
-| `arc` place to an `owned` parameter | no | see below |
+| `arc` place to an `owned` parameter | no | see below. **IMPLEMENTED** in `borrowck.zig`, the only clause of R10 that is |
 | `owned` place to an `arc` parameter | yes | moved into a fresh `arc` box; the source is dead by R2 |
 | `shared` or `exclusive` borrow to an `arc` parameter | no | see below |
 | `copy` and `arc` on the same declaration | no | see below |
 
 > `err: cannot pass 'arc' value 'n' to 'owned' parameter 'b': ownership is shared and cannot be made unique`
+> `note: an 'owned' callee frees the value, and the 'arc' box would free it again`
+
+That first row is enforced today, and the reason it is a REFUSAL rather than a
+retain is worth stating, because "insert a `cell_arc_clone`" is the wrong
+instinct here and was tried. `owned [T]` and `shared [T]` lower to the **same**
+C type, `cell_slice_t` by value, so the C backend's unbox emitted
+`take((*(const cell_slice_t *)xs.ptr))` and it compiled clean at
+`-Wall -Wextra -Werror`. `runtime/cell_rt.h` section 7 makes an `owned` callee
+responsible for the eventual free, and `cell_slice_drop_glue` frees the same
+**buffer** again when the box dies. `cell_arc_clone` increments a refcount, and
+the buffer is not what the refcount governs, so no retain can fix it. The
+`arc` binding itself stays legal: only the conversion is refused. See
+`examples/rejected/arc_to_owned.cell`.
+
+The refusal is a `cell check` refusal. `cell emit` does not run borrowck (true
+of every rule in this file, not just this one), so emitting a rejected program
+directly still produces the bad C.
 
 > `err: cannot create an 'arc' from a borrow: 'b' is a shared borrow and does not own its value`
 
@@ -474,24 +491,40 @@ refuse `arc` outright and emit no drops at all):
 
 ### What still goes wrong, with the evidence for each
 
-An earlier version of this section said the remaining gaps were "leaks, never
-use-after-free". **That categorical was false**, and it was false while being
-asserted: review reproduced two use-after-frees under AddressSanitizer that it
-covered. Both are fixed, and the claim is restated as evidence rather than as
-a category, because the same sentence pattern is what hid them.
+This section has been rewritten twice after review falsified it, and the
+history is the most useful thing in it. Version one said the remaining gaps
+were "leaks, never use-after-free"; review found two use-after-frees it
+covered. Version two repeated the claim in softer words after a re-derivation
+that searched **return-position places**; review found three more, all of them
+on paths that are not places at all. So the claim is now stated together with
+the shape of the search behind it, and the shape is the part that matters.
 
-Fixed, and named so the next reader can tell what the tests are for:
+**Fixed, with tests, and named so the next reader knows what the tests are
+for:**
 
-1. **A returned `arc` field.** `fn peek(shared s: Session) -> arc String {
-   return s.name }` emitted a bare `return s->name;`, handing the caller the
-   record's reference. The caller released it and the record was left pointing
-   at a freed box. Now cloned, on both of `emitReturnStmt`'s branches.
+1. **A returned `arc` field.** `return s.name` emitted a bare `return
+   s->name;`, handing the caller the record's reference to release.
 2. **A shadowed `arc` local.** Drops are spelled by name, so two visible
-   bindings sharing one name emitted two identical `cell_arc_drop(s)`, both
-   resolving to the inner binding: released twice, and the outer never. Now
-   the shadowed outer binding is not dropped at all, which leaks it instead.
+   bindings sharing one released the inner box twice and the outer never.
+3. **An `arc` place flowing out of an `if`-expression branch.**
+   `let arc r = if (c > 0) { a } else { b }` assigned into the statement
+   expression's temporary without a retain, so `r` aliased `a`'s box and scope
+   exit released both.
+4. **An `arc` place flowing out of a `match` arm in return position.**
+   `return match c { 0 => a, _ => a }`. A `match` IS valued in return position
+   where an `if` is not, and it is not a place, so the return-position rule
+   never saw it and `cell_arc_drop(a)` ran before the `return`.
+5. **An `arc` place passed to an `owned` parameter**, now refused by R10 above
+   rather than retained, because no retain can fix a double free of the
+   buffer.
 
-Still broken, all of them leaks, each one measured rather than asserted:
+Numbers 3 and 4 had one root cause: a value slot is a position with a declared
+type exactly as a parameter, a `let`, or a struct field is, and it was the only
+such position not asking the conversion question. All five were silent at
+`cell check` and clean under `-Wall -Wextra -Werror`; only running them showed
+anything.
+
+**Still broken, all of them leaks, each measured rather than asserted:**
 
 | Gap | Evidence |
 |---|---|
@@ -502,13 +535,42 @@ Still broken, all of them leaks, each one measured rather than asserted:
 | Reassigning an `arc` `var` leaks the previous box (`var arc v = "one"` then `v = "two"`), the same class as the R3a-revival leak R16 documents for `owned` | `leaks`: **3 leaks / 64 bytes** for a single reassignment |
 | An `owned` String or list PLACE bound as `arc` is not boxed at all, and is left as a C type error rather than a silent double free | see retain rule 1 above |
 
-What that list is: every `arc` failure mode found by writing programs against
-this implementation and running them under `leaks` and AddressSanitizer, after
-two real use-after-frees were found in exactly the place a categorical claim
-said none could be. It is not a proof that no dangling case remains. One case
-this file's rules describe cannot be written today at all: a `match` arm whose
-body is a `return`, since `return` is not an expression in this grammar, so
-the match-arm retain is chosen for safety and is currently unreachable.
+### What the search covered, which is the honest form of the claim
+
+Not "every remaining gap is a leak", which has been falsified twice. What can
+be said is which positions were examined and with what.
+
+**Place positions**: a `let`/`var` initializer, a call argument, a struct
+literal field, a list element, an assignment's right side, and a `return`,
+each for a bare identifier, a field path including a nested one
+(`o.inner.name`), a parameter, and a shadowed binding.
+
+**Value positions**, the ones version two missed and this version added: an
+`if`-expression branch, a `match` arm, a block's trailing expression, and each
+of those in initializer, return, and call-argument position, plus a `match`
+scrutinee. A program exercising five of them at once runs clean under
+AddressSanitizer and UndefinedBehaviorSanitizer, and its `leaks` output
+accounts for exactly the three disclosed leaks above and nothing else. Two
+value paths cannot be reached at all today for an unrelated reason:
+typecheck gives every `if`-expression the type `()`, so an if-derived value
+cannot flow into a typed parameter or an annotated binding, and the
+un-annotated `let` is the reachable form.
+
+**What that is not.** It is not a proof. It is a list of positions that were
+written as programs and run. A position not on that list has not been ruled
+out, and the record of this section is that unexamined positions have twice
+contained a dangling reference.
+
+**One landmine, left deliberately and recorded here as well as in the code.**
+`returnedArcNeedsRetain` spells R11 rule 3's exception as "not droppable",
+which conflates a parameter with a match-arm binding. That is safe today only
+because a match-arm binding cannot reach it: `return` is not an expression in
+this grammar, so an arm body cannot contain one, and a trailing `match` is not
+an implicit return. If either changes, an `arc` match-arm binding returned
+directly will be handed back without a retain while the scrutinee it copies is
+released. Restore a parameter-only test at that point. An earlier revision
+carried a `Local.is_param` field for exactly this, and it was removed because
+it defended nothing reachable.
 
 A hand-written C callee that honours `cell_rt.h` section 7 and releases its
 `arc` parameter balances exactly; `examples/arc_host.c` is one.

@@ -1,7 +1,12 @@
 //! Borrow and move checker for Cell.
 //!
 //! Implements `docs/OWNERSHIP.md` rules R1, R2, R3, R3a, R4, R5, R6, R8, R14
-//! and R15. It is deliberately independent of
+//! and R15, plus ONE clause of R10: an `arc` place may not be passed to an
+//! `owned` parameter. The rest of R10, in particular move-into-`arc`, is
+//! still designed only. That single clause is here rather than in codegen
+//! because codegen cannot refuse it: `owned [T]` and `shared [T]` lower to
+//! the SAME C type, so the emitted conversion compiles clean and double frees
+//! the buffer. It is deliberately independent of
 //! `typecheck.zig`: it carries its own scope stack, its own signature table,
 //! and imports only `ast.zig` and `diag.zig`, so it neither depends on nor
 //! disturbs the type checker.

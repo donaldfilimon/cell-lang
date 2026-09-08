@@ -105,10 +105,11 @@
 //! retain every returned `arc` place except a parameter returned directly.
 //! A list is what got this wrong the first time, by omitting a field.
 //!
-//! TWO USE-AFTER-FREES LIVED HERE, and the sentence that used to occupy this
-//! paragraph said none could. Both were introduced by the same act: turning
-//! source that had been a C type error into source that compiles. Keep them
-//! named, because the next `arc` change can reintroduce either.
+//! FIVE USE-AFTER-FREES LIVED HERE, found in two review rounds, and the
+//! sentence that used to occupy this paragraph said none could. Every one was
+//! introduced by the same act: turning source that had been a C type error
+//! into source that compiles. Keep them named, because the next `arc` change
+//! can reintroduce any of them.
 //!
 //!   1. A returned `arc` FIELD. `return s.name` emitted a bare
 //!      `return s->name;`, handing the caller the record's own reference.
@@ -119,6 +120,24 @@
 //!      `cell_arc_drop(s)`, both resolving to the inner binding. Fixed by
 //!      `isShadowedAt`, which declines to drop a binding a later one
 //!      shadows, leaking it instead.
+//!   3. An `arc` place flowing out of an `if`-EXPRESSION branch.
+//!      `let arc r = if (c > 0) { a } else { b }` aliased `a`'s box.
+//!   4. An `arc` place flowing out of a `match` ARM in return position.
+//!      `return match c { 0 => a, _ => a }` dropped `a` before returning it.
+//!      A `match` is valued in return position where an `if` is not, and it
+//!      is not a PLACE, so the return-position rule never saw it.
+//!   5. An `arc` place passed to an `owned` parameter, now REFUSED by
+//!      `borrowck.zig` under R10 rather than retained. No retain can fix it:
+//!      `owned [T]` and `shared [T]` are the same C type, so the unbox
+//!      compiles and the buffer is freed twice, and a refcount does not
+//!      govern the buffer.
+//!
+//! 3 and 4 shared one root cause and one fix: `emitValueInto`'s leaf, which
+//! was the only position with a declared type that did not ask the
+//! conversion question. THE LESSON THAT GENERALIZES: 1 and 2 were found by
+//! searching return-position PLACES, and that search is what missed 3, 4 and
+//! 5. A retain rule has to be derived over positions, and a value slot is a
+//! position.
 //!
 //! Known gaps, every one of them MEASURED as a leak with `leaks` rather than
 //! argued to be one (`docs/OWNERSHIP.md` R11 carries the numbers): a Cell
@@ -133,7 +152,9 @@
 //! `arc` is not boxed at all, because `cell_arc_from_string` moves its
 //! argument while `borrowck.zig` leaves the source unmoved, and a loud C
 //! type error beats a silent double free. That list is what running programs
-//! has found, not a proof that nothing else dangles.
+//! has found, not a proof that nothing else dangles; `docs/OWNERSHIP.md` R11
+//! records exactly which positions the search covered, values as well as
+//! places.
 
 const std = @import("std");
 const ast = @import("ast.zig");
