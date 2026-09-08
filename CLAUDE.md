@@ -13,7 +13,8 @@ cross-file picture that no single source file states.
    parsed versus only designed.
 2. `docs/SPEC.md` section 12, the construct-by-construct status index, and
    `docs/OWNERSHIP.md` for the numbered rules `borrowck.zig` implements
-   (R1, R2, R3, R3a, R4, R5, R6, R8, **R9**, R14 and R15 today, **plus one
+   (R1, R2, **R2.a**, **R2.b**, R3, R3a, R4, R5, R6, R8, **R9**, R14 and R15
+   today, **plus one
    clause of R10**: an `arc` value may not be made unique. The rest of R10,
    move-into-`arc` in particular, is not enforced. Its header comment is the
    live list and this line has already drifted from it once, dropping R9 and
