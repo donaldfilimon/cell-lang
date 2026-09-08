@@ -1,0 +1,81 @@
+// EXPECT: currently-rejected
+// Violates: docs/OWNERSHIP.md R9 (an `arc` value may not be borrowed as
+// `exclusive`, and may not be written through).
+//
+// WHY THIS FILE EXISTS. `docs/SPEC.md` 4.1.4 said mutation through `arc` was
+// "not permitted in this revision", and every program below was ACCEPTED at
+// exit 0. That is the one direction of documentation error this repository
+// treats as worse than silence: an overclaimed safety guarantee. Elsewhere
+// these docs underclaim, which costs nothing but confidence; here the claim
+// was that a whole class of aliasing mutation could not be written, and it
+// could.
+//
+// The four measurements, all against `zig-out/bin/cell` built at `b3698a7`,
+// all `cell check` exit 0, and the emitted C compiled at
+// `-Wall -Wextra -Werror` except where noted:
+//
+//   let arc s = "x"; grow(exclusive s)
+//     cell_grow(((cell_string_t *)s.ptr))
+//     A mutable pointer INTO the shared box, handed to a callee that writes
+//     through it. Every other holder observes the write. Silent.
+//
+//   let arc s = "x"; grow(&mut s)
+//     The same emit by the sigil spelling. A rule enforced at the keyword
+//     form and not the sigil is not enforced.
+//
+//   H { arc h: String }; grow(&mut b.h)
+//     cell_grow(((cell_string_t *)&b.h.ptr))
+//     The worst of the four: a `cell_string_t *` aimed at the arc handle's own
+//     pointer field, so the callee writes over the refcount box pointer rather
+//     than the value. Silent. A check that asked only about the BINDING would
+//     miss it, which is why R9's classifier walks every step of the chain.
+//
+//   grow(&mut fresh()) with fresh() -> arc String
+//     cell_grow(((cell_string_t *)&cell_fresh().ptr))
+//     A VALUE position, so no place and no loan, so the choke point in
+//     `createLoan` never saw it. This one is LOUD: `cc` refuses to take the
+//     address of an rvalue, and refuses it for every type rather than by two C
+//     types happening to coincide. It is refused in the checker anyway.
+//
+// WHY REFUSAL AND NOT A COPY-ON-WRITE. `arc` shares ONE value between holders
+// and Cell has no interior mutability, so a unique reference into the box is
+// an aliasing violation and a data race at once, and the refcounts are atomic
+// (SPEC 4.1.4) precisely because the holders may be on different threads.
+// Nothing can be inserted that makes the write correct: the holders are meant
+// to observe the same value, so either the write is visible to all of them,
+// which R9 forbids, or the value is silently forked, which is not what the
+// program asked for. A later revision that adds interior mutability or a
+// uniqueness check can relax this without invalidating any program that
+// compiles today, which is the whole argument for being conservative now.
+//
+// WHAT STAYS LEGAL, because "arc is immutable" has to be scoped to mean this
+// and nothing wider: reading an `arc` place, passing it to an `arc` parameter
+// (retained), passing it to a `shared` parameter (borrowed, not retained, and
+// safe by R8), and reassigning a `var arc` handle, which rebinds the reference
+// rather than mutating the shared value and is R11's leak, not R9's rule.
+// `examples/arc.cell` exercises the legal set and still runs.
+
+pub struct Holder {
+    arc h: String
+}
+
+pub fn grow(exclusive s: String) -> Int;
+pub fn fresh() -> arc String;
+
+pub fn main() {
+    let arc s = "x"
+
+    // The keyword spelling.
+    let copy a = grow(exclusive s)
+
+    // The sigil spelling of the same borrow.
+    let copy b = grow(&mut s)
+
+    // An `arc` FIELD, reached through an `owned` binding: the binding is not
+    // `arc`, the last step is.
+    let owned k = Holder { h: "y" }
+    let copy c = grow(&mut k.h)
+
+    // A value position: no place, so no loan, so the choke point never saw it.
+    let copy d = grow(&mut fresh())
+}

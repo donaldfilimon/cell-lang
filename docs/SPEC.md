@@ -777,7 +777,7 @@ statement of the rules a checker must enforce, written as numbered rules with
 violating examples and diagnostics. This section defines the vocabulary.
 
 **Status of the whole model: partially enforced.** Annotations are accepted by
-the parser and recorded on the AST. `cell check` enforces R2, R3, R5, R8, R14,
+the parser and recorded on the AST. `cell check` enforces R2, R3, R5, R8, R9, R14,
 R15, and one clause of R10: an `arc` value may not be made **unique**, which is
 refused at six consumption sites (an `owned` parameter, an `owned` binding, an
 assignment to an `owned` place, an `owned` struct field, a list-literal element,
@@ -849,6 +849,23 @@ last one releases it.
   Mutation through `arc` is **not permitted in this revision** (OWNERSHIP.md
   R9); a mutable-through-`arc` story needs interior mutability, which does not
   exist yet.
+
+  **That sentence is now true, and it was not when it was first written.**
+  `borrowck.zig` enforces R9 as of this revision: an `arc` place may not be
+  borrowed as `exclusive` (refused in `createLoan`, so every spelling is
+  covered, plus a value position such as `&mut fresh()` over an `arc`-returning
+  callee) and may not be written through (refused in `checkAssign`, asked of
+  the strict prefixes of the target's path). Before that, five programs
+  compiled: `grow(exclusive s)` and `grow(&mut s)` on an `arc` binding both
+  emitted `cell_grow(((cell_string_t *)s.ptr))`, a mutable pointer into the
+  shared box, clean at `-Wall -Wextra -Werror`; `grow(&mut b.h)` on an `arc`
+  FIELD emitted a `cell_string_t *` aimed at the handle's own pointer field;
+  and two more were loud C errors. OWNERSHIP.md R9 tables all five with their
+  emits, and `examples/rejected/arc_exclusive_borrow.cell` is the corpus form.
+  Two things stay legal and the rule has to be read as scoped to exclude them:
+  a `shared` borrow of an `arc` place (R10's table requires it), and
+  reassigning a `var arc` handle, which rebinds the reference rather than
+  mutating the shared value and is R11's leak.
 - Caller afterward: full use. Its own reference is still valid.
 - Rust: `Arc<T>`. Swift: a `class` reference under ARC.
 
@@ -945,9 +962,10 @@ and omitting it is allowed and inferred from the callee's signature. The
 
 ### 4.3 What ownership does today
 
-`cell check` enforces R2, R3, R5, R8, R14, R15, and R10's
+`cell check` enforces R2, R3, R5, R8, R9, R14, R15, and R10's
 `arc`-cannot-be-made-unique clause (at six consumption sites) through
-`src/cell/borrowck.zig`. Codegen lowers `shared` aggregates
+`src/cell/borrowck.zig`. R9 covers both halves of "`arc` grants shared access
+only": no `exclusive` borrow of an `arc` place, and no write through one. Codegen lowers `shared` aggregates
 to `const T *`, `exclusive` aggregates to `T *`, and `arc` parameters to
 `cell_arc_t`. It boxes a literal or call result bound as `arc`, inserts
 `cell_arc_clone` at OWNERSHIP.md R11's three retain-a-place sites, and emits
@@ -1255,6 +1273,17 @@ R14 lives in `src/cell/borrowck.zig`. It names the place and notes the `let`:
 examples/rejected/immutable_assign.cell:9:5: error: cannot assign to immutable binding 'x'
 ```
 
+R14 has a **second clause** as of this revision: a binding that already holds a
+borrow may not be reassigned. `let` was already covered by the first clause,
+through immutability; `var` was not, and `var exclusive e = &mut a` followed by
+`e = &mut b` was accepted while the checker read the statement as a retarget
+and the C backend emitted `*e = *&b;`, a write through. With heap values that
+aliases one buffer into two owners and frees it twice, measured as an
+AddressSanitizer double free at exit 134. It is refused rather than modelled;
+`docs/OWNERSHIP.md` R14 gives the emit, the measurement, and the two
+neighbouring forms that stay legal, and
+`examples/rejected/borrow_retarget.cell` is the corpus form.
+
 Typecheck does **not** also report R14; a same-type write to an immutable
 binding is a typecheck-clean borrow error. A type mismatch on assignment is
 still a typecheck error. Measured, with a real path, line, and column. Three
@@ -1266,7 +1295,11 @@ behaviors worth stating precisely:
 2. **Parameter mutability follows the ownership mode**: `exclusive` and `owned`
    parameters are mutable, and `shared`, `arc`, and `copy` parameters are not.
    Measured for all three of the immutable modes. For `arc` this agrees with
-   OWNERSHIP.md R9, though by derivation rather than by an explicit rule.
+   OWNERSHIP.md R9, and it is still a derivation rather than R9's own message:
+   R9 now owns the exclusive borrow and the write THROUGH an `arc` place, while
+   `arc n: String` with `n = "other"` has an empty path, is a rebind of the
+   parameter's own handle, and is still reported by this derivation with R14's
+   generic text. `examples/rejected/arc_mutation.cell` pins that.
 3. **The symbol table was module-wide and never scoped**, so a `let x` in one
    function was visible to an assignment in a *different* function. **Fixed in
    `8dd5673`** (see 0.5): the same probe now reports `unknown identifier 'x'`.
@@ -1884,6 +1917,8 @@ records the missing lowering.
 | Call-site ownership prefix | implemented (see 0.7; this row postdates the 0.2 count) |
 | Move checking | implemented |
 | Shared-XOR-exclusive aliasing | implemented |
+| R9: `arc` grants shared access only | implemented in `borrowck.zig`, both halves. The borrow half refuses an `exclusive` borrow of an `arc` place at `createLoan`, the one point every exclusive loan passes through, so the keyword form, both sigil forms and both `let` forms are one check; `refuseArcValueBorrow` adds the VALUE position (`&mut fresh()` over an `arc`-returning callee) at the two sites that can reach it. The mutation half refuses a write through an `arc` place, asked of the STRICT prefixes of the target's path, so `b.n = 2` on an `arc` `b` is refused while rebinding a `var arc` handle stays legal (that is R11's leak, not R9). The classifier walks the binding plus every field segment and REFUSES a step whose annotation it cannot read, the same total verdict R10 had to adopt. **Five programs were accepted before this**, three of them silently, and 4.1.4 claimed the rule was already in force; OWNERSHIP.md R9 tables them with their emitted C. NOT covered: `arc n: String` with `n = "other"`, an empty path and therefore a handle rebind, still refused by R14's immutability derivation with R14's generic message |
+| R14 second clause: a borrow-holding binding may not be reassigned | implemented in `borrowck.zig`. `let` was already covered by immutability; `var` was not, and the gap was that the statement has two meanings: borrowck read `e = &mut b` as a retarget (creating a TEMPORARY loan that died with the statement, leaving a loan on the old referent and none on the new one) while the C backend emits `*e = *&b;`, a write through. Measured as an AddressSanitizer double free at exit 134 with heap values, plus a leak of the old referent's buffer in the same statement. Refused rather than modelled, because a retarget means killing a NAME-keyed loan (the unsafe direction) and a write-through means a place for `*e`, which "places, not names" does not have. Scoped to an empty target path and to a value `borrowSource` proves is a borrow, so a field write through an `exclusive` parameter and a whole-value write through a borrow both stay legal |
 | Retain / release insertion for `arc` | partially implemented, C backend only: all four R11 retain sites, the `shared`-parameter non-retain, a retain for every returned `arc` place except a PARAMETER returned directly (a match-arm binding returned from a block arm body is retained, and spelling that exception as "not droppable" instead of "not a parameter" reopened a use-after-free once), and a retain for an `arc` place flowing out of an `if` branch, a `match` arm, or a block's trailing expression; release is the drop pass, function-scoped. **Six** leaks remain, and `docs/OWNERSHIP.md` R11 tables them with a `leaks` measurement each: an `arc` parameter is never released by a Cell body, a struct with an `arc` field is never dropped, an unbound `arc` temporary unboxed for a `shared` parameter drops its handle, a block-scoped `arc` local is never released (unbounded in a `while` body), reassigning an `arc` `var` leaks the previous box, and an `owned` place bound as `arc` is not boxed because R10's move-into-`arc` is unimplemented. NINE use-after-frees were found under earlier "leaks, never dangling" claims and are fixed with tests: a returned `arc` FIELD handed out unretained, a SHADOWED `arc` local released twice because drops are spelled by name, an `arc` place flowing out of an `if` branch, one flowing out of a `match` arm in return position, an `arc` place passed to an `owned` parameter, an `arc` match-arm binding returned from a BLOCK arm body (which the round that removed `Local.is_param` had derived to be unreachable), `let owned ys: [Int] = xs`, a double free of the buffer that the parameter-position guard did not reach, R10's refusal being place-only so every VALUE position escaped it, and `take(owned fresh())` over an `arc`-returning callee, the one that was a LIVE ASan double free rather than masked. The last four are refused by R10 rather than retained, since no retain can fix a double free of the buffer. Do not restate the categorical, and note that each of the three rounds was falsified by a FORM of a construct the previous round had not written out |
 | Atomic refcounts in the runtime | implemented |
 | Drop insertion for `owned` | partially implemented: unmoved `owned`/`arc` `let`/`var` locals only, function-scoped, conservative on moves; not structs, not parameters, not a value revived after a move (see `docs/OWNERSHIP.md` R16) |

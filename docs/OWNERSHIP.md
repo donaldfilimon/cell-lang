@@ -12,8 +12,11 @@ source, believe the source.
 
 **Implementation status.** `src/cell/borrowck.zig` is wired into `cell check`
 and enforces R2 (use-after-move), R3 (move-out-of-borrow), R5 (shared XOR
-exclusive), R8 (escaping borrow), R14 (assignment through an immutable place,
-including fields), and R15 (call-site annotation agreement). Diagnostics name
+exclusive), R8 (escaping borrow), R9 (`arc` grants shared access only: no
+exclusive borrow of an `arc` place and no write through one), R14 (assignment
+through an immutable place, including fields, and the second clause that
+refuses reassigning a binding which already holds a borrow), and R15
+(call-site annotation agreement). Diagnostics name
 the place and land at the use site. That file's header comment is the
 authoritative list and moves with the code; believe it over this paragraph.
 NLL is still designed. **R11** retain-release insertion is implemented in the
@@ -433,11 +436,78 @@ pub fn rename(arc n: String) {
 > `err: cannot assign through 'n': 'arc' grants shared access only`
 > `note: mutation through 'arc' needs interior mutability, which Cell does not have yet`
 
-Today this is caught, but by R14 and with R14's generic message, because
-`checkFn` derives parameter mutability as `ownership == .exclusive or
-ownership == .owned` and `arc` therefore lands on the immutable side. Measured.
-That agreement is a derivation, not a rule; R9 should be stated explicitly so
-the message explains the actual reason.
+**IMPLEMENTED in `borrowck.zig`.** The rule has two halves and they are
+enforced at different places, because they ask different questions.
+
+**The borrow half: an `arc` place may not be borrowed as `exclusive`.**
+Enforced in `createLoan`, which is the ONE point every exclusive loan passes
+through, so the keyword form (`grow(exclusive s, ...)`), both sigil forms
+(`&mut s`, `&exclusive s`), and both `let` forms (`let exclusive e = &mut s`,
+`let exclusive e = s`) are all covered by one check rather than by five copies
+of it. A `shared` borrow of an `arc` place stays legal, which R10's table
+requires: it borrows the pointee without retaining, and R8 keeps it inside the
+block.
+
+**The mutation half: an `arc` place may not be written through.** Enforced in
+`checkAssign`, asked of the STRICT prefixes of the target's path. `b.n = 2`
+where `b` is `arc` mutates the shared value and is refused; `b = other` where
+`b` is a `var arc` REBINDS the handle, does not touch the shared value, and
+stays legal (it is R11's leak of the previous box, not R9's rule).
+
+**The classifier is total and walks the whole chain**, the binding plus every
+field segment, and a step whose annotation cannot be read is REFUSED rather
+than permitted. That is the same discipline R10's `arcUniqueSource` had to
+adopt, for the same reason: every one of R10's three widenings escaped through
+a permissive default, and silence is what an unenumerated form produces. One
+consequence bounds the over-refusal: a one-segment write such as
+`b.len = b.len + 1` through an `exclusive b: Buffer` asks only about the
+binding, so no struct has to resolve and the unresolved case cannot reach it.
+
+**What was measured before this landed**, every one at `cell check` exit 0
+against `zig-out/bin/cell` built at `b3698a7`, and every emitted C accepted at
+`-Wall -Wextra -Werror` except the last:
+
+| Program | Emitted C | Loud? |
+|---|---|---|
+| `let arc s = "x"` then `grow(exclusive s)` | `cell_grow(((cell_string_t *)s.ptr))` | no, a mutable pointer into the shared box |
+| the same with `grow(&mut s)` | identical | no |
+| `H { arc h: String }` then `grow(&mut b.h)` | `cell_grow(((cell_string_t *)&b.h.ptr))` | no, and it aims at the handle's own pointer field |
+| `var arc b` then `b.n = 2` | `cell_arc_t b = ...; b.n = 2;` | yes, `cc` refuses it |
+| `grow(&mut fresh())` with `fresh() -> arc String` | `cell_grow(((cell_string_t *)&cell_fresh().ptr))` | yes, `cc` refuses the address of an rvalue |
+
+The last row is the PLACE-versus-VALUE axis, R10's axis 1 recurring in a new
+rule: `createLoan` is the choke point for exclusive loans and a loan is only
+created for a place, so a value never reached it. It is refused now, in
+`refuseArcValueBorrow`, at BOTH sites that can reach it, because `checkCall`
+peels the sigil itself and hands `checkExpr` the operand rather than the unary
+node. Fixing only the unary arm left the measured program accepted, which is
+this file's own failure mode caught inside its own fix.
+
+**`docs/SPEC.md` 4.1.4 claimed this was already forbidden while all five
+compiled.** These docs underclaim elsewhere, which costs confidence and nothing
+else; here the claim was that a class of aliasing mutation could not be
+written, and it could. That is the one direction of documentation error this
+repository cannot afford, and it is why the rule was implemented rather than
+the sentence softened. `examples/rejected/arc_exclusive_borrow.cell` is the
+corpus form and carries the measurements.
+
+**What is still NOT R9's message.** The example above, `arc n: String` with
+`n = "other"`, has an EMPTY path, so it is a rebind of the parameter's own
+handle and R9's mutation half does not ask about it. It is still refused, still
+by R14's immutability derivation (`checkFn` makes a parameter mutable exactly
+when it is `owned` or `exclusive`, so `arc` lands on the immutable side), and
+still with R14's generic message. `examples/rejected/arc_mutation.cell` pins
+that, unchanged. The explicit R9 wording for a parameter rebind remains
+designed only; the diagnostic above is what R9 prints for the forms it does
+own.
+
+**Why refusal and not a copy-on-write or a retain.** `arc` shares ONE value
+between holders and Cell has no interior mutability, so a unique reference into
+the box is an aliasing violation and a data race at once, and the refcounts are
+atomic (SPEC 4.1.4) precisely because holders may be on different threads.
+Nothing can be inserted that makes the write correct: either it is visible to
+every holder, which R9 forbids, or the value is silently forked, which is not
+what the program asked for.
 
 This is the conservative half of the Swift analogue. A Swift `class` reference
 does permit mutation, and Cell will need either interior mutability or a
@@ -450,7 +520,7 @@ revision can relax the rule without invalidating existing programs.
 |---|---|---|
 | `arc` place to an `arc` parameter | yes | retains; both holders live afterward |
 | `arc` place to a `shared` parameter | yes | borrows the pointee for the call; no retain |
-| `arc` place to an `exclusive` parameter | no | R9 |
+| `arc` place to an `exclusive` parameter | no | R9. **IMPLEMENTED** in `borrowck.zig` as of the R9 work above, at `createLoan`, which covers every spelling of an exclusive borrow rather than this position alone |
 | `arc` place to an `owned` parameter | no | see below. **IMPLEMENTED** in `borrowck.zig`, the only clause of R10 that is, and enforced at four positions rather than just this one |
 | `owned` place to an `arc` parameter | yes | moved into a fresh `arc` box; the source is dead by R2 |
 | `shared` or `exclusive` borrow to an `arc` parameter | no | see below |
@@ -961,6 +1031,62 @@ What works, verified:
   immutable modes.
 - Diagnostics go through `Bag.render`, so they carry the source line and caret.
 
+**Second clause: a binding that already holds a borrow may not be reassigned.**
+Enforced in `checkAssign`.
+
+> `err: cannot assign a borrow of 'b' to 'e': it already holds a borrow, and rebinding one is not defined in this revision`
+> `note: the C backend writes THROUGH the borrow rather than retargeting it, so the two readings of this statement differ; bind a new name instead`
+
+R14's first clause already refused this for a `let`, by immutability, and there
+is a test named for it. `var` reached a gap, and the gap was that the statement
+has TWO meanings and the compiler implemented a different one in each half:
+
+```cell
+var exclusive e = &mut a
+e = &mut b
+```
+
+- `borrowck.zig` read it as a RETARGET, and read it wrong. `placeOf` returns
+  null for a unary, so `checkExpr` created a TEMPORARY loan on `b` that died
+  with the statement, while `e`'s named loan still pointed at `a`. After the
+  statement there was a loan on `a` and NONE on `b`, so a following
+  `take(owned b)` was accepted.
+- `codegen.zig` reads it as a WRITE THROUGH and emits `*e = *&b;`. It never
+  retargets anything.
+
+The second reading is the one that runs, and it is not a stale-loan nuisance.
+Measured at `b3698a7` with `make() -> String`, `var owned a = make()`,
+`var owned b = make()`, `var exclusive e = &mut a`, `e = &mut b`: the emit was
+`*e = *&b;` followed by `cell_string_free(&b); cell_string_free(&a);` with `a`
+and `b` holding the same buffer pointer. **AddressSanitizer: attempting
+double-free, exit 134.** `a`'s original buffer leaks in the same statement.
+`cell check` said `ok`; `cc` said nothing at `-Wall -Wextra -Werror`.
+
+It is REFUSED rather than modelled. Modelling the retarget means killing `e`'s
+old loan, and killing a loan is the unsafe direction under a holder keyed by
+NAME rather than by binding id: a shadowed name would remove a loan that is not
+this binding's, and a removed loan permits. Modelling the write-through means a
+place for `*e`, which "places, not names" does not have, since a place is a
+binding plus a field path and a referent is a different binding. Neither is
+contained, and the language has not decided which meaning it wants.
+
+The refusal is scoped to an EMPTY target path and to a value that is provably a
+borrow, so the two legitimate neighbours survive: `buf.len = new_len` through
+an `exclusive buf: Buffer` (a field write, which `examples/ownership.cell`
+does) and `e = Buffer { len: 3 }` (a whole-value write through the borrow,
+which `runtime/cell_rt.h` section 7 defines). `borrowSource` is what tells
+those from a retarget, and it is total: a value it cannot prove is not a borrow
+is refused too.
+
+"Holds a borrow" is asked TWO ways, because neither alone is enough. The
+declared annotation catches `var exclusive e = &mut a`. A scan for a named loan
+whose holder is this binding's name catches `var owned e = &mut a`, which
+`checkLetInit` also turns into a named loan: it creates one whenever the
+initializer is a `&` form, regardless of the annotation. The scan is by name,
+so a shadowed name can match a loan that is not this binding's; that direction
+only ever refuses an assignment, never permits one.
+`examples/rejected/borrow_retarget.cell` is the corpus form.
+
 There is still no check that the target is *assignable* at all. Assigning to a
 literal or a call result is accepted and emits nonsense C:
 
@@ -1064,7 +1190,12 @@ Ordered so each step is testable and none depends on a later one. Steps marked
    exist. `examples/rejected/use_after_move.cell` is the first test.
 3. *(front end)* **Keep the call-argument ownership annotation**, then **R15**
    and the explicit form of **R9**. The annotation and **R15** are **done** as
-   of `67529a9`; the explicit form of **R9** is not.
+   of `67529a9`. **R9** is now **done** too, for the forms it owns: an
+   exclusive borrow of an `arc` place (every spelling, through `createLoan`)
+   and a write through one (the strict prefixes of an assignment target). The
+   one form it still does not own is the parameter rebind its own example
+   shows, `arc n: String` with `n = "other"`, which has an empty path and stays
+   R14's, with R14's generic message. See R9.
 4. **R4, R5**: shared XOR exclusive, with the lexical loan scopes of 0.3.
    Needs loan provenance recovered from `&`/`&mut` initializers.
 5. **R6**: field-path disjointness, using `Expr.field` and `rootName`.

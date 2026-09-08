@@ -1,7 +1,7 @@
 //! Borrow and move checker for Cell.
 //!
-//! Implements `docs/OWNERSHIP.md` rules R1, R2, R3, R3a, R4, R5, R6, R8, R14
-//! and R15, plus ONE clause of R10: an `arc` value may not be made UNIQUE,
+//! Implements `docs/OWNERSHIP.md` rules R1, R2, R3, R3a, R4, R5, R6, R8, R9,
+//! R14 and R15, plus ONE clause of R10: an `arc` value may not be made UNIQUE,
 //! refused at six consumption sites (an `owned` parameter, an `owned`
 //! binding, an assignment into an `owned` place, an `owned` struct field, a
 //! list-literal element, and a `return` whose declared return type is not
@@ -13,7 +13,25 @@
 //! a source whose ownership it cannot resolve is refused, not permitted.
 //! Read that function's comment before widening it a fourth time; the three
 //! widenings so far were three different axes and each escaped through the
-//! same permissive default. It is deliberately independent of
+//! same permissive default.
+//!
+//! **R9** is both halves of "`arc` grants shared access only": no `exclusive`
+//! borrow of an `arc` place, refused in `createLoan` because that is the ONE
+//! point every exclusive loan passes through, plus `refuseArcValueBorrow` for
+//! the value positions no loan is created for; and no write THROUGH an `arc`
+//! place, refused in `checkAssign` against the STRICT prefixes of the target's
+//! path, so rebinding a `var arc` handle stays legal. `arcReach` is its
+//! classifier and is total the same way `arcUniqueSource` is. The one form R9
+//! does not own is an empty-path rebind of an immutable `arc` parameter, which
+//! R14's immutability derivation still reports with R14's generic message.
+//!
+//! **R14 has a second clause**: a binding that already holds a borrow may not
+//! be reassigned. `let` was covered by immutability; `var` was not, and
+//! `e = &mut b` had two meanings, a retarget this checker modelled wrongly and
+//! a write-through the C backend actually emits. Read the comment at that
+//! check before relaxing it.
+//!
+//! It is deliberately independent of
 //! `typecheck.zig`: it carries its own scope stack, its own signature table,
 //! and imports only `ast.zig` and `diag.zig`, so it neither depends on nor
 //! disturbs the type checker.
@@ -593,6 +611,29 @@ pub const Checker = struct {
                     }
                 }
             }
+            // And ACROSS A BORROW. `let exclusive e = &mut buf` has no
+            // annotation, is not a struct literal and is not a call, so `e`
+            // used to carry no struct type at all, and `&mut e.len` then had
+            // no field annotation to read. That is harmless while an
+            // unresolved annotation means "permit"; R9's verdict is total, so
+            // it would mean REFUSE, and a plain field borrow through a named
+            // loan would stop compiling. Same shape as the call inference
+            // above, added for the same reason.
+            if (struct_name == null) {
+                const referent: ?*const ast.Expr = if (refKind(v)) |r|
+                    r.operand
+                else if (l.ownership == .shared or l.ownership == .exclusive)
+                    v
+                else
+                    null;
+                if (referent) |operand| {
+                    if (try self.placeOf(operand)) |p| {
+                        if (self.bindingById(p.binding)) |rb| {
+                            struct_name = self.placeStructName(rb, p.path);
+                        }
+                    }
+                }
+            }
             try self.checkLetInit(l, v);
         }
 
@@ -709,6 +750,32 @@ pub const Checker = struct {
             return;
         }
 
+        // R9, the mutation half. Asked of the STRICT prefixes, so writing
+        // `b.n = 2` through an `arc` binding is refused while `s = other` on
+        // a `var arc s` stays legal: that one rebinds the handle, which is
+        // R11's leak and not a mutation of the shared value.
+        //
+        // Measured before this at exit 0: `var arc b = B { n: 1 }` then
+        // `b.n = 2` was accepted, and emitted `cell_arc_t b = (cell_B){...};
+        // b.n = 2;`, which `cc` then refused. A loud C error is the mild end
+        // of this rule; `&mut b.h` on an `arc` field was silent (see
+        // `createLoan`).
+        //
+        // The spec's own R9 example, `pub fn rename(arc n: String) { n = "other" }`,
+        // does NOT reach here: it is an empty path, so R14's immutability
+        // check above fires first and reports its generic message. That is
+        // unchanged and still what `examples/rejected/arc_mutation.cell`
+        // pins; the explicit R9 message for a parameter rebind is still
+        // designed only, and OWNERSHIP.md R9 says so.
+        if (try self.refuseArcShared(
+            try self.arcReach(place, .strict_prefix),
+            place,
+            .assign,
+        )) {
+            try self.checkExpr(&a.value);
+            return;
+        }
+
         // R5 applied to a write. The spec fixes the wording for reads only;
         // a write is strictly stronger than a read, so an outstanding loan of
         // either kind blocks it.
@@ -729,6 +796,89 @@ pub const Checker = struct {
             try self.noteLoanScope(loan);
             try self.checkExpr(&a.value);
             return;
+        }
+
+        // R14's second clause: a binding that already holds a borrow may not
+        // be reassigned. R14 already refuses this for a `let`, by
+        // immutability; `var` reached here and nothing stopped it.
+        //
+        // THE STATEMENT HAS TWO MEANINGS AND THE COMPILER IMPLEMENTS BOTH,
+        // DIFFERENTLY. For `var exclusive e = &mut a` then `e = &mut b`:
+        //
+        //   * this checker read it as a RETARGET, and read it wrong. `placeOf`
+        //     returns null for a unary, so `checkExpr` made a TEMPORARY loan
+        //     on `b` that died with the statement, while `e`'s named loan
+        //     still pointed at `a`. After the statement there was a loan on
+        //     `a` and NONE on `b`, so `take(owned b)` was accepted.
+        //   * the C backend reads it as a WRITE THROUGH, and emits
+        //     `*e = *&b;`, copying `b`'s value into `a`.
+        //
+        // The second reading is the one that runs, and it is a live double
+        // free, not a stale-loan nuisance. Measured on
+        //
+        //     var owned a = make()   var owned b = make()
+        //     var exclusive e = &mut a
+        //     e = &mut b
+        //
+        // with `make() -> String`: the emit was `*e = *&b;` followed by
+        // `cell_string_free(&b); cell_string_free(&a);`, `a` and `b` holding
+        // the same buffer. AddressSanitizer: attempting double-free, exit 134.
+        // `a`'s original buffer leaks in the same statement.
+        //
+        // So this is refused rather than modelled. Modelling the retarget
+        // would mean killing `e`'s old loan, and killing a loan is the unsafe
+        // direction under a name-keyed holder; modelling the write-through
+        // would mean a place for `*e`, which the "places, not names" model
+        // does not have (a place is a binding plus a field path, and a
+        // referent is a different binding). Neither is a contained change, and
+        // the language has not decided which meaning it wants. Refusing costs
+        // a program that can be spelled with a fresh `let`.
+        //
+        // Scoped to an EMPTY path and to a borrow-producing value, so the two
+        // legitimate neighbours survive: `buf.len = new_len` through an
+        // `exclusive buf: Buffer` (a field write, and `examples/ownership.cell`
+        // does it) and `e = B { n: 3 }` (a whole-value write-through, which
+        // `runtime/cell_rt.h` section 7 defines and a codegen fix already
+        // landed for). `borrowSource` is what tells those from a retarget, and
+        // it is total: a value it cannot classify is refused too.
+        if (place.path.len == 0 and self.holdsBorrow(b)) {
+            switch (try self.borrowSource(&a.value)) {
+                .not_borrow => {},
+                .borrow => |s| {
+                    try self.diagnostics.err(
+                        self.allocator,
+                        place.span,
+                        try self.msg(
+                            "cannot assign {s} to '{s}': it already holds a borrow, and rebinding one is not defined in this revision",
+                            .{ s.display, place.display },
+                        ),
+                    );
+                    try self.diagnostics.note(
+                        self.allocator,
+                        place.span,
+                        "the C backend writes THROUGH the borrow rather than retargeting it, so the two readings of this statement differ; bind a new name instead",
+                    );
+                    try self.checkExpr(&a.value);
+                    return;
+                },
+                .unresolved => |s| {
+                    try self.diagnostics.err(
+                        self.allocator,
+                        place.span,
+                        try self.msg(
+                            "cannot assign to '{s}', which holds a borrow: {s} cannot be classified as a value or a borrow here",
+                            .{ place.display, s.display },
+                        ),
+                    );
+                    try self.diagnostics.note(
+                        self.allocator,
+                        place.span,
+                        "R14 refuses what it cannot prove is not a borrow: a retarget the checker does not see leaves a loan on the old referent and none on the new one",
+                    );
+                    try self.checkExpr(&a.value);
+                    return;
+                },
+            }
         }
 
         // R10, the assignment position: the same double free as the `let`
@@ -782,6 +932,24 @@ pub const Checker = struct {
                         try self.createLoan(place, kind, false, null);
                         return;
                     }
+                    // R9 in a VALUE position, which is axis 1 of R10's history
+                    // repeating in a new rule: `createLoan` is the choke point
+                    // for every exclusive loan, and a loan is only created for
+                    // a PLACE, so `&mut fresh()` with `fresh() -> arc String`
+                    // never reached it. Measured: accepted at exit 0, emitting
+                    // `cell_grow(((cell_string_t *)&cell_fresh().ptr))`.
+                    //
+                    // That emit is LOUD, and loud for every type rather than
+                    // by the coincidence of two C types: `cc` refuses to take
+                    // the address of an rvalue. It is refused here anyway, on
+                    // the argument `refuseArcUnique` already makes, that a
+                    // rule which holds for every type beats one whose
+                    // enforcement depends on what the backend happens to emit.
+                    //
+                    // `arcUniqueSource` is R10's classifier and answers the
+                    // question both rules need here, "is this expression an
+                    // `arc` handle", with a total verdict.
+                    if (kind == .exclusive and try self.refuseArcValueBorrow(u.operand)) return;
                 }
                 try self.checkExpr(u.operand);
             },
@@ -1006,6 +1174,11 @@ pub const Checker = struct {
 
             const place = try self.placeOf(operand);
             if (place == null) {
+                // R9 in a value position. `checkCall` peels the `&mut` itself
+                // and hands `checkExpr` the operand, so the unary arm's copy
+                // of this check never sees a call argument. See
+                // `refuseArcValueBorrow`.
+                if (mode == .exclusive and try self.refuseArcValueBorrow(operand)) continue;
                 try self.checkExpr(operand);
                 continue;
             }
@@ -1142,6 +1315,42 @@ pub const Checker = struct {
         if (self.findDead(place)) |d| {
             try self.reportUseAfterMove(d, place.span);
             return;
+        }
+
+        // R9, the exclusive-borrow half, and this is the ONE choke point every
+        // exclusive loan passes through: `&mut s`, `exclusive s` as a call
+        // argument, `grow(&mut s)`, `let exclusive e = &mut s` and
+        // `let exclusive e = s` all arrive here. Enforcing it at each of those
+        // sites instead is the enumeration this file has been caught by four
+        // times; one gate is the point.
+        //
+        // What was measured before this, all at exit 0 from `cell check`:
+        //
+        //   let arc s = "x"           grow(exclusive s)
+        //                             emitted `cell_grow(((cell_string_t *)s.ptr))`,
+        //                             a mutable pointer INTO the shared box,
+        //                             clean at `-Wall -Wextra -Werror`.
+        //   let arc s = "x"           grow(&mut s)              same emit
+        //   var arc s = "x"           let exclusive e = &mut s  accepted
+        //   H { arc h: String }       grow(&mut b.h)
+        //                             emitted `cell_grow(((cell_string_t *)&b.h.ptr))`,
+        //                             a `cell_string_t *` aimed at the handle's
+        //                             own pointer field. Silent.
+        //
+        // `docs/SPEC.md` 4.1.4 claimed mutation through `arc` was "not
+        // permitted in this revision" while all four compiled, which is the
+        // one direction of documentation error this repository cannot afford:
+        // an overclaimed safety guarantee.
+        //
+        // A `shared` loan of an `arc` place stays legal, and deliberately so:
+        // R10's table makes `arc` to a `shared` parameter a borrow of the
+        // pointee with no retain, and R8 keeps it inside the block.
+        if (kind == .exclusive) {
+            if (try self.refuseArcShared(
+                try self.arcReach(place, .whole),
+                place,
+                .borrow_exclusive,
+            )) return;
         }
 
         if (try self.findBlockingLoan(place, kind)) |loan| {
@@ -1536,6 +1745,394 @@ pub const Checker = struct {
         return true;
     }
 
+    /// R9: what an `exclusive` borrow of, or a write through, a place would
+    /// reach. The verdict is TOTAL for the same reason `ArcSource`'s is: a
+    /// step whose annotation cannot be read is `.unresolved` and is REFUSED,
+    /// not permitted. Silence must not mean safe.
+    const ArcReach = union(enum) {
+        /// Every step this depth asked about has a resolved, non-`arc`
+        /// annotation.
+        not_arc,
+        /// A step is `arc`. `display` names that step, which is the whole
+        /// place for a bare binding and a strict prefix for a field path.
+        arc: ArcSource.Site,
+        /// A step's annotation could not be read. Refused.
+        unresolved: ArcSource.Site,
+    };
+
+    /// How far along a place's chain the R9 question runs. The two sites ask
+    /// DIFFERENT questions and the difference is not cosmetic.
+    const ReachDepth = enum {
+        /// Every step, the final field included. An exclusive BORROW asks
+        /// this: `&mut b.h` with `arc h: String` hands the callee a mutable
+        /// pointer built from the handle itself. Measured, it emitted
+        /// `cell_grow(((cell_string_t *)&b.h.ptr))`, a `cell_string_t *`
+        /// aimed at the box pointer, and `cc` accepted it silently.
+        whole,
+        /// Every step but the last. An ASSIGNMENT asks this: writing
+        /// `b.h = ...` where `h` is `arc` REBINDS that handle, which is R11's
+        /// leak and not a mutation of the pointee, while writing `b.h.x = ...`
+        /// mutates the shared value through it. A consequence worth stating,
+        /// because it bounds the over-refusal: a one-segment write such as
+        /// `b.len = b.len + 1` through an `exclusive b: Buffer` asks only
+        /// about the binding, so no struct has to resolve and `.unresolved`
+        /// cannot reach it.
+        strict_prefix,
+    };
+
+    /// Walk a place's chain and report the first `arc` step, or the first step
+    /// whose annotation is unreadable.
+    ///
+    /// The binding itself is the empty-path prefix and is always asked, at
+    /// both depths. That matters: `let arc s` then `&mut s` has no field path
+    /// at all, and it is the plainest form of the rule.
+    fn arcReach(self: *Checker, place: Place, depth: ReachDepth) Error!ArcReach {
+        const b = self.bindingById(place.binding) orelse return .{ .unresolved = .{
+            .display = try self.msg("the place '{s}'", .{place.display}),
+            .span = place.span,
+        } };
+        // The binding is the empty-path prefix. It is a STRICT prefix only
+        // when there is a field path after it, which is why this cannot be
+        // hoisted above the depth split: `var arc b` then `b = other` rebinds
+        // the handle and is R11's leak, while `b.len = 2` writes through it
+        // and is R9's rule. The accepted-case test caught this being hoisted.
+        if (place.path.len == 0) {
+            return switch (depth) {
+                .whole => if (b.ownership == .arc) .{ .arc = .{
+                    .display = b.name,
+                    .span = place.span,
+                } } else .not_arc,
+                .strict_prefix => .not_arc,
+            };
+        }
+        if (b.ownership == .arc) return .{ .arc = .{ .display = b.name, .span = place.span } };
+
+        var total: usize = 1;
+        for (place.path) |ch| {
+            if (ch == '.') total += 1;
+        }
+        const limit = switch (depth) {
+            .whole => total,
+            .strict_prefix => total - 1,
+        };
+        if (limit == 0) return .not_arc;
+
+        var current: ?[]const u8 = b.struct_name;
+        var prefix: []const u8 = b.name;
+        var it = std.mem.splitScalar(u8, place.path, '.');
+        var i: usize = 0;
+        while (it.next()) |segment| : (i += 1) {
+            if (i == limit) break;
+            const unreadable: ArcReach = .{ .unresolved = .{
+                .display = try self.msg("the field '{s}' of '{s}'", .{ segment, prefix }),
+                .span = place.span,
+            } };
+            const struct_name = current orelse return unreadable;
+            const def = self.structs.get(struct_name) orelse return unreadable;
+            const field = findField(def, segment) orelse return unreadable;
+            prefix = try self.msg("{s}.{s}", .{ prefix, segment });
+            if (field.ownership == .arc) return .{ .arc = .{
+                .display = prefix,
+                .span = place.span,
+            } };
+            current = typeStructName(&field.ty);
+        }
+        return .not_arc;
+    }
+
+    /// R9: an `arc` value grants shared access only. One function for both
+    /// enforcement sites, so they cannot drift apart the way R10's four
+    /// hand-written copies did.
+    ///
+    /// It is a REFUSAL and there is nothing to insert instead. `arc` shares
+    /// one value between holders and Cell has no interior mutability, so a
+    /// mutable pointer into the box is a data race and an aliasing violation
+    /// at once; no clone or retain changes that, because the holders are meant
+    /// to observe the SAME value.
+    ///
+    /// Returns true when it refused.
+    fn refuseArcShared(
+        self: *Checker,
+        reach: ArcReach,
+        place: Place,
+        op: enum { borrow_exclusive, assign },
+    ) Error!bool {
+        switch (reach) {
+            .not_arc => return false,
+            .arc => |s| {
+                const same = std.mem.eql(u8, s.display, place.display);
+                const message = switch (op) {
+                    .borrow_exclusive => if (same)
+                        try self.msg(
+                            "cannot borrow '{s}' as exclusive: 'arc' grants shared access only",
+                            .{place.display},
+                        )
+                    else
+                        try self.msg(
+                            "cannot borrow '{s}' as exclusive: it is reached through the 'arc' handle '{s}', which grants shared access only",
+                            .{ place.display, s.display },
+                        ),
+                    .assign => if (same)
+                        try self.msg(
+                            "cannot assign through '{s}': 'arc' grants shared access only",
+                            .{place.display},
+                        )
+                    else
+                        try self.msg(
+                            "cannot assign to '{s}': it is reached through the 'arc' handle '{s}', which grants shared access only",
+                            .{ place.display, s.display },
+                        ),
+                };
+                try self.diagnostics.err(self.allocator, place.span, message);
+                try self.diagnostics.note(
+                    self.allocator,
+                    place.span,
+                    "mutation through 'arc' needs interior mutability, which Cell does not have yet",
+                );
+            },
+            .unresolved => |s| {
+                const message = switch (op) {
+                    .borrow_exclusive => try self.msg(
+                        "cannot borrow '{s}' as exclusive: the ownership of {s} cannot be resolved here",
+                        .{ place.display, s.display },
+                    ),
+                    .assign => try self.msg(
+                        "cannot assign to '{s}': the ownership of {s} cannot be resolved here",
+                        .{ place.display, s.display },
+                    ),
+                };
+                try self.diagnostics.err(self.allocator, place.span, message);
+                try self.diagnostics.note(
+                    self.allocator,
+                    place.span,
+                    "R9 refuses what it cannot prove is not 'arc': a unique reference into a shared value mutates every holder",
+                );
+            },
+        }
+        return true;
+    }
+
+    /// R9 in a VALUE position, which is axis 1 of R10's history repeating in a
+    /// new rule. `createLoan` is the choke point for every exclusive loan, and
+    /// a loan is only ever created for a PLACE, so an exclusive borrow of a
+    /// VALUE never reached it: `grow(&mut fresh())` with
+    /// `fresh() -> arc String` was accepted at exit 0 and emitted
+    /// `cell_grow(((cell_string_t *)&cell_fresh().ptr))`.
+    ///
+    /// That emit is LOUD, and loud for every type rather than by the
+    /// coincidence of two C types: `cc` refuses to take the address of an
+    /// rvalue. It is refused here anyway, on the argument `refuseArcUnique`
+    /// already makes, that a rule holding for every type beats one whose
+    /// enforcement depends on what the backend happens to emit.
+    ///
+    /// Two sites reach it, and both are needed. A bare `&mut <value>` arrives
+    /// through `checkExpr`'s unary arm; `grow(&mut fresh())` does NOT, because
+    /// `checkCall` peels the sigil itself and then calls `checkExpr` on the
+    /// operand rather than on the unary. Fixing only the first left the
+    /// measured program still accepted, which is this file's failure mode
+    /// caught inside its own fix.
+    ///
+    /// `arcUniqueSource` is R10's classifier and answers the question both
+    /// rules need here, "is this expression an `arc` handle", with a total
+    /// verdict whose undecidable case is refused.
+    fn refuseArcValueBorrow(self: *Checker, operand: *const ast.Expr) Error!bool {
+        switch (try self.arcUniqueSource(operand)) {
+            .not_arc => return false,
+            .arc_place, .arc_value => |s| {
+                try self.diagnostics.err(
+                    self.allocator,
+                    s.span,
+                    try self.msg(
+                        "cannot borrow '{s}' as exclusive: 'arc' grants shared access only",
+                        .{s.display},
+                    ),
+                );
+                try self.diagnostics.note(
+                    self.allocator,
+                    s.span,
+                    "mutation through 'arc' needs interior mutability, which Cell does not have yet",
+                );
+            },
+            .unknown => |s| {
+                try self.diagnostics.err(
+                    self.allocator,
+                    s.span,
+                    try self.msg(
+                        "cannot borrow {s} as exclusive: its ownership cannot be resolved here",
+                        .{s.display},
+                    ),
+                );
+                try self.diagnostics.note(
+                    self.allocator,
+                    s.span,
+                    "R9 refuses what it cannot prove is not 'arc': a unique reference into a shared value mutates every holder",
+                );
+            },
+        }
+        return true;
+    }
+
+    /// Whether an expression yields a BORROW rather than a value. Total, with
+    /// `.unresolved` refused, for the same reason `ArcSource` is total: this
+    /// question is asked in a position where accepting the wrong answer leaves
+    /// a stale loan, and refusing only costs a program that can be spelled
+    /// with a fresh name.
+    const BorrowSource = union(enum) {
+        /// Provably a value. Every arm returning this states why.
+        not_borrow,
+        borrow: ArcSource.Site,
+        unresolved: ArcSource.Site,
+
+        /// Any branch that yields a borrow makes the whole expression one,
+        /// because any branch may be the one taken; otherwise `.unresolved`
+        /// wins over `.not_borrow`, for the same reason.
+        fn join(a: BorrowSource, b: BorrowSource) BorrowSource {
+            return switch (a) {
+                .borrow => a,
+                .unresolved => switch (b) {
+                    .borrow => b,
+                    else => a,
+                },
+                .not_borrow => b,
+            };
+        }
+    };
+
+    /// Classify the right-hand side of an assignment into a binding that
+    /// already holds a borrow. See the call site in `checkAssign` for why the
+    /// question is asked at all.
+    ///
+    /// The switch is exhaustive with no `else`, and exhaustive over the FIELDS
+    /// of each variant it descends into rather than only over the variants: a
+    /// `match` visits every arm, an `if` both branches, a `unary` splits on
+    /// its operator. Treating those as one claim is what hid a match guard
+    /// from `exprUsesName` in this same file.
+    fn borrowSource(self: *Checker, e: *const ast.Expr) Error!BorrowSource {
+        return switch (e.kind) {
+            // A literal is a fresh value with no referent behind it.
+            .int, .float, .string, .bool => .not_borrow,
+            // A struct or list literal constructs a fresh aggregate. Whether
+            // one of its FIELDS holds a borrow is R8's question about escaping
+            // borrows, not this one: the aggregate itself is a value.
+            .struct_lit, .list_lit => .not_borrow,
+            // Every binary operator in this grammar yields a fresh scalar.
+            .binary => .not_borrow,
+            .unary => |u| switch (u.op) {
+                .neg, .not => .not_borrow,
+                .ref_shared, .ref_exclusive => .{ .borrow = .{
+                    .display = if (try self.placeOf(u.operand)) |p|
+                        try self.msg("a borrow of '{s}'", .{p.display})
+                    else
+                        "a borrow",
+                    .span = e.span,
+                } },
+            },
+            // A written `shared`/`exclusive` prefix says the argument is a
+            // borrow outright (R15's spelling). Any other prefix is peeled.
+            .annotated => |a| switch (a.ownership) {
+                .shared, .exclusive => .{ .borrow = .{
+                    .display = if (try self.placeOf(a.value)) |p|
+                        try self.msg("a borrow of '{s}'", .{p.display})
+                    else
+                        "a borrow",
+                    .span = e.span,
+                } },
+                .owned, .arc, .copy => try self.borrowSource(a.value),
+            },
+            .ident, .field => blk: {
+                const place = try self.placeOf(e) orelse {
+                    // Not rooted at a binding in scope. A qualified enum
+                    // variant is a unit constant and can never be a borrow;
+                    // anything else is a field of a temporary, unresolved.
+                    if (e.kind == .field and e.kind.field.base.kind == .ident and
+                        self.enums.contains(e.kind.field.base.kind.ident)) break :blk .not_borrow;
+                    break :blk .{ .unresolved = .{
+                        .display = try self.msg("the expression at this position", .{}),
+                        .span = e.span,
+                    } };
+                };
+                const b = self.bindingById(place.binding) orelse break :blk .{ .unresolved = .{
+                    .display = try self.msg("the place '{s}'", .{place.display}),
+                    .span = e.span,
+                } };
+                const own = self.placeOwnership(b, place.path) orelse break :blk .{ .unresolved = .{
+                    .display = try self.msg("the place '{s}'", .{place.display}),
+                    .span = e.span,
+                } };
+                break :blk switch (own) {
+                    .shared, .exclusive => .{ .borrow = .{
+                        .display = try self.msg("the borrow '{s}'", .{place.display}),
+                        .span = e.span,
+                    } },
+                    .owned, .arc, .copy => .not_borrow,
+                };
+            },
+            .call => |c| blk: {
+                const name: []const u8 = switch (c.callee.kind) {
+                    .ident => |n| n,
+                    else => break :blk .{ .unresolved = .{
+                        .display = "the result of an indirect call",
+                        .span = e.span,
+                    } },
+                };
+                const sig = self.fns.get(name) orelse break :blk .{ .unresolved = .{
+                    .display = try self.msg("the result of the unresolved callee '{s}'", .{name}),
+                    .span = e.span,
+                } };
+                // No declared return type is unit, which is not a borrow.
+                const rt = sig.return_type orelse break :blk .not_borrow;
+                break :blk if (typeIsBorrow(&rt) != null) .{ .borrow = .{
+                    .display = try self.msg("the borrow returned by '{s}'", .{name}),
+                    .span = e.span,
+                } } else .not_borrow;
+            },
+            .if_expr => |i| blk: {
+                const then_v = try self.borrowSource(i.then_body);
+                // A missing `else` yields unit on that path.
+                const else_v: BorrowSource = if (i.else_body) |eb|
+                    try self.borrowSource(eb)
+                else
+                    .not_borrow;
+                break :blk BorrowSource.join(then_v, else_v);
+            },
+            .match_expr => |m| blk: {
+                var acc: BorrowSource = .not_borrow;
+                for (m.arms) |arm| {
+                    acc = BorrowSource.join(acc, try self.borrowSource(arm.body));
+                }
+                break :blk acc;
+            },
+            // A block's value is its trailing expression statement.
+            .block => |stmts| blk: {
+                if (stmts.len == 0) break :blk .not_borrow;
+                const last = &stmts[stmts.len - 1];
+                if (last.kind != .expr) break :blk .not_borrow;
+                break :blk try self.borrowSource(&last.kind.expr);
+            },
+        };
+    }
+
+    /// Whether this binding holds a borrow, asked two ways because neither
+    /// alone is enough.
+    ///
+    /// The declared annotation catches `var exclusive e = &mut a`. The holder
+    /// scan catches `var owned e = &mut a`, which `checkLetInit` also turns
+    /// into a named loan: it creates one whenever the initializer is a `&`
+    /// form, REGARDLESS of the annotation, so reading the annotation alone
+    /// would be exactly the enumeration this file has been caught by before.
+    ///
+    /// The scan is by NAME, which the loan record is keyed on, so a shadowed
+    /// name can match a loan that is not this binding's. That direction is
+    /// safe: it can only refuse an assignment, never permit one.
+    fn holdsBorrow(self: *const Checker, b: *const Binding) bool {
+        if (b.ownership == .shared or b.ownership == .exclusive) return true;
+        for (self.block_loans.items) |loan| {
+            const holder = loan.holder orelse continue;
+            if (std.mem.eql(u8, holder, b.name)) return true;
+        }
+        return false;
+    }
+
     /// R12 and R10's exemptions, which R2 depends on: a `copy` place is
     /// duplicated and an `arc` place is retained, so neither dies.
     fn isDuplicable(self: *const Checker, b: *const Binding, path: []const u8) bool {
@@ -1559,6 +2156,23 @@ pub const Checker = struct {
             current = typeStructName(&field.ty);
         }
         return result;
+    }
+
+    /// The struct type a place has, which is what `placeOwnership` needs one
+    /// level down. Used to carry a referent's type across a borrow in
+    /// `checkLet`, so that `let exclusive e = &mut buf` knows `e` names a
+    /// `Buffer` and `&mut e.len` can be classified rather than refused.
+    fn placeStructName(self: *const Checker, b: *const Binding, path: []const u8) ?[]const u8 {
+        if (path.len == 0) return b.struct_name;
+        var current: ?[]const u8 = b.struct_name;
+        var it = std.mem.splitScalar(u8, path, '.');
+        while (it.next()) |segment| {
+            const struct_name = current orelse return null;
+            const def = self.structs.get(struct_name) orelse return null;
+            const field = findField(def, segment) orelse return null;
+            current = typeStructName(&field.ty);
+        }
+        return current;
     }
 
     // ── diagnostics helpers ─────────────────────────────────────────────
@@ -3854,5 +4468,262 @@ test "R2.a does not fire for a place declared inside the loop body" {
         \\        i = i + 1
         \\    }
         \\}
+    );
+}
+
+// ── R9: `arc` grants shared access only ─────────────────────────────────
+//
+// Every program in this group was ACCEPTED at exit 0 before these checks
+// landed, measured against `zig-out/bin/cell` built at `b3698a7`. The
+// `docs/SPEC.md` 4.1.4 text calling mutation through `arc` "not permitted in
+// this revision" was therefore an overclaimed safety guarantee, which is the
+// one direction of documentation error this repository treats as worse than
+// silence.
+
+test "R9: an arc place may not be passed to an exclusive parameter" {
+    // Measured before this check: accepted, and emitted
+    // `cell_grow(((cell_string_t *)s.ptr))` for the String analogue, a mutable
+    // pointer into the shared box, clean at `-Wall -Wextra -Werror`.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let arc b = Buffer { data: [], len: 0 }
+        \\    grow(exclusive b, shared 1)
+        \\}
+    ,
+        \\t.cell:11:20: error: cannot borrow 'b' as exclusive: 'arc' grants shared access only
+        \\t.cell:11:20: note: mutation through 'arc' needs interior mutability, which Cell does not have yet
+        \\
+    );
+}
+
+test "R9: an arc place may not be borrowed as exclusive by a let" {
+    // The other spelling, and the reason the check lives in `createLoan`
+    // rather than in `checkCall`: one choke point, not a second enumeration.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    var arc b = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut b
+        \\}
+    ,
+        \\t.cell:11:28: error: cannot borrow 'b' as exclusive: 'arc' grants shared access only
+        \\t.cell:11:28: note: mutation through 'arc' needs interior mutability, which Cell does not have yet
+        \\
+    );
+}
+
+test "R9 asks every step of the chain, so an arc FIELD is refused too" {
+    // The worst of the measured emits: `cell_grow(((cell_string_t *)&b.h.ptr))`
+    // for the String analogue, a mutable pointer aimed at the arc handle's own
+    // pointer field. Silent, and accepted by `cc`. A check that only asked
+    // about the BINDING would miss it, which is this file's recurring failure.
+    try expectDiagnostics(prelude ++
+        \\pub struct Holder { arc h: Buffer }
+        \\pub fn main() {
+        \\    let owned k = Holder { h: Buffer { data: [], len: 0 } }
+        \\    grow(&mut k.h, shared 1)
+        \\}
+    ,
+        \\t.cell:12:15: error: cannot borrow 'k.h' as exclusive: 'arc' grants shared access only
+        \\t.cell:12:15: note: mutation through 'arc' needs interior mutability, which Cell does not have yet
+        \\
+    );
+}
+
+test "R9: a write through an arc binding is refused" {
+    // Measured before this check: accepted, and emitted
+    // `cell_arc_t b = (cell_B){ .n = 1 }; b.n = 2;`, which `cc` then refused.
+    // A loud C error is the mild end of R9; the borrow forms above are silent.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    var arc b = Buffer { data: [], len: 0 }
+        \\    b.len = 2
+        \\}
+    ,
+        \\t.cell:11:5: error: cannot assign to 'b.len': it is reached through the 'arc' handle 'b', which grants shared access only
+        \\t.cell:11:5: note: mutation through 'arc' needs interior mutability, which Cell does not have yet
+        \\
+    );
+}
+
+test "R9 refuses an exclusive borrow whose ownership it cannot resolve" {
+    // The verdict is total, so an unreadable annotation is a REFUSAL and not
+    // silence. `s` is an `Int`, so `s.data` has no field annotation to read.
+    try expectDiagnostics(prelude ++
+        \\pub fn use_bytes(exclusive d: [Byte]) { }
+        \\pub fn main() {
+        \\    let copy s = 1
+        \\    use_bytes(&mut s.data)
+        \\}
+    ,
+        \\t.cell:12:20: error: cannot borrow 's.data' as exclusive: the ownership of the field 'data' of 's' cannot be resolved here
+        \\t.cell:12:20: note: R9 refuses what it cannot prove is not 'arc': a unique reference into a shared value mutates every holder
+        \\
+    );
+}
+
+test "R9 leaves a shared borrow of an arc place alone" {
+    // R10's table makes `arc` to a `shared` parameter legal: it borrows the
+    // pointee without retaining, and R8 keeps the borrow inside the block.
+    // Refusing this would break `examples/arc.cell`.
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    let arc b = Buffer { data: [], len: 0 }
+        \\    read(shared b)
+        \\}
+    );
+}
+
+test "R9 leaves rebinding a var arc handle alone" {
+    // Assigning to the handle ITSELF replaces the reference and does not
+    // mutate the shared value, so it is R11's leak (the previous box is never
+    // released) and not R9's rule. That is why the assignment check asks only
+    // the STRICT prefixes of the target's path.
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    var arc b = Buffer { data: [], len: 0 }
+        \\    b = Buffer { data: [], len: 1 }
+        \\}
+    );
+}
+
+test "a field borrow through a named loan resolves the referent's struct type" {
+    // `let exclusive e = &mut buf` carries no type annotation, is not a struct
+    // literal and is not a call, so `e` used to reach `declare` with no
+    // `struct_name` at all. Harmless while an unresolved annotation meant
+    // "permit"; under R9's total verdict it would mean REFUSE, and this
+    // ordinary field borrow would stop compiling. Same shape as the call
+    // inference `b3698a7` had to add for R10, in a new position.
+    try expectAccepted(prelude ++
+        \\pub fn use_bytes(exclusive d: [Byte]) { }
+        \\pub fn main() {
+        \\    var owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    use_bytes(&mut e.data)
+        \\}
+    );
+}
+
+// ── R14's second clause: a borrow-holding binding may not be rebound ─────
+
+test "R14: a var-bound exclusive borrow may not be retargeted" {
+    // Measured before this check: accepted at exit 0. `placeOf` returns null
+    // for a unary, so `checkExpr` made a TEMPORARY loan on the new referent
+    // that died with the statement, leaving a loan on the OLD referent and
+    // none on the new one; a following `take(owned other)` was accepted.
+    //
+    // The C backend does not retarget at all: it emits `*e = *&other;`. With
+    // heap values that aliases one buffer into two owners and both are freed,
+    // measured as an AddressSanitizer double free at exit 134. Refusing is the
+    // answer because the statement has two meanings and the compiler
+    // implements a different one in each half.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let owned other = Buffer { data: [], len: 0 }
+        \\    var exclusive e = &mut buf
+        \\    e = &mut other
+        \\}
+    ,
+        \\t.cell:13:5: error: cannot assign a borrow of 'other' to 'e': it already holds a borrow, and rebinding one is not defined in this revision
+        \\t.cell:13:5: note: the C backend writes THROUGH the borrow rather than retargeting it, so the two readings of this statement differ; bind a new name instead
+        \\
+    );
+}
+
+test "R14's rebinding clause reads the loan, not only the annotation" {
+    // `checkLetInit` creates a named loan whenever the initializer is a `&`
+    // form, REGARDLESS of the annotation, so a binding written `var owned`
+    // can hold one. Asking only about the declared mode would be exactly the
+    // enumeration this file keeps being caught by; `holdsBorrow` asks both.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let owned other = Buffer { data: [], len: 0 }
+        \\    var owned e = &mut buf
+        \\    e = &mut other
+        \\}
+    ,
+        \\t.cell:13:5: error: cannot assign a borrow of 'other' to 'e': it already holds a borrow, and rebinding one is not defined in this revision
+        \\t.cell:13:5: note: the C backend writes THROUGH the borrow rather than retargeting it, so the two readings of this statement differ; bind a new name instead
+        \\
+    );
+}
+
+test "R14's rebinding clause refuses a value it cannot classify" {
+    // `borrowSource` is total for the same reason `arcUniqueSource` is: the
+    // permissive default is what every previous widening escaped through.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    var exclusive e = &mut buf
+        \\    e = unresolved_callee()
+        \\}
+    ,
+        \\t.cell:12:5: error: cannot assign to 'e', which holds a borrow: the result of the unresolved callee 'unresolved_callee' cannot be classified as a value or a borrow here
+        \\t.cell:12:5: note: R14 refuses what it cannot prove is not a borrow: a retarget the checker does not see leaves a loan on the old referent and none on the new one
+        \\
+    );
+}
+
+test "a whole-value write through a var exclusive borrow is still allowed" {
+    // The legitimate neighbour the rebinding clause must not eat.
+    // `runtime/cell_rt.h` section 7 defines `exclusive` as the callee mutating
+    // the caller's value, and a codegen fix already landed for this form.
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    var exclusive e = &mut buf
+        \\    e = Buffer { data: [], len: 3 }
+        \\    use_it(e)
+        \\}
+    );
+}
+
+test "a field write through a let-bound exclusive borrow is still allowed" {
+    // The other neighbour: `examples/ownership.cell` writes `buf.len` through
+    // an `exclusive buf: Buffer` parameter, and the rebinding clause is scoped
+    // to an EMPTY path so it never sees this.
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    var owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    grow(exclusive e, shared 1)
+        \\    e.len = 4
+        \\}
+    );
+}
+
+test "R9 reaches a VALUE position: an arc call result may not be borrowed as exclusive" {
+    // Axis 1 of R10's history, repeating in a new rule. `createLoan` is the
+    // choke point for every exclusive loan and only a PLACE creates one, so
+    // this escaped the rule that refuses `grow(exclusive b, shared 1)` for the
+    // same handle. Measured before this: accepted at exit 0, emitting
+    // `cell_grow(((cell_string_t *)&cell_fresh().ptr))`.
+    try expectDiagnostics(prelude ++
+        \\pub fn fresh() -> arc Buffer;
+        \\pub fn main() {
+        \\    grow(&mut fresh(), shared 1)
+        \\}
+    ,
+        \\t.cell:11:15: error: cannot borrow 'fresh()' as exclusive: 'arc' grants shared access only
+        \\t.cell:11:15: note: mutation through 'arc' needs interior mutability, which Cell does not have yet
+        \\
+    );
+}
+
+test "R9's value position is checked at BOTH sites, not only the unary one" {
+    // `checkCall` peels the sigil itself and hands `checkExpr` the operand, so
+    // the unary arm never sees a call argument. Fixing only the unary arm left
+    // the measured program above still accepted; this test is the bare form
+    // that the unary arm does see, and the pair is what keeps them together.
+    try expectDiagnostics(prelude ++
+        \\pub fn fresh() -> arc Buffer;
+        \\pub fn main() {
+        \\    &mut fresh()
+        \\}
+    ,
+        \\t.cell:11:10: error: cannot borrow 'fresh()' as exclusive: 'arc' grants shared access only
+        \\t.cell:11:10: note: mutation through 'arc' needs interior mutability, which Cell does not have yet
+        \\
     );
 }

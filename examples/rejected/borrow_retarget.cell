@@ -1,0 +1,83 @@
+// EXPECT: currently-rejected
+// Violates: docs/OWNERSHIP.md R14, second clause (a binding that already holds
+// a borrow may not be reassigned).
+//
+// WHY THIS FILE EXISTS. This statement has TWO meanings and the compiler
+// implemented a different one in each half, so neither half was sound.
+//
+//   var exclusive e = &mut a
+//   e = &mut b
+//
+//   * `borrowck.zig` read it as a RETARGET, and read it wrong. `placeOf`
+//     returns null for a unary, so `checkExpr` created a TEMPORARY loan on `b`
+//     that died with the statement, while `e`'s named loan still pointed at
+//     `a`. After the statement there was a loan on `a` and NONE on `b`, so
+//     `take(owned b)` was accepted with `e` supposedly aliasing `b`.
+//   * `codegen.zig` reads it as a WRITE THROUGH, and emits `*e = *&b;`,
+//     copying `b`'s value into `a`. It never retargets anything.
+//
+// The second reading is the one that runs, and it is not a stale-loan
+// nuisance. Measured at `b3698a7` with `make() -> String`:
+//
+//   var owned a = make()
+//   var owned b = make()
+//   var exclusive e = &mut a
+//   e = &mut b
+//
+//   cell_string_t a = cell_make();
+//   cell_string_t b = cell_make();
+//   cell_string_t *e = &a;
+//   *e = *&b;
+//   cell_string_free(&b);
+//   cell_string_free(&a);
+//
+// `a` and `b` hold the same buffer pointer after the copy, so both frees hit
+// it: AddressSanitizer, attempting double-free, exit 134. `a`'s original
+// buffer leaks in the same statement. `cell check` said `ok` and `cc` said
+// nothing at `-Wall -Wextra -Werror`.
+//
+// WHY REFUSAL RATHER THAN MODELLING EITHER READING. Modelling the retarget
+// means killing `e`'s old loan, and killing a loan is the unsafe direction
+// under a holder that is keyed by NAME rather than by binding id: a shadowed
+// name would remove a loan that is not this binding's, and a removed loan
+// permits. Modelling the write-through means a place for `*e`, which the
+// "places, not names" model does not have, since a place is a binding plus a
+// field path and a referent is a different binding. Neither is a contained
+// change, and the language has not decided which meaning it wants. Refusing
+// costs a program that can be spelled with a fresh `let`.
+//
+// WHAT STAYS LEGAL, because the refusal is scoped to an EMPTY path and to a
+// value that is provably a borrow:
+//
+//   * `buf.len = new_len` through an `exclusive buf: Buffer`, a field write.
+//     `examples/ownership.cell` does exactly this.
+//   * `e = Buffer { len: 3 }`, a whole-value write through the borrow, which
+//     `runtime/cell_rt.h` section 7 defines and a codegen fix already landed
+//     for.
+//
+// The classifier that tells those from a retarget is total: a value it cannot
+// prove is not a borrow is refused too, for the same reason R10's verdict is
+// total. Silence must not mean safe.
+//
+// R14 already refused this for a `let`, by immutability, and there is a test
+// named for it. Only `var` reached the gap.
+
+pub struct B {
+    copy n: Int
+}
+
+pub fn take(owned b: B) -> Int;
+pub fn use_it(exclusive b: B) -> Int;
+
+pub fn main() {
+    var owned a = B { n: 1 }
+    var owned b = B { n: 2 }
+
+    var exclusive e = &mut a
+    e = &mut b
+
+    // Accepted before the refusal landed: no live loan on `b`, because the one
+    // the reassignment created died with its own statement.
+    let copy x = take(owned b)
+    let copy y = use_it(exclusive e)
+}
