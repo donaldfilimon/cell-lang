@@ -19,7 +19,10 @@ refuses reassigning a binding which already holds a borrow), and R15
 (call-site annotation agreement). Diagnostics name
 the place and land at the use site. That file's header comment is the
 authoritative list and moves with the code; believe it over this paragraph.
-NLL is still designed. **R11** retain-release insertion is implemented in the
+Named-loan NLL slices 1 and 2 are enforced as described in section 0.3;
+derived-loan propagation remains conservative. See [FEATURES.md](FEATURES.md)
+for the current cross-backend matrix, rather than treating this historical
+summary as an exhaustive rule inventory. **R11** retain-release insertion is implemented in the
 C backend, with the gaps R11 itself names; **R10**'s move-into-`arc` is not
 implemented in the checker, which is why one of those gaps exists. R10's other
 direction, an `arc` value made UNIQUE, IS implemented, at six consumption

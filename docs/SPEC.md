@@ -492,9 +492,10 @@ Measured now: `cell check examples/rejected/while_is_not_a_loop.cell` reports
 records the whole sequence, including the middle state where it was rejected by
 name resolution rather than by this rule.
 
-**Reserving a word does not implement it.** Cell still has no loops of any kind
-(section 7.6). Only `while`, `break` and `continue` are scheduled to gain
-parser rules; the rest are reserved and nothing more.
+**Reserving a word does not implement it.** The measurement above is historical:
+`while`, `break` and `continue` now have parser and execution paths (section
+7.6). Other reserved words require their own grammar and semantic work; see
+[FEATURES.md](FEATURES.md) and the approved completion program.
 
 ### 2.6 Integer literals
 
@@ -1639,7 +1640,8 @@ A negative numeric pattern is folded in the parser (`-1` becomes the literal
   adding them means extending the type, not filling a field.
 - **Struct patterns** (`Point { x, y }`), tuple patterns, and slice patterns.
 - **Or-patterns.** There is no `|` operator in the lexer (section 2.10).
-- **Guards** (`if cond` after a pattern).
+- **Guards on binding patterns** (`if cond` after a binding). Other scalar
+  pattern guards are implemented as described in section 9.0.
 - **Range patterns.**
 - **Exhaustiveness checking.** Nothing verifies that the arms cover the
   scrutinee's type or that a `_` arm exists. Nothing warns about an unreachable
@@ -1869,14 +1871,12 @@ and asserts the full rendered text including the caret line, so the position the
 parser records and the position the renderer prints are checked against each
 other.
 
-Three gaps remain, and the first is the one a user actually hits:
+Current diagnostic boundaries:
 
-1. **The CLI does not surface parse diagnostics.** `root.compile` returns the
-   bare `error.UnexpectedToken` and `main` lets it escape. Measured: a syntax
-   error prints the Zig error name and a Zig stack trace pointing into
-   `parser.zig`, with no source location and no caret. The recorded message and
-   span exist and nothing reads them. Wiring `reportInto` into `root.compile`
-   is a small change and is the highest-value remaining diagnostic work.
+1. **The CLI surfaces parse diagnostics.** Loading records the parser's
+   message and span through `reportInto`, renders the source location and
+   caret, and reports `ParseFailed`. The older bare Zig-error behavior is
+   historical and is not the current CLI path.
 2. **Check diagnostics do reach the user**, with path, line, column, the source
    line, and a caret. Measured. They are printed through `Bag.printAll` /
    `Bag.render` from `root.check`.
@@ -1887,10 +1887,10 @@ Three gaps remain, and the first is the one a user actually hits:
 
 ## 12. Status index
 
-Every construct in this specification, with its status. The counts in section
-0.2 are the counts of this table. Where the parser implements something that
-codegen does not lower, the row is **parsed, not enforced** and a separate row
-records the missing lowering.
+Historical snapshot index, retained to explain the counts in section 0.2.
+It includes statuses from multiple earlier revisions and is not a current
+qualification table. [FEATURES.md](FEATURES.md) is the current-status entry
+point and separates checking, backend lowering, cleanup and release evidence.
 
 ### Lexical
 

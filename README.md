@@ -112,7 +112,11 @@ Two notes on the build, both worth knowing before you trust a green result:
 
 ## Status
 
-The parsed surface is enforced and executable, through **three backends**.
+Cell has three backends with different current coverage. Parsing, checking,
+lowering, execution and resource cleanup are separate capabilities. See
+[the capability matrix](docs/FEATURES.md) for current boundaries and the
+[completion program](docs/superpowers/plans/2026-09-08-full-language-completion.md)
+for the approved parity and release target.
 
 `cell check` typechecks and borrow-checks. `cell emit` produces C that `cc -c`
 accepts for `examples/hello.cell`, `examples/control_flow.cell`, and
@@ -127,17 +131,17 @@ links against the runtime and prints `24` through all three backends, and the
 LLVM path also builds `examples/hello.cell` into a native executable that
 prints `42`.
 
-Both newer backends are deliberately **scalar-first**. `String`, `[T]`, `T?`,
-`Result` and `arc` are refused with a `cannot lower` diagnostic at the offending
-span rather than emitted as something that merely looks right. The reason is
-concrete: an aggregate crossing the C boundary means choosing a calling
-convention by hand on AArch64, and every aggregate constructor in
-`runtime/cell_rt.h` is `static inline` and so has no symbol to call. The MLIR
-MLIR backend carries structs too, as `!llvm.struct`, so `examples/hello.cell`
-now runs through all three backends and prints `42` from each.
+Both newer backends are deliberately **scalar-first**, with selected aggregate
+operations. Support depends on ownership, expression position and ABI placement,
+not just the type name. Unsupported operations should produce `cannot lower`;
+the gate separately records disclosed ABI defects where this contract is still
+incomplete. Runtime aggregate helpers that are `static inline` need callable
+equivalents before IR backends can use them. The MLIR backend carries structs
+as `!llvm.struct`, including the `examples/hello.cell` execution contract.
 
 Enforced ownership rules, read off `src/cell/borrowck.zig`'s own header
-rather than from memory: **R1, R2, R2.a, R2.b, R3, R3a, R4, R5, R6, R8, R9,
+rather than from memory: **R1, R2, R2.a, R2.b, R3, R3a, R4, R5, R6, R7's
+consumption clause, R8, R9,
 R14, R15 and R18**, plus one clause of **R10** (an `arc` value may not be made
 unique, refused at **six** consumption sites). `arc` retain and release are
 emitted by the C backend, with the gaps named honestly in
