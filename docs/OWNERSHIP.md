@@ -224,9 +224,12 @@ positions asked `placeOf` first and READ anything else, so an `owned` slot
 filled by a `match` double freed. R2.b is where the question is asked of the
 expression instead.
 
-**The fifth entry OVERCLAIMS, and this was measured rather than assumed.** "Moved
-into a `match` arm binding (R7)" is not enforced: `borrowck.zig`'s header does
-not list R7, and the scrutinee is not moved at all.
+**The fifth entry STILL OVERCLAIMS, and this was measured rather than assumed.**
+"Moved into a `match` arm binding (R7)" is not enforced as a MOVE: the
+scrutinee is not moved at all, and R7's consumption clause below refuses the
+consumption instead of performing the move. Read the entry as "consuming an
+arm binding is refused", not as "the scrutinee is dead after the match".
+Before that refusal existed:
 
 ```cell
 pub fn mk() -> String;
@@ -244,10 +247,10 @@ emits `cell_string_t x = s1;`, then `cell_take(x)` frees the buffer, then
 plain place or a value shape (`match (match c { 0 => s1, _ => s1 }) { ... }` is
 also 134), which is what tells it apart from R2.b: R2.b is about a consumption
 site asking the wrong question, and this is a consumption site that asks no
-question. It is **not fixed here**, deliberately. Moving the scrutinee changes
-what `wasMoved` reports for every arm binding, and `codegen.zig`'s
-`pendingDrops` reads exactly that, so it is a separate change with its own
-measurement rather than a rider on this one.
+question. It was **not fixed there**, deliberately; it is fixed under R7 below,
+and by a REFUSAL rather than by the move. Moving the scrutinee changes what
+`wasMoved` reports for every arm binding, and `codegen.zig`'s `pendingDrops`
+reads exactly that, so it remains a separate change with its own measurement.
 
 ### R3. Moving out of a borrow is an error
 
@@ -614,6 +617,71 @@ the parser decides binding-versus-variant by whether the first letter is
 uppercase, so a lowercase enum variant will be treated as a binding and
 silently moved. That heuristic is the checker's problem to remove, and until it
 is removed R7 inherits it.
+
+#### R7's consumption clause: an arm binding may not be consumed while the scrutinee still owns the value
+
+**Enforced.** `borrowck.zig`, `ArmOrigin` and `ownedMoveSource`'s
+`.aliases_place`.
+
+The scrutinee is READ, never moved, so an arm binding is an ALIAS of it and not
+a second owner. Every `owned` consumption site asked `placeOf`, got a perfectly
+good place rooted at the arm binding, and moved THAT, leaving the scrutinee
+live and both headers holding one buffer.
+
+```cell
+pub fn main() {
+    let owned s1 = mk()
+    print_int(match s1 { x => take(owned x) })
+}
+```
+
+> `err: cannot pass the match binding 'x' aliasing 's1' to 'owned' parameter 's': the scrutinee still owns the value`
+> `note: R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again`
+
+Measured at `4698dbc`, that program was `cell check` exit 0, `cc
+-fsanitize=address` exit 0, running it exit 134. **Eleven shapes were live**,
+not the one the brief named: the call argument, a `return`, an assignment into
+an `owned` place, a `var owned` scrutinee, an `[Int]` scrutinee, a `shared [T]`
+parameter as scrutinee, an arm binding nested one `match` deep, a multi-arm
+`match` where only the last arm consumes, the same inside a `while`, an
+`arc [Int]` place whose arm binding launders R10 (`take_list(owned a)` was
+already refused, `match a { x => take_list(owned x) }` was exit 134), and that
+`arc` case nested one deep as well.
+
+**The condition is "does anything else still own this", not "is this an arm
+binding".** A scrutinee with no place behind it -- a call result, a literal, a
+fresh aggregate -- has no other owner, so
+`match make() { x => take(owned x) }` still lowers and still runs (measured
+exit 0 before and after). Temp-ness propagates through a scrutinee that is
+exactly a whole `.temp` arm binding, so one level of nesting over a call result
+stays accepted too; it does NOT propagate through a field path, which is the
+safe direction.
+
+**It reads, and does not refuse, at the struct-field and list-element
+positions**, exactly as a plain `.place` does there. `Tag { name: x }` with an
+aliasing `x` and `Tag { name: s1 }` with the scrutinee itself are one latent
+hazard, R11's record drop and element release, and neither is a double free
+today.
+
+**The designed follow-up: MOVE the scrutinee instead.** Moving is the better
+semantics, it would make `take(owned s1)` after the match report use-after-move
+for the right reason instead of being silently accepted, and it would let the
+refusals above become moves. It is not done yet because it changes `wasMoved`
+for every arm binding and `codegen.zig`'s `pendingDrops` reads exactly that, so
+it reschedules drops: three separate fixes in this repository shipped a new
+silent miscompile in the fixer's own first commit by changing what a binding
+holds or when it is dropped without asking what reads that. It needs its own
+measurement of the emitted C, not a rider on a refusal.
+
+**Residual, disclosed rather than left to be rediscovered.** Two shapes are
+accepted today only because nothing drops them: an arm binding is never
+dropped, and a call temporary is never dropped. So
+`match make() { x => take(owned x) }` and its `arc` spelling LEAK rather than
+double free, which is the safe direction under the same asymmetry R11 uses, and
+they become double frees the day precise drops land. Whoever lands those drops
+must revisit `ArmOrigin.temp`.
+
+Corpus: `examples/rejected/owned_move_through_match_binding.cell`.
 
 ### R8. A borrow may not outlive its referent
 

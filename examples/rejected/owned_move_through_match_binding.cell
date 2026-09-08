@@ -1,0 +1,115 @@
+// EXPECT: currently-rejected
+// Violates: docs/OWNERSHIP.md R7's consumption clause (an arm binding may not
+// be consumed while the scrutinee still owns the value).
+//
+// WHY THIS FILE EXISTS. This was the LAST known live memory-safety defect in
+// the language, and it is the sibling of
+// `examples/rejected/owned_move_through_match.cell` next to it: that one is a
+// `match` in an `owned` SLOT, this one is a `match` BINDING in an `owned`
+// slot. They look alike and fail for opposite reasons. There, `placeOf`
+// returned null and the site READ a value it should have refused. Here
+// `placeOf` returns a perfectly good place, the site MOVED it, and the move
+// was of the wrong thing: R7 does not move the scrutinee, so the arm binding
+// is an ALIAS of it and not a second owner.
+//
+// Measured end to end against `zig-out/bin/cell` built at `4698dbc`, with
+// `make`, `take` and `print_int` supplied by a C host whose `take` frees:
+//
+//     cell check                                    exit 0
+//     cc -fsanitize=address                         exit 0
+//     running it                                    exit 134
+//
+//     AddressSanitizer: attempting double-free
+//       free <- cell_string_free <- cell_main
+//
+// The emitted C was:
+//
+//     cell_string_t s1 = cell_make();
+//     cell_string_t _cell_t1 = s1;
+//     cell_string_t x = _cell_t1;      /* the arm binding COPIES the header */
+//     _cell_t0 = cell_take(x);         /* the callee frees the buffer */
+//     ...
+//     cell_string_free(&s1);           /* and so does the scope drop */
+//
+// ELEVEN SHAPES WERE LIVE, not the one the brief named. The brief's matrix had
+// five rows and was measured by its author; the enumeration below is what
+// forty programs said. Every one of these was `cell check` exit 0 and running
+// it exit 134 at `4698dbc`:
+//
+//     print_int(match s1 { x => take(owned x) })            call argument
+//     match seed { x => { return x } }                      return
+//     match s1 { x => { d = x } }                           assignment
+//     var owned d = make(); match d { x => take(owned x) }  var owned source
+//     match xs { x => take_list(owned x) }  over [Int]      non-String type
+//     fn f(shared xs: [Int]) { match xs { x => ... } }      BORROWED source
+//     match s1 { x => match x { y => take(owned y) } }      nested one deep
+//     match s1 { "yes" => 1, x => take(owned x) }           multi-arm
+//     while i < 1 { match s1 { x => take(owned x) } }       inside a loop
+//     match a { x => take_list(owned x) }  over arc [Int]   R10 LAUNDERED
+//     match a { x => match x { y => ... } } over arc [Int]  both at once
+//
+// The last row is worth its own sentence. `take_list(owned a)` on an
+// `arc [Int]` place is refused by R10 and has been for some time. Binding the
+// same place through a `match` arm defeated that refusal completely, because
+// `arcUniqueSource` reads the ARM BINDING's own annotation and `checkMatch`
+// declares every arm binding `.owned`. One hole, two rules escaping through
+// it.
+//
+// The `shared [Int]` row is worth a second one. The `String` spelling of that
+// same program ran CLEAN, because `owned String` and `shared String` are
+// different C types and codegen inserted a `cell_string_from_str` copy, while
+// `owned [T]` and `shared [T]` are the same type and it inserted nothing. A
+// rule whose enforcement depends on which two C types happen to coincide is
+// exactly what `refuseArcUnique`'s comment already refuses to write, so both
+// spellings are refused.
+//
+// WHY IT IS REFUSED AND NOT MOVED. Moving the scrutinee is the better
+// semantics and is recorded as the designed follow-up in
+// `docs/OWNERSHIP.md` R7. It would additionally make a later `take(owned s1)`
+// report use-after-move for the right reason, which is currently accepted
+// because the move never happened. It is not done here: it changes `wasMoved`
+// for every arm binding and `codegen.zig`'s `pendingDrops` reads exactly that,
+// so it reschedules drops. Three separate fixes in this repository have
+// shipped a NEW silent miscompile in the fixer's own first commit, every one
+// of them by changing what a binding holds or when it is dropped without
+// asking what reads that.
+//
+// HOW IT IS ENFORCED, which is the reusable part. Not by a list of shapes.
+// ONE question, `armAlias`, asked at the top of `ownedMoveSource` above its
+// `.place` return, so every `owned` consumption site inherits the answer and a
+// site added later inherits it without knowing R7 exists. Its verdict is a new
+// `.aliases_place` variant, and adding that variant is what enumerated the
+// sites: those switches have no `else` arm, so the compiler refused to build
+// until each one answered.
+//
+// WHAT STILL COMPILES, so "refused" is scoped to mean something. The condition
+// is "does anything else still own this", not "is this an arm binding":
+//
+//     match make() { x => take(owned x) }                   no other owner
+//     match make() { x => match x { y => take(owned y) } }  temp-ness carries
+//     match s1 { x => use_it(shared x) }                    a read, not owned
+//     match n { x => show(copy x) }                         copy duplicates
+//     match s1 { x => Tag { name: x } }                     see below
+//
+// The last one READS, exactly as `Tag { name: s1 }` already does. Those two
+// are the same latent hazard, R11's record drop, and neither is a double free
+// today; splitting one gap across two rules would buy nothing.
+//
+// THE NAMED OVER-REFUSALS, all in the safe direction and all measured exit 0
+// before this rule: a struct FIELD as scrutinee, an `owned` parameter as
+// scrutinee, a `shared String` parameter or borrow as scrutinee, a field of an
+// aliasing arm binding, and `let owned y = x` inside an arm. Each is a latent
+// double free held open only by a disclosed R11 gap (a record is never
+// dropped, a slice element is never released, an `owned` parameter is never
+// dropped, an arm binding is never dropped). The file's standing choice is to
+// refuse a latent case alongside the live ones rather than leave it as a trap
+// for the change that lands those drops.
+
+pub fn make() -> String;
+pub fn take(owned s: String) -> Int;
+pub fn print_int(copy value: Int);
+
+pub fn main() {
+    let owned s1: String = make()
+    print_int(match s1 { x => take(owned x) })
+}

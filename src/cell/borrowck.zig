@@ -1,7 +1,7 @@
 //! Borrow and move checker for Cell.
 //!
 //! Implements `docs/OWNERSHIP.md` rules R1, R2, R2.a, **R2.b**, R3, R3a, R4,
-//! R5, R6, R8, R9,
+//! R5, R6, **R7's consumption clause**, R8, R9,
 //! R14, R15 and **R18**, plus ONE clause of R10: an `arc` value may not be
 //! made UNIQUE,
 //! refused at six consumption sites (an `owned` parameter, an `owned`
@@ -27,13 +27,35 @@
 //! never return a movable place. The struct-field and list-element sites
 //! refuse `.unknown` ONLY, leaving a plain place a READ; read the comments
 //! there before changing that, because the choice belongs to R11's record-drop
-//! and element-release gaps rather than to this rule. **NOT covered, and
-//! measured rather than assumed: a `match` SCRUTINEE is not moved at all.**
-//! `match s1 { x => take(owned x) }` frees `s1`'s buffer in the callee and
-//! again at the scope drop, at exit 134, and it does so identically whether
-//! the scrutinee is a plain place or a value shape, so it is a separate R7 gap
-//! and not this one. R2's move list in `docs/OWNERSHIP.md` claims R7 moves it
-//! and overclaims.
+//! and element-release gaps rather than to this rule.
+//!
+//! **R7's consumption clause** closes what R2.b left open, and it is the fifth
+//! instance of this file's recurring defect rather than a new kind. The
+//! scrutinee of a `match` is READ, never moved, so an arm binding is an ALIAS
+//! of it and not a second owner; every consumption site then asked `placeOf`,
+//! got a perfectly good place rooted at the arm binding, and MOVED that,
+//! leaving the scrutinee live. `match s1 { x => take(owned x) }` freed `s1`'s
+//! buffer in the callee and again at the scope drop: `cell check` exit 0,
+//! `cc -fsanitize=address` exit 0, running it exit 134. ELEVEN shapes were
+//! measured live at `4698dbc`, including a `[Int]` scrutinee, a `shared [T]`
+//! parameter as scrutinee, an arm binding nested one match deep, and an
+//! `arc [Int]` place whose arm binding launders R10 (`take_list(owned a)` is
+//! refused, `match a { x => take_list(owned x) }` was exit 134).
+//!
+//! It is enforced by ONE question, `armAlias`, asked at the top of
+//! `ownedMoveSource` above its `.place` return, so every `owned` consumption
+//! site inherits it and a site added later inherits it without knowing R7
+//! exists. Its verdict is the `.aliases_place` variant, and adding that
+//! variant is what enumerated the sites: the switches have no `else` arm, so
+//! the compiler refused to build until each one answered.
+//!
+//! It REFUSES rather than moving the scrutinee. Moving is the better long-term
+//! semantics and is recorded as the designed follow-up in `docs/OWNERSHIP.md`
+//! R7; it is not done here because it changes `wasMoved` for every arm binding
+//! and codegen's `pendingDrops` reads that. The distinction the refusal draws
+//! is "does anything else still own this": a scrutinee that is not a place has
+//! no other owner, so `match make() { x => take(owned x) }` still lowers and
+//! still runs. See `ArmOrigin`.
 //!
 //! **R18** is R3 read in the other direction: R3 refuses moving OUT of a
 //! borrow, and R18 refuses binding an `owned` name TO one. It is the second
@@ -126,6 +148,28 @@ pub const LoanKind = enum {
     }
 };
 
+/// Whether a binding was introduced by a match arm pattern, and if so whether
+/// anything ELSE still owns the value it names. R7 does not move the
+/// scrutinee, so an arm binding is an ALIAS of it rather than a new owner, and
+/// that is the whole of the R7 gap: `match s1 { x => take(owned x) }` moved
+/// `x`, left `s1` live, and both headers held one buffer.
+///
+/// Three states rather than a bool, because the answer is not "is this an arm
+/// binding" but "does something else still own this". A scrutinee that is not
+/// a place (a call result, a literal, a fresh aggregate) has no other owner,
+/// so a binding derived from it is as consumable as any temporary, and
+/// `match make() { x => take(owned x) }` must keep lowering and running.
+const ArmOrigin = enum {
+    /// A parameter or a `let`/`var`. Not an arm binding.
+    not_an_arm,
+    /// An arm binding over a scrutinee with no place behind it. Nothing else
+    /// owns the value, so consuming it is a move of a temporary.
+    temp,
+    /// An arm binding over a scrutinee that IS a place. Consuming it gives up
+    /// a buffer the scrutinee's own drop will free again.
+    alias,
+};
+
 /// A binding introduced by a parameter, a `let`/`var`, or a match arm pattern.
 const Binding = struct {
     id: u32,
@@ -138,6 +182,13 @@ const Binding = struct {
     /// initializing struct literal. Needed to read field annotations.
     struct_name: ?[]const u8,
     decl_span: Span,
+    /// R7. Defaults to `.not_an_arm` so the two non-arm `declare` sites are
+    /// unchanged; only `checkMatch` ever sets it.
+    arm_origin: ArmOrigin = .not_an_arm,
+    /// The scrutinee place this arm binding aliases, for the diagnostic.
+    /// Arena-allocated by `placeOf` (or a slice of the source), so it outlives
+    /// the match. Only meaningful when `arm_origin == .alias`.
+    arm_scrutinee: ?[]const u8 = null,
 };
 
 /// A place: a binding plus a field path relative to it.
@@ -610,6 +661,13 @@ pub const Checker = struct {
                                 try self.refuseUnknownMove(s, "return", "from", "function", fn_name);
                                 return;
                             },
+                            // R7, the return position. Measured at `4698dbc`:
+                            // an arm binding returned out of a `-> String`
+                            // function was exit 134.
+                            .aliases_place => |s| {
+                                try self.refuseScrutineeAlias(s, "return", "from", "function", fn_name);
+                                return;
+                            },
                             // A place is moved below, unchanged.
                             .place, .no_owned_place => {},
                         }
@@ -829,6 +887,15 @@ pub const Checker = struct {
                     try self.refuseUnknownMove(s, "bind", "to", "binding", l.name);
                     return;
                 },
+                // R7, the `let` position. Not a double free at `4698dbc` only
+                // because an arm binding is never dropped either, so
+                // `match s1 { x => { let owned y = x } }` merely aliased three
+                // headers onto one buffer; it detonates the moment arm-scope
+                // drops land, which is why it is refused with the live ones.
+                .aliases_place => |s| {
+                    try self.refuseScrutineeAlias(s, "bind", "to", "binding", l.name);
+                    return;
+                },
                 .no_owned_place => {},
             }
         }
@@ -1037,6 +1104,14 @@ pub const Checker = struct {
                     self.revive(place);
                     return;
                 },
+                // R7, the assignment position. Measured at `4698dbc`:
+                // `match s1 { x => { d = x } }` into a `var owned d` was
+                // exit 134.
+                .aliases_place => |s| {
+                    try self.refuseScrutineeAlias(s, "assign", "to", "place", place.display);
+                    self.revive(place);
+                    return;
+                },
                 // A place is moved by the shared path below, unchanged.
                 .place, .no_owned_place => {},
             }
@@ -1141,7 +1216,19 @@ pub const Checker = struct {
                                         try self.refuseUnknownMove(s, "store", "in", "field", f.name);
                                         continue;
                                     },
-                                    .place, .no_owned_place => {},
+                                    // R7, and it READS here, exactly as
+                                    // `.place` does. `Tag { name: x }` with
+                                    // an aliasing `x` and `Tag { name: s1 }`
+                                    // with the scrutinee itself are the SAME
+                                    // latent record-drop hazard, and neither
+                                    // is a double free today: measured at
+                                    // `4698dbc`, exit 0. Refusing one while
+                                    // reading the other would split a single
+                                    // R11 gap across two rules for no gain.
+                                    // A branch-reached alias is still refused,
+                                    // because `ownedMoveBranch` promotes it to
+                                    // `.unknown`.
+                                    .aliases_place, .place, .no_owned_place => {},
                                 }
                             }
                         }
@@ -1187,7 +1274,12 @@ pub const Checker = struct {
                             try self.refuseUnknownMove(s, "store", "in", "list element", null);
                             continue;
                         },
-                        .place, .no_owned_place => {},
+                        // R7, and it READS here, for the same reason as the
+                        // struct field above: `[x]` with an aliasing `x` and
+                        // `[s1]` with the scrutinee are one gap, R11's
+                        // element release, and neither is a double free today
+                        // (measured at `4698dbc`, exit 0).
+                        .aliases_place, .place, .no_owned_place => {},
                     }
                     try self.checkExpr(item);
                 }
@@ -1231,7 +1323,13 @@ pub const Checker = struct {
         defer self.temp_loans.shrinkRetainingCapacity(region);
 
         // R7 (a pattern binding inherits the scrutinee's ownership) is not
-        // implemented, so the scrutinee is read, not moved.
+        // implemented, so the scrutinee is read, not moved. The arm binding is
+        // therefore an ALIAS of whatever the scrutinee names, and consuming it
+        // in an `owned` position is refused rather than moved: see
+        // `ArmOrigin`, `ownedMoveSource`'s `.aliases_place`, and
+        // `docs/OWNERSHIP.md` R7. Moving the scrutinee instead is the designed
+        // follow-up and is NOT this change; it would alter `wasMoved` for
+        // every arm binding, and codegen's `pendingDrops` reads that.
         try self.checkExpr(m.scrutinee);
 
         // The scrutinee's STRUCT TYPE, carried to an arm binding below. Not
@@ -1246,11 +1344,40 @@ pub const Checker = struct {
         // "the ownership of the field 'data' of 'x' cannot be resolved here".
         // Resolving it can only turn `.unresolved` into a verdict read off a
         // real annotation; it never turns silence into acceptance.
+        const scrutinee_place = try self.placeOf(m.scrutinee);
+
         const scrutinee_struct: ?[]const u8 = blk: {
-            const p = try self.placeOf(m.scrutinee) orelse break :blk null;
+            const p = scrutinee_place orelse break :blk null;
             const sb = self.bindingById(p.binding) orelse break :blk null;
             break :blk self.placeStructName(sb, p.path);
         };
+
+        // R7, and the ONE question this rule asks: does anything else still
+        // own what the arm binding will name?
+        //
+        // A scrutinee with no place behind it -- a call result, a literal, a
+        // fresh aggregate -- has no other owner, so the arm binding is the
+        // only handle and consuming it is a move of a temporary. That row was
+        // measured correct (`match make() { x => take(owned x) }`, exit 0) and
+        // refusing it too would be over-refusal with nothing to show for it.
+        //
+        // The one propagation, and it is deliberately narrow: a scrutinee that
+        // is EXACTLY a whole `.temp` arm binding is itself a temporary with no
+        // other owner, so `match make() { x => match x { y => take(owned y) } }`
+        // stays accepted (measured exit 0) while
+        // `match s1 { x => match x { y => take(owned y) } }` is refused
+        // (measured exit 134). A non-empty PATH does not propagate: the field
+        // of a temporary is reached through a value the whole of which would
+        // be dropped once precise drops land, and the safe direction there is
+        // to refuse.
+        const arm_origin: ArmOrigin = if (scrutinee_place) |p| blk: {
+            if (p.path.len == 0) {
+                if (self.bindingById(p.binding)) |sb| {
+                    if (sb.arm_origin == .temp) break :blk .temp;
+                }
+            }
+            break :blk .alias;
+        } else .temp;
 
         var entry = try self.dead.clone(self.allocator);
         defer entry.deinit(self.allocator);
@@ -1272,6 +1399,8 @@ pub const Checker = struct {
                     .mutable = false,
                     .struct_name = scrutinee_struct,
                     .decl_span = arm.pattern.span,
+                    .arm_origin = arm_origin,
+                    .arm_scrutinee = if (scrutinee_place) |p| p.display else null,
                 });
             }
             try self.checkExpr(arm.body);
@@ -1377,6 +1506,20 @@ pub const Checker = struct {
                 switch (try self.ownedMoveSource(operand)) {
                     .unknown => |s| {
                         try self.refuseUnknownMove(s, "pass", "to", "parameter", slot_name);
+                        continue;
+                    },
+                    // R7, the call-argument position: the reproducer.
+                    // Measured at `4698dbc`,
+                    // `print_int(match s1 { x => take(owned x) })` was
+                    // `cell check` exit 0, `cc` exit 0, running it exit 134.
+                    // It also closes an R10 escape at the same site, because
+                    // `arcUniqueSource` reads the arm binding's own `.owned`
+                    // annotation and cannot see the scrutinee's `arc`:
+                    // `match a { x => take_list(owned x) }` over an
+                    // `arc [Int]` place was exit 134 while `take_list(owned a)`
+                    // was already refused.
+                    .aliases_place => |s| {
+                        try self.refuseScrutineeAlias(s, "pass", "to", "parameter", slot_name);
                         continue;
                     },
                     // A place is moved by the `.owned` arm below, unchanged.
@@ -1934,6 +2077,18 @@ pub const Checker = struct {
         /// A value shape that may give up an owned place, on a path this
         /// checker does not resolve. Refused, not read.
         unknown: ArcSource.Site,
+        /// **R7.** The expression is a place rooted at a match-arm binding
+        /// that ALIASES a scrutinee place. Consuming it hands over a buffer
+        /// the scrutinee's own drop frees again, because R7 does not move the
+        /// scrutinee. Refused at every site that would MOVE a `.place`, and
+        /// read at the two sites that already only read one.
+        ///
+        /// A separate variant rather than a reuse of `.unknown` on purpose:
+        /// this switch has no `else` arm anywhere it is consumed, so adding it
+        /// made every consumption site a compile error until it answered. That
+        /// is the enumeration done by the compiler instead of by the author,
+        /// which is the failure mode this file has hit four times.
+        aliases_place: ArcSource.Site,
 
         /// Combine two branch verdicts. `.unknown` from any branch wins,
         /// because any branch may be the one taken.
@@ -1946,7 +2101,10 @@ pub const Checker = struct {
         /// caller cannot justify.
         fn join(a: OwnedMove, b: OwnedMove) OwnedMove {
             return switch (a) {
-                .unknown, .place => a,
+                // `.aliases_place` joins with `.unknown` and `.place`: all
+                // three are verdicts a branch must not hand back as movable,
+                // and letting one win is the over-refusing direction.
+                .unknown, .place, .aliases_place => a,
                 .no_owned_place => b,
             };
         }
@@ -1963,11 +2121,44 @@ pub const Checker = struct {
                 .span = p.span,
             } },
             .unknown => |s| .{ .unknown = s },
+            // Promoted to `.unknown` for the same reason `.place` is: the two
+            // sites that read a `.place` rather than moving it must not start
+            // reading one reached through a branch either, and `.unknown` is
+            // the verdict every site already refuses. The display already
+            // names the arm binding and its scrutinee, so nothing is lost.
+            .aliases_place => |s| .{ .unknown = s },
+        };
+    }
+
+    /// R7's one question, asked once, at the single point every `owned`
+    /// consumption site routes through. See `OwnedMove.aliases_place`.
+    ///
+    /// It sits above the `.place` return rather than beside it because a
+    /// place rooted at an aliasing arm binding IS a place: `placeOf` resolves
+    /// it, R2's move list covers it, and moving it is exactly the defect.
+    /// Asking here means a consumption site added later inherits the answer
+    /// without knowing R7 exists.
+    fn armAlias(self: *Checker, place: Place) Error!?ArcSource.Site {
+        const b = self.bindingById(place.binding) orelse return null;
+        switch (b.arm_origin) {
+            .not_an_arm, .temp => return null,
+            .alias => {},
+        }
+        const scrutinee = b.arm_scrutinee orelse "the scrutinee";
+        return .{
+            .display = try self.msg(
+                "the match binding '{s}' aliasing '{s}'",
+                .{ place.display, scrutinee },
+            ),
+            .span = place.span,
         };
     }
 
     fn ownedMoveSource(self: *Checker, e: *const ast.Expr) Error!OwnedMove {
-        if (try self.placeOf(e)) |place| return .{ .place = place };
+        if (try self.placeOf(e)) |place| {
+            if (try self.armAlias(place)) |site| return .{ .aliases_place = site };
+            return .{ .place = place };
+        }
         return switch (e.kind) {
             // A literal is a fresh value with no binding behind it.
             .int, .float, .string, .bool => .no_owned_place,
@@ -2089,6 +2280,45 @@ pub const Checker = struct {
             self.allocator,
             s.span,
             "R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path",
+        );
+    }
+
+    /// R7's refusal. Its own function and not `refuseUnknownMove`, because
+    /// that one's note tells the reader to "bind the value to a name first",
+    /// and here the name IS the problem: the arm binding is the alias.
+    ///
+    /// It is a refusal and not a move of the scrutinee, and that is a scoped
+    /// decision rather than the end state. Moving the scrutinee is the better
+    /// semantics and would additionally make a later `take(owned s1)` report
+    /// use-after-move for the right reason; it is recorded as the designed
+    /// follow-up in `docs/OWNERSHIP.md` R7. It is not done here because it
+    /// changes `wasMoved` for every arm binding and codegen's `pendingDrops`
+    /// reads that, which is the exact shape of the three fixes in this
+    /// repository that each shipped a new silent miscompile in their own first
+    /// commit.
+    fn refuseScrutineeAlias(
+        self: *Checker,
+        s: ArcSource.Site,
+        verb: []const u8,
+        prep: []const u8,
+        slot: []const u8,
+        slot_name: ?[]const u8,
+    ) Error!void {
+        const message = if (slot_name) |n|
+            try self.msg(
+                "cannot {s} {s} {s} 'owned' {s} '{s}': the scrutinee still owns the value",
+                .{ verb, s.display, prep, slot, n },
+            )
+        else
+            try self.msg(
+                "cannot {s} {s} {s} an 'owned' {s}: the scrutinee still owns the value",
+                .{ verb, s.display, prep, slot },
+            );
+        try self.diagnostics.err(self.allocator, s.span, message);
+        try self.diagnostics.note(
+            self.allocator,
+            s.span,
+            "R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again",
         );
     }
 
@@ -5573,6 +5803,283 @@ test "R9 reaches an arc field through a match arm binding" {
     ,
         \\t.cell:13:24: error: cannot borrow 'x.h' as exclusive: 'arc' grants shared access only
         \\t.cell:13:24: note: mutation through 'arc' needs interior mutability, which Cell does not have yet
+        \\
+    );
+}
+
+// ── R7's consumption clause ─────────────────────────────────────────────
+//
+// The scrutinee is READ, never moved, so an arm binding is an alias of it and
+// not a second owner. Every `owned` consumption site asked `placeOf`, got a
+// place rooted at the arm binding, and moved THAT. Eleven shapes were measured
+// live at `4698dbc`; the four below that carry a measured exit code name it in
+// their comment, and `examples/rejected/owned_move_through_match_binding.cell`
+// carries the whole table.
+
+test "R7: an arm binding may not be passed to an owned parameter" {
+    // The reproducer, measured at `4698dbc`: `cell check` exit 0,
+    // `cc -fsanitize=address` exit 0, running it exit 134,
+    // `AddressSanitizer: attempting double-free`.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    match buf {
+        \\        x => take(owned x)
+        \\    }
+        \\}
+    ,
+        \\t.cell:12:25: error: cannot pass the match binding 'x' aliasing 'buf' to 'owned' parameter 'b': the scrutinee still owns the value
+        \\t.cell:12:25: note: R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again
+        \\
+    );
+}
+
+test "R7: a call-result scrutinee still lowers, because nothing else owns it" {
+    // The distinction the rule draws, and the row that must NOT be refused:
+    // measured at `4698dbc` and again after the fix, exit 0. A scrutinee with
+    // no place behind it has no other owner, so the arm binding is the only
+    // handle and consuming it is a move of a temporary.
+    try expectAccepted(prelude ++
+        \\pub fn fresh() -> Buffer;
+        \\pub fn main() {
+        \\    match fresh() {
+        \\        x => take(owned x)
+        \\    }
+        \\}
+    );
+}
+
+test "R7: temp-ness propagates through a whole arm binding, one match deep" {
+    // `match fresh() { x => match x { y => take(owned y) } }` was measured
+    // exit 0 before and after: `x` is a temporary with no other owner, so `y`
+    // is one too. The propagation exists so the call-result row survives
+    // nesting; without it this is an over-refusal with nothing behind it.
+    try expectAccepted(prelude ++
+        \\pub fn fresh() -> Buffer;
+        \\pub fn main() {
+        \\    match fresh() {
+        \\        x => match x {
+        \\            y => take(owned y)
+        \\        }
+        \\    }
+        \\}
+    );
+}
+
+test "R7: a nested arm binding over a PLACE scrutinee is refused" {
+    // The same nesting over a place was measured exit 134 at `4698dbc`. The
+    // pair with the test above is the whole point: nesting does not launder
+    // the question, it forwards it.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    match buf {
+        \\        x => match x {
+        \\            y => take(owned y)
+        \\        }
+        \\    }
+        \\}
+    ,
+        \\t.cell:13:29: error: cannot pass the match binding 'y' aliasing 'x' to 'owned' parameter 'b': the scrutinee still owns the value
+        \\t.cell:13:29: note: R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again
+        \\
+    );
+}
+
+test "R7: an arm binding may not be returned" {
+    // Measured at `4698dbc`: returning an arm binding out of a `-> String`
+    // body was exit 134, the caller's holder and the callee's scope drop
+    // freeing one buffer.
+    try expectDiagnostics(prelude ++
+        \\pub fn pick(owned seed: Buffer) -> Buffer {
+        \\    match seed {
+        \\        x => { return x }
+        \\    }
+        \\    return seed
+        \\}
+    ,
+        \\t.cell:11:23: error: cannot return the match binding 'x' aliasing 'seed' from 'owned' function 'pick': the scrutinee still owns the value
+        \\t.cell:11:23: note: R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again
+        \\
+    );
+}
+
+test "R7: an arm binding may not be assigned into an owned place" {
+    // Measured at `4698dbc`: `match s1 { x => { d = x } }` into a
+    // `var owned d` was exit 134.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    var owned dst = Buffer { data: [], len: 0 }
+        \\    match buf {
+        \\        x => { dst = x }
+        \\    }
+        \\}
+    ,
+        \\t.cell:13:22: error: cannot assign the match binding 'x' aliasing 'buf' to 'owned' place 'dst': the scrutinee still owns the value
+        \\t.cell:13:22: note: R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again
+        \\
+    );
+}
+
+test "R7: an arm binding may not initialise an owned let" {
+    // NOT a double free at `4698dbc` (measured exit 0), and refused anyway:
+    // an arm binding is never dropped either, so the three headers merely
+    // aliased one buffer. Arm-scope drops detonate it, and the file's standing
+    // choice is to refuse a latent case with the live ones rather than leave
+    // it as a trap for the change that lands them.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    match buf {
+        \\        x => { let owned y: Buffer = x
+        \\               read(shared y) }
+        \\    }
+        \\}
+    ,
+        \\t.cell:12:38: error: cannot bind the match binding 'x' aliasing 'buf' to 'owned' binding 'y': the scrutinee still owns the value
+        \\t.cell:12:38: note: R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again
+        \\
+    );
+}
+
+test "R7: a FIELD of an aliasing arm binding is refused too" {
+    // The question is asked of the place, not of the name, so `x.data` is the
+    // same alias one segment deeper. Measured exit 0 at `4698dbc` only because
+    // this backend never drops a `record`, which is R11's gap and not a reason
+    // to accept.
+    try expectDiagnostics(prelude ++
+        \\pub fn eat(owned d: [Byte]) { }
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    match buf {
+        \\        x => eat(owned x.data)
+        \\    }
+        \\}
+    ,
+        \\t.cell:13:24: error: cannot pass the match binding 'x.data' aliasing 'buf' to 'owned' parameter 'd': the scrutinee still owns the value
+        \\t.cell:13:24: note: R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again
+        \\
+    );
+}
+
+test "R7: a BORROWED scrutinee is refused, and the C type is why that matters" {
+    // Measured at `4698dbc` with a `shared [Int]` parameter as the scrutinee:
+    // exit 134. The `String` spelling of the same program ran clean, because
+    // `owned String` and `shared String` are DIFFERENT C types and codegen
+    // inserted a copy, while `owned [T]` and `shared [T]` are the same type
+    // and it inserted nothing. A rule whose enforcement depends on which two C
+    // types happen to coincide is the thing `refuseArcUnique`'s comment
+    // already refuses to write, so both spellings are refused here.
+    try expectDiagnostics(prelude ++
+        \\pub fn borrowing(shared b: Buffer) {
+        \\    match b {
+        \\        x => take(owned x)
+        \\    }
+        \\}
+    ,
+        \\t.cell:11:25: error: cannot pass the match binding 'x' aliasing 'b' to 'owned' parameter 'b': the scrutinee still owns the value
+        \\t.cell:11:25: note: R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again
+        \\
+    );
+}
+
+test "a FIELD of a temp arm binding is refused, and R10 gets there first" {
+    // Written to pin R7's narrow propagation -- temp-ness crosses an EMPTY
+    // path only, so `take(owned x)` is accepted above while `x.data` is not --
+    // and MEASURED to be refused by something else entirely. `scrutinee_struct`
+    // is read off `placeOf(scrutinee)`, which is null for a call, so a `.temp`
+    // arm binding never has a struct name, and R10's total verdict calls every
+    // field of it unresolved. That is the residual `checkLet` already records
+    // for an unannotated `match` or call initializer, reached from the other
+    // side.
+    //
+    // The test is kept with its real output rather than deleted, because the
+    // shape it was written for is genuinely unreachable as an R7 diagnostic
+    // today: anyone who closes R10's residual will land here, and the arm
+    // below is the answer they need. Both refusals are the safe direction.
+    try expectDiagnostics(prelude ++
+        \\pub fn fresh() -> Buffer;
+        \\pub fn eat(owned d: [Byte]) { }
+        \\pub fn main() {
+        \\    match fresh() {
+        \\        x => eat(owned x.data)
+        \\    }
+        \\}
+    ,
+        \\t.cell:13:24: error: cannot pass the place 'x.data' to 'owned' parameter 'd': its ownership cannot be resolved here
+        \\t.cell:13:24: note: R10 refuses what it cannot prove is not 'arc': an 'arc' value made unique is freed twice
+        \\
+    );
+}
+
+test "R7 reads, and does not refuse, at the two sites that already only read" {
+    // The struct-field and list-element positions leave a plain `.place` a
+    // READ, because a record is never dropped and a slice element is never
+    // released (R11). `Buffer { data: x }` with an aliasing `x` and
+    // `Buffer { data: buf.data }` with the scrutinee's own field are the SAME
+    // latent hazard and neither is a double free today; both were measured
+    // exit 0 before and after. Splitting one R11 gap across two rules would
+    // buy nothing. A branch-reached alias is still refused, because
+    // `ownedMoveBranch` promotes it.
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    match buf {
+        \\        x => read(shared Buffer { data: x, len: 0 })
+        \\    }
+        \\}
+    );
+}
+
+test "R7 leaves a shared read of an arm binding alone" {
+    // The rule is scoped to `owned` consumption. Reading through an arm
+    // binding is what `match` is for, was measured exit 0, and stays exit 0.
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    match buf {
+        \\        x => use_it(shared x)
+        \\    }
+        \\    take(buf)
+        \\}
+    );
+}
+
+test "R7 does not touch a copy scrutinee" {
+    // A `copy` place duplicates rather than moving, so nothing is aliased and
+    // there is nothing to refuse. Measured exit 0 before and after.
+    try expectAccepted(prelude ++
+        \\pub fn show(copy n: Int) { }
+        \\pub fn main() {
+        \\    let copy n = 3
+        \\    match n {
+        \\        x => show(copy x)
+        \\    }
+        \\}
+    );
+}
+
+test "R7 closes an R10 escape: an arm binding launders an arc scrutinee" {
+    // `arcUniqueSource` reads the ARM BINDING's own annotation, which
+    // `checkMatch` declares `.owned`, so it could not see the scrutinee's
+    // `arc`. Measured at `4698dbc` with an `arc [Int]` place:
+    // `take_list(owned a)` was already refused by R10, and
+    // `match a { x => take_list(owned x) }` was `cell check` exit 0 and
+    // running it exit 134. R7's question is asked of the PLACE and does not
+    // need to know the scrutinee is `arc`, which is why one check closes two
+    // rules' escapes.
+    try expectDiagnostics(prelude ++
+        \\pub fn shared_buf() -> arc Buffer;
+        \\pub fn main() {
+        \\    let arc a: Buffer = shared_buf()
+        \\    match a {
+        \\        x => take(owned x)
+        \\    }
+        \\}
+    ,
+        \\t.cell:13:25: error: cannot pass the match binding 'x' aliasing 'a' to 'owned' parameter 'b': the scrutinee still owns the value
+        \\t.cell:13:25: note: R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again
         \\
     );
 }

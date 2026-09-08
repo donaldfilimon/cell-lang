@@ -252,6 +252,22 @@ twice, so keep both:
   could see it. A refused program emits no C, so the ASan stage cannot run
   either; the rejected loop's `EXPECT` line is what pins them.
 
+Two files carry the `match` half of the same family, and they look alike and
+fail for opposite reasons, so keep both:
+
+- `owned_move_through_match.cell`: R2.b, a `match` in an `owned` SLOT.
+  `placeOf` returned null for the value shape and the site READ it.
+- `owned_move_through_match_binding.cell`: R7's consumption clause, a `match`
+  BINDING in an `owned` slot. `placeOf` returned a perfectly good place and the
+  site MOVED it, and the move was of the wrong thing: the scrutinee is never
+  moved, so an arm binding is an alias of it and not a second owner. It was the
+  last known live memory-safety defect in the language, exit 134 under
+  AddressSanitizer at `4698dbc`, and ELEVEN shapes were live rather than the
+  one the reproducer shows. Its header carries the whole enumeration, including
+  the row where an arm binding launders R10's `arc` refusal. A refused program
+  emits no C, so the ASan stage cannot pin either file; the `EXPECT` line is
+  what does.
+
 Two other files are not ownership bugs at all. One is currently-rejected for
 the wrong reason (unknown identifier); the other, `unknown_type.cell`, is still
 accepted:
