@@ -68,3 +68,23 @@ exit and actual test count. Update current false 'not a double free today'
 comments in the changed code and ownership rule discussion, explicitly leaving
 list elements and fresh-aggregate cleanup outstanding. Request independent
 review of the complete task commit range before marking the slice complete.
+
+## Independent review follow-up: ARC representation
+
+The first implementation at `6b6a8ee` ignores field ownership while recursively
+classifying structs. Review measured a scalar-only `Point`, an `arc Point`
+field inside `Holder`, and a `copy Holder` field inside `Bad`: checking and C
+emission succeed, and the nested field is a `cell_arc_t` handle. Treating
+`Holder` as resource-free permits an unretained duplicate. The canonical
+ownership-qualified type spelling `copy point: arc Point` has the same gap.
+
+Classification must preserve representation-changing ownership at both field
+annotations and `.ref` types. ARC over a nonprimitive payload is a resource
+even when the payload itself contains only scalars. Primitive ARC remains
+by-value under the existing language contract: measured `arc Int` emits
+`int64_t`, so rejecting every ARC annotation would impose the wrong boundary.
+Use the compiler's canonical primitive classification and fail closed on
+unknown representations. Include nested and qualified ARC-record tests,
+primitive ARC controls, and the scalar identifier/scalar-record initializer
+controls requested by specification review. Review and rerun the full gate
+before closing this field-safety slice.
