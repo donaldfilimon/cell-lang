@@ -55,7 +55,9 @@
 //! and codegen's `pendingDrops` reads that. The distinction the refusal draws
 //! is "does anything else still own this": a scrutinee that is not a place has
 //! no other owner, so `match make() { x => take(owned x) }` still lowers and
-//! still runs. See `ArmOrigin`.
+//! still runs. See `ArmOrigin`, and read `checkMatch`'s comment on why that
+//! answer does NOT propagate to a nested match: the version that propagated
+//! was a twelfth live shape, not a precision win.
 //!
 //! **R18** is R3 read in the other direction: R3 refuses moving OUT of a
 //! borrow, and R18 refuses binding an `owned` name TO one. It is the second
@@ -159,6 +161,11 @@ pub const LoanKind = enum {
 /// a place (a call result, a literal, a fresh aggregate) has no other owner,
 /// so a binding derived from it is as consumable as any temporary, and
 /// `match make() { x => take(owned x) }` must keep lowering and running.
+///
+/// `.temp` does NOT propagate to a nested match's arm binding. See
+/// `checkMatch`: the version that propagated left two live handles on one
+/// temporary and a measured exit-134 double free that R2 cannot see, because
+/// the two handles are two different bindings.
 const ArmOrigin = enum {
     /// A parameter or a `let`/`var`. Not an arm binding.
     not_an_arm,
@@ -1361,23 +1368,29 @@ pub const Checker = struct {
         // measured correct (`match make() { x => take(owned x) }`, exit 0) and
         // refusing it too would be over-refusal with nothing to show for it.
         //
-        // The one propagation, and it is deliberately narrow: a scrutinee that
-        // is EXACTLY a whole `.temp` arm binding is itself a temporary with no
-        // other owner, so `match make() { x => match x { y => take(owned y) } }`
-        // stays accepted (measured exit 0) while
-        // `match s1 { x => match x { y => take(owned y) } }` is refused
-        // (measured exit 134). A non-empty PATH does not propagate: the field
-        // of a temporary is reached through a value the whole of which would
-        // be dropped once precise drops land, and the safe direction there is
-        // to refuse.
-        const arm_origin: ArmOrigin = if (scrutinee_place) |p| blk: {
-            if (p.path.len == 0) {
-                if (self.bindingById(p.binding)) |sb| {
-                    if (sb.arm_origin == .temp) break :blk .temp;
-                }
-            }
-            break :blk .alias;
-        } else .temp;
+        // A scrutinee that IS a place makes an alias, full stop. There is no
+        // propagation, and the first version of this rule had one that was
+        // WRONG in the dangerous direction.
+        //
+        // It read: a scrutinee that is exactly a whole `.temp` arm binding is
+        // itself a temporary with no other owner, so
+        // `match fresh() { x => match x { y => take(owned y) } }` may stay
+        // accepted. That is sound about ONE consumer and false about two, and
+        // nesting a `match` is the only construct in this grammar that makes
+        // two live handles on one value: `let owned y = x` MOVES `x`, so R2
+        // catches the `let` spelling, while an arm binding COPIES it and
+        // nothing did. Measured against the propagating version:
+        //
+        //     match fresh() { x => match x { y => take(owned y) }
+        //                                  + take(owned x) }      exit 134
+        //
+        // R2 cannot fire there, because `x` and `y` are two different bindings
+        // with two different ids. The propagation bought exactly one contrived
+        // single-consumer program and kept a live double free open to do it,
+        // which is the wrong side of the asymmetry this file runs on. Removing
+        // it costs a documented over-refusal of that program and closes the
+        // class outright.
+        const arm_origin: ArmOrigin = if (scrutinee_place == null) .temp else .alias;
 
         var entry = try self.dead.clone(self.allocator);
         defer entry.deinit(self.allocator);
@@ -5849,12 +5862,14 @@ test "R7: a call-result scrutinee still lowers, because nothing else owns it" {
     );
 }
 
-test "R7: temp-ness propagates through a whole arm binding, one match deep" {
-    // `match fresh() { x => match x { y => take(owned y) } }` was measured
-    // exit 0 before and after: `x` is a temporary with no other owner, so `y`
-    // is one too. The propagation exists so the call-result row survives
-    // nesting; without it this is an over-refusal with nothing behind it.
-    try expectAccepted(prelude ++
+test "R7 over-refuses a nested arm binding over a TEMP, and that is the fix" {
+    // This program is safe today, measured exit 0, and it is refused anyway.
+    // The first version of R7 accepted it, by propagating `.temp` through a
+    // whole arm binding: `x` is a temporary with no other owner, so `y` is one
+    // too. Sound about ONE consumer, false about two, and the version below is
+    // what falsified it -- so this pair is kept together on purpose, the
+    // over-refusal above the reason for it.
+    try expectDiagnostics(prelude ++
         \\pub fn fresh() -> Buffer;
         \\pub fn main() {
         \\    match fresh() {
@@ -5863,6 +5878,37 @@ test "R7: temp-ness propagates through a whole arm binding, one match deep" {
         \\        }
         \\    }
         \\}
+    ,
+        \\t.cell:13:29: error: cannot pass the match binding 'y' aliasing 'x' to 'owned' parameter 'b': the scrutinee still owns the value
+        \\t.cell:13:29: note: R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again
+        \\
+    );
+}
+
+test "R7: two live handles on one temp, which R2 cannot see" {
+    // The measurement that removed the propagation. `x` and `y` are two
+    // different bindings with two different ids, both holding one buffer, so
+    // R2's use-after-move never fires: `take(owned y)` frees it and
+    // `take(owned x)` frees it again, exit 134 under AddressSanitizer.
+    //
+    // Nesting a `match` is the ONLY construct in this grammar that makes two
+    // live handles: `let owned y = x` moves `x`, which is why the `let`
+    // spelling was already safe and why this one was not. Refusing the inner
+    // binding closes the class rather than this shape.
+    try expectDiagnostics(prelude ++
+        \\pub fn fresh() -> Buffer;
+        \\pub fn main() {
+        \\    match fresh() {
+        \\        x => { match x {
+        \\                   y => take(owned y)
+        \\               }
+        \\               take(owned x) }
+        \\    }
+        \\}
+    ,
+        \\t.cell:13:36: error: cannot pass the match binding 'y' aliasing 'x' to 'owned' parameter 'b': the scrutinee still owns the value
+        \\t.cell:13:36: note: R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again
+        \\
     );
 }
 

@@ -2,7 +2,7 @@
 // Violates: docs/OWNERSHIP.md R7's consumption clause (an arm binding may not
 // be consumed while the scrutinee still owns the value).
 //
-// WHY THIS FILE EXISTS. This was the LAST known live memory-safety defect in
+// WHY THIS FILE EXISTS. This was the largest live memory-safety defect left in
 // the language, and it is the sibling of
 // `examples/rejected/owned_move_through_match.cell` next to it: that one is a
 // `match` in an `owned` SLOT, this one is a `match` BINDING in an `owned`
@@ -86,7 +86,6 @@
 // is "does anything else still own this", not "is this an arm binding":
 //
 //     match make() { x => take(owned x) }                   no other owner
-//     match make() { x => match x { y => take(owned y) } }  temp-ness carries
 //     match s1 { x => use_it(shared x) }                    a read, not owned
 //     match n { x => show(copy x) }                         copy duplicates
 //     match s1 { x => Tag { name: x } }                     see below
@@ -104,6 +103,36 @@
 // dropped, an arm binding is never dropped). The file's standing choice is to
 // refuse a latent case alongside the live ones rather than leave it as a trap
 // for the change that lands those drops.
+//
+// A SIXTH over-refusal, and it is the interesting one because the first
+// version of this rule ACCEPTED it:
+//
+//     match fresh() { x => match x { y => take(owned y) } }
+//
+// is safe today and refused anyway. That version propagated "no other owner"
+// through a whole arm binding, which is sound about ONE consumer and false
+// about two:
+//
+//     match fresh() { x => match x { y => take(owned y) } + take(owned x) }
+//
+// was exit 134 under it. `x` and `y` are two different bindings holding one
+// buffer, so R2 cannot see it, and nesting a `match` is the ONLY construct in
+// this grammar that makes two live handles on one value: `let owned y = x`
+// MOVES `x`, which is why the `let` spelling was already safe. The precision
+// was worth one contrived program and cost a live double free.
+//
+// WHAT IS STILL LIVE, so "the last defect" is not claimed here. Found while
+// measuring this one and NOT fixed by it, because it is R2.b's rule and R11's
+// gap rather than R7's:
+//
+//     let owned s1 = make()
+//     let owned t: Tag = Tag { name: s1 }
+//     take(owned t.name)                     exit 134, at 2b05a2a and after
+//
+// R2.b leaves a plain place a READ at the struct-field position, arguing that a
+// record is never dropped so the buffer is freed once by `s1`. That holds only
+// while nobody moves the field back OUT, and `t.name` is a different place from
+// `s1`, so R2 sees no use-after-move and both are freed.
 
 pub fn make() -> String;
 pub fn take(owned s: String) -> Int;

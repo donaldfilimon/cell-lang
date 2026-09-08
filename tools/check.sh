@@ -992,6 +992,16 @@ fi
 #     signal this stage exists for. It is a named blind spot, not an oversight.
 #   * the field structure of DIRECT aggregates, for the clang-coercion reason
 #     above. Two 16-byte aggregates with different fields compare equal.
+#   * the difference between "a pointer" and "a caller-allocated COPY behind a
+#     pointer", which src/cell/abi.zig:194 already warns about in capitals:
+#     `.direct = "ptr"` AND `.indirect` RENDER AS THE SAME FOUR CHARACTERS.
+#     clang emits a bare `ptr` for an over-16-byte aggregate passed by value
+#     too, so on the C leg `owned String`, `shared [T]` and `exclusive String`
+#     all canonicalize to `ptr`, and an emitter that handed the callee a
+#     pointer to the CALLER'S ORIGINAL where the ABI says a copy would agree
+#     with C here perfectly. That is a real hole in this stage and it is named
+#     rather than papered over; ownership of the pointee is abi.zig's subject
+#     and its own tests', not this comparison's.
 #   * hint attributes (noalias, noundef, dead_on_unwind, writable, align, ...),
 #     parameter names, and linkage. None of those are calling convention.
 #   * functions that are not present in BOTH IRs. clang drops a declaration
@@ -1015,7 +1025,11 @@ fi
 #
 # SKIPS. `cc -S -emit-llvm` is the reference leg, so if it does not work the
 # whole stage skips loudly. mlir-opt/mlir-translate missing skips the MLIR leg
-# only, the way stage 8 does. llc is not needed: nothing is run here.
+# only, the way stage 8 does. llc is not needed: nothing is run here. A skipped
+# leg also suppresses the pin-rot check for ITS pins, and that clause was
+# written after measuring the alternative: with LLVM_BIN=/nonexistent the three
+# `:MLIR` pins below all reported themselves as never compared, and the gate
+# blamed its own pin list for a missing tool.
 printf '\n== declared signatures (C is the reference) ==\n'
 sig_before=$fails
 sig_compared=0
@@ -1390,6 +1404,15 @@ else
     # the example moved, or the backend stopped emitting it. Failing here is
     # what keeps SIG_DISCLOSED from silently describing a world that is gone.
     for pin in $SIG_DISCLOSED; do
+        # A LEG THAT DID NOT RUN IS NOT A ROTTED PIN. Measured with
+        # LLVM_BIN=/nonexistent before this guard existed: a legitimately
+        # skipped MLIR leg turned all three of its pins into FAILURES, so the
+        # gate reported a defect in its own pin list when the only real fact
+        # was a missing tool. That is the exact shape of dishonesty the SKIP
+        # convention exists to prevent, arriving through the back door.
+        case "$pin" in
+            *:MLIR) [ "$sig_mlir" = yes ] || continue ;;
+        esac
         [ -f "$TMP/sighit_$(printf '%s' "$pin" | tr '/:' '__')" ] || \
             fail "signatures: the pin '$pin' was never compared this run (renamed, moved, or no longer emitted). Delete it or fix the key."
     done

@@ -652,10 +652,24 @@ already refused, `match a { x => take_list(owned x) }` was exit 134), and that
 binding".** A scrutinee with no place behind it -- a call result, a literal, a
 fresh aggregate -- has no other owner, so
 `match make() { x => take(owned x) }` still lowers and still runs (measured
-exit 0 before and after). Temp-ness propagates through a scrutinee that is
-exactly a whole `.temp` arm binding, so one level of nesting over a call result
-stays accepted too; it does NOT propagate through a field path, which is the
-safe direction.
+exit 0 before and after).
+
+That answer does **not** propagate to a nested `match`, and the first version of
+this rule was wrong to let it. It reasoned that a scrutinee which is itself a
+whole temporary arm binding has no other owner either, so
+`match fresh() { x => match x { y => take(owned y) } }` could stay accepted.
+Sound about ONE consumer, false about two:
+
+```cell
+match fresh() { x => match x { y => take(owned y) } + take(owned x) }
+```
+
+was **exit 134** under that version. `x` and `y` are two different bindings
+holding one buffer, so R2's use-after-move cannot see it, and nesting a `match`
+is the ONLY construct in this grammar that makes two live handles on one value
+(`let owned y = x` moves `x`, which is why the `let` spelling was already safe).
+The single-consumer nesting is therefore a documented over-refusal, and closing
+the class beats keeping one contrived program.
 
 **It reads, and does not refuse, at the struct-field and list-element
 positions**, exactly as a plain `.place` does there. `Tag { name: x }` with an
@@ -673,13 +687,31 @@ silent miscompile in the fixer's own first commit by changing what a binding
 holds or when it is dropped without asking what reads that. It needs its own
 measurement of the emitted C, not a rider on a refusal.
 
-**Residual, disclosed rather than left to be rediscovered.** Two shapes are
-accepted today only because nothing drops them: an arm binding is never
-dropped, and a call temporary is never dropped. So
+**Residual, disclosed rather than left to be rediscovered.** The `.temp` row is
+accepted today only because nothing drops a call temporary. So
 `match make() { x => take(owned x) }` and its `arc` spelling LEAK rather than
 double free, which is the safe direction under the same asymmetry R11 uses, and
 they become double frees the day precise drops land. Whoever lands those drops
 must revisit `ArmOrigin.temp`.
+
+**A neighbouring defect this rule does NOT close, found while measuring it and
+reported rather than fixed.** R2.b leaves a plain place a READ at the
+struct-literal field position, on the argument that a `record` is never dropped
+so the field's buffer is freed once by the source's own drop. That argument
+holds only while nobody moves the field back out:
+
+```cell
+let owned s1 = make()
+let owned t: Tag = Tag { name: s1 }
+take(owned t.name)
+```
+
+is **exit 134**, measured at `2b05a2a` and unchanged by R7. `t.name` is a
+bitwise copy of `s1` at a different place, so R2 sees no use-after-move, and
+both are freed. It predates R7 entirely, it is R2.b's decision plus R11's
+record-drop gap rather than this rule, and its repair is the record-drop
+question. It is recorded here so the next reader of that comment knows the
+argument in it is incomplete.
 
 Corpus: `examples/rejected/owned_move_through_match_binding.cell`.
 
