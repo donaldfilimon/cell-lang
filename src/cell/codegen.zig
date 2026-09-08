@@ -1009,28 +1009,92 @@ pub const Generator = struct {
     }
 
     /// The declared type of a `let`. An annotation wins; otherwise the
-    /// initializer decides; otherwise int64_t, matching the language's default
+    /// initializer names the OBJECT and the declared ownership decides how
+    /// this binding holds it; otherwise int64_t, the language's default
     /// integer.
     ///
-    /// The un-annotated path consults `own` for `arc` ALONE, and that
-    /// asymmetry is deliberate. `arc` is the one mode whose C spelling is not
-    /// derivable from the initializer: `let arc label = "session"` must be a
-    /// `cell_arc_t` no matter that the literal infers as `cell_str_t`, and
-    /// before this consultation existed the binding kept the view's type and
-    /// the emitted C failed to compile the moment it reached an `arc`
-    /// parameter. The other modes stay initializer-driven on purpose, because
-    /// `Local.ownership`'s doc comment already records that a `shared`/`copy`
-    /// local initialized from a call keeps the call's owned result type, and
-    /// the drop pass reads the declared annotation rather than the shape
-    /// precisely so that it can tell those apart. `applyOwnership` returns a
-    /// primitive unchanged, so `arc Int` stays `int64_t` here for free.
+    /// THE INITIALIZER'S SHAPE USED TO DECIDE, AND THAT WAS FIVE MISCOMPILES.
+    /// The rule here was "an annotation wins, otherwise the inferred type is
+    /// the type", with `own` consulted for `arc` alone. An initializer's
+    /// SPELLING therefore decided whether the binding was a reference, and the
+    /// spellings disagree with each other and with `borrowck.zig`:
+    ///
+    ///     let exclusive e = exclusive buf     cell_Buffer e = buf;
+    ///     let exclusive e = exclusive &buf    const cell_Buffer *e = &buf;
+    ///     let exclusive e = &mut buf          cell_Buffer *e = &buf;
+    ///
+    /// all three of which borrowck treats identically, as a named exclusive
+    /// loan on `buf` (`checkLetInit`). The first is a COPY, so
+    /// `bump(exclusive e)` wrote into it and `buf.len` printed 37 where the
+    /// LLVM and MLIR backends printed 42: the REFERENCE backend on the wrong
+    /// side of a backend disagreement, silently. The second discards the
+    /// qualifier at the call, which `cc` catches only because the gate's
+    /// AddressSanitizer stage compiles at `-Werror`; nothing DESIGNED that
+    /// guard, and the same program passes plain `cc` with a warning.
+    ///
+    /// The same defect over an OWNING type is worse than a lost write. For
+    /// `var owned name = make()` with `make() -> String`:
+    ///
+    ///     let exclusive e = name    ->  cell_string_t e = name;
+    ///     reset(exclusive e)        ->  cell_reset(&e);
+    ///                               ->  cell_string_free(&name);
+    ///
+    /// `e` is a SHALLOW copy of an owning `cell_string_t`, so the write is
+    /// lost AND one heap buffer is reachable for freeing through two paths.
+    /// `[T]` is the same one type over: `cell_slice_t e = xs;` against a
+    /// `cell_slice_free(&xs)`. Both pass `cell check`.
+    ///
+    /// And in the other direction, a binding that is NOT a borrow inherited
+    /// the initializer's reference-ness: `let copy snap = e` over a live
+    /// borrow emitted `cell_Buffer *snap = e;`, so the snapshot ALIASED the
+    /// lender and saw every later write. `copy` means a value copy, and the
+    /// LLVM backend loads through; C was wrong there too.
+    ///
+    /// TWO BUCKETS, NOT A CASE PER SPELLING. `base` strips whatever
+    /// reference-ness the initializer's spelling happened to carry, and then
+    /// the DECLARED annotation alone decides, through the same
+    /// `applyOwnership` that lowers a parameter. A binding is a reference
+    /// exactly when `isNamedLoan` says borrowck made it one; everything else
+    /// is by value. The catch-all bucket being by-value is the point: an
+    /// initializer shape nobody enumerated cannot become a reference by
+    /// accident, which is the same reason `borrowck.arcUniqueSource` returns a
+    /// total verdict whose undecidable case is refused rather than an optional
+    /// whose "none" meant permit.
+    ///
+    /// `arc` is answered FIRST and is untouched. It is the one mode whose C
+    /// spelling is not derivable from the initializer at all: `let arc label =
+    /// "session"` must be a `cell_arc_t` no matter that the literal infers as
+    /// `cell_str_t`, and before this consultation existed the binding kept the
+    /// view's type and the emitted C failed to compile the moment it reached
+    /// an `arc` parameter. Asking it before `base` also keeps a handle from
+    /// ever being dereferenced: an `arc` is a struct by value and
+    /// `applyOwnership` never makes one a pointer.
+    ///
+    /// WHAT THIS DOES NOT CHANGE, and the reason the two buckets are needed
+    /// rather than an unconditional `applyOwnership`. `Local.ownership`'s doc
+    /// comment records that a `shared`/`copy` local initialized from a CALL
+    /// keeps the call's owned result type, and the drop pass reads the
+    /// declared annotation rather than the shape precisely so it can tell
+    /// those apart. A call result is not a place, so `isNamedLoan` is false
+    /// and `let shared s = make()` still lands on `cell_string_t` rather than
+    /// being demoted to a `cell_str_t` view of a temporary nothing owns.
+    /// `applyOwnership` returns a primitive unchanged, so `arc Int` and
+    /// `exclusive Int` stay `int64_t` here for free.
     fn letType(self: *Generator, ann: ?ast.TypeExpr, value: ?ast.Expr, own: ast.Ownership) Alloc!CType {
         if (ann) |t| return try self.lowerType(&t, own);
         if (value) |v| {
             const inferred = try self.inferExpr(&v);
             if (inferred.shape != .unknown and inferred.shape != .unit) {
                 if (own == .arc) return try self.applyOwnership(inferred, .arc);
-                return inferred;
+
+                // The initializer names WHICH OBJECT, never whether this
+                // binding refers to it. `pointerTo` is the only thing that
+                // sets `pointer`, and it always sets `pointee` beside it, so
+                // `.?` here cannot fire on a type this module built.
+                const base = if (inferred.pointer) inferred.pointee.?.* else inferred;
+
+                if (isNamedLoan(&v, own)) return try self.applyOwnership(base, own);
+                return base;
             }
         }
         return CType.int64;
@@ -2433,6 +2497,67 @@ fn isPlace(e: *const ast.Expr) bool {
         .annotated => |a| isPlace(a.value),
         else => false,
     };
+}
+
+/// The borrow sigil at the head of an expression, ignoring any written
+/// ownership prefix wrapped around it. `&buf`, `&mut buf`, `&var buf` and
+/// `&exclusive buf` all answer here, and so does `exclusive &buf`, because a
+/// written prefix is an `.annotated` wrapper (see the module doc comment's
+/// rule 3).
+///
+/// The OPERAND is what this returns, not the sigil's own kind. Which mode the
+/// resulting binding is in is the `let`'s declared annotation and not the
+/// sigil: `examples/borrows.cell` states the rule for the argument position as
+/// "the KEYWORD WINS", and `emitArgLike` already emits `&buf` for both
+/// `grow(exclusive &buf)` and `grow(exclusive buf)`. `letType` applies the
+/// same rule to a binding.
+///
+/// Deliberately a private twin of `borrowck.refKind` rather than a call into
+/// it. That one is file-private and returns the sigil's kind, which this side
+/// does not use; keeping a two-line copy here is cheaper than widening
+/// borrowck's surface for a caller that wants less than it offers.
+fn borrowOperand(e: *const ast.Expr) ?*const ast.Expr {
+    return switch (e.kind) {
+        .annotated => |a| borrowOperand(a.value),
+        .unary => |u| switch (u.op) {
+            .ref_shared, .ref_exclusive => u.operand,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// Whether a `let` with this initializer and this declared ownership is a
+/// binding that REFERS to an existing place, rather than one holding a value
+/// of its own.
+///
+/// A MIRROR OF `borrowck.checkLetInit`, clause for clause and in its order,
+/// the way `llvmemit.borrowedByPointer` mirrors `codegen.applyOwnership` row
+/// for row. That function is the language's definition of a named loan, and
+/// the two must not drift: when it says a `let` creates a loan, the C backend
+/// must spell that binding as a reference to the lender, and when it does not,
+/// the binding is a value. The five miscompiles `letType` documents were all
+/// this predicate being absent, so codegen answered the question from the
+/// initializer's spelling and disagreed with the checker about what the
+/// program meant.
+///
+///     checkLetInit clause 1   refKind(v) over a place -> named loan
+///     checkLetInit clause 2   `shared`/`exclusive` over a place -> named loan
+///     everything after        an ordinary expression, no named loan
+///
+/// borrowck exposes no query for "is binding N a loan holder", so this is a
+/// mirror rather than an assertion against the real answer. If one is ever
+/// added, `pushLocal` is where the two should be cross-checked, beside the
+/// binding-id agreement it already asserts there.
+///
+/// Total by construction: two recognised shapes and a catch-all, and the
+/// catch-all is the by-value answer. An initializer form nobody enumerated
+/// cannot become a reference by accident, only a copy, which is the safe
+/// direction here.
+fn isNamedLoan(v: *const ast.Expr, own: ast.Ownership) bool {
+    if (borrowOperand(v)) |operand| return isPlace(operand);
+    if (own == .shared or own == .exclusive) return isPlace(v);
+    return false;
 }
 
 /// True when `emitUnbox` has a spelling for `want`, which is exactly the
@@ -4649,4 +4774,314 @@ test "an unbound arc temporary's release balances, compiled and run under ASan" 
         return error.ProgramCrashed;
     }
     try std.testing.expectEqualStrings("12\n", run_result.stdout);
+}
+
+// ── `let` bindings: the annotation decides, not the initializer's shape ──
+//
+// FIVE MISCOMPILES LIVED IN ONE MISSING QUESTION, and `letType`'s doc comment
+// says which. The tests below pin the answer at the level the defects lived
+// at, the emitted DECLARATION, plus one that runs a program because the
+// String case is a double free rather than a wrong number and no text
+// comparison can tell those apart.
+//
+// The corpus half is examples/let_binding_modes.cell (records, all three
+// backends, a host that counts distinct addresses because a `shared` copy has
+// no other observable) and examples/let_binding_owning.cell (String and [T],
+// C only). Measured against the ea36e3d compiler, the first prints 44241 in C
+// where LLVM and MLIR print 14242, and the second aborts under
+// AddressSanitizer at exit 134 with `attempting double-free`.
+
+test "every unique-borrow spelling in a let initializer binds the lender" {
+    // examples/borrows.cell declares these five identical, and
+    // write_through.cell pins that for the ARGUMENT position. A `let`
+    // initializer used to break the group in two: `exclusive buf` emitted a
+    // COPY and `exclusive &buf` emitted a const pointer whose qualifier the
+    // next call discarded.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn grow(exclusive b: Buffer);
+        \\pub fn main() {
+        \\  var owned buf = Buffer { len: 1 }
+        \\  let exclusive e1 = exclusive buf
+        \\  grow(exclusive e1)
+        \\  let exclusive e2 = &mut buf
+        \\  grow(exclusive e2)
+        \\  let exclusive e3 = &var buf
+        \\  grow(exclusive e3)
+        \\  let exclusive e4 = &exclusive buf
+        \\  grow(exclusive e4)
+        \\  let exclusive e5 = exclusive &buf
+        \\  grow(exclusive e5)
+        \\}
+    );
+    defer e.deinit();
+    for ([_][]const u8{ "e1", "e2", "e3", "e4", "e5" }) |name| {
+        var buf: [64]u8 = undefined;
+        try expectContains(e.text, try std.fmt.bufPrint(&buf, "cell_Buffer *{s} = &buf;", .{name}));
+    }
+    // The two that were wrong, spelled out so a regression names itself.
+    try expectAbsent(e.text, "cell_Buffer e1 = buf;");
+    try expectAbsent(e.text, "const cell_Buffer *e5");
+}
+
+test "every shared spelling in a let initializer binds the lender" {
+    // `let shared s = buf` emitted `cell_Buffer s = buf;`, a copy, while
+    // `let shared s = &buf` emitted the pointer. borrowck creates one
+    // identical shared loan for both (`checkLetInit`), so the split was the
+    // backend's alone. It is invisible to any Cell-side read, because Cell
+    // forbids mutating a lender while it is shared-borrowed: only the address
+    // the callee is handed can tell a copy from a reference, which is what
+    // examples/let_binding_modes.cell's host counts.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn look(shared b: Buffer);
+        \\pub fn main() {
+        \\  var owned buf = Buffer { len: 1 }
+        \\  let shared s1 = buf
+        \\  look(shared s1)
+        \\  let shared s2 = shared buf
+        \\  look(shared s2)
+        \\  let shared s3 = &buf
+        \\  look(shared s3)
+        \\}
+    );
+    defer e.deinit();
+    for ([_][]const u8{ "s1", "s2", "s3" }) |name| {
+        var buf: [64]u8 = undefined;
+        try expectContains(e.text, try std.fmt.bufPrint(&buf, "const cell_Buffer *{s} = &buf;", .{name}));
+    }
+    try expectAbsent(e.text, "cell_Buffer s1 = buf;");
+}
+
+test "a copy binding of a live borrow is a snapshot, not a second name for it" {
+    // The other direction of the same defect: a binding that is NOT a borrow
+    // inherited the initializer's reference-ness, so `snap` ALIASED the lender
+    // and saw every later write. `copy` means a value copy, and the LLVM
+    // backend loads through, so C was the deviant one here too.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn grow(exclusive b: Buffer);
+        \\pub fn main() {
+        \\  var owned buf = Buffer { len: 1 }
+        \\  let exclusive v = &mut buf
+        \\  let copy snap = v
+        \\  grow(exclusive v)
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_Buffer snap = *v;");
+    try expectAbsent(e.text, "cell_Buffer *snap = v;");
+}
+
+test "an exclusive let over an owning place binds the header, not a shallow copy" {
+    // `cell_string_t` and `cell_slice_t` are OWNING headers. A shallow copy of
+    // one is not a lost write, it is a second owner of the same heap buffer,
+    // and the function-scope drop then frees what the callee already freed.
+    // examples/let_binding_owning.cell runs this; here it is pinned at the
+    // declaration for both types at once.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn extend(exclusive s: String);
+        \\pub fn fresh() -> [Int];
+        \\pub fn push(exclusive xs: [Int]);
+        \\pub fn main() {
+        \\  var owned text = make()
+        \\  let exclusive a = text
+        \\  extend(exclusive a)
+        \\  var owned xs = fresh()
+        \\  let exclusive b = xs
+        \\  push(exclusive b)
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_string_t *a = &text;");
+    try expectContains(e.text, "cell_slice_t *b = &xs;");
+    try expectAbsent(e.text, "cell_string_t a = text;");
+    try expectAbsent(e.text, "cell_slice_t b = xs;");
+}
+
+test "a let whose initializer is not a place keeps the initializer's owned type" {
+    // THE ASYMMETRY THIS FIX HAD TO PRESERVE, and the reason `isNamedLoan`
+    // exists instead of an unconditional `applyOwnership`. `Local.ownership`'s
+    // doc comment records that a `shared`/`copy` local initialized from a CALL
+    // keeps the call's owned result type, and the drop pass reads the declared
+    // annotation rather than the shape precisely so it can tell those apart.
+    // A call result is not a place, so no loan is created and the binding is
+    // NOT demoted to a `cell_str_t` view of a temporary nothing owns.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn fresh() -> [Int];
+        \\pub fn main() {
+        \\  let copy a = make()
+        \\  let shared b = make()
+        \\  let copy c = fresh()
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_string_t a = cell_make();");
+    try expectContains(e.text, "cell_string_t b = cell_make();");
+    try expectContains(e.text, "cell_slice_t c = cell_fresh();");
+    try expectAbsent(e.text, "cell_str_t b");
+}
+
+test "an arc let is answered before any dereference of the initializer" {
+    // `arc` is asked first in `letType` and never reaches the deref, because
+    // an `arc` is a handle by value and `applyOwnership` never makes one a
+    // pointer. Pinned because moving the `arc` clause below the deref would
+    // still pass every other test in this file.
+    var e = try emitSource(
+        \\pub fn observe(arc s: String) -> Int;
+        \\pub fn main() {
+        \\  let arc a = "x"
+        \\  let arc b = a
+        \\  let copy n = observe(arc b)
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_arc_t b = cell_arc_clone(a);");
+    try expectAbsent(e.text, "cell_arc_t *b");
+}
+
+test "an exclusive String let is not a double free, run under AddressSanitizer" {
+    // THE ONE THAT NEEDED RUNNING. Every other test here compares emitted
+    // text, and text comparison cannot tell a wrong number from a double free.
+    // Against the ea36e3d compiler this exact program aborts at exit 134 with
+    // `AddressSanitizer: attempting double-free`, because `cell_string_t a =
+    // text;` makes `a` and `text` two owners of one buffer: `reset` releases
+    // it through `&a`, the read after that is a use after free, and the
+    // function-scope `cell_string_free(&text)` frees it a second time.
+    //
+    // The host is written inline rather than reusing examples/arc_host.c,
+    // because the operation that matters is "free the old buffer, then install
+    // a new one", which is what turns a shallow copy of the header from a
+    // wrong answer into a double free. A host that only appended would leave
+    // the defect silent.
+    var e = try emitSource(
+        \\pub fn make_text() -> String;
+        \\pub fn reset(exclusive s: String);
+        \\pub fn text_len(shared s: String) -> Int;
+        \\pub fn print_int(copy value: Int);
+        \\pub fn main() {
+        \\  var owned text = make_text()
+        \\  let exclusive a = text
+        \\  reset(exclusive a)
+        \\  print_int(text_len(shared text))
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_string_t *a = &text;");
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.c", .data = e.text });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "host.c",
+        .data =
+        \\#include "cell_rt.h"
+        \\cell_string_t cell_make_text(void) { return cell_string_from_cstr("hi"); }
+        \\void cell_reset(cell_string_t *s) {
+        \\    cell_string_t bigger = cell_string_from_cstr("hello, world");
+        \\    cell_string_free(s);
+        \\    *s = bigger;
+        \\}
+        \\int64_t cell_text_len(cell_str_t s) { return (int64_t)s.len; }
+        ,
+    });
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const root = cwd_buf[0..cwd_len];
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{root});
+    defer gpa.free(include);
+    const rt_c = try std.fmt.allocPrint(gpa, "{s}/runtime/cell_rt.c", .{root});
+    defer gpa.free(rt_c);
+
+    const cc_result = try std.process.run(gpa, io, .{
+        .argv = &.{
+            "cc", "-std=c11",                     "-Wall",  "-Wextra", "-Werror",
+            "-g", "-fsanitize=address,undefined", "body.c", "host.c",  rt_c,
+            "-I", include,                        "-o",     "body",
+        },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(cc_result.stdout);
+    defer gpa.free(cc_result.stderr);
+    if (!cc_result.term.success()) {
+        std.debug.print("cc rejected emitted C:\n{s}\n--- source ---\n{s}\n", .{ cc_result.stderr, e.text });
+        return error.CcRejectedEmittedC;
+    }
+
+    const run_result = try std.process.run(gpa, io, .{
+        .argv = &.{"./body"},
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(run_result.stdout);
+    defer gpa.free(run_result.stderr);
+    if (!run_result.term.success()) {
+        std.debug.print(
+            "an exclusive String let is not binding the lender's header (ASan reports a double free):\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ run_result.stdout, run_result.stderr },
+        );
+        return error.ProgramCrashed;
+    }
+    // 12 is "hello, world", which `reset` installed THROUGH the borrow. A copy
+    // reads 2, the length of what `make_text` returned, if it survives at all.
+    try std.testing.expectEqualStrings("12\n", run_result.stdout);
+}
+
+test "isNamedLoan mirrors borrowck.checkLetInit over every initializer shape" {
+    // The predicate itself, asked directly, because the emission tests above
+    // all go through `applyOwnership` and would still pass if this answered
+    // correctly for the wrong reason. The table is `checkLetInit`'s two
+    // clauses and its catch-all, and the catch-all is what makes this total:
+    // an initializer shape nobody enumerated becomes a COPY, never a
+    // reference.
+    const arena_backing = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena_backing);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Case = struct {
+        src: []const u8,
+        own: ast.Ownership,
+        want: bool,
+        why: []const u8,
+    };
+    // Each source is a whole `let` statement; the initializer is parsed out of
+    // it, so the spellings here are the ones a user actually writes.
+    const cases = [_]Case{
+        .{ .src = "&buf", .own = .exclusive, .want = true, .why = "clause 1, shared sigil over a place" },
+        .{ .src = "&mut buf", .own = .exclusive, .want = true, .why = "clause 1, unique sigil over a place" },
+        .{ .src = "exclusive &buf", .own = .exclusive, .want = true, .why = "clause 1 through an annotation" },
+        .{ .src = "&buf", .own = .copy, .want = true, .why = "clause 1 does not consult the annotation" },
+        .{ .src = "buf", .own = .exclusive, .want = true, .why = "clause 2, keyword over a bare place" },
+        .{ .src = "exclusive buf", .own = .exclusive, .want = true, .why = "clause 2 through an annotation" },
+        .{ .src = "buf", .own = .shared, .want = true, .why = "clause 2, shared" },
+        .{ .src = "buf.len", .own = .shared, .want = true, .why = "a field path is a place" },
+        .{ .src = "buf", .own = .copy, .want = false, .why = "copy of a place is a value" },
+        .{ .src = "buf", .own = .owned, .want = false, .why = "owned of a place is a move, not a loan" },
+        .{ .src = "make()", .own = .exclusive, .want = false, .why = "a call result is not a place" },
+        .{ .src = "Buffer { len: 1 }", .own = .exclusive, .want = false, .why = "a struct literal is not a place" },
+        .{ .src = "1 + 2", .own = .exclusive, .want = false, .why = "the catch-all is by value" },
+        .{ .src = "&make()", .own = .exclusive, .want = false, .why = "clause 1 still requires a place" },
+    };
+
+    for (cases) |c| {
+        const src = try std.fmt.allocPrint(arena, "pub fn f() {{ let copy x = {s} }}", .{c.src});
+        var lex = lexer.Lexer.init(src, "t.cell");
+        const toks = try lex.tokenizeAll(arena);
+        var p = parser.Parser.init(arena, toks.items, "t.cell");
+        const module = try p.parseModule();
+        const body = module.items[0].kind.fn_def.body.?;
+        const init_expr = body[0].kind.let.value.?;
+        const got = isNamedLoan(&init_expr, c.own);
+        if (got != c.want) {
+            std.debug.print("\nisNamedLoan(\"{s}\", .{s}) = {}, want {} ({s})\n", .{
+                c.src, @tagName(c.own), got, c.want, c.why,
+            });
+            return error.WrongVerdict;
+        }
+    }
 }

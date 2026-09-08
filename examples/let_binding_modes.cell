@@ -1,0 +1,129 @@
+// The DECLARED ownership of a `let` decides what the binding holds. The
+// initializer only says WHICH OBJECT.
+//
+// WHY THIS FILE EXISTS BESIDE write_through.cell AND write_through_named.cell.
+// write_through.cell measures the five unique-borrow spellings in the ARGUMENT
+// position, `grow(exclusive buf)`. write_through_named.cell measures three of
+// them parked in a name first, and its header says plainly that it can carry
+// only three, because the C backend broke the other two in a `let` initializer
+// and pinning either answer would have blessed a wrong one. This file is the
+// completion of that: all five unique spellings AND all three shared spellings
+// in a `let`, plus the `copy`-of-a-borrow shape, now that the reference backend
+// agrees with the other two about every one of them.
+//
+// WHAT WENT WRONG, measured at ea36e3d. `codegen.letType` derived an
+// un-annotated binding's C type from `inferExpr(initializer)`, consulting the
+// declared ownership for `arc` alone. So the SPELLING decided whether the
+// binding was a reference, and the spellings disagreed with each other and with
+// `borrowck.checkLetInit`, which creates one identical named loan for all of
+// them:
+//
+//     let exclusive e = exclusive buf     cell_Buffer e = buf;          COPY
+//     let exclusive e = exclusive &buf    const cell_Buffer *e = &buf;  qualifier lost
+//     let exclusive e = &mut buf          cell_Buffer *e = &buf;        correct
+//     let shared s = buf                  cell_Buffer s = buf;          COPY
+//     let shared s = &buf                 const cell_Buffer *s = &buf;  correct
+//     let copy snap = <a live borrow>     cell_Buffer *snap = e;        ALIAS
+//
+// The first cost a lost write, silently: `bump(exclusive e)` then `buf.len`
+// printed 37 where the LLVM and MLIR backends printed 42, with the REFERENCE
+// backend on the wrong side. The last aliased the lender, so a `copy`
+// snapshot saw every later write where LLVM loads through. Neither produced
+// any diagnostic from anything.
+//
+// WHY A HOST C FILE. A lost write is visible in the arithmetic, but a `shared`
+// binding that is secretly a COPY is not: Cell's own rules forbid mutating a
+// lender while it is shared-borrowed, so no Cell-side read can tell a copy
+// from a reference. Only the callee knows which address it was handed. That is
+// the same reasoning write_through_host.c records, and `distinct()` is the
+// same instrument: it counts the distinct addresses handed over, so a spelling
+// that copies raises it whether or not anything writes.
+//
+// WHY THE READING OF `buf.len` COMES BEFORE THE LAST BORROW, which is not
+// cosmetic. A named loan ends early only when its holder is provably never
+// reached again, and the liveness window whitelists exactly ONE position, a
+// direct call argument (AGENTS.md, OWNERSHIP.md 0.3). `let copy snap = e6`
+// mentions `e6` somewhere else, which makes that loan ineligible, so it lasts
+// to the end of the block and every later read of `buf` is refused. Measured,
+// not guessed: writing this file the other way round produced
+// "cannot use 'buf.len' while it is exclusively borrowed". The snapshot shape
+// therefore has to come last, which is the same order write_through_named.cell
+// arrived at for the same reason.
+//
+// WHAT IT PRINTS, and how to read a wrong answer. One integer, `14242`, which
+// decomposes as `distinct() | snap.len | len_before`:
+//
+//   len_before  42   37 plus one per `grow`, and five run before it is read.
+//   snap.len    42   the value BEFORE the sixth grow, because `copy` is a
+//                    snapshot. An aliasing `snap` reads 43.
+//   distinct     1   every one of the nine calls handed over `&buf` itself.
+//
+//   A unique spelling whose write is LOST costs 1 from `len_before` AND adds 1
+//   to `distinct`, because a copy is a different address: 24141 for one broken
+//   spelling, 34040 for two. A SHARED spelling that copies moves `distinct`
+//   alone, since `look` writes nothing: 24242. An aliasing `snap` moves only
+//   the middle field: 14342. So the leading digit counts broken spellings of
+//   either kind, and the other two fields say which kind.
+//
+// EXPECT-OUTPUT: 14242
+
+pub struct Buffer {
+    copy len: Int,
+}
+
+pub fn print_int(copy value: Int);
+
+// Defined in let_binding_modes_host.c. `grow` records the address it was
+// handed and then increments through it; `look` records the address and
+// touches nothing, which is exactly what `shared` promises. `distinct` is how
+// many different addresses the two of them have seen.
+pub fn grow(exclusive b: Buffer);
+pub fn look(shared b: Buffer);
+pub fn distinct() -> Int;
+
+pub fn main() {
+    var owned buf = Buffer { len: 37 }
+
+    // All five unique-borrow spellings that examples/borrows.cell declares
+    // identical, each parked in a NAME before the call. `exclusive buf` is the
+    // bare keyword form and reaches a backend as a bare reference, because
+    // lowering consumes the written prefix; the four sigil forms arrive
+    // wrapped in a unary borrow node. `exclusive &buf` mixes the two, and
+    // borrows.cell states the rule for that: the KEYWORD WINS.
+    //
+    // Each loan ends at its `grow`, which is the one position the named-loan
+    // liveness window whitelists (AGENTS.md, OWNERSHIP.md 0.3), so the next
+    // binding may borrow `buf` again.
+    let exclusive e1 = exclusive buf
+    grow(exclusive e1)
+    let exclusive e2 = &mut buf
+    grow(exclusive e2)
+    let exclusive e3 = &var buf
+    grow(exclusive e3)
+    let exclusive e4 = &exclusive buf
+    grow(exclusive e4)
+    let exclusive e5 = exclusive &buf
+    grow(exclusive e5)
+
+    // All three shared spellings, for the same reason. `look` writes nothing,
+    // so these are measurable only through `distinct`.
+    let shared s1 = buf
+    look(shared s1)
+    let shared s2 = shared buf
+    look(shared s2)
+    let shared s3 = &buf
+    look(shared s3)
+
+    // Read `buf` while it is still readable; see the header for why this
+    // cannot come after the borrow below.
+    let copy len_before = buf.len
+
+    // And the other direction: a `copy` binding taken FROM a live borrow is a
+    // snapshot of the object, never a second name for it. The grow after it
+    // must not be visible in `snap`.
+    let exclusive e6 = &mut buf
+    let copy snap = e6
+    grow(exclusive e6)
+
+    print_int(len_before + 100 * snap.len + 10000 * distinct())
+}

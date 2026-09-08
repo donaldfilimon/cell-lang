@@ -78,7 +78,32 @@
 #                       a silent class of defect is never the whole fix: the
 #                       corpus has to carry the shape, or the next regression
 #                       is silent again. examples/write_through_named.cell is
-#                       that half for these three.
+#                       that half for these three, and
+#                       examples/let_binding_modes.cell is that half for the
+#                       five in codegen.zig's `letType`.
+#                       A SHAPE THIS STAGE STILL CANNOT CARRY, recorded so it
+#                       is a known hole rather than a silence. The `let`
+#                       family's fix covers OWNING types too: `let exclusive e
+#                       = <a String or [T] place>` used to emit a shallow copy
+#                       of the owning header, which is a double free rather
+#                       than a wrong number. There is no corpus entry for it,
+#                       because this stage runs every backend that EMITS a
+#                       program and the MLIR backend emits this one wrongly:
+#                       measured, it declares both `exclusive String` and
+#                       `shared String` as `!llvm.struct<(ptr, i64)>`, passing
+#                       a 16-byte view by value where the C ABI and
+#                       runtime/cell_rt.h section 7 say `cell_string_t *`, and
+#                       the linked program dies at exit 134. That is the
+#                       unfixed twin of the `abi.classifyParam` defect 1fffcf8
+#                       fixed for the LLVM backend, it predates the `letType`
+#                       change (identical emission at ea36e3d), and it lives in
+#                       src/cell/mlirmit.zig. Adding the example before that is
+#                       fixed would mean either a red gate or teaching this
+#                       stage to look away from a real defect, and stage 7's
+#                       header already says which of those is allowed. The
+#                       coverage lives meanwhile in codegen.zig's test "an
+#                       exclusive String let is not a double free, run under
+#                       AddressSanitizer", which compiles and RUNS the shape.
 #   9. sanitizers       the same programs, rebuilt with -fsanitize=address and
 #                       run, with an ASan REPORT failing the gate. Eight
 #                       use-after-frees were found in this repository in one
