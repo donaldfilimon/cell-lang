@@ -1,0 +1,77 @@
+// Returning an `arc` FIELD, the shape that produced a heap-use-after-free.
+//
+// WHY THIS FILE EXISTS. `99d2971` fixed exactly this: `return s.name` for an
+// `arc` field emitted `return s->name;` without a retain, so the caller
+// released a reference nobody had taken for it. docs/OWNERSHIP.md R11 release
+// rule 3 is categorical, a returned `arc` comes back already retained and the
+// caller releases it, and that was honoured for a returned LOCAL only.
+//
+// The defect passed `cell check`, compiled clean at `-std=c11 -Wall -Wextra
+// -Werror`, and was found only when a reviewer ran the program under
+// AddressSanitizer BY HAND. Nothing in the corpus reproduced it: measured at
+// `99d2971^`, every runnable example was ASan-clean, so a sanitizer stage over
+// the corpus as it stood would have found nothing either. A sanitizer is only
+// as good as the programs it runs, so the program has to exist. This is that
+// program, and `tools/check.sh` runs it under ASan.
+//
+// `arc.cell` does not cover it, and its near miss is instructive: it declares
+// this same `Session` with an `arc name` field and then never constructs one
+// and never returns a field, so the whole field path went unexercised while
+// looking covered.
+//
+// WHY TWO CALLS TO `peek`, AND NOT ONE. This is the load-bearing detail. With
+// ONE alias the arithmetic balances by accident and the program is clean even
+// when the retain is missing: `label` holds one reference, the struct literal
+// clones a second, the unretained alias is dropped (2 to 1) and `label` is
+// dropped (1 to 0), and nothing touches the box afterwards. Measured: that
+// version exits 0 under ASan against the broken compiler, so it would have
+// pinned nothing. A SECOND alias takes the count one drop too far: the two
+// aliases release 2 to 1 to 0, freeing the box while `label` is still live,
+// and `label`'s own drop is then a heap-use-after-free inside cell_arc_drop.
+// Measured against the compiler at `99d2971^`: exit 134, "AddressSanitizer:
+// heap-use-after-free". Do not "simplify" this file down to one call.
+//
+// The struct's own reference is never released, because R11 row 2 discloses
+// that a struct holding an `arc` field is never dropped. That leak is a known,
+// measured gap with its own fixture in examples/leaks/, not something this
+// file is trying to fix; leaking is the safe side of the error, and the point
+// here is that the program no longer DANGLES.
+//
+// The printed value is `s.id`, a plain 7, and it is deliberately not the thing
+// under test. What this file measures is whether the program is memory-safe,
+// which is a fact about how it dies rather than about what it prints, and
+// `tools/check.sh`'s sanitizer stage is what reads it. The number is here so
+// that the answer-comparison stage has something to pin as well.
+//
+// LLVM and MLIR refuse this file, identically and on purpose, the same way
+// they refuse arc.cell: `arc` has no retain and release insertion in either
+// backend. The gate's agreement stage pins that refusal.
+//
+// EXPECT-OUTPUT: 7
+
+pub struct Session {
+    arc name: String
+    copy id: Int
+}
+
+pub fn print_int(copy value: Int);
+
+// The returned `arc` place. `s` is a `shared` borrow, so this function does
+// not own the field it is handing out, and the caller is going to release
+// whatever it receives: the reference has to be created here or it does not
+// exist. `cell_arc_clone(s->name)` is the correct emission.
+pub fn peek(shared s: Session) -> arc String {
+    return s.name
+}
+
+pub fn main() {
+    let arc label = "session"
+    let owned s = Session { name: arc label, id: 7 }
+
+    // Two aliases, for the reason the header explains at length. One is not
+    // enough to make the missing retain observable.
+    let arc one = peek(shared s)
+    let arc two = peek(shared s)
+
+    print_int(s.id)
+}

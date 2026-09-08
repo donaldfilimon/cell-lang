@@ -68,6 +68,18 @@
 #                       example may declare `// EXPECT-OUTPUT:` to pin the
 #                       answer itself, since three backends agreeing is not the
 #                       same as three backends being right.
+#   9. sanitizers       the same programs, rebuilt with -fsanitize=address and
+#                       run, with an ASan REPORT failing the gate. Eight
+#                       use-after-frees were found in this repository in one
+#                       evening and this gate caught none of them: every one
+#                       passed `cell check`, compiled at -Wall -Wextra -Werror,
+#                       ran to completion and printed a plausible answer, so
+#                       stages 6 and 8 saw nothing wrong. Read this stage as a
+#                       claim about the CORPUS rather than the compiler: at
+#                       `99d2971^` every runnable example was measured
+#                       ASan-clean while a real heap-use-after-free was live,
+#                       because no example returned an `arc` field. That is
+#                       what examples/arc_return_field.cell is for.
 #
 # TRAPS THIS SCRIPT IS WRITTEN AGAINST, each one having actually bitten:
 #
@@ -80,6 +92,9 @@
 #     Homebrew LLVM keg. When they are absent the MLIR checks SKIP loudly
 #     rather than passing silently, because a check that quietly succeeds when
 #     its subject is missing is worse than no check.
+#   * `zig cc -fsanitize=address` does NOT link here, the same way `zig cc -x ir`
+#     does not work. Stage 9 uses `cc`, and skips loudly when even that cannot
+#     link a sanitized binary.
 #   * macOS's `leaks` tool is not always installed (CI, a minimal machine), and
 #     the leaks stage below SKIPS loudly rather than passing silently when it
 #     is absent, for the same reason as the MLIR tools above.
@@ -144,6 +159,17 @@ skips=0
 fail() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
 pass() { printf '  ok    %s\n' "$*"; }
 skip() { printf '  SKIP  %s\n' "$*"; skips=$((skips + 1)); }
+
+# The mlir-opt pipeline, read back out of the emitted file's own
+# `// lower with:` comment. Stage 5 says in as many words that the pipeline is
+# NOT written into this script because a second copy could drift from the
+# backend, and then run_mlir hardcoded the same six flags sixty lines below it,
+# so the script contradicted itself in one file about one pipeline. Both call
+# sites now ask here. An absent line is an error rather than a fallback to a
+# remembered default, for exactly the reason stage 5 gives.
+mlir_pipeline() {
+    sed -n 's|^// lower with: mlir-opt ||p' "$1" | head -1
+}
 
 # ---------------------------------------------------------------- 1. build --
 printf '\n== build ==\n'
@@ -258,7 +284,7 @@ else
             }
             continue
         fi
-        pipeline=$(sed -n 's|^// lower with: mlir-opt ||p' "$TMP/low_$n.mlir" | head -1)
+        pipeline=$(mlir_pipeline "$TMP/low_$n.mlir")
         if [ -z "$pipeline" ]; then
             fail "$f: emitted MLIR carries no '// lower with:' line to read the pipeline from"
             continue
@@ -323,9 +349,10 @@ run_mlir() {
         return
     fi
     $CELL emit --target=mlir "examples/$ex.cell" > "$TMP/$ex.mlir" 2>/dev/null || { fail "mlir emit $ex"; return; }
-    "$LLVM_BIN/mlir-opt" "$TMP/$ex.mlir" \
-        --expand-strided-metadata --finalize-memref-to-llvm --convert-cf-to-llvm \
-        --convert-func-to-llvm --convert-arith-to-llvm --reconcile-unrealized-casts \
+    pipeline=$(mlir_pipeline "$TMP/$ex.mlir")
+    [ -n "$pipeline" ] || { fail "mlir $ex: emitted MLIR carries no '// lower with:' line"; return; }
+    # Unquoted on purpose: $pipeline is a list of flags and must split.
+    "$LLVM_BIN/mlir-opt" "$TMP/$ex.mlir" $pipeline \
         -o "$TMP/${ex}_low.mlir" 2>/dev/null || { fail "mlir-opt $ex"; return; }
     "$LLVM_BIN/mlir-translate" --mlir-to-llvmir "$TMP/${ex}_low.mlir" -o "$TMP/${ex}_m.ll" 2>/dev/null \
         || { fail "mlir-translate $ex"; return; }
@@ -512,9 +539,13 @@ for f in examples/*.cell; do
 
     # -- MLIR. Emits cell_main only, so it needs the driver stage 6 wrote.
     if [ "$answers_mlir" = yes ] && $CELL emit --target=mlir "$f" > "$TMP/ans_$n.mlir" 2>/dev/null; then
-        if "$LLVM_BIN/mlir-opt" "$TMP/ans_$n.mlir" \
-                --expand-strided-metadata --finalize-memref-to-llvm --convert-cf-to-llvm \
-                --convert-func-to-llvm --convert-arith-to-llvm --reconcile-unrealized-casts \
+        pipeline=$(mlir_pipeline "$TMP/ans_$n.mlir")
+        if [ -z "$pipeline" ]; then
+            fail "answers $n: emitted MLIR carries no '// lower with:' line"
+            pipeline=""
+        fi
+        # Unquoted on purpose: $pipeline is a list of flags and must split.
+        if "$LLVM_BIN/mlir-opt" "$TMP/ans_$n.mlir" $pipeline \
                 -o "$TMP/ans_${n}_low.mlir" 2>"$TMP/ans_${n}_m.log" \
             && "$LLVM_BIN/mlir-translate" --mlir-to-llvmir "$TMP/ans_${n}_low.mlir" -o "$TMP/ans_${n}_m.ll" 2>>"$TMP/ans_${n}_m.log" \
             && "$LLVM_BIN/llc" -filetype=obj "$TMP/ans_${n}_m.ll" -o "$TMP/ans_${n}_m.o" 2>>"$TMP/ans_${n}_m.log" \
@@ -582,6 +613,116 @@ elif [ "$answers_printing" -eq 0 ]; then
     fail "every program compared was silent, so nothing was actually compared"
 elif [ $fails -eq $answers_before ]; then
     pass "every backend that runs an example computes the same answer"
+fi
+
+# -------------------------------------------------- 9. sanitized execution --
+# THE GATE HAD NO SANITIZER, AND THAT IS WHY IT CAUGHT NONE OF THE EIGHT
+# USE-AFTER-FREES FOUND IN THIS REPOSITORY IN ONE EVENING. Every one of them
+# passed `cell check`, compiled clean at `-Wall -Wextra -Werror`, ran to
+# completion, printed a plausible answer, and surfaced only when a reviewer
+# ran the program under AddressSanitizer BY HAND. Stages 6 and 8 run these
+# programs and read what they print; a use-after-free that does not happen to
+# corrupt the printed value is invisible to both.
+#
+# So the same programs are built again with -fsanitize=address and run, and an
+# ASan report FAILS the gate. That last clause is the whole stage: a sanitizer
+# whose output nobody checks is worse than no sanitizer, because it looks like
+# coverage. Both signals are read, the report text and the exit status, since
+# ASan exits non-zero on a report and a program can also die without printing
+# one.
+#
+# A SANITIZER IS ONLY AS GOOD AS THE PROGRAMS IT RUNS, and this is the part
+# that is easy to get wrong. Measured at `99d2971^`, the commit before a real
+# heap-use-after-free in returned `arc` fields was fixed: EVERY runnable
+# example in the corpus was ASan-clean. This stage, run against that compiler
+# and that corpus, would have reported nothing at all. What was missing was not
+# the sanitizer but a program that returned an `arc` field, so
+# examples/arc_return_field.cell was written to be that program, and against
+# `99d2971^` it exits 134 with "AddressSanitizer: heap-use-after-free". A
+# sanitizer stage should be read as a claim about the corpus, not about the
+# compiler: when a defect class has no example, this stage is silent about it.
+#
+# The build is `-std=c11 -Wall -Wextra -Werror`, which is stricter than stages
+# 6 and 8 and deliberately so. Those two send compiler diagnostics to
+# /dev/null, so a warning in emitted C is information this gate used to throw
+# away; here a warning fails, and examples/README.md's claim that every
+# emitted file compiles under those flags becomes a thing the gate checks
+# rather than a thing a document asserts. Measured today: zero warnings across
+# the corpus, so this starts green rather than pinning a backlog.
+#
+# `cc`, never `zig cc`: measured, `zig cc -fsanitize=address` does not link
+# here, the same way `zig cc -x ir` does not work for stage 6.
+#
+# LeakSanitizer is OFF. Leaks are stage 7's subject, it measures them with
+# macOS `leaks` against pinned counts, and several fixtures there leak ON
+# PURPOSE because docs/OWNERSHIP.md R11 discloses those gaps. Turning leak
+# detection on here would report those same disclosed gaps a second time, in a
+# stage that cannot tell a disclosed one from a new one.
+#
+# Only the C backend is sanitized, and the limit is real rather than an
+# oversight. ASan instruments at COMPILE time from source; the LLVM and MLIR
+# legs hand `cc` an already-emitted .ll or object, so their emitted code would
+# carry no instrumentation and a pass over them would report far less than it
+# appears to. The C backend is also where all eight of those defects were, it
+# being the only backend that implements `arc` at all.
+#
+# examples/leaks/ is not covered here. Its fixtures take examples/arc_host.c
+# under a different convention that stage 7 owns and passes explicitly, and
+# they exist to leak; four of the five were measured ASan-clean, and the fifth
+# does not link under the `<stem>_host.c` rule this stage shares with stage 8.
+printf '\n== sanitized execution (AddressSanitizer) ==\n'
+asan_before=$fails
+asan_ran=0
+
+printf 'int main(void){return 0;}\n' > "$TMP/asan_probe.c"
+if ! cc -fsanitize=address "$TMP/asan_probe.c" -o "$TMP/asan_probe" 2>/dev/null; then
+    skip "sanitized execution of every runnable example (cc -fsanitize=address does not link here)"
+else
+    for f in examples/*.cell; do
+        n=$(basename "$f" .cell)
+        grep -q '^pub fn main() *{' "$f" || continue
+
+        # An emit refusal is stage 4's subject, not this one.
+        $CELL emit "$f" > "$TMP/san_$n.c" 2>/dev/null || continue
+
+        host=""
+        if [ -f "examples/${n}_host.c" ]; then
+            host="examples/${n}_host.c"
+        fi
+
+        # -Werror on purpose, and the log is printed rather than discarded.
+        if ! cc -std=c11 -Wall -Wextra -Werror -fsanitize=address -g -I runtime \
+                "$TMP/san_$n.c" $host runtime/cell_rt.c -o "$TMP/san_$n" 2>"$TMP/san_$n.log"; then
+            fail "asan $n: emitted C did not build at -Wall -Wextra -Werror -fsanitize=address"
+            sed -n '1,6p' "$TMP/san_$n.log"
+            continue
+        fi
+
+        # detect_leaks=0: see the header. The status is captured from the
+        # program itself and never through a pipe.
+        ASAN_OPTIONS=detect_leaks=0 "$TMP/san_$n" > "$TMP/san_$n.out" 2>"$TMP/san_$n.err"
+        st=$?
+        asan_ran=$((asan_ran + 1))
+
+        if grep -q 'ERROR: AddressSanitizer' "$TMP/san_$n.err"; then
+            fail "asan $n: $(grep -m1 -o 'AddressSanitizer: [a-z0-9-]*' "$TMP/san_$n.err") (exit $st)"
+            sed -n '1,8p' "$TMP/san_$n.err"
+        elif [ $st -ne 0 ]; then
+            # No report, but it still died. Worth failing on its own: stages 6
+            # and 8 compare what a program printed, and a program can print the
+            # right thing and then abort.
+            fail "asan $n: exited $st under AddressSanitizer with no report"
+            sed -n '1,6p' "$TMP/san_$n.err"
+        fi
+    done
+
+    # A stage that sanitized nothing has proved nothing, and must say so.
+    printf '  ....  %d program(s) run under AddressSanitizer\n' "$asan_ran"
+    if [ "$asan_ran" -eq 0 ]; then
+        fail "the sanitizer stage ran against nothing at all"
+    elif [ $fails -eq $asan_before ]; then
+        pass "every runnable example is clean under AddressSanitizer"
+    fi
 fi
 
 # ---------------------------------------------------------------- verdict --
