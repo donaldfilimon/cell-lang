@@ -103,6 +103,27 @@ both halves of it are measured over every file here rather than a chosen few:
 
 - **`cc -std=c11 -Wall -Wextra -c`: they all compile.** `arc.cell` was the
   last one that did not, and now does.
+
+  **Read that as a statement about this directory, not about the language,
+  and here is a measured hole that shows the difference.** No file here
+  returns a `String` from a body. `primitives.cell:33` only *declares*
+  `take_string(shared v: String) -> String` with no body, so this stage has
+  never once compiled a conversion from a string literal to an owned
+  `String`. Six one-line programs pass `cell check` with exit 0 and emit C
+  that this command rejects outright, as errors rather than warnings, so the
+  absent `-Werror` does not save them: a `return` from `-> String`, a `let
+  owned` initializer, a `var owned` initializer, an `owned` call argument, a
+  struct-literal field, and an assignment's right side. A string literal is a
+  16-byte borrowed `cell_str_t` and an owned `String` is a 24-byte
+  `cell_string_t`; nothing converts between them outside the `arc` direction.
+  `AGENTS.md` carries the full record. A fixture would turn this stage red,
+  which is correct, so it lands with the fix rather than before it.
+
+  The reusable point is that a corpus-wide check is only as strong as the
+  shapes the corpus contains, and the shapes it lacks are invisible by
+  construction. That is the sanitizer lesson from `AGENTS.md` one stage over:
+  at one commit the entire corpus was AddressSanitizer-clean while a real
+  use-after-free was live. A magnifier is not a net.
 - **Link and run**, measured 2026-09-08: seven link on their own
   (`hello` 42, `backends` 24, `loops` 55, `while_is_now_a_loop` 10,
   `arc_return_field` 7, and `ownership` and `borrows` both silent at exit 0);
