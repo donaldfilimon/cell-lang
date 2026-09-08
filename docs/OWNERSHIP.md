@@ -688,6 +688,33 @@ as constants carrying the commit they were measured at. The closed row is
 pinned at 0, so any nonzero reading re-opens it. **Read the gate, not this
 table, for a current number**; the table is here to say what each gap IS.
 
+**Two make-unique positions R10 does NOT enforce, kept safe only by a C type
+error.** R10 above refuses making an `arc` place unique at the positions it
+knows about. Two more exist and reach codegen instead:
+
+| Position | What stops it today |
+|---|---|
+| a list ELEMENT: `let owned zs: [String] = [a, a]` over an `arc a` | the emitted C assigns a `cell_arc_t` into a `cell_string_t` slot and `cc` refuses it |
+| a `return`: `f(arc xs: [Int]) -> [Int] { return xs }` | the emitted C returns a `cell_arc_t` where `cell_slice_t` is declared and `cc` refuses it |
+
+Both pass `cell check`. **A C type error is a real stop and it is loud, which is
+the safe side, but it is not enforcement**: it holds because `cell_arc_t`
+happens to coincide with no other C type, which is exactly the protection R10's
+own text says it deliberately stopped relying on. Making either COMPILE without
+first extending R10 would reintroduce the double free R10 exists to prevent,
+because the buffer, not the refcount, is what gets freed twice. That is worth
+stating plainly: these two are on the "correctly refused" side of the ledger,
+not the "to be fixed" side, and a reader who mistakes them for defects will
+undo a guard.
+
+The list-element case additionally used to be SILENT rather than loud. The
+element C type came from the first element rather than the declared element
+type, so a `[String]` could hold `cell_arc_t` and a callee reading element 0 got
+a refcount box pointer reinterpreted as a length. `a28b773` made it take the
+declared type, which converted silent corruption into the loud `cc` error above.
+That defect predated the `arc` work; the retain pass only added a reference leak
+on top of it.
+
 ### What the search covered, which is the honest form of the claim
 
 Not "every remaining gap is a leak", which has been falsified twice. What can
