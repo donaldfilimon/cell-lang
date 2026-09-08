@@ -42,7 +42,11 @@ by planning. Task reports below will record actual commits and validation.
   Independent review requires artifact-path collision/source protection,
   correct dirty deletion/rename sampling, and an exit-zero truncation test.
   Review fixes landed in `3e50928` and `337fd01`; independent re-review is
-  checking hard-link protection, including artifacts outside the repository.
+  found an outside-root inode-check bypass. Follow-up `e4c41e5..282e75a`
+  closes it and explicitly limits reports to local gate qualification.
+  Independent review approved; 19 integration tests pass and outside-path
+  negative controls fail against the old implementation. Evidence is under
+  `docs/qualification/2026-09-08-282e75a/`.
   The recorded real run is not evidence for these later commits.
 - Confirmed current defect: an owning String place copied into a struct field
   and consumed by a freeing C host produces an ASan double free (SIGABRT).
@@ -55,7 +59,10 @@ by planning. Task reports below will record actual commits and validation.
 
 - Owning struct-field safety: implementation `337fd01..6b6a8ee`, independent
   specification review approved with a non-blocking request for scalar and
-  scalar-record initializer controls; quality review remains in progress.
+  scalar-record initializer controls. Quality review found a remaining
+  nonprimitive ARC-field classification gap: a boxed scalar-only record
+  inside an outer copy field can still be shallow-copied. Follow-up is queued.
+  Primitive ARC remains by-value and is not that defect.
   Implementer reports direct
   full-gate exit 0, 419 library tests, 151 borrow-checker tests, and rejection
   of the retained double-free reproduction before emission. Resource-bearing
