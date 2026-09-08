@@ -4,7 +4,7 @@ Canonical agent guidance for cell-lang. `CLAUDE.md` points here.
 
 Cell compiler (Zig host) + C/C++/Swift runtime emitting C ABI. Language design in `README.md`, `docs/SPEC.md`, `docs/OWNERSHIP.md`. Example contracts in `examples/README.md`.
 
-This is the canonical checkout (no git remote).
+This is the canonical checkout. **CORRECTED 2026-09-07: it HAS a remote**, `https://github.com/donaldfilimon/cell-lang.git`, reachable (`git ls-remote --heads origin` answers). Earlier lines here and in `~/CLAUDE.md` calling it remoteless are stale. Verify ahead/behind rather than assuming either way; a commit that is not pushed still exists only on this disk.
 
 ## Toolchain and gates
 
@@ -183,6 +183,6 @@ Match the Zig already present (master idioms): `std.ArrayList(T) = .empty`, allo
 
 No em dashes in source comments, docs, or commit messages.
 
-No git remote: all work is local. Re-bundle to `~/at-risk-bundles/` after meaningful changes.
+There IS a git remote (see the top of this file); it was added after the lines that said otherwise were written. That makes `origin` the backup of record for anything PUSHED, and only for that. Anything unpushed still exists on this disk alone, so check `git rev-list --count origin/main..main` before deciding a bundle is redundant, and re-bundle to `~/at-risk-bundles/` when it is not zero.
 
 Run `tools/check.sh` (or at minimum the corpus loops + backend execution) after front-end or lowering changes before claiming completion.
