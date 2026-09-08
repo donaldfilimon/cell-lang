@@ -61,8 +61,28 @@ const CfgError = std.mem.Allocator.Error;
 
 /// One node: a straight-line run of statements with a single entry and a
 /// single terminator.
+/// The syntactic role a block was allocated for. Recorded ONLY so a second
+/// traversal of the same `hir.Fn` can prove its allocation order matches this
+/// one; nothing in this module reads it back. See `liveness.zig`'s header for
+/// the drift it closes.
+pub const BlockKind = enum {
+    entry,
+    while_cond,
+    while_body,
+    while_exit,
+    if_then,
+    if_join,
+    if_else,
+    match_join,
+    match_body,
+    match_guard,
+    match_next,
+};
+
 pub const Block = struct {
     id: u32,
+    /// What this block was allocated for. A correlation key, not semantics.
+    kind: BlockKind,
     /// Successor block ids, in the order the terminator branches to them.
     succs: []u32,
     /// Predecessor block ids. Stored rather than derived, because backward
@@ -100,7 +120,7 @@ pub fn build(allocator: std.mem.Allocator, f: *const hir.Fn) !?Graph {
     const body = f.body orelse return null;
 
     var b: Builder = .{ .allocator = allocator };
-    const entry = try b.newBlock();
+    const entry = try b.newBlock(.entry);
     b.cur = entry;
     try b.lowerStmts(body);
 
@@ -119,6 +139,7 @@ pub fn build(allocator: std.mem.Allocator, f: *const hir.Fn) !?Graph {
     for (b.blocks.items, 0..) |*built, i| {
         blocks[i] = .{
             .id = @intCast(i),
+            .kind = built.kind,
             // `.items` rather than a copy: `built`'s lists were allocated
             // from the same arena the caller owns, matching how
             // `hir.Lowerer.run` hands back `self.structs.items` directly.
@@ -158,6 +179,7 @@ const Builder = struct {
         succs: std.ArrayList(u32) = .empty,
         preds: std.ArrayList(u32) = .empty,
         term: ?Terminator = null,
+        kind: BlockKind = .entry,
     };
 
     /// `cond` is the block continue jumps to; `exit` is the block break
@@ -165,9 +187,9 @@ const Builder = struct {
     /// a `break`/`continue` inside the body must be able to name them.
     const LoopCtx = struct { cond: u32, exit: u32 };
 
-    fn newBlock(self: *Builder) CfgError!u32 {
+    fn newBlock(self: *Builder, kind: BlockKind) CfgError!u32 {
         const id: u32 = @intCast(self.blocks.items.len);
-        try self.blocks.append(self.allocator, .{});
+        try self.blocks.append(self.allocator, .{ .kind = kind });
         return id;
     }
 
@@ -294,7 +316,7 @@ const Builder = struct {
         // The condition needs its own block: a back edge from the body has
         // to land somewhere, and re-running the last statement of whatever
         // block preceded the loop is not that.
-        const cond_id = try self.newBlock();
+        const cond_id = try self.newBlock(.while_cond);
         try self.addEdge(entry_block, cond_id);
         self.seal(entry_block, .goto);
 
@@ -306,8 +328,8 @@ const Builder = struct {
         // there, `cond_id` included, so there is nothing left to seal here.
         const test_block = self.cur orelse return;
 
-        const body_id = try self.newBlock();
-        const exit_id = try self.newBlock();
+        const body_id = try self.newBlock(.while_body);
+        const exit_id = try self.newBlock(.while_exit);
         try self.addEdge(test_block, body_id);
         try self.addEdge(test_block, exit_id);
         self.seal(test_block, .branch);
@@ -377,12 +399,12 @@ const Builder = struct {
         if (self.cur == null) return;
         const branch_block = self.cur.?;
 
-        const then_id = try self.newBlock();
-        const join_id = try self.newBlock();
+        const then_id = try self.newBlock(.if_then);
+        const join_id = try self.newBlock(.if_join);
         // No else means the "not taken" edge IS the join: there is no code
         // to run, so allocating an empty else block just to goto the join
         // would be a block this module could never justify to rule 1.
-        const else_id: u32 = if (ie.else_body != null) try self.newBlock() else join_id;
+        const else_id: u32 = if (ie.else_body != null) try self.newBlock(.if_else) else join_id;
 
         try self.addEdge(branch_block, then_id);
         try self.addEdge(branch_block, else_id);
@@ -411,7 +433,7 @@ const Builder = struct {
         try self.lowerExprValue(me.scrutinee);
         if (self.cur == null) return;
 
-        const join_id = try self.newBlock();
+        const join_id = try self.newBlock(.match_join);
         // The first arm is tested in the same block the scrutinee finished
         // in; only a failed test needs a fresh block to test the next arm.
         var test_block = self.cur.?;
@@ -429,7 +451,7 @@ const Builder = struct {
             };
             const catch_all = arm.guard == null and pattern_matches_all;
 
-            const body_id = try self.newBlock();
+            const body_id = try self.newBlock(.match_body);
 
             if (catch_all) {
                 try self.addEdge(test_block, body_id);
@@ -443,8 +465,8 @@ const Builder = struct {
                 // exactly as the three existing backends emit it (their
                 // `pattern_matches_all` branch skips the comparison and
                 // branches on the guard alone).
-                const guard_id = try self.newBlock();
-                const next_id = try self.newBlock();
+                const guard_id = try self.newBlock(.match_guard);
+                const next_id = try self.newBlock(.match_next);
                 try self.addEdge(test_block, guard_id);
                 self.seal(test_block, .goto);
 
@@ -457,13 +479,13 @@ const Builder = struct {
                 }
                 test_block = next_id;
             } else {
-                const next_id = try self.newBlock();
+                const next_id = try self.newBlock(.match_next);
                 if (arm.guard) |g| {
                     // The guard gets its own block: it may itself hold
                     // control flow (or, in a later language version, a call
                     // with a visible side effect), and it must run only when
                     // the pattern already matched.
-                    const guard_id = try self.newBlock();
+                    const guard_id = try self.newBlock(.match_guard);
                     try self.addEdge(test_block, guard_id);
                     try self.addEdge(test_block, next_id);
                     self.seal(test_block, .branch);

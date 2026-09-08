@@ -49,30 +49,35 @@
 //! break, continue, non-exhaustive match, a fully-diverging if inside a
 //! loop) specifically so a drift would be caught here rather than downstream.
 //!
-//! WHAT THIS DOES NOT CATCH. The block-count check catches a `Walker` that
-//! allocates a different NUMBER of blocks than `cfg.build` did. It cannot
-//! catch a `Walker` that allocates the same number in a different ORDER
-//! (for instance, swapping which of `then_id`/`join_id` is allocated
-//! first in `walkIf`): the counts would still agree, so the check would
-//! not fire, and every op list would silently point at the wrong block
-//! from then on. `cfg.Block` is not empty -- it carries `id`, `succs`,
-//! `preds` and `term` -- but **none of those is a fact this module derives
-//! independently**, and that is what matters for a cross-check. `Walker`
-//! records ops; it never builds a terminator or an edge, so it holds nothing
-//! to compare them against. A correlation check needs two independent
-//! derivations of the same fact, and there is only one here. (An earlier
-//! version of this comment said `Block` "carries no per-block fact, nothing",
-//! which review measured as false; the conclusion below survives, the premise
-//! did not.) The only real defense against an order drift is that
-//! `Walker`'s allocation order is written to match `cfg.Builder`'s
-//! line-for-line, and the tests below would need to break in a way that
-//! happens to still assert something true for a silent order-swap to slip
-//! through un-noticed here. This is a structural hole, not an oversight
-//! this module chose to leave: it belongs to whoever writes the first
-//! consumer of `Result`, who will need either a stronger correlation
-//! primitive from `cfg.zig` (a per-block token `Walker` and `cfg.Builder`
-//! could both stamp and compare) or enough end-to-end testing against
-//! real compiled output to catch a wrong answer downstream.
+//! ORDER DRIFT, WHICH THIS ONCE COULD NOT CATCH AND NOW DOES. The block-count
+//! check catches a `Walker` that allocates a different NUMBER of blocks than
+//! `cfg.build` did. On its own it cannot catch a `Walker` that allocates the
+//! same number in a different ORDER (swapping which of `then_id`/`join_id`
+//! comes first in `walkIf`, say): the counts still agree, so nothing fires,
+//! and every op list silently points at the wrong block from then on.
+//!
+//! This paragraph used to call that a structural hole with no fix available
+//! here, reasoning that a correlation check needs two INDEPENDENT derivations
+//! of the same fact and that only one existed, since `Walker` records ops and
+//! never builds a terminator or an edge to compare against. The reasoning was
+//! sound and the conclusion was still wrong: nothing required the second
+//! derivation to be a fact either module ALREADY computed. It only had to be
+//! one each traversal could produce separately. The old text even named the
+//! remedy while calling it someone else's problem, "a per-block token
+//! `Walker` and `cfg.Builder` could both stamp and compare".
+//!
+//! That token now exists. Every `newBlock` call names the syntactic role it
+//! allocates for (`cfg.BlockKind`), both walkers record that sequence, and
+//! `analyze` compares them element by element, returning `error.GraphMismatch`
+//! on the first disagreement.
+//!
+//! FALSIFIED rather than asserted, because a check that cannot fail is worth
+//! nothing: swapping `then_id` and `join_id` in `Walker` alone, leaving the
+//! block count identical, fails at that comparison; reverting is green again.
+//! Before the change the same swap was silent.
+//!
+//! What no cross-check between these two traversals could ever catch is both
+//! drifting IDENTICALLY, and that is still true.
 //!
 //! WHAT COUNTS AS A DEF OR A USE, AND WHICH FORMS WERE ACTUALLY BUILT.
 //! Enumerated exhaustively over `hir.Stmt.Kind` and `hir.Expr.Kind`, not
@@ -253,7 +258,7 @@ pub fn analyze(allocator: std.mem.Allocator, f: *const hir.Fn, g: *const cfg.Gra
     const body = f.body.?;
 
     var w: Walker = .{ .allocator = allocator };
-    const entry = try w.newBlock();
+    const entry = try w.newBlock(.entry);
     w.cur = entry;
     try w.walkStmts(body);
 
@@ -272,6 +277,20 @@ pub fn analyze(allocator: std.mem.Allocator, f: *const hir.Fn, g: *const cfg.Gra
     // matching the fix `74f8e63` made to the same defect class in the
     // drop pass.
     if (w.blocks.items.len != g.blocks.len) return error.GraphMismatch;
+
+    // ORDER, not just count. The count check above cannot see a `Walker` that
+    // allocates the same NUMBER of blocks in a different order (swapping which
+    // of `then_id`/`join_id` comes first, say): the counts still agree and
+    // every op list silently points at the wrong block from then on. The module
+    // header used to record that as a structural hole with no fix, on the
+    // grounds that a correlation check needs two independent derivations of the
+    // same fact and only one existed here. That premise is no longer true:
+    // `cfg.Block.kind` and `Walker.kinds` are two independent recordings of the
+    // same allocation sequence, made by the two traversals separately, and
+    // comparing them catches exactly the drift the counts cannot.
+    for (w.kinds.items, 0..) |kind, i| {
+        if (kind != g.blocks[i].kind) return error.GraphMismatch;
+    }
 
     const nblocks = g.blocks.len;
     const nslots = f.bindings.len;
@@ -377,6 +396,12 @@ fn transferBlock(ops: []const Op, live_out: []const bool, out_live_in: []bool) v
 const Walker = struct {
     allocator: std.mem.Allocator,
     blocks: std.ArrayList(std.ArrayList(Op)) = .empty,
+    /// The syntactic role of each block, in allocation order. This is the
+    /// SECOND, independent derivation of a fact `cfg.Builder` also records,
+    /// and it is the whole point: without it an order drift between the two
+    /// traversals is undetectable, because the block COUNTS still agree. See
+    /// the module header.
+    kinds: std.ArrayList(cfg.BlockKind) = .empty,
     /// The block currently open, or null when the path reaching here has
     /// already diverged and nothing reachable follows until the next
     /// merge point. Same meaning as `cfg.Builder.cur`.
@@ -389,9 +414,10 @@ const Walker = struct {
     /// `cond`/`exit` pair `cfg.Builder.LoopCtx` carries.
     loop_depth: u32 = 0,
 
-    fn newBlock(self: *Walker) LivenessError!u32 {
+    fn newBlock(self: *Walker, kind: cfg.BlockKind) LivenessError!u32 {
         const id: u32 = @intCast(self.blocks.items.len);
         try self.blocks.append(self.allocator, .empty);
+        try self.kinds.append(self.allocator, kind);
         return id;
     }
 
@@ -442,13 +468,13 @@ const Walker = struct {
     fn walkWhile(self: *Walker, w: anytype) LivenessError!void {
         if (self.cur == null) return;
 
-        const cond_id = try self.newBlock();
+        const cond_id = try self.newBlock(.while_cond);
         self.cur = cond_id;
         try self.walkExpr(&w.cond);
         if (self.cur == null) return;
 
-        const body_id = try self.newBlock();
-        const exit_id = try self.newBlock();
+        const body_id = try self.newBlock(.while_body);
+        const exit_id = try self.newBlock(.while_exit);
 
         self.loop_depth += 1;
         self.cur = body_id;
@@ -502,9 +528,9 @@ const Walker = struct {
         try self.walkExpr(ie.cond);
         if (self.cur == null) return;
 
-        const then_id = try self.newBlock();
-        const join_id = try self.newBlock();
-        const else_id: u32 = if (ie.else_body != null) try self.newBlock() else join_id;
+        const then_id = try self.newBlock(.if_then);
+        const join_id = try self.newBlock(.if_join);
+        const else_id: u32 = if (ie.else_body != null) try self.newBlock(.if_else) else join_id;
 
         // Mirrors `cfg.Builder.deadJoinOrLive`: with no else, the
         // not-taken edge IS the join (`else_id == join_id`), wired
@@ -529,7 +555,7 @@ const Walker = struct {
         try self.walkExpr(me.scrutinee);
         if (self.cur == null) return;
 
-        const join_id = try self.newBlock();
+        const join_id = try self.newBlock(.match_join);
         var join_reachable = false;
 
         for (me.arms) |arm| {
@@ -539,7 +565,7 @@ const Walker = struct {
             };
             const catch_all = arm.guard == null and pattern_matches_all;
 
-            const body_id = try self.newBlock();
+            const body_id = try self.newBlock(.match_body);
 
             if (catch_all) {
                 // No test, no guard: the pattern can never fail and there
@@ -548,14 +574,14 @@ const Walker = struct {
                 // `_ if c => ...` (or a guarded binding pattern, which
                 // `typecheck.zig` rejects but this module, like `cfg.zig`,
                 // is total over): the guard is the only decision point.
-                const guard_id = try self.newBlock();
-                _ = try self.newBlock(); // next_id: a pure test point, never itself the site of an op.
+                const guard_id = try self.newBlock(.match_guard);
+                _ = try self.newBlock(.match_next); // next_id: a pure test point, never itself the site of an op.
                 self.cur = guard_id;
                 try self.walkExpr(arm.guard.?);
             } else {
-                _ = try self.newBlock(); // next_id
+                _ = try self.newBlock(.match_next); // next_id
                 if (arm.guard) |g| {
-                    const guard_id = try self.newBlock();
+                    const guard_id = try self.newBlock(.match_guard);
                     self.cur = guard_id;
                     try self.walkExpr(g);
                 }
@@ -1025,6 +1051,55 @@ test "a match arm's binding pattern is a def at the start of its body, not befor
     // into the body (it is defined there, not received from entry).
     try std.testing.expect(!r.live_in[body_b.id][1]);
     try std.testing.expect(hasLastUse(r.last_uses, body_b.id, 1));
+}
+
+test "analyze rejects an allocation-ORDER drift, which the block count cannot see" {
+    // The case the module header used to call unfixable: the same NUMBER of
+    // blocks in a different order, so the count check stays silent while every
+    // op list points at the wrong block.
+    //
+    // The graph's recorded kinds are perturbed rather than `Walker` sabotaged,
+    // because a drift is a disagreement BETWEEN the two derivations and either
+    // side moving produces it. `g.blocks.len` is untouched, so a pass here
+    // cannot be the count check firing by accident.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = [_]hir.Binding{dummyBinding(0)};
+    var then_stmts = [_]hir.Stmt{exprStmt(refExpr(0))};
+    var then_body = unitExpr(.{ .block = .{ .stmts = &then_stmts, .tail = null } });
+    var else_body = unitExpr(.{ .block = .{ .stmts = &.{}, .tail = null } });
+    var cond = boolExpr(true);
+    const if_e = unitExpr(.{ .if_expr = .{
+        .cond = &cond,
+        .then_body = &then_body,
+        .else_body = &else_body,
+    } });
+    var stmts = [_]hir.Stmt{ letStmt(0, intExpr(1)), exprStmt(if_e) };
+    const f = testFn(&stmts, &bindings);
+
+    var g = (try cfg.build(a, &f)).?;
+
+    // The honest pairing analyzes cleanly. Without this the assertion below
+    // could be satisfied by a fixture that was broken to begin with.
+    _ = try analyze(a, &f, &g);
+
+    const before = g.blocks.len;
+    var swapped = false;
+    var i: usize = 0;
+    while (i + 1 < g.blocks.len) : (i += 1) {
+        if (g.blocks[i].kind != g.blocks[i + 1].kind) {
+            const k = g.blocks[i].kind;
+            g.blocks[i].kind = g.blocks[i + 1].kind;
+            g.blocks[i + 1].kind = k;
+            swapped = true;
+            break;
+        }
+    }
+    try std.testing.expect(swapped);
+    try std.testing.expectEqual(before, g.blocks.len);
+    try std.testing.expectError(error.GraphMismatch, analyze(a, &f, &g));
 }
 
 test "analyze returns error.GraphMismatch rather than silently misaligning op lists" {
