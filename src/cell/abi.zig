@@ -189,18 +189,55 @@ fn collectHfa(m: *const hir.Module, name: []const u8, elem: *?[]const u8, count:
     return true;
 }
 
+/// How a value is placed.
+///
+/// ⚠️ `.direct = "ptr"` AND `.indirect` RENDER AS THE SAME FOUR CHARACTERS AND
+/// MEAN OPPOSITE THINGS. This is the one trap in this file that a reader can
+/// walk into from either direction, so it is stated at the type rather than
+/// only at the two call sites that depend on it.
+///
+///   `.direct = "ptr"`  a BORROW. The pointer is the LENDER'S OBJECT. The
+///                      caller passes the address of the original, and a write
+///                      through it is meant to be seen.
+///   `.indirect`        a COPY the ABI could not fit in registers. The CALLER
+///                      allocates it and passes its address, and the callee is
+///                      entitled to scribble on it.
+///
+/// Measured, and this is why the distinction cannot come from the rendered
+/// type: `cell_slice_t` is 24 bytes, so
+///
+///     int64_t f(cell_slice_t s)   -> define i64 @f(ptr noundef %0)
+///     int64_t g(cell_slice_t *s)  -> define i64 @g(ptr noundef %0)
+///
+/// are indistinguishable in the signature. The difference is entirely on the
+/// caller's side, and the only thing that decides it is the OWNERSHIP MODE.
+/// So a backend must never re-derive "is this a borrow" by string-matching
+/// `renderParam`; it must ask `classifyParam` and read the tag, which is what
+/// `llvmemit.borrowsByPointer` does and says.
+///
+/// The same measurement does NOT excuse a wrong size. `exclusive String` was
+/// classified as a 16-byte `cell_str_t` and emitted `define void
+/// @cell_reset([2 x i64])` where the C it must link against is `void
+/// cell_reset(cell_string_t *)`, which clang compiles to `ptr`. A struct in
+/// x0/x1 where the callee expects a pointer in x0 is not a semantic
+/// disagreement about copies; it is the wrong signature. Two of the three
+/// `exclusive` aggregates were wrong that way and one, `[T]`, was right by the
+/// coincidence above.
 pub const Class = union(enum) {
     /// Passed and returned as this exact LLVM type: "i64", "double", "i1",
     /// "ptr", or, for an HFA return, the struct's bare NAME. The caller adds
     /// the `%cell_` prefix, which keeps this module allocation free and is
     /// what makes it a leaf.
+    ///
+    /// `"ptr"` here means a BORROW specifically. See the warning above.
     direct: []const u8,
     /// Coerced to [n x i64].
     coerce_int: u32,
     /// Coerced to [count x elem]. HFA parameters only.
     coerce_float: struct { count: u32, elem: []const u8 },
-    /// Parameter: a plain `ptr`. Return: the function returns void and takes
-    /// an `sret` pointer as a prepended first parameter.
+    /// Parameter: a plain `ptr`, addressing a CALLER-OWNED COPY. Return: the
+    /// function returns void and takes an `sret` pointer as a prepended first
+    /// parameter. See the warning above: this renders exactly like a borrow.
     indirect,
     /// Not classified by this module. The caller emits `cannot lower` and
     /// refuses the module. NEVER guess: a refusal is a fact about the
@@ -656,6 +693,66 @@ test "every exclusive aggregate is a pointer, because codegen writes through it"
     try std.testing.expect(!borrowedByPointer(types.t_int, .exclusive));
     try std.testing.expect(!borrowedByPointer(types.t_bool, .exclusive));
     try expectDirect(classifyParam(&m, types.t_int, .exclusive), "i64");
+}
+
+test "a borrow and an indirect copy render identically and must not be told apart by the text" {
+    // THE TRAP, pinned so a reader who finds it by reading `renderParam` is
+    // stopped here. `cell_slice_t` is 24 bytes, so clang gives the same
+    // `define i64 @f(ptr noundef %0)` for `cell_slice_t s` and for
+    // `cell_slice_t *s`. `exclusive [T]` and `owned [T]` therefore RENDER the
+    // same and CLASSIFY differently, and only the classification says whether
+    // the caller passes the lender's address or a copy's.
+    //
+    // This is also why the `[T]` row of the misclassification this test's
+    // neighbour describes was invisible: the spelling was right by coincidence
+    // while the meaning was wrong, and no signature comparison could have
+    // caught it. Running the program could, and did.
+    const m = emptyModule();
+    const elem = types.t_byte;
+    const list_ty: hir.Ty = .{ .list = &elem };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqualStrings(
+        renderParam(arena, &m, list_ty, .owned).?,
+        renderParam(arena, &m, list_ty, .exclusive).?,
+    );
+    try std.testing.expectEqualStrings("ptr", renderParam(arena, &m, list_ty, .owned).?);
+    // Identical text, opposite meaning, and the tag is the only thing that
+    // says so.
+    try std.testing.expect(classifyParam(&m, list_ty, .owned) == .indirect);
+    try expectDirect(classifyParam(&m, list_ty, .exclusive), "ptr");
+}
+
+test "the exclusive rows that were the WRONG SIGNATURE, not just the wrong semantics" {
+    // Two of the three `exclusive` aggregates were misclassified in a way a
+    // link would have got wrong, and one was right by coincidence. Measured
+    // against clang on this host, `-S -emit-llvm -O0` over the real header:
+    //
+    //   exclusive Int?     C is cell_opt_i64_t *  -> ptr    was [2 x i64]  WRONG
+    //   exclusive String   C is cell_string_t *   -> ptr    was [2 x i64]  WRONG
+    //   exclusive [Byte]   C is cell_slice_t *    -> ptr    was ptr        right
+    //   shared String      C is cell_str_t        -> [2 x i64]             unchanged
+    //   owned String       C is cell_string_t     -> ptr                   unchanged
+    //
+    // The two wrong rows came from `layoutOf` grouping `.exclusive` with
+    // `.shared` at 16 bytes, so they took the register path instead of the
+    // pointer path. `16 > 16` is false, which is the whole mechanism.
+    const m = emptyModule();
+    const inner = types.t_int;
+    const opt_ty: hir.Ty = .{ .optional = &inner };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqualStrings("ptr", renderParam(arena, &m, opt_ty, .exclusive).?);
+    try std.testing.expectEqualStrings("ptr", renderParam(arena, &m, types.t_string, .exclusive).?);
+    // The two rows this change must NOT have touched.
+    try std.testing.expectEqualStrings("[2 x i64]", renderParam(arena, &m, types.t_string, .shared).?);
+    try std.testing.expectEqualStrings("ptr", renderParam(arena, &m, types.t_string, .owned).?);
 }
 
 // ---------------------------------------------------------------------------
