@@ -79,7 +79,7 @@ awk '/^## 12\. Status index/,/^## 13\./' docs/SPEC.md \
   | awk -F'|' '{gsub(/^ +| +$/,"",$3); print $3}' | sort | uniq -c
 ```
 
-The headline consequence: **the front end, a typechecker, a borrow checker for R1/R2/R2.a/R2.b/R3/R3a/R4/R5/R6/R8/R9/R14/R15 plus one
+The headline consequence: **the front end, a typechecker, a borrow checker for R1/R2/R2.a/R2.b/R3/R3a/R4/R5/R6/R8/R9/R14/R15/R18 plus one
 clause of R10, and C lowering for the flagship examples are real.** As of
 the working tree the lexer, parser, AST, diagnostics, typechecker, and
 borrowck are wired into `cell check`. `if` / `else`, `match`, blocks, struct
@@ -795,8 +795,7 @@ statement of the rules a checker must enforce, written as numbered rules with
 violating examples and diagnostics. This section defines the vocabulary.
 
 **Status of the whole model: partially enforced.** Annotations are accepted by
-the parser and recorded on the AST. `cell check` enforces R2, R3, R5, R8, R9, R14,
-R15, and one clause of R10: an `arc` value may not be made **unique**, which is
+the parser and recorded on the AST. `cell check` enforces R1, R2, R2.a, R2.b, R3, R3a, R4, R5, R6, R8, R9, R14, R15, R18, and one clause of R10: an `arc` value may not be made **unique**, which is
 refused at six consumption sites (an `owned` parameter, an `owned` binding, an
 assignment to an `owned` place, an `owned` struct field, a list-literal element,
 and a `return` whose declared return type is not `arc`). There is no NLL,
@@ -984,9 +983,13 @@ and omitting it is allowed and inferred from the callee's signature. The
 
 ### 4.3 What ownership does today
 
-`cell check` enforces R2, R3, R5, R8, R9, R14, R15, and R10's
+`cell check` enforces R1, R2, R2.a, R2.b, R3, R3a, R4, R5, R6, R8, R9, R14, R15, R18, and R10's
 `arc`-cannot-be-made-unique clause (at six consumption sites) through
-`src/cell/borrowck.zig`. R9 covers both halves of "`arc` grants shared access
+`src/cell/borrowck.zig`. **This file carried THREE rule lists and all three
+disagreed** (2026-09-08): section 0.2 named thirteen rules, this section and
+section 8's status paragraph named seven, and none carried R18. Cite
+`borrowck.zig`'s module header instead of copying a list; it is the only one
+that cannot drift from the code. R9 covers both halves of "`arc` grants shared access
 only": no `exclusive` borrow of an `arc` place, and no write through one. Codegen lowers `shared` aggregates
 to `const T *`, `exclusive` aggregates to `T *`, and `arc` parameters to
 `cell_arc_t`. It boxes a literal or call result bound as `arc`, inserts
