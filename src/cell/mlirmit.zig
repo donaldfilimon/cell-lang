@@ -455,12 +455,18 @@ const Emitter = struct {
         what: []const u8,
     ) EmitError!bool {
         if (std.mem.eql(u8, val_ty, dest_ty)) return true;
+        // Appended only for the pairing it is true of, as in `llvmemit.fits`.
+        const string_pair = std.mem.eql(u8, val_ty, "!llvm.struct<(ptr, i64)>") and
+            std.mem.eql(u8, dest_ty, "!llvm.struct<(ptr, i64, i64)>");
+        const why: []const u8 = if (string_pair)
+            " (converting a borrowed view into an owning value needs" ++
+                " cell_string_from_str, which this backend cannot call)"
+        else
+            "";
         try self.unsupported(span, try std.fmt.allocPrint(
             self.arena,
-            "a value of type {s} where {s} is expected, in {s}" ++
-                " (converting between a borrowed view and an owning value needs" ++
-                " a runtime call this backend cannot emit)",
-            .{ val_ty, dest_ty, what },
+            "a value of type {s} where {s} is expected, in {s}{s}",
+            .{ val_ty, dest_ty, what, why },
         ));
         return false;
     }
@@ -781,6 +787,26 @@ const Emitter = struct {
                         return .{ .text = addr, .ty = "!llvm.ptr", .ptr_to = pointee };
                     }
                 }
+                // A KNOWN TYPE LIE, DELIBERATELY LEFT IN PLACE, and the twin of
+                // the note at `llvmemit.zig`'s `.ref` arm.
+                //
+                // `mlirType(.string)` is the BORROWED view `(ptr, i64)`,
+                // whatever the slot holds, so reading an owning
+                // `(ptr, i64, i64)` binding yields a value this backend calls
+                // 16 bytes wide; the slot's real type is in `slot_ty`. Before
+                // the placement guard that was a silent 16-byte load off a
+                // 24-byte alloca, never copying `cap`. Such programs are
+                // REFUSED now, which is the right verdict reached through a
+                // misleading message: the diagnostic says "borrowed view to
+                // owning value" while the source was already owning.
+                //
+                // Loading `slot_ty` here alone is not the fix: it would flip
+                // `inspect(shared s)` for an owned `s`, which works only
+                // because the view is a layout prefix of the owning value.
+                // Lift it in both backends together or they split on a
+                // verdict, which is what `tools/check.sh`'s agreement stage
+                // exists to catch. The same lie sits on `.field` below, where
+                // `fe.sel.ty` carries no ownership either.
                 const t = self.mlirType(e.ty) orelse {
                     try self.unsupported(e.span, "type of a binding");
                     return Value.none;

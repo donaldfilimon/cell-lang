@@ -521,12 +521,21 @@ const Emitter = struct {
         what: []const u8,
     ) EmitError!bool {
         if (std.mem.eql(u8, val_ty, dest_ty)) return true;
+        // The explanation is appended only for the pairing it is TRUE of.
+        // Printing it for every mismatch would attach a String story to, say,
+        // an i64 where a struct belongs, which is a different defect and would
+        // send the next reader to the wrong module.
+        const string_pair = std.mem.eql(u8, val_ty, "%cell_str") and
+            std.mem.eql(u8, dest_ty, "%cell_string");
+        const why: []const u8 = if (string_pair)
+            " (converting a borrowed view into an owning value needs" ++
+                " cell_string_from_str, which this backend cannot call)"
+        else
+            "";
         try self.unsupported(span, try std.fmt.allocPrint(
             self.arena,
-            "a value of type {s} where {s} is expected, in {s}" ++
-                " (converting between a borrowed view and an owning value needs" ++
-                " a runtime call this backend cannot emit)",
-            .{ val_ty, dest_ty, what },
+            "a value of type {s} where {s} is expected, in {s}{s}",
+            .{ val_ty, dest_ty, what, why },
         ));
         return false;
     }
@@ -902,6 +911,29 @@ const Emitter = struct {
                 return Value.void_value;
             },
             .ref => |slot| {
+                // A KNOWN TYPE LIE, DELIBERATELY LEFT IN PLACE, and the reason
+                // an owned String cannot round-trip through a binding.
+                //
+                // `llType(.string)` is the BORROWED view `%cell_str`, whatever
+                // the slot holds, so reading an owning `%cell_string` binding
+                // yields a value this backend then calls 16 bytes wide. The
+                // slot's real type is in `slot_ty`. Before the placement guard
+                // that was silent wrong code: `let owned s: String = make()
+                // return s` emitted `load %cell_str, ptr %slot0` off a
+                // `%cell_string` alloca and stored 16 bytes into a 24-byte
+                // sret buffer, never copying `cap`. It is now REFUSED, which
+                // is the right verdict reached through a misleading message:
+                // the diagnostic says "borrowed view to owning value" while
+                // the source was already owning.
+                //
+                // Loading `slot_ty` here instead is NOT the fix on its own. It
+                // would flip `inspect(shared s)` for an owned `s`, which works
+                // today only because `%cell_str` is a layout prefix of
+                // `%cell_string`; making that correct needs a
+                // `cell_string_as_str` equivalent, and that is `static inline`
+                // in `runtime/cell_rt.h` too. Lift it in both backends at
+                // once, with `mlirmit.zig`'s identical note, or the two split
+                // on a verdict.
                 const t = self.llType(e.ty) orelse {
                     try self.unsupported(e.span, "type of a binding");
                     return Value.void_value;
@@ -939,6 +971,22 @@ const Emitter = struct {
             .field => |f| {
                 const base = try self.emitExpr(f.base);
                 if (base.isVoid()) return base;
+                // THE SAME TYPE LIE as `.ref` above, one level in, and here it
+                // produced IR clang rejects outright rather than merely wrong
+                // IR. `f.sel.ty` carries no ownership, so an `owned name:
+                // String` field reads as `%cell_str` while the `extractvalue`
+                // that produced it genuinely yields the struct's declared
+                // `%cell_string`. Measured on `pub fn f() -> String { let
+                // owned b = mk() return b.name }` before the guard:
+                //
+                //   error: '%3' defined with type '%cell_string' but expected
+                //   '%cell_str'
+                //
+                // so this shape was accepted by the emitter and could not be
+                // compiled. It is refused now. The real fix is to read the
+                // declared field's ownership, the way `emitStructLit` and
+                // `placeDestType` already do, and it belongs with the `.ref`
+                // lift above rather than on its own.
                 const t = self.llType(f.sel.ty) orelse {
                     try self.unsupported(e.span, "field type");
                     return Value.void_value;
