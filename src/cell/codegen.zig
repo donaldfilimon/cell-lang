@@ -554,7 +554,7 @@ pub const Generator = struct {
         for (body, 0..) |_, i| {
             try self.emitStmt(&body[i], body[i + 1 ..], 1);
         }
-        try self.emitScopeDrops(1);
+        if (!endsInReturn(body)) try self.emitScopeDrops(1);
         try out.writeAll("}\n\n");
         self.locals.clearRetainingCapacity();
     }
@@ -2010,6 +2010,35 @@ fn isPlace(e: *const ast.Expr) bool {
     };
 }
 
+/// True when a function body's LAST top-level statement is a `return`, so
+/// the end-of-body drop point `emitFn` would reach afterward is unreachable
+/// C. `emitReturnStmt` has already emitted every drop that return owes, so
+/// what `emitScopeDrops` writes there is a byte-identical duplicate that no
+/// execution can reach.
+///
+/// This decides where a drop is WRITTEN, never whether one is owed, so it
+/// cannot over-drop in either direction: deleting statements after a
+/// `return` removes code the program never runs, and the drops before the
+/// `return` are untouched. Removing them would be the dangerous direction
+/// and this does not do that.
+///
+/// It is deliberately the narrowest test that is exactly right rather than
+/// the widest one that is arguably right. A body ending in an `if` whose
+/// branches all `return`, or in a `while (true)` with no `break`, also
+/// terminates, and both are left alone: each needs a derivation over the
+/// FORMS of a construct, and this file's history is that such derivations
+/// enumerate some forms and assert a property of all of them. A
+/// `.return_stmt` needs no derivation. The cost of the narrow test is a dead
+/// `cell_arc_drop` in the shapes it declines, which is what was already
+/// emitted, so nothing regresses.
+fn endsInReturn(body: []const ast.Stmt) bool {
+    if (body.len == 0) return false;
+    return switch (body[body.len - 1].kind) {
+        .return_stmt => true,
+        else => false,
+    };
+}
+
 // ── use analysis, for the (void) casts that keep -Wextra quiet ───────────
 
 fn exprUses(e: *const ast.Expr, name: []const u8) bool {
@@ -2743,8 +2772,7 @@ test "an arc binding is a cell_arc_t and a literal initializer is boxed" {
     // R11 rule 1: the box does not exist yet, so this is cell_arc_new by way
     // of the from_string helper, not a clone. cell_string_from_str copies the
     // literal's characters onto the heap, so the box owns them outright.
-    try expectContains(
-        e.text,
+    try expectContains(e.text,
         \\  cell_arc_t s = cell_arc_from_string(cell_string_from_str(cell_str_from_parts("x", 1)));
     );
     try expectAbsent(e.text, "cell_arc_clone");
@@ -3050,6 +3078,33 @@ test "an arc place flowing out of a match arm in return position is cloned" {
     try expectContains(e.text,
         \\  cell_arc_drop(a);
         \\  return _cell_t0;
+    );
+}
+
+test "no drop is emitted after a body-terminating return" {
+    var e = try emitSource(
+        \\pub fn f() -> arc String {
+        \\  let arc s = "x"
+        \\  return s
+        \\}
+    );
+    defer e.deinit();
+    // `emitReturnStmt` already emits every drop that `return` owes, and
+    // `emitFn` then ran `emitScopeDrops` again at the end of the body, so a
+    // second identical `cell_arc_drop(s);` sat after the `return` where no
+    // execution reaches it. Harmless under `-Wall -Wextra` (clang does not
+    // put `-Wunreachable-code` in either), but it is emitted dead code.
+    //
+    // The positive half is what keeps this honest: an `expectAbsent` alone
+    // would pass just as well if the drop pass stopped firing altogether.
+    try expectContains(e.text,
+        \\  cell_arc_drop(s);
+        \\  return _cell_t0;
+        \\}
+    );
+    try expectAbsent(e.text,
+        \\  return _cell_t0;
+        \\  cell_arc_drop(s);
     );
 }
 
