@@ -95,6 +95,14 @@ backend carried no structs. It does now (`!llvm.struct`), so `hello.cell`
 runs through all three and prints `42` from each. What all three still refuse
 is `[T]`, which SPEC 3.3 says has no representation at all.
 
+`owned_string.cell` is the deliberate opposite: **C only, and the other two
+backends refusing it is the correct answer, not a gap to close.** Turning a
+borrowed view into an owning `String` is a call to `cell_string_from_str`, and
+every aggregate constructor in `runtime/cell_rt.h` is `static inline` with no
+symbol for LLVM IR or MLIR to call, so both refuse with `cannot lower`. They
+refuse TOGETHER, which is why the agreement contract below still holds while
+the three backends disagree about the program.
+
 ## What `cell check` covers
 
 `cell check` parses, typechecks, and borrow-checks. A file in `examples/`
@@ -104,20 +112,29 @@ both halves of it are measured over every file here rather than a chosen few:
 - **`cc -std=c11 -Wall -Wextra -c`: they all compile.** `arc.cell` was the
   last one that did not, and now does.
 
-  **Read that as a statement about this directory, not about the language,
-  and here is a measured hole that shows the difference.** No file here
-  returns a `String` from a body. `primitives.cell:33` only *declares*
-  `take_string(shared v: String) -> String` with no body, so this stage has
+  **Read that as a statement about this directory, not about the language.
+  The hole this paragraph used to describe is CLOSED, and how it was found is
+  worth more than the fix.** Until `owned_string.cell` existed, no file here
+  returned a `String` from a body: `primitives.cell:33` only *declares*
+  `take_string(shared v: String) -> String` with no body, so this stage had
   never once compiled a conversion from a string literal to an owned
-  `String`. Six one-line programs pass `cell check` with exit 0 and emit C
-  that this command rejects outright, as errors rather than warnings, so the
-  absent `-Werror` does not save them: a `return` from `-> String`, a `let
-  owned` initializer, a `var owned` initializer, an `owned` call argument, a
-  struct-literal field, and an assignment's right side. A string literal is a
-  16-byte borrowed `cell_str_t` and an owned `String` is a 24-byte
-  `cell_string_t`; nothing converts between them outside the `arc` direction.
-  `AGENTS.md` carries the full record. A fixture would turn this stage red,
-  which is correct, so it lands with the fix rather than before it.
+  `String`. A string literal is a 16-byte borrowed `cell_str_t` and an owned
+  `String` is a 24-byte `cell_string_t`, and nothing converted between them
+  outside the `arc` direction, so eight one-line programs passed `cell check`
+  with exit 0 and emitted C that this command rejected outright, as errors
+  rather than warnings, so the absent `-Werror` did not save them.
+
+  **The recorded defect said SIX, and six was short.** The six were a `return`
+  from `-> String`, a `let owned` initializer, a `var owned` initializer, an
+  `owned` call argument, a struct-literal field, and an assignment's right
+  side. The seventh and eighth are a value-slot `match` arm at a `let` and the
+  same at a `return`, and they were found by asking which positions route
+  through the conversion rather than by re-reading the list. The fix is one
+  predicate at one funnel (`codegen.emitConversion`), so a ninth position
+  inherits the answer instead of needing a ninth patch; `owned_string.cell`
+  exercises all eight and prints 44, the sum of their lengths, so a
+  conversion that produced an empty or mis-sized value changes the answer
+  rather than passing quietly.
 
   The reusable point is that a corpus-wide check is only as strong as the
   shapes the corpus contains, and the shapes it lacks are invisible by
@@ -127,8 +144,9 @@ both halves of it are measured over every file here rather than a chosen few:
 - **Link and run**, measured 2026-09-08: seven link on their own
   (`hello` 42, `backends` 24, `loops` 55, `while_is_now_a_loop` 10,
   `arc_return_field` 7, and `ownership` and `borrows` both silent at exit 0);
-  two more link once their host is added (`arc` 13 with `arc_host.c`,
-  `write_through` 142 with `write_through_host.c`); the rest do not link for
+  three more link once their host is added (`arc` 13 with `arc_host.c`,
+  `write_through` 142 with `write_through_host.c`, `owned_string` 44 with
+  `owned_string_host.c`); the rest do not link for
   one reason, and it is not a codegen defect: they declare no `pub fn main()`
   with a body, so no C `main` is emitted and the link stops at `_main`.
 

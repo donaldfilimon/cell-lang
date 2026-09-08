@@ -482,6 +482,24 @@ done
 # changing the retain rules, not only under this equality.
 run_c_host arc 13 examples/arc_host.c
 
+# owned_string is C only for the same KIND of reason and a different one: the
+# `str` -> owning-`String` conversion is a call to cell_string_from_str, which
+# is `static inline` in the header and so has no symbol the LLVM or MLIR
+# backend can call. Both refuse it, together, which stage 4 pins.
+#
+# 44 is 2+3+4+5+6+7+8+9, the byte length of each of the EIGHT positions where
+# a borrowed view meets a declared owning `String`. Six of those were the
+# recorded defect; the seventh and eighth are a value-slot `match` arm at a
+# `let` and at a `return`, which no list of positions predicted. A conversion
+# that produced an empty or a mis-sized value moves this number rather than
+# passing quietly, and the emitted C would still compile.
+#
+# Stage 9 is the other half and the half that matters: its host FREES the
+# `owned` argument, so a caller that passed a borrowed view of a string
+# literal frees a non-heap pointer and AddressSanitizer says so. Compiling was
+# never the hard part for this defect.
+run_c_host owned_string 44 examples/owned_string_host.c
+
 # -------------------------------------------------------------- 7. leaks --
 # THESE FIXTURES ASSERT LEAKS THAT CURRENTLY EXIST. Read this script's header
 # comment (stage 7) before touching anything below: a fixture failing because

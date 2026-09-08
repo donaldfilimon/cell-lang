@@ -1,0 +1,112 @@
+// The shape this corpus did not have: a body that produces an OWNING
+// `String`.
+//
+// `examples/README.md` recorded the hole rather than filling it. No file here
+// returned a `String` from a body, `primitives.cell:33` only *declares*
+// `take_string`, and so no stage of the gate had ever compiled a conversion
+// from a borrowed `cell_str_t` view into an owning 24-byte `cell_string_t`.
+// Eight one-line programs passed `cell check` with exit 0 and emitted C that
+// `cc` rejected outright. This file is those eight, in one program that runs.
+//
+// EIGHT, not the six that were first written down. The recorded table listed
+// a `return`, a `let owned` initializer, a `var owned` initializer, an
+// `owned` call argument, a struct-literal field, and an assignment's right
+// side. Two more have the same cause and appear in neither: a value-slot
+// `match` arm at a `let`, and the same at a `return`. `inferExpr` types a
+// `match` from its FIRST arm, so an arm that yields an owned `String` gives
+// the slot the type `cell_string_t` while a sibling arm writes a literal
+// into it. Both are here, last, because the reusable lesson of this defect is
+// that the enumeration is never the fix.
+//
+// C ONLY, DELIBERATELY. The LLVM and MLIR backends refuse every line below
+// with `cannot lower`, because the conversion is a call to
+// `cell_string_from_str` and every aggregate constructor in
+// `runtime/cell_rt.h` is `static inline` with no symbol to call. They refuse
+// TOGETHER, so the gate's agreement stage stays green; the three backends
+// disagreeing here is the intended end state, not a defect.
+//
+// It prints 44, which is 2+3+4+5+6+7+8+9: the byte length of each of the
+// eight conversions, so a conversion that silently produced an empty or a
+// mis-sized value changes the answer rather than passing quietly.
+//
+// Needs examples/owned_string_host.c, and needs it for a reason the run would
+// be much weaker without. `take` there FREES the value it is handed, which is
+// what an `owned` parameter promises at the C ABI. Under AddressSanitizer
+// that is a real assertion: had the argument stayed a borrowed view of a
+// string literal, freeing it aborts. Compiling was never the hard part here.
+
+pub fn print_int(copy value: Int);
+
+/// The byte length of a borrowed view. No Cell body can reach `cell_str_t.len`
+/// (SPEC has no field access on builtins), so the host supplies it.
+pub fn view_len(shared v: String) -> Int;
+
+/// Consumes its argument and frees it. See the header: this is the row-4
+/// destination and the ASan assertion at the same time.
+pub fn take(owned s: String) -> Int;
+
+/// Bodyless on purpose. Row 6 needs the ONLY literal to be on the
+/// assignment; a literal in the initializer masks it.
+pub fn make() -> String;
+
+pub struct Tag {
+    name: String
+}
+
+/// Row 1: a `return` from a `-> String` body.
+pub fn label() -> String {
+    return "ab"
+}
+
+/// Row 8: the value slot of a `match` arm, at a `return`. The first arm makes
+/// the slot `cell_string_t`; the second writes a literal into it.
+pub fn pick(copy n: Int) -> String {
+    return match n {
+        0 => make(),
+        _ => "abcdefghi",
+    }
+}
+
+pub fn main() {
+    // Row 1.
+    let owned a: String = label()
+
+    // Row 2.
+    let owned b: String = "abc"
+
+    // Row 3.
+    var owned c: String = "abcd"
+
+    // Row 5.
+    let owned t: Tag = Tag { name: "abcdef" }
+
+    // Row 6. `make` supplies the initializer so the literal is only ever on
+    // the assignment.
+    var owned d: String = make()
+    d = "abcdefg"
+
+    // Row 7: the value slot of a `match` arm, at a `let`.
+    let copy n = 1
+    let owned e: String = match n {
+        0 => make(),
+        _ => "abcdefgh",
+    }
+
+    // Row 8.
+    let owned g: String = pick(copy n)
+
+    // Row 4 is the call itself, and its answer is the length the callee read
+    // out of the value it then freed.
+    let copy total = view_len(shared a)
+        + view_len(shared b)
+        + view_len(shared c)
+        + take(owned "abcde")
+        + view_len(shared t.name)
+        + view_len(shared d)
+        + view_len(shared e)
+        + view_len(shared g)
+
+    print_int(total)
+}
+
+// EXPECT-OUTPUT: 44

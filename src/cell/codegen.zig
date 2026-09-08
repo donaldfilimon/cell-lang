@@ -78,12 +78,17 @@
 //! ## Arc retain insertion (task 4b), the other half of the same rule
 //!
 //! `docs/OWNERSHIP.md` R11 pairs a retain with each of those releases, and
-//! `emitArcConversion` emits every one of them. It hangs off `emitArgLike`
-//! because that is already the single place a value is lowered into a
-//! position whose C type is declared: a `let` initializer, a call argument,
-//! a struct literal field, a list element, and an assignment's right side.
-//! All four of R11's retain sites are one of those, so there is no second
-//! place to keep in step. `letType` had to learn about `arc` first: it took
+//! `emitArcConversion` emits every one of them. This paragraph used to end
+//! "it hangs off `emitArgLike`, which is the single place a value is lowered
+//! into a position whose C type is declared, so there is no second place to
+//! keep in step". THAT SENTENCE WAS WRONG TWICE, and both times the cost was
+//! emitted C that `cc` refused: a `return` is a second such place, and
+//! `emitValueInto`'s value slot is a third. The claim is now structural
+//! instead of enumerated. `emitConversion` is the funnel, it asks the `arc`
+//! rule and the `str` -> owning-`String` rule together, and the three
+//! callers named above route through it; what a reader should check is that
+//! a new declared-type position CALLS it, not that it appears in a list.
+//! `letType` had to learn about `arc` first: it took
 //! the initializer's inferred type and never the declared ownership, so
 //! `let arc label = "session"` stayed a `cell_str_t` and `applyOwnership`'s
 //! `.arc => CType.arc` was unreachable for it.
@@ -898,8 +903,13 @@ pub const Generator = struct {
     /// passed `cell check` and emitted `return cell_str_from_parts("x", 1);`,
     /// which only `cc` caught.
     ///
-    /// The BOX direction is routed through the shared conversion, so
-    /// `emitArcConversion` stays the one place R11 rule 1 is spelled.
+    /// The BOX direction is routed through the shared funnel, so
+    /// `emitArcConversion` stays the one place R11 rule 1 is spelled. The
+    /// same routing is what carries the `str` -> owning-`String` conversion
+    /// here, and it arrived by the same argument one axis over: `pub fn f()
+    /// -> String { return "ab" }` emitted `return cell_str_from_parts("ab",
+    /// 2);` from a `cell_string_t` function for as long as the guard below
+    /// mentioned `arc`.
     ///
     /// THE UNBOX DIRECTION IS DELIBERATELY NOT ROUTED, and this is the whole
     /// safety argument. `pub fn f(arc xs: [Int]) -> [Int] { return xs }` is
@@ -932,8 +942,15 @@ pub const Generator = struct {
         }
         const want = self.current_ret_ty;
         const have = try self.inferExpr(v);
-        if (want.shape == .arc and have.shape != .arc) {
-            if (try self.emitArcConversion(v, want, have, indent)) return;
+        // THE GUARD IS ON `have` ALONE, and it is the unbox refusal below
+        // written as one condition rather than as a pair naming `want`. The
+        // old spelling was `want.shape == .arc and have.shape != .arc`, which
+        // also excluded the `str` -> owning-`String` direction that `-> String
+        // { return "ab" }` needs, for no reason connected to `arc` at all.
+        // `emitArcConversion` answers nothing when neither side is `arc`, so
+        // widening this changes no `arc` program.
+        if (have.shape != .arc) {
+            if (try self.emitConversion(v, want, have, indent)) return;
         }
         try self.emitExpr(v, indent);
     }
@@ -1420,9 +1437,9 @@ pub const Generator = struct {
 
     /// Emit `e` as statements that leave its value in `dest`.
     ///
-    /// The leaf case routes through `emitArcConversion` rather than writing a
+    /// The leaf case routes through `emitConversion` rather than writing a
     /// bare assignment, because a value slot is a position with a declared
-    /// type and therefore owes the same `arc` retain that a parameter, a
+    /// type and therefore owes the same conversions that a parameter, a
     /// `let`, or a struct field does. Two reachable use-after-frees came in
     /// through here, both silent at `cell check` and clean under
     /// `-Wall -Wextra -Werror`:
@@ -1430,12 +1447,25 @@ pub const Generator = struct {
     ///   let arc r = if (c > 0) { a } else { b }   // r aliased a's box
     ///   return match c { 0 => a, _ => a }         // dropped before return
     ///
-    /// Only the `arc` conversion is applied, not all of `emitArgLike`. The
-    /// address-of and dereference rules there would newly compile
-    /// cross-branch type mismatches that are C errors today, and one of them
-    /// (`&x` on a branch-local place) would hand out a pointer that dies at
-    /// the branch's closing brace. Fixing an aliasing bug is no reason to
-    /// introduce a different one.
+    /// It routes the WHOLE funnel, not only the `arc` half, and the `str` ->
+    /// owning-`String` half is reachable here in a way no list of positions
+    /// predicted. `inferExpr` types a `match` from its FIRST arm, so
+    ///
+    ///   let owned s: String = match c { 0 => make(), _ => "x" }
+    ///
+    /// gives the slot the C type `cell_string_t` and then writes a
+    /// `cell_str_t` literal into it from the second arm. Both that and its
+    /// `return` twin passed `cell check` and emitted C that `cc` rejected,
+    /// and neither appears in the six-position table the defect was recorded
+    /// with. Routing the funnel is what makes them right without adding a
+    /// seventh and an eighth row to a list that will be short again.
+    ///
+    /// What is still NOT applied is the rest of `emitArgLike`. Its
+    /// address-of and dereference rules would newly compile cross-branch type
+    /// mismatches that are C errors today, and one of them (`&x` on a
+    /// branch-local place) would hand out a pointer that dies at the branch's
+    /// closing brace. Fixing an aliasing bug is no reason to introduce a
+    /// different one.
     fn emitValueInto(self: *Generator, e: *const ast.Expr, dest: Dest, indent: usize) EmitError!void {
         const out = self.writer;
         switch (e.kind) {
@@ -1490,7 +1520,7 @@ pub const Generator = struct {
                         else => {},
                     }
                 }
-                if (!try self.emitArcConversion(e, dest.ty, have, indent)) {
+                if (!try self.emitConversion(e, dest.ty, have, indent)) {
                     try self.emitExpr(e, indent);
                 }
                 try out.writeAll(";\n");
@@ -1806,10 +1836,16 @@ pub const Generator = struct {
     /// unbox direction must NOT be routed (it would turn R10's documented
     /// double free from a C type error into compiling code).
     ///
-    /// The claim to keep making is the enumeration, not the "no second
-    /// place": six positions reach this function, and the way the seventh
-    /// gets found is by someone listing them again rather than by trusting
-    /// a sentence that says the list is closed.
+    /// THE ENUMERATION WAS SHORT AGAIN, AND THAT IS WHY THIS IS NO LONGER
+    /// THE ENTRY POINT. The paragraph above used to end "six positions reach
+    /// this function, and the way the seventh gets found is by someone
+    /// listing them again". Someone did, and found two: `emitValueInto`'s
+    /// value slot reaches here as well, from a `match` arm and from a block,
+    /// which is a seventh and an eighth. Callers now route through
+    /// `emitConversion`, which asks this question and the `str` ->
+    /// owning-`String` one together, so a ninth position inherits both
+    /// answers by calling the funnel rather than by appearing in a list. This
+    /// function is the `arc` RULE; it is not the door any more.
     ///
     /// Three cases, in the order they are tested:
     ///
@@ -1889,6 +1925,115 @@ pub const Generator = struct {
         }
     }
 
+    /// THE FUNNEL. Every position that lowers a value into a destination with
+    /// a DECLARED TYPE asks this one function, and asks nothing else.
+    ///
+    /// WHY IT EXISTS AT ALL, rather than a conversion per position. Both of
+    /// the conversions below were added the same way: someone found a
+    /// position emitting wrong C, fixed that position, and the next position
+    /// with the same shape stayed wrong. `emitArcConversion`'s own doc
+    /// comment records the second round of that ("there is no second place to
+    /// keep in step", which was false, and a `return` was the second place),
+    /// and the `str` -> owning-`String` defect was the third: the `arc` axis
+    /// of six positions was fixed and the plain-`String` axis of the same six
+    /// was never asked about. The table of six that recorded it was ALSO
+    /// short, measured before this function existed: `let owned s: String =
+    /// match c { 0 => make(), _ => "x" }` and the same shape at a `return`
+    /// put the literal inside a value-slot arm, which is a seventh and an
+    /// eighth position, and neither is any of the six.
+    ///
+    /// So the enumeration is not the fix and must not be treated as one. The
+    /// fix is that the question is asked ONCE, of the pair (`have`, `want`),
+    /// and a position nobody anticipated inherits the answer by routing here
+    /// instead of by being listed. What a reader should verify is that every
+    /// declared-type position CALLS this, which is three call sites today:
+    /// `emitArgLike` (a `let` initializer, an assignment's right side, a call
+    /// argument, a struct-literal field, a list element), `emitReturnValue`
+    /// (the declared return type), and `emitValueInto` (a value slot a
+    /// block, `if`, or `match` arm writes into).
+    ///
+    /// ORDER IS NOT ARBITRARY. The `arc` question is asked first because it
+    /// is the only one with an answer when either side is `arc`, and its
+    /// declines are load-bearing refusals (R10's unbox-to-owned direction
+    /// stays a `cc` error on purpose). `emitOwningStringConversion` sees only
+    /// pairs `emitArcConversion` has already declined, and it requires both
+    /// sides to be non-`arc` string shapes, so the two can never both fire.
+    fn emitConversion(
+        self: *Generator,
+        arg: *const ast.Expr,
+        want: CType,
+        have: CType,
+        indent: usize,
+    ) EmitError!bool {
+        if (try self.emitArcConversion(arg, want, have, indent)) return true;
+        return try self.emitOwningStringConversion(arg, want, have, indent);
+    }
+
+    /// A borrowed view where an owning `String` is wanted: `cell_str_t` ->
+    /// `cell_string_t`, which is a real call to `cell_string_from_str` that
+    /// COPIES the characters into a fresh heap buffer.
+    ///
+    /// WHY THIS IS SAFE FOR EVERY SOURCE, which is the question
+    /// `emitArcConversion`'s case-3 refusal makes it obvious to ask. That
+    /// refusal exists because `cell_arc_from_string` MOVES its argument, so
+    /// boxing an `owned` String PLACE leaves the source local unmoved, the
+    /// drop pass still schedules its `cell_string_free`, and the box's glue
+    /// frees the same buffer: a silent double free. The same question here
+    /// has a different answer for a structural reason, not a case-by-case one:
+    ///
+    ///   1. The conversion COPIES rather than moving, so it takes no
+    ///      ownership from the source and cannot make a second owner of one
+    ///      buffer.
+    ///   2. NOTHING WHOSE C TYPE IS `cell_str_t` IS EVER FREED BY THIS
+    ///      BACKEND. `hasDropCall` is false for `.str`, so `pendingDrops`
+    ///      cannot select such a local whatever its ownership annotation
+    ///      says, and `emitDropFor` has no `.str` spelling to emit.
+    ///
+    /// Those two together are what makes the guard a TYPE test rather than an
+    /// enumeration of source shapes. A literal, a `shared String` parameter
+    /// or local, a `shared` field selection, and a function returning
+    /// `shared String` are all `.str`, and clause 2 covers them without this
+    /// function naming any of them.
+    ///
+    /// AN OWNED `String` PLACE IS NOT REACHED AND MUST NOT BE. Its `have` is
+    /// `.string`, not `.str`, so the first guard declines before anything is
+    /// written. That is the brief's trap, and it is closed by the shape of
+    /// the predicate rather than by a check that could be forgotten:
+    /// converting an owned place would emit a second owner of one buffer
+    /// exactly the way case 3's boxing would. `let owned t: String = s` over
+    /// an owned `s` therefore still emits a bare `s`, and borrowck's move of
+    /// `s` is what stops the pair being freed twice, unchanged by this.
+    ///
+    /// WHAT THE DESTINATION SIDE COSTS, stated rather than left implicit.
+    /// `want.pointer` is excluded because `exclusive String` is a
+    /// `cell_string_t *` and a fresh value has no address to hand over; that
+    /// stays a `cc` error. Of the destinations that ARE accepted, three own
+    /// the result exactly once (an `owned` local the drop pass frees, an
+    /// `owned` parameter the callee frees, the declared return type the
+    /// caller receives), and three LEAK it: a struct field, because this
+    /// backend generates no per-struct drop; a list element, because
+    /// `cell_slice_free` frees the buffer and not the elements; and an
+    /// assignment target, because an assignment drops nothing first. A
+    /// `copy String` destination leaks too, `pendingDrops` taking only
+    /// `.owned` and `.arc`. All six were already the behaviour for a
+    /// non-literal source of the same shape, so none of them is new here, and
+    /// every one is on the leak side of this backend's stated asymmetry
+    /// rather than the corruption side.
+    fn emitOwningStringConversion(
+        self: *Generator,
+        arg: *const ast.Expr,
+        want: CType,
+        have: CType,
+        indent: usize,
+    ) EmitError!bool {
+        if (have.shape != .str or have.pointer) return false;
+        if (want.shape != .string or want.pointer) return false;
+        try self.writer.writeAll("cell_string_from_str(");
+        try self.emitExpr(arg, indent);
+        try self.writer.writeAll(")");
+        return true;
+    }
+
     /// R11's deliberate non-retain, written once so the hoisted and the
     /// un-hoisted spelling can never drift apart.
     ///
@@ -1951,13 +2096,15 @@ pub const Generator = struct {
         const out = self.writer;
         const have = try self.inferExpr(arg);
 
-        // Both arc directions are answered FIRST, before any of the
+        // The declared-type conversions are answered FIRST, before any of the
         // address-of and dereference rules below. An arc handle is a struct
         // by value, so `&x` and `*x` are never the conversion it needs, and
         // letting the pointer rule see an `arc` place bound for a
         // `shared Record` parameter would emit `&x` (the address of the
-        // handle) where the pointee is wanted.
-        if (try self.emitArcConversion(arg, want, have, indent)) return;
+        // handle) where the pointee is wanted. The `str` -> owning-`String`
+        // direction is disjoint from every rule below, including the
+        // `.string` -> `.str` one at the bottom, which runs the other way.
+        if (try self.emitConversion(arg, want, have, indent)) return;
 
         // A list literal is the one expression whose element C type is not
         // recoverable from the expression alone, because `cell_slice_t` is
@@ -2774,6 +2921,21 @@ fn expectAbsent(haystack: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, haystack, needle) != null) {
         std.debug.print("\nexpected NOT to find:\n{s}\nin:\n{s}\n", .{ needle, haystack });
         return error.Found;
+    }
+}
+
+/// How many times `needle` appears, for the assertions where ONE is the
+/// answer and two is a double free. `expectContains` cannot tell those apart,
+/// and a drop test that only asks "is the free there" passes just as happily
+/// when it is there twice.
+fn expectOccurrences(haystack: []const u8, needle: []const u8, want: usize) !void {
+    const got = std.mem.count(u8, haystack, needle);
+    if (got != want) {
+        std.debug.print(
+            "\nexpected {d} occurrence(s) of:\n{s}\nbut found {d}, in:\n{s}\n",
+            .{ want, needle, got, haystack },
+        );
+        return error.WrongCount;
     }
 }
 
@@ -5202,4 +5364,223 @@ test "the owning-header guard is keyed on the drop call, so records still copy" 
     defer e.deinit();
     try expectContains(e.text, "cell_Buffer snap = *v;");
     try expectContains(e.text, "cell_string_t *text = &name;");
+}
+
+// ── str -> owning String, the funnel (defect 10) ────────────────────────
+//
+// EIGHT POSITIONS, and the count is the point of the section rather than a
+// heading. The defect was recorded as a table of six, and the table was
+// itself an instance of the reasoning failure it recorded: two more positions
+// have the same cause and appear in neither the table nor the report that
+// produced it. All eight route through `emitConversion`, so what these tests
+// pin is one predicate observed from eight sides, not eight fixes.
+//
+// The three negatives at the end are the half that matters more. Turning six
+// loud `cc` errors into six silent double frees is the failure mode this
+// change is one commit away from at every moment, and it has happened twice
+// in this file's history.
+
+test "row 1: a literal returned from a -> String body is copied into an owning value" {
+    var e = try emitSource(
+        \\pub fn f() -> String {
+        \\  return "ab"
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "return cell_string_from_str(cell_str_from_parts(\"ab\", 2));");
+}
+
+test "rows 2 and 3: let owned and var owned initializers convert, and are freed once each" {
+    // Both spellings in one module because they are one code path
+    // (`emitStmt`'s `.let` arm handles `var` too) and pinning only one of
+    // them would leave the other free to drift.
+    //
+    // The `expectOccurrences` half is the safety half. The conversion
+    // allocates, so the local must be freed exactly once; twice is the double
+    // free this whole design is arranged to avoid, and `expectContains` alone
+    // cannot see the difference.
+    var e = try emitSource(
+        \\pub fn f() {
+        \\  let owned s: String = "ab"
+        \\  var owned t: String = "cd"
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_string_t s = cell_string_from_str(cell_str_from_parts(\"ab\", 2));");
+    try expectContains(e.text, "cell_string_t t = cell_string_from_str(cell_str_from_parts(\"cd\", 2));");
+    try expectOccurrences(e.text, "cell_string_free(&s);", 1);
+    try expectOccurrences(e.text, "cell_string_free(&t);", 1);
+}
+
+test "row 4: a literal passed to an owned String parameter is copied for the callee" {
+    // The callee owns and frees what it is handed (cell_rt.h section 7), so
+    // handing it a view of a static literal would be a free of a non-heap
+    // pointer. examples/owned_string_host.c does exactly that free, under
+    // AddressSanitizer, which is what makes this more than a compile check.
+    var e = try emitSource(
+        \\pub fn g(owned s: String);
+        \\pub fn f() {
+        \\  g(owned "ab")
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_g(cell_string_from_str(cell_str_from_parts(\"ab\", 2)));");
+}
+
+test "row 5: a struct literal field of declared type String converts" {
+    var e = try emitSource(
+        \\pub struct B { name: String }
+        \\pub fn f() {
+        \\  let owned b: B = B { name: "ab" }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, ".name = cell_string_from_str(cell_str_from_parts(\"ab\", 2))");
+    // A record has no generated drop, so the field's buffer is never freed.
+    // Pinned rather than left implicit: this is a disclosed leak, and the
+    // test would be lying if it read as though the field were managed.
+    try expectAbsent(e.text, "cell_string_free(&b");
+}
+
+test "row 6: an assignment's right side converts, with the only literal on the assignment" {
+    // `make()` supplies the initializer on purpose. A literal there would
+    // convert first and mask whether the ASSIGNMENT converts, which is how
+    // this row hides.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  var owned s: String = make()
+        \\  s = "cd"
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "s = cell_string_from_str(cell_str_from_parts(\"cd\", 2));");
+    try expectOccurrences(e.text, "cell_string_free(&s);", 1);
+}
+
+test "row 7: a match arm writing into an owning String value slot converts" {
+    // NOT IN THE RECORDED TABLE OF SIX. `inferExpr` types a `match` from its
+    // FIRST arm, so the first arm's `make()` makes the slot `cell_string_t`
+    // and the second arm then writes a literal into it. This reaches
+    // `emitValueInto`, which is a different call site from `emitArgLike`, and
+    // it was found only by asking which positions route through the funnel
+    // rather than by reading the table.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f(shared c: Int) {
+        \\  let owned s: String = match c {
+        \\    0 => make(),
+        \\    _ => "x",
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "= cell_string_from_str(cell_str_from_parts(\"x\", 1));");
+    try expectOccurrences(e.text, "cell_string_free(&s);", 1);
+}
+
+test "row 8: the same match arm shape at a return converts" {
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f(shared c: Int) -> String {
+        \\  return match c {
+        \\    0 => make(),
+        \\    _ => "x",
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "= cell_string_from_str(cell_str_from_parts(\"x\", 1));");
+}
+
+test "row 7's slot type follows the first arm, so an all-literal match converts once outside" {
+    // The other half of `inferExpr`'s first-arm rule, and it is a different
+    // emission rather than a variation on the same one: with both arms
+    // literal the SLOT is `cell_str_t`, so no arm converts and the single
+    // conversion wraps the whole statement expression. Pinned because a
+    // "fix" that converted per arm instead would still compile here and
+    // would then allocate on a path that discards the result.
+    var e = try emitSource(
+        \\pub fn f(shared c: Int) {
+        \\  let owned s: String = match c {
+        \\    0 => "a",
+        \\    _ => "x",
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_string_t s = cell_string_from_str(({");
+    try expectOccurrences(e.text, "cell_string_from_str", 1);
+    try expectOccurrences(e.text, "cell_string_free(&s);", 1);
+}
+
+test "an OWNED String place is NOT converted, and the moved pair is freed exactly once" {
+    // THE TRAP, and the reason the predicate tests `have.shape == .str`
+    // rather than enumerating source expressions. An owned place is already a
+    // `cell_string_t`; wrapping it in `cell_string_from_str` would not even
+    // type-check, and a conversion that took ownership instead would make two
+    // owners of one buffer, which is exactly why `emitArcConversion` refuses
+    // to BOX an owned place. borrowck moves `s` into `t`, so the pair owes
+    // ONE free, and that is what is counted here.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  let owned s: String = make()
+        \\  let owned t: String = s
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_string_t t = s;");
+    try expectAbsent(e.text, "cell_string_from_str");
+    try expectOccurrences(e.text, "cell_string_free", 1);
+}
+
+test "an exclusive String destination is a pointer and is NOT converted" {
+    // `exclusive String` is `cell_string_t *` and a freshly converted value
+    // has no address to hand over, so this stays the loud `cc` error it is
+    // today. The guard is `want.pointer`, and dropping it would emit a
+    // 24-byte value where a pointer is read.
+    var e = try emitSource(
+        \\pub fn g(exclusive s: String);
+        \\pub fn f() {
+        \\  g(exclusive "ab")
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_g(cell_str_from_parts(\"ab\", 2));");
+    try expectAbsent(e.text, "cell_string_from_str");
+}
+
+test "an arc value returned from a -> String body is still refused by cc" {
+    // The unbox direction stays unrouted. `emitReturnValue`'s guard is on
+    // `have` alone now, and this pins that widening it to cover the string
+    // conversion did not also open the arc-to-owned one: docs/OWNERSHIP.md
+    // R10 documents that emission as a double free, and the C type error is
+    // the only thing refusing it at this layer.
+    var e = try emitSource(
+        \\pub fn f(arc a: String) -> String {
+        \\  return a
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "return a;");
+    try expectAbsent(e.text, "cell_string_from_str");
+}
+
+test "a shared String parameter borrowed for a shared parameter is not converted either" {
+    // The neighbouring direction, `.string` -> `.str`, which runs the other
+    // way through `emitArgLike` and must be untouched by the new rule. If the
+    // funnel ever answered this pair it would allocate a copy for every
+    // borrow in the corpus.
+    var e = try emitSource(
+        \\pub fn inspect(shared v: String) -> Int;
+        \\pub fn make() -> String;
+        \\pub fn f() -> Int {
+        \\  let owned s: String = make()
+        \\  return inspect(shared s)
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_inspect(cell_string_as_str(&s))");
+    try expectAbsent(e.text, "cell_string_from_str");
 }
