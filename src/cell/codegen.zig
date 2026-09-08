@@ -101,15 +101,39 @@
 //! (`isDuplicable`, R10 by design), so a returned `arc` local is always
 //! still in `pendingDrops` and would be released between the return
 //! temporary and the `return` itself. The clone is exactly balanced, not a
-//! leak.
+//! leak. The rule it applies is deliberately an EXCEPTION and not a list:
+//! retain every returned `arc` place except a parameter returned directly.
+//! A list is what got this wrong the first time, by omitting a field.
 //!
-//! Known gaps, all of them leaks and none a dangling reference: a Cell body
-//! never releases its own `arc` parameter, because no parameter is dropped,
-//! so every call-site retain into one leaks a reference; a struct holding an
-//! `arc` field is never dropped, so the field's retain leaks; and an `owned`
-//! String or list PLACE bound as `arc` is not boxed at all, because
-//! `cell_arc_from_string` moves its argument while `borrowck.zig` leaves the
-//! source unmoved, and a loud C type error beats a silent double free.
+//! TWO USE-AFTER-FREES LIVED HERE, and the sentence that used to occupy this
+//! paragraph said none could. Both were introduced by the same act: turning
+//! source that had been a C type error into source that compiles. Keep them
+//! named, because the next `arc` change can reintroduce either.
+//!
+//!   1. A returned `arc` FIELD. `return s.name` emitted a bare
+//!      `return s->name;`, handing the caller the record's own reference.
+//!      Fixed by retaining every returned `arc` place that is not a
+//!      parameter, on BOTH branches of `emitReturnStmt`.
+//!   2. A SHADOWED `arc` local. `emitDropFor` spells a drop by NAME, so two
+//!      visible bindings sharing one name emitted two identical
+//!      `cell_arc_drop(s)`, both resolving to the inner binding. Fixed by
+//!      `isShadowedAt`, which declines to drop a binding a later one
+//!      shadows, leaking it instead.
+//!
+//! Known gaps, every one of them MEASURED as a leak with `leaks` rather than
+//! argued to be one (`docs/OWNERSHIP.md` R11 carries the numbers): a Cell
+//! body never releases its own `arc` parameter, because no parameter is
+//! dropped, so every call-site retain into one leaks a reference; a struct
+//! holding an `arc` field is never dropped, so the field's retain leaks; an
+//! `arc` value unboxed for a `shared` parameter without ever being bound
+//! (`inspect(shared fresh())`) drops its handle on the floor; a block-scoped
+//! `arc` local is never released at all, since release is function-scoped,
+//! which inside a `while` body is unbounded; reassigning an `arc` `var`
+//! leaks the previous box; and an `owned` String or list PLACE bound as
+//! `arc` is not boxed at all, because `cell_arc_from_string` moves its
+//! argument while `borrowck.zig` leaves the source unmoved, and a loud C
+//! type error beats a silent double free. That list is what running programs
+//! has found, not a proof that nothing else dangles.
 
 const std = @import("std");
 const ast = @import("ast.zig");

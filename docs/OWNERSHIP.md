@@ -465,13 +465,51 @@ refuse `arc` outright and emit no drops at all):
   caller now owns. This is because an `arc` place is never made dead by
   borrowck (`isDuplicable`, R10 by design), so the drop pass cannot recognize
   the exception itself.
-- Release rule 3 holds by construction: a parameter is never dropped.
+- Release rule 3 holds for every returned `arc` place, and the rule codegen
+  applies is stated as an exception rather than a list: **retain every
+  returned `arc` place except a parameter returned directly.** A parameter is
+  the one reference the frame received pre-retained and hands straight back.
+  A local, a FIELD (`s.name`), and a match-arm binding all belong to something
+  the caller does not own, so each is cloned.
 
-The gap that leaks, stated plainly rather than left to be discovered: a Cell
-function body never releases its own `arc` parameter, because the C backend
-drops no parameter at all. So each call-site retain into a Cell-bodied `arc`
-parameter leaks one reference, and a struct holding an `arc` field is never
-destroyed, so rule 4's retain leaks too. Both are leaks, never use-after-free.
+### What still goes wrong, with the evidence for each
+
+An earlier version of this section said the remaining gaps were "leaks, never
+use-after-free". **That categorical was false**, and it was false while being
+asserted: review reproduced two use-after-frees under AddressSanitizer that it
+covered. Both are fixed, and the claim is restated as evidence rather than as
+a category, because the same sentence pattern is what hid them.
+
+Fixed, and named so the next reader can tell what the tests are for:
+
+1. **A returned `arc` field.** `fn peek(shared s: Session) -> arc String {
+   return s.name }` emitted a bare `return s->name;`, handing the caller the
+   record's reference. The caller released it and the record was left pointing
+   at a freed box. Now cloned, on both of `emitReturnStmt`'s branches.
+2. **A shadowed `arc` local.** Drops are spelled by name, so two visible
+   bindings sharing one name emitted two identical `cell_arc_drop(s)`, both
+   resolving to the inner binding: released twice, and the outer never. Now
+   the shadowed outer binding is not dropped at all, which leaks it instead.
+
+Still broken, all of them leaks, each one measured rather than asserted:
+
+| Gap | Evidence |
+|---|---|
+| A Cell body never releases its own `arc` parameter (no parameter is dropped), so every call-site retain into one leaks a reference | by construction; `examples/arc_host.c` is the ABI-correct contrast, and `examples/arc.cell` reports 0 leaks because of it |
+| A struct holding an `arc` field is never dropped, so rule 4's retain leaks | `record` shapes are excluded from `hasDropCall` |
+| An `arc` value unboxed for a `shared` parameter without ever being bound (`inspect(shared fresh())`) drops its handle on the floor | `leaks`: **2998 leaks / 63968 bytes** over 1000 iterations |
+| An `arc` local declared inside a block is never released, because release is function-scoped; inside a `while` body that is unbounded | `leaks`: **2997 leaks / 63936 bytes** over 1000 iterations |
+| Reassigning an `arc` `var` leaks the previous box (`var arc v = "one"` then `v = "two"`), the same class as the R3a-revival leak R16 documents for `owned` | `leaks`: **3 leaks / 64 bytes** for a single reassignment |
+| An `owned` String or list PLACE bound as `arc` is not boxed at all, and is left as a C type error rather than a silent double free | see retain rule 1 above |
+
+What that list is: every `arc` failure mode found by writing programs against
+this implementation and running them under `leaks` and AddressSanitizer, after
+two real use-after-frees were found in exactly the place a categorical claim
+said none could be. It is not a proof that no dangling case remains. One case
+this file's rules describe cannot be written today at all: a `match` arm whose
+body is a `return`, since `return` is not an expression in this grammar, so
+the match-arm retain is chosen for safety and is currently unreachable.
+
 A hand-written C callee that honours `cell_rt.h` section 7 and releases its
 `arc` parameter balances exactly; `examples/arc_host.c` is one.
 

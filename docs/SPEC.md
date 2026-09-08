@@ -862,13 +862,26 @@ a struct field is cloned; and an `arc` place passed to a `shared` parameter is
 deliberately not cloned (OWNERSHIP.md R11, safe by R8).
 `examples/arc.cell` compiles, links and runs, and prints a strong count.
 
-Three gaps remain, all of them leaks rather than use-after-free, and all
-listed in OWNERSHIP.md R11: an `arc` parameter is never released by a Cell
+Six gaps remain and OWNERSHIP.md R11 lists them all with the `leaks` and
+AddressSanitizer measurements: an `arc` parameter is never released by a Cell
 body, because no parameter is dropped; a struct holding an `arc` field is
-never dropped at all; and an `owned` String or list **place** bound as `arc`
-is not boxed, because R10's move-into-`arc` is unimplemented in the checker
-and boxing an un-moved place would double free it. The LLVM and MLIR backends
-refuse `arc` outright and emit nothing.
+never dropped at all; an `arc` value unboxed for a `shared` parameter without
+ever being bound drops its handle on the floor; an `arc` local declared inside
+a block is never released, because release is function-scoped, which inside a
+`while` body is unbounded; reassigning an `arc` `var` leaks the previous box;
+and an `owned` String or list **place** bound as `arc` is not boxed, because
+R10's move-into-`arc` is unimplemented in the checker and boxing an un-moved
+place would double free it.
+
+**Every one of those is a leak, and that is a measurement, not a category.**
+An earlier draft here called the gaps "leaks rather than use-after-free" while
+two use-after-frees were live in the same code: a returned `arc` field was
+handed out unretained, and a shadowed `arc` local was released twice. Both are
+fixed and both carry tests; R11 names them. Read that list as what running
+programs under `leaks` and AddressSanitizer has found, not as a proof that
+nothing dangles.
+
+The LLVM and MLIR backends refuse `arc` outright and emit nothing.
 
 #### 4.1.5 `copy`
 
