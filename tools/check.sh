@@ -202,7 +202,8 @@ set -u
 cd "$(dirname "$0")/.." || exit 2
 
 LLVM_BIN=${LLVM_BIN:-/opt/homebrew/opt/llvm/bin}
-CELL=./zig-out/bin/cell
+ZIG=${ZIG:-zig}
+CELL=${CELL:-./zig-out/bin/cell}
 TMP=$(mktemp -d) || exit 2
 trap 'rm -rf "$TMP"' EXIT
 
@@ -301,9 +302,69 @@ mlir_pipeline() {
     sed -n 's|^// lower with: mlir-opt ||p' "$1" | head -1
 }
 
+accepted_examples() {
+    for _example in examples/*.cell examples/pairing/*.cell examples/signatures/*.cell; do
+        [ -f "$_example" ] && printf '%s\n' "$_example"
+    done
+}
+
+artifact_tag() {
+    printf '%s' "$1" | od -An -tx1 | tr -d ' \n'
+}
+
+backend_emit_verdict() {
+    _backend=$1; _source=$2; _output=$3; _diagnostic=$4
+    if "$CELL" emit --target="$_backend" "$_source" > "$_output" 2> "$_diagnostic"; then
+        BACKEND_STATUS=0
+    else
+        BACKEND_STATUS=$?
+    fi
+    if [ "$BACKEND_STATUS" -eq 0 ]; then
+        BACKEND_VERDICT=accept
+    elif [ "$BACKEND_STATUS" -eq 1 ] && grep -q 'cannot lower' "$_diagnostic"; then
+        BACKEND_VERDICT=refuse
+    else
+        BACKEND_VERDICT=error
+    fi
+}
+
+collect_root_test_count() {
+    _count_log=$1
+    if "$ZIG" test src/root.zig > "$_count_log" 2>&1; then
+        _count_status=0
+    else
+        _count_status=$?
+    fi
+    if [ "$_count_status" -eq 0 ]; then
+        printf '  ....  %s\n' "$(tail -1 "$_count_log")"
+    else
+        fail "zig test src/root.zig for test count (exit $_count_status)"
+        sed -n '1,10p' "$_count_log"
+    fi
+}
+
+mlir_to_llvm() {
+    _mlir=$1; _pipeline=$2; _low=$3; _llvm=$4; _log_prefix=$5
+    # Unquoted on purpose: the pipeline is a list of flags and must split.
+    if ! "$LLVM_BIN/mlir-opt" "$_mlir" $_pipeline -o "$_low" 2>"${_log_prefix}.opt"; then
+        MLIR_LOWER_FAILURE=opt
+        return 1
+    fi
+    if ! "$LLVM_BIN/mlir-translate" --mlir-to-llvmir "$_low" -o "$_llvm" 2>"${_log_prefix}.translate"; then
+        MLIR_LOWER_FAILURE=translate
+        return 1
+    fi
+    MLIR_LOWER_FAILURE=none
+    return 0
+}
+
+if [ "${CELL_GATE_LIBRARY_ONLY:-0}" = 1 ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 # ---------------------------------------------------------------- 1. build --
 printf '\n== build ==\n'
-zig build -Dswift=false > "$TMP/build.log" 2>&1
+"$ZIG" build -Dswift=false > "$TMP/build.log" 2>&1
 build_status=$?
 if [ $build_status -ne 0 ]; then
     fail "zig build -Dswift=false (exit $build_status)"
@@ -316,7 +377,7 @@ pass "zig build -Dswift=false"
 
 # ---------------------------------------------------------------- 2. tests --
 printf '\n== tests ==\n'
-zig build test -Dswift=false > "$TMP/test.log" 2>&1
+"$ZIG" build test -Dswift=false > "$TMP/test.log" 2>&1
 test_status=$?
 if [ $test_status -ne 0 ]; then
     fail "zig build test -Dswift=false (exit $test_status)"
@@ -327,10 +388,7 @@ fi
 
 # The count, not just the colour. AGENTS.md: check the count before citing a
 # green run. `zig build test` prints nothing on success, so ask root.zig.
-zig test src/root.zig > "$TMP/count.log" 2>&1
-if [ $? -eq 0 ]; then
-    printf '  ....  %s\n' "$(tail -1 "$TMP/count.log")"
-fi
+collect_root_test_count "$TMP/count.log"
 
 # --------------------------------------------------------------- 3. corpus --
 # The four contracts declared in examples/README.md.
@@ -402,14 +460,26 @@ done
 # runtime/cell_rt.h, is the one that does.
 printf '\n== backend agreement ==\n'
 disagreements=0
-for f in examples/*.cell examples/pairing/*.cell; do
-    if $CELL emit --target=llvm "$f" > /dev/null 2>&1; then l=accept; else l=refuse; fi
-    if $CELL emit --target=mlir "$f" > /dev/null 2>&1; then m=accept; else m=refuse; fi
+accepted_examples > "$TMP/accepted_examples"
+while IFS= read -r f; do
+    tag=$(artifact_tag "$f")
+    backend_emit_verdict llvm "$f" "$TMP/agree_$tag.ll" "$TMP/agree_$tag.llvm.err"
+    l=$BACKEND_VERDICT
+    if [ "$l" = error ]; then
+        fail "$f: llvm emit failed unexpectedly (exit $BACKEND_STATUS)"
+        sed -n '1,4p' "$TMP/agree_$tag.llvm.err"
+    fi
+    backend_emit_verdict mlir "$f" "$TMP/agree_$tag.mlir" "$TMP/agree_$tag.mlir.err"
+    m=$BACKEND_VERDICT
+    if [ "$m" = error ]; then
+        fail "$f: mlir emit failed unexpectedly (exit $BACKEND_STATUS)"
+        sed -n '1,4p' "$TMP/agree_$tag.mlir.err"
+    fi
     if [ "$l" != "$m" ]; then
         fail "$f: llvm=$l mlir=$m"
         disagreements=$((disagreements + 1))
     fi
-done
+done < "$TMP/accepted_examples"
 [ $disagreements -eq 0 ] && pass "llvm and mlir agree on every example"
 
 # --------------------------------------------------------- 5. mlir lowering --
@@ -430,17 +500,18 @@ if [ ! -x "$LLVM_BIN/mlir-opt" ]; then
     skip "mlir lowering of every example (mlir-opt not found in $LLVM_BIN)"
 else
     lower_before=$fails
-    for f in examples/*.cell examples/pairing/*.cell; do
-        n=$(basename "$f" .cell)
+    while IFS= read -r f; do
+        n=$(artifact_tag "$f")
         # An emit REFUSAL is designed scalar-first behaviour and stage 4 already
         # pins it. A CRASH is not, so the two are told apart the way
         # .claude/skills/run-cell-lang/driver.sh tells them apart, and only what
         # emitted is lowered.
-        if ! $CELL emit --target=mlir "$f" > "$TMP/low_$n.mlir" 2> "$TMP/low_$n.emit"; then
-            grep -q 'cannot lower' "$TMP/low_$n.emit" || {
-                fail "mlir emit $f (not a 'cannot lower' refusal)"
-                sed -n '1,4p' "$TMP/low_$n.emit"
-            }
+        backend_emit_verdict mlir "$f" "$TMP/low_$n.mlir" "$TMP/low_$n.emit"
+        if [ "$BACKEND_VERDICT" = refuse ]; then
+            continue
+        elif [ "$BACKEND_VERDICT" = error ]; then
+            fail "mlir emit $f failed unexpectedly (exit $BACKEND_STATUS)"
+            sed -n '1,4p' "$TMP/low_$n.emit"
             continue
         fi
         pipeline=$(mlir_pipeline "$TMP/low_$n.mlir")
@@ -454,7 +525,7 @@ else
             fail "mlir-opt $f"
             sed -n '1,4p' "$TMP/low_$n.err"
         }
-    done
+    done < "$TMP/accepted_examples"
     [ $fails -eq $lower_before ] && pass "every emitted MLIR module lowers"
 fi
 
@@ -1332,7 +1403,7 @@ else
         # literal path is not a file.
         [ -f "$f" ] || continue
         key=$(printf '%s' "$f" | sed 's|^examples/||; s|\.cell$||')
-        tag=$(printf '%s' "$key" | tr '/' '_')
+        tag=$(artifact_tag "$key")
 
         # The C leg is the reference. A refusal here is not designed behaviour
         # the way an LLVM/MLIR refusal is, so it fails rather than skipping.
@@ -1375,27 +1446,41 @@ else
         # same LLVM-level shape as the other two rather than against MLIR
         # types. A lowering failure is stage 5's subject, so it is skipped
         # here rather than failed twice.
-        if [ "$sig_mlir" = yes ] && $CELL emit --target=mlir "$f" > "$TMP/sig_$tag.mlir" 2>/dev/null; then
+        if [ "$sig_mlir" = yes ]; then
+            backend_emit_verdict mlir "$f" "$TMP/sig_$tag.mlir" "$TMP/sig_$tag.memit"
+        fi
+        if [ "$sig_mlir" = yes ] && [ "$BACKEND_VERDICT" = accept ]; then
             pipeline=$(mlir_pipeline "$TMP/sig_$tag.mlir")
             if [ -z "$pipeline" ]; then
                 fail "signatures $key: emitted MLIR carries no '// lower with:' line"
             # Unquoted on purpose: $pipeline is a list of flags and must split.
-            elif "$LLVM_BIN/mlir-opt" "$TMP/sig_$tag.mlir" $pipeline -o "$TMP/sig_${tag}_low.mlir" 2>/dev/null \
-                && "$LLVM_BIN/mlir-translate" --mlir-to-llvmir "$TMP/sig_${tag}_low.mlir" -o "$TMP/sig_${tag}_m.ll" 2>/dev/null; then
+            elif ! mlir_to_llvm "$TMP/sig_$tag.mlir" "$pipeline" \
+                    "$TMP/sig_${tag}_low.mlir" "$TMP/sig_${tag}_m.ll" "$TMP/sig_$tag"; then
+                if [ "$MLIR_LOWER_FAILURE" = opt ]; then
+                fail "signatures $key: emitted MLIR failed to lower"
+                    sed -n '1,4p' "$TMP/sig_$tag.opt"
+                else
+                    fail "signatures $key: lowered MLIR failed to translate to LLVM IR"
+                    sed -n '1,4p' "$TMP/sig_$tag.translate"
+                fi
+            else
                 awk -f "$TMP/sig.awk" "$TMP/sig_${tag}_m.ll" | LC_ALL=C sort > "$TMP/sig_$tag.msig"
                 sig_join "$key" MLIR "$TMP/sig_$tag.csig" "$TMP/sig_$tag.msig"
                 legs="$legs MLIR"
             fi
+        elif [ "$sig_mlir" = yes ] && [ "$BACKEND_VERDICT" = error ]; then
+            fail "signatures $key: MLIR emit failed unexpectedly (exit $BACKEND_STATUS)"
+            sed -n '1,4p' "$TMP/sig_$tag.memit"
         fi
 
         sig_examples=$((sig_examples + 1))
-        if [ -z "$legs" ]; then
+        if [ -z "$legs" ] && { [ "$sig_mlir" != yes ] || [ "$BACKEND_VERDICT" = refuse ]; }; then
             # Both IR backends refused the whole program. Designed behaviour,
             # counted rather than passed over in silence, because an example
             # that leaves this list is coverage this stage gained.
             sig_conly=$((sig_conly + 1))
             printf '  ....  %-30s C only (both IR backends refuse it)\n' "$key"
-        else
+        elif [ -n "$legs" ]; then
             printf '  ....  %-30s C vs%s\n' "$key" "$legs"
         fi
     done
