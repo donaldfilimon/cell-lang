@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -54,6 +55,25 @@ def validate_artifact_paths(root: Path, report: Path, log: Path) -> None:
     resolved = {name: path.resolve(strict=False) for name, path in artifacts.items()}
     if len(set(resolved.values())) != len(resolved):
         raise ValueError("report, log, and report temporary paths must be distinct")
+    tracked_files = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=root, capture_output=True, check=False,
+    )
+    if tracked_files.returncode != 0:
+        raise RuntimeError("could not enumerate tracked source artifact identities")
+    tracked_identities: set[tuple[int, int]] = set()
+    for raw_path in tracked_files.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        candidate = root / raw_path.decode(errors="surrogateescape")
+        try:
+            info = candidate.stat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise RuntimeError("could not inspect tracked source artifact identities") from error
+        if stat.S_ISREG(info.st_mode):
+            tracked_identities.add((info.st_dev, info.st_ino))
+    artifact_identities: dict[tuple[int, int], str] = {}
     for name, path in resolved.items():
         try:
             relative = path.relative_to(root)
@@ -67,6 +87,20 @@ def validate_artifact_paths(root: Path, report: Path, log: Path) -> None:
             raise ValueError(f"{name} path resolves to tracked source: {path}")
         if tracked.returncode not in (0, 1):
             raise RuntimeError(f"could not validate {name} path against tracked source")
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise RuntimeError(f"could not inspect {name} path identity") from error
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        identity = (info.st_dev, info.st_ino)
+        if identity in tracked_identities:
+            raise ValueError(f"{name} path is a hardlink to tracked source: {path}")
+        if identity in artifact_identities:
+            raise ValueError(f"{name} path is a hardlink alias of {artifact_identities[identity]}")
+        artifact_identities[identity] = name
 
 
 def porcelain_entries(data: bytes) -> list[tuple[bytes, list[bytes]]]:

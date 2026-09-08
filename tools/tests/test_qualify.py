@@ -201,6 +201,42 @@ class QualifyIntegrationTests(unittest.TestCase):
                 self.assertEqual((self.root / "tracked.txt").read_text(), tracked_before)
                 self.assertEqual(tracked_temporary.read_text(), "must survive\n")
 
+    def test_rejects_artifact_hardlinks_to_tracked_source(self):
+        qualify = str(self.root / "tools/qualify.py")
+        tracked = self.root / "tracked.txt"
+        original = tracked.read_text()
+        hard_log = self.root / "hard log"
+        os.link(tracked, hard_log)
+        result = subprocess.run(
+            [qualify, "--report", str(self.root / "safe.json"), "--log", str(hard_log)],
+            cwd=self.root, text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(tracked.read_text(), original)
+        hard_log.unlink()
+
+        hard_temporary = self.root / "safe.json.tmp"
+        os.link(tracked, hard_temporary)
+        result = subprocess.run(
+            [qualify, "--report", str(self.root / "safe.json")],
+            cwd=self.root, text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(tracked.read_text(), original)
+
+    def test_rejects_pairwise_artifact_hardlink_aliases(self):
+        qualify = str(self.root / "tools/qualify.py")
+        report = self.root / "report.json"
+        report.write_text("artifact\n")
+        log = self.root / "gate.log"
+        os.link(report, log)
+        result = subprocess.run(
+            [qualify, "--report", str(report), "--log", str(log)],
+            cwd=self.root, text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(report.read_text(), "artifact\n")
+
     def test_missing_tool_versions_are_null(self):
         absent = str(self.root / "does not exist")
         result, report = self.run_qualify("complete", env={"ZIG": absent, "CC": absent, "LLVM_BIN": absent})
