@@ -137,12 +137,24 @@ MLIR backend carries structs too, as `!llvm.struct`, so `examples/hello.cell`
 now runs through all three backends and prints `42` from each.
 
 Enforced ownership rules, read off `src/cell/borrowck.zig`'s own header
-rather than from memory: **R1, R2, R3, R3a, R4, R5, R6, R8, R14, R15**, plus
-the first clause of **R10** (an `arc` place may not be made unique, refused at
-four positions). `arc` retain and release are emitted by the C backend, with
-the gaps named honestly in `docs/OWNERSHIP.md` R11 and measured rather than
-guessed. Still designed and not implemented: non-lexical lifetimes, generics,
-`Result<T,E>`, and enum payloads. `.cell`/`.cel` modules pair with
+rather than from memory: **R1, R2, R2.a, R2.b, R3, R3a, R4, R5, R6, R8, R9,
+R14, R15 and R18**, plus one clause of **R10** (an `arc` value may not be made
+unique, refused at **six** consumption sites). `arc` retain and release are
+emitted by the C backend, with the gaps named honestly in
+`docs/OWNERSHIP.md` R11 and measured rather than guessed.
+
+That sentence claimed to be read off the header and was not: it omitted R2.a,
+R2.b, R9 and R18, said four positions where the header says six, and named
+non-lexical lifetimes as unimplemented. **Non-lexical lifetimes ARE enforced
+for named loans** (slices 1 and 2 of `docs/OWNERSHIP.md` 0.3): a named loan
+ends as soon as its holder is provably never reached again. Only slice 3, a
+taint closure over derived bindings, is absent, and `let exclusive f = e`
+therefore stays `ineligible`, which rejects, and rejecting is safe. The list
+even contradicted itself, since the paragraph below names R2.a as a rule that
+loops brought in. Cite the header; do not copy it.
+
+Still designed and not implemented: generics, `Result<T,E>`, and enum
+payloads. `.cell`/`.cel` modules pair with
 `.body`/`.bod` by stem. See `docs/SPEC.md` section 12 and `docs/OWNERSHIP.md`.
 
 **Loops exist.** `while` is a keyword, with `break` and `continue`;
