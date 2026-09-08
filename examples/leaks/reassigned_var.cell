@@ -1,0 +1,31 @@
+// R11 gap 5 (docs/OWNERSHIP.md, "Still broken" table, row 5): reassigning an
+// `arc` `var` leaks the previous box. `v = "two"` boxes the new literal
+// (R11 retain rule 1, BOX) and overwrites `v`'s C-local storage; nothing
+// drops the box `v` held a moment before, because the drop pass only ever
+// schedules ONE release per binding id, at scope exit, and has no notion of
+// "this place was reassigned N times before that." The same class of gap
+// R16 documents for `owned` locals (a moved-from revival), applied to `arc`.
+//
+// This fixture ISOLATES that gap alone: `v` is declared once, outside any
+// nested block, so the block-scoped-local gap
+// (examples/leaks/block_scoped_local.cell) cannot also fire here, and the
+// initial box and every reassignment are all plain string literals, never a
+// struct field or a `shared` unbox. tools/check.sh's `leaks` stage pins the
+// expected count; see that file for the number and the commit measured at.
+//
+// Status: parses, passes `cell check`. LLVM and MLIR refuse it (scalar-first,
+// same as examples/arc.cell); this file lives under examples/leaks/ so it is
+// invisible to the top-level examples/*.cell corpus, agreement, and
+// mlir-lowering loops (see examples/leaks/README.md).
+
+pub fn print_int(copy value: Int);
+
+pub fn main() {
+    var arc v = "one"
+    var i = 0
+    while i < 1000 {
+        v = "two"
+        i = i + 1
+    }
+    print_int(i)
+}

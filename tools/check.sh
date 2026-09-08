@@ -34,6 +34,26 @@
 #                       runtime, RUN, and its answer checked. Every backend
 #                       defect found in this repo that mattered was invisible
 #                       in the IR and visible only here.
+#   7. leaks            docs/OWNERSHIP.md R11's "Still broken" table discloses
+#                       six `arc` retain/release gaps and MEASURES five of
+#                       them with `leaks`, in prose that lived nowhere as a
+#                       file: nobody could re-run a single one of those
+#                       numbers, or tell whether a change moved them.
+#                       examples/leaks/*.cell isolates each measurable gap in
+#                       its own program. THESE FIXTURES ASSERT LEAKS THAT
+#                       CURRENTLY EXIST, ON PURPOSE: that is the entire value.
+#                       A later change that closes one of R11's gaps makes a
+#                       pinned number here go DOWN, which is visible instead
+#                       of silent; a change that makes one WORSE, or opens a
+#                       new one, makes a number go UP or a clean fixture start
+#                       leaking, which fails the gate instead of shipping
+#                       quietly. DO NOT "fix" a failing fixture by loosening
+#                       its expected count. A dropped count means a gap
+#                       closed: update the constant, cite the new commit, and
+#                       update docs/OWNERSHIP.md's row. A risen count, or a
+#                       new leak in a program that used to be clean, means
+#                       codegen regressed. Either way the fix belongs in
+#                       src/, never in the pinned number.
 #
 # TRAPS THIS SCRIPT IS WRITTEN AGAINST, each one having actually bitten:
 #
@@ -46,6 +66,18 @@
 #     Homebrew LLVM keg. When they are absent the MLIR checks SKIP loudly
 #     rather than passing silently, because a check that quietly succeeds when
 #     its subject is missing is worse than no check.
+#   * macOS's `leaks` tool is not always installed (CI, a minimal machine), and
+#     the leaks stage below SKIPS loudly rather than passing silently when it
+#     is absent, for the same reason as the MLIR tools above.
+#   * `leaks -atExit` can UNDER-count by exactly one instance for a program
+#     whose leaked allocation is still referenced by a stale CPU register or
+#     stack slot at exit, a real false negative and not this script's bug (one
+#     agent measured `leaks` reporting 0 for a case that genuinely leaked one
+#     reference). The counts pinned below were re-measured 8 times each and
+#     were IDENTICAL every time, so they are stable-but-possibly-undercounting
+#     numbers, not flaky ones; if a future re-measurement is not reproducible
+#     run to run, say so in the report rather than pinning whichever number
+#     came up first.
 
 set -u
 
@@ -55,6 +87,38 @@ LLVM_BIN=${LLVM_BIN:-/opt/homebrew/opt/llvm/bin}
 CELL=./zig-out/bin/cell
 TMP=$(mktemp -d) || exit 2
 trap 'rm -rf "$TMP"' EXIT
+
+# ---- docs/OWNERSHIP.md R11 disclosed-leak constants, pinned by commit -----
+# Each number is the exact `leaks -atExit` count this fixture produced when
+# it was measured, over 1000 loop iterations, on THIS commit. Not the number
+# quoted in docs/OWNERSHIP.md's prose (that prose predates these fixtures and
+# used a different string literal in one case, which changes byte totals but
+# not leak counts): re-measured fresh so the constant and the fixture that
+# produces it live in the same place. Re-measured 8 times each and identical
+# every time; see tools/check.sh's header trap note on `leaks -atExit`
+# under-counting by one via a stale stack/register reference, which is why
+# three of these read 999-worth of leaked units rather than the 1000 the
+# source loop actually runs.
+#
+# When one of these changes because a gap in docs/OWNERSHIP.md R11 closed:
+# update the constant AND that document's row, and cite the new commit here.
+LEAKS_MEASURED_AT=78eadb22dd0e943f6f3ed15d8914d58a54e1ed11
+
+# R11 row 1: a Cell body never releases its own `arc` parameter.
+LEAK_PARAM_NEVER_RELEASED=2997
+# R11 row 2: a struct holding an `arc` field is never dropped.
+LEAK_STRUCT_ARC_FIELD=2997
+# R11 row 3: an `arc` value unboxed for a `shared` parameter without ever
+# being bound (`inspect(shared fresh())`) drops its handle on the floor.
+# This is the one row whose count matches docs/OWNERSHIP.md's own prose
+# exactly (2998 leaks / 63968 bytes), because that measurement used the same
+# string length this fixture does.
+LEAK_UNBOUND_SHARED_TEMP=2998
+# R11 row 4: an `arc` local declared inside a block is never released
+# (function-scoped release, block-scoped binding); the "block form" row.
+LEAK_BLOCK_SCOPED_LOCAL=2997
+# R11 row 5: reassigning an `arc` `var` leaks the previous box.
+LEAK_REASSIGNED_VAR=3000
 
 fails=0
 skips=0
@@ -271,6 +335,54 @@ done
 # would not change the number but would leak, so run this under `leaks` when
 # changing the retain rules, not only under this equality.
 run_c_host arc 13 examples/arc_host.c
+
+# -------------------------------------------------------------- 7. leaks --
+# THESE FIXTURES ASSERT LEAKS THAT CURRENTLY EXIST. Read this script's header
+# comment (stage 7) before touching anything below: a fixture failing because
+# its count moved is reporting a real change in codegen, in either direction,
+# and the fix belongs in src/ or in the pinned constant plus
+# docs/OWNERSHIP.md, never in loosening this stage.
+printf '\n== leaks (docs/OWNERSHIP.md R11 disclosed gaps) ==\n'
+if ! command -v leaks > /dev/null 2>&1; then
+    skip "leaks stage entirely (macOS 'leaks' tool not found; R11's disclosed gaps were NOT checked this run)"
+else
+    # Same shape as run_c_host: emit, compile, link against the real runtime
+    # (plus an optional host for a bodyless declaration), except the fixture
+    # is RUN under `leaks -atExit` and the verdict is a leak COUNT rather than
+    # stdout. `host` may be empty; when it is not, the same "isolate the ABI
+    # boundary in a hand-written C file" reasoning documented on run_c_host
+    # applies (examples/leaks/unbound_shared_temp.cell reuses
+    # examples/arc_host.c's existing `cell_inspect` rather than duplicating it).
+    run_c_leaks() {
+        ex=$1; host=$2; want=$3; note=$4
+        $CELL emit "examples/leaks/$ex.cell" > "$TMP/leak_$ex.c" 2>/dev/null \
+            || { fail "leaks: C emit $ex"; return; }
+        if [ -n "$host" ]; then
+            cc -I runtime "$TMP/leak_$ex.c" "$host" runtime/cell_rt.c -o "$TMP/leak_$ex" 2>/dev/null \
+                || { fail "leaks: C compile $ex"; return; }
+        else
+            cc -I runtime "$TMP/leak_$ex.c" runtime/cell_rt.c -o "$TMP/leak_$ex" 2>/dev/null \
+                || { fail "leaks: C compile $ex"; return; }
+        fi
+        got=$(leaks -atExit -- "$TMP/leak_$ex" 2>/dev/null \
+            | sed -n 's/^Process [0-9][0-9]*: \([0-9][0-9]*\) leaks for .*/\1/p' | tail -1)
+        if [ -z "$got" ]; then
+            fail "leaks $ex: could not parse a leak count from 'leaks -atExit' output"
+            return
+        fi
+        if [ "$got" -eq "$want" ]; then
+            pass "leaks $ex -> $got leaks (pinned, $note)"
+        else
+            fail "leaks $ex -> $got leaks, want $want (pinned $note; a DROP means the R11 gap closed and the constant plus docs/OWNERSHIP.md need updating; a RISE, or any leak in a previously clean fixture, means codegen regressed)"
+        fi
+    }
+
+    run_c_leaks param_never_released "" "$LEAK_PARAM_NEVER_RELEASED" "R11 row 1 @ ${LEAKS_MEASURED_AT}"
+    run_c_leaks struct_arc_field "" "$LEAK_STRUCT_ARC_FIELD" "R11 row 2 @ ${LEAKS_MEASURED_AT}"
+    run_c_leaks unbound_shared_temp examples/arc_host.c "$LEAK_UNBOUND_SHARED_TEMP" "R11 row 3 @ ${LEAKS_MEASURED_AT}"
+    run_c_leaks block_scoped_local "" "$LEAK_BLOCK_SCOPED_LOCAL" "R11 row 4 @ ${LEAKS_MEASURED_AT}"
+    run_c_leaks reassigned_var "" "$LEAK_REASSIGNED_VAR" "R11 row 5 @ ${LEAKS_MEASURED_AT}"
+fi
 
 # ---------------------------------------------------------------- verdict --
 printf '\n== verdict ==\n'

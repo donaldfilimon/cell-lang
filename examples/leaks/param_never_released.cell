@@ -1,0 +1,44 @@
+// R11 gap 1 (docs/OWNERSHIP.md, "Still broken" table, row 1): a Cell body
+// never releases its own `arc` parameter, because no parameter is dropped
+// (`Local.droppable` excludes every parameter, arc included), so every
+// reference handed into one leaks. `examples/arc_host.c`'s `cell_observe` is
+// the ABI-correct contrast: it honours `runtime/cell_rt.h` section 7 by
+// dropping the `arc` parameter it is handed, which is exactly what a
+// Cell-bodied `consume` below never does.
+//
+// `make()` returns an already-retained `arc String` (R11 release rule 3, the
+// same shape as `examples/codegen tests` "a call that returns arc is bound
+// without a second retain"); passed to `consume`'s `arc` parameter, the
+// value is not itself a PLACE, so R11 retain rule 2's clone does not fire
+// either (nothing to clone: the callee simply receives the one reference
+// `make()` already produced) and `consume` then does nothing with it. Each
+// call leaks exactly the one box `make()` allocated.
+//
+// This fixture ISOLATES that gap alone: `make()`'s own `let arc a` is
+// declared directly in `make`'s body, not nested under a loop, so the
+// block-scoped-local gap (examples/leaks/block_scoped_local.cell) cannot
+// also fire here, and nothing here is a struct field or a `shared` unbox.
+//
+// Status: parses, passes `cell check`. LLVM and MLIR refuse it (arc is
+// scalar-first-refused there, same as examples/arc.cell); lives under
+// examples/leaks/ so it is invisible to the top-level examples/*.cell
+// corpus, agreement, and mlir-lowering loops (see examples/leaks/README.md).
+
+pub fn print_int(copy value: Int);
+
+pub fn make() -> arc String {
+    let arc a = "x"
+    return a
+}
+
+pub fn consume(arc s: String) {
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        consume(arc make())
+        i = i + 1
+    }
+    print_int(i)
+}

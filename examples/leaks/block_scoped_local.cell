@@ -1,0 +1,34 @@
+// R11 gap 4 (docs/OWNERSHIP.md, "Still broken" table, row 4): an `arc` local
+// declared inside a block is never released, because the drop pass is
+// function-scoped rather than block-scoped, so nothing schedules a release
+// for a binding a nested block (here, a `while` body) pops before the
+// function returns. Re-executing the block reassigns the same C-local
+// variable to a fresh box each time, so the loop leaks one box per iteration
+// after the first: 999 leaks for 1000 iterations, not 1000, since the LAST
+// iteration's box is the one live value the function-scoped drop at the end
+// of `main` actually releases.
+//
+// This fixture ISOLATES that gap alone: `a` is boxed straight from a string
+// literal (BOX, R11 retain rule 1), never touches a struct or a `shared`
+// parameter, and is never reassigned as a `var` would be (that is the
+// SEPARATE gap `reassigned_var.cell` measures). tools/check.sh's `leaks`
+// stage pins the expected leak count; see that file for the number and the
+// commit it was measured at.
+//
+// Status: parses, passes `cell check`. LLVM and MLIR refuse it (arc is
+// scalar-first-refused there, same as examples/arc.cell), which the existing
+// backend-agreement stage already tolerates for arc.cell; this file lives
+// under examples/leaks/ specifically so it is invisible to the top-level
+// examples/*.cell corpus, agreement, and mlir-lowering loops (see
+// examples/leaks/README.md).
+
+pub fn print_int(copy value: Int);
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        let arc a = "leaked-block-local"
+        i = i + 1
+    }
+    print_int(i)
+}

@@ -1,0 +1,38 @@
+// R11 gap 2 (docs/OWNERSHIP.md, "Still broken" table, row 2): a struct
+// holding an `arc` field is never dropped, so rule 4's retain (boxing the
+// literal into `name`, `cell_arc_clone`/`cell_arc_from_string` at the
+// struct-literal field) leaks. `record` shapes are excluded from
+// `hasDropCall` outright, so this holds no matter what ownership the
+// STRUCT binding itself carries (`owned Session` here; `codegen.zig` never
+// emits a free for it, arc field included).
+//
+// This fixture ISOLATES that gap alone: `name` is boxed directly from a
+// string literal in the struct literal (BOX, R11 retain rule 1), so no
+// separate `arc` local is bound first. That matters: an `arc` local bound
+// inside this same `while` body before being stored would ALSO trip the
+// block-scoped-local gap (examples/leaks/block_scoped_local.cell), and this
+// fixture exists to measure the struct-field gap on its own. `sess` is
+// re-declared every iteration inside the loop body, but as an `owned`
+// RECORD, not an `arc` local, so the block-scoped gap (which is specific to
+// `arc`-annotated bindings) does not apply to it.
+//
+// Status: parses, passes `cell check`. LLVM and MLIR refuse it (arc is
+// scalar-first-refused there, same as examples/arc.cell); lives under
+// examples/leaks/ so it is invisible to the top-level examples/*.cell
+// corpus, agreement, and mlir-lowering loops (see examples/leaks/README.md).
+
+pub struct Session {
+    arc name: String
+    copy id: Int
+}
+
+pub fn print_int(copy value: Int);
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        let owned sess = Session { name: "session", id: i }
+        i = i + 1
+    }
+    print_int(i)
+}

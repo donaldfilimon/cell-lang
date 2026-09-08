@@ -1,0 +1,48 @@
+// R11 gap 3 (docs/OWNERSHIP.md, "Still broken" table, row 3): an `arc` value
+// unboxed for a `shared` parameter without ever being bound
+// (`inspect(shared fresh())`) drops its handle on the floor. `fresh()`
+// returns an already-retained `arc String` (R11 release rule 3); passed
+// straight into `inspect`'s `shared String` parameter, `emitArcConversion`'s
+// UNBOX case (have.shape == .arc, want.shape != .arc) reads the pointee
+// through the handle and discards the handle itself, because the unbox exists
+// to express the ONE deliberate non-retain (an `arc` PLACE passed to
+// `shared`, safe by R8) and cannot tell that case apart from a temporary that
+// was never a place at all and has no scope to release it in.
+//
+// `inspect` is declared bodyless on purpose, exactly as
+// docs/OWNERSHIP.md and examples/arc.cell already do: only a real C
+// definition can be measured against the `shared` calling convention at the
+// boundary. examples/arc_host.c already defines `cell_inspect` with this
+// exact signature (reads the borrowed view's length, retains and frees
+// nothing), so this fixture is compiled against that file rather than a new
+// one; tools/check.sh's `run_c_leaks` passes it the same way `run_c_host`
+// already passes it for examples/arc.cell.
+//
+// This fixture ISOLATES that gap alone: `fresh()` boxes a literal into a
+// fresh local (`let arc a = ...`) declared directly in `fresh`'s own body,
+// not inside a block nested under a loop, so the block-scoped-local gap
+// (examples/leaks/block_scoped_local.cell) cannot also fire here.
+//
+// Status: parses, passes `cell check`. LLVM and MLIR refuse it (arc is
+// scalar-first-refused there, same as examples/arc.cell); lives under
+// examples/leaks/ so it is invisible to the top-level examples/*.cell
+// corpus, agreement, and mlir-lowering loops (see examples/leaks/README.md).
+
+pub fn print_int(copy value: Int);
+
+pub fn inspect(shared name: String) -> Int;
+
+pub fn fresh() -> arc String {
+    let arc a = "fresh"
+    return a
+}
+
+pub fn main() {
+    var i = 0
+    var total = 0
+    while i < 1000 {
+        total = total + inspect(shared fresh())
+        i = i + 1
+    }
+    print_int(total)
+}
