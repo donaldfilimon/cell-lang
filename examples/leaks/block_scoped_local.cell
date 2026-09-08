@@ -3,10 +3,19 @@
 // function-scoped rather than block-scoped, so nothing schedules a release
 // for a binding a nested block (here, a `while` body) pops before the
 // function returns. Re-executing the block reassigns the same C-local
-// variable to a fresh box each time, so the loop leaks one box per iteration
-// after the first: 999 leaks for 1000 iterations, not 1000, since the LAST
-// iteration's box is the one live value the function-scoped drop at the end
-// of `main` actually releases.
+// variable to a fresh box each time, so the loop leaks every iteration.
+//
+// MEASURED 2026-09-08, and it corrects what this comment used to claim. The
+// old text said the last iteration's box is released by a function-scoped
+// drop at the end of `main`, which is why the count came out one short. That
+// is FALSE: this program emits ZERO release calls of any kind (`cell emit ...
+// | grep -c cell_arc_drop` is 0), so nothing is ever freed. An interposed
+// malloc counter reports ALLOC=3000 FREE=0 LIVE=3000 for 1000 iterations at
+// three allocations each. The `leaks -atExit` reading of 2997 is a
+// conservative-scan artifact, not a release: the last iteration's
+// allocations are still reachable from a stale stack/register slot when the
+// scan runs. tools/check.sh's leak stage documents the mechanism and both
+// recipes that prove it.
 //
 // This fixture ISOLATES that gap alone: `a` is boxed straight from a string
 // literal (BOX, R11 retain rule 1), never touches a struct or a `shared`
