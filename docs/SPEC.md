@@ -625,8 +625,13 @@ implemented**, because there is no type representation to distinguish them in.
 
 `String` is a length-prefixed `cell_str_t`, matching `runtime/cell_rt.h`.
 Section 10.3 is the ABI table. A literal bound as `arc` is now boxed
-(`cell_arc_from_string(cell_string_from_str(...))`); the remaining string gap
-is `owned`, which still has no coercion from a literal's view.
+(`cell_arc_from_string(cell_string_from_str(...))`). The `owned` gap that
+sentence used to name is CLOSED as of 2026-09-08: the C backend coerces a
+literal's borrowed view into an owning `String` through `cell_string_from_str`
+at eight positions, funnelled through one predicate. The LLVM and MLIR
+backends REFUSE those same programs, because neither can call a `static
+inline` runtime helper, so the three backends disagree here by design rather
+than by accident.
 
 **Any other type name silently becomes `void*` with no diagnostic.** `Int8`,
 `UInt32`, `Char`, a misspelled `Strng`, and every user-defined struct or enum
