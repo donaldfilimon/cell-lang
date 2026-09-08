@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+SOURCE = Path(__file__).resolve().parents[1] / "qualify.py"
+
+FAKE_GATE = r'''#!/bin/sh
+scenario=${FAKE_SCENARIO:-complete}
+stage() { printf '\n== %s ==\n' "$1"; }
+
+# These literal headings are the source-of-truth inventory parsed by qualify.py.
+printf '\n== build ==\n'
+if [ "$scenario" = early ]; then printf '  FAIL  injected build failure\n'; exit 1; fi
+printf '  ok    build\n'
+printf '\n== tests ==\n'
+printf '  ok    tests\n  ....  All 12 tests passed.\n'
+printf '\n== corpus ==\n'
+printf '  ok    corpus\n'
+printf '\n== backend agreement ==\n'
+printf '  ok    agreement\n'
+printf '\n== mlir lowering ==\n'
+if [ "$scenario" = partial ]; then printf '  SKIP  injected missing mlir-opt\n'; else printf '  ok    lowering\n'; fi
+printf '\n== execution ==\n'
+printf '  ok    execution\n'
+printf '\n== leaks (docs/OWNERSHIP.md R11 disclosed gaps) ==\n'
+if [ "$scenario" = disclosed ]; then printf '  ok    leaks fixture -> 3 leaks (pinned, injected)\n'; else printf '  ok    leaks fixture -> 0 leaks (pinned, injected)\n'; fi
+printf '\n== backend answers ==\n'
+printf '  ok    answers\n'
+printf '\n== sanitized execution (AddressSanitizer) ==\n'
+printf '  ok    sanitized\n'
+if [ "$scenario" != missing ]; then
+printf '\n== declared signatures (C is the reference) ==\n'
+  if [ "$scenario" = disclosed ]; then printf '  ok    signatures fixture: MLIR disagrees with C (DISCLOSED, injected)\n'; else printf '  ok    signatures\n'; fi
+fi
+if [ "$scenario" = drift ] || [ "$scenario" = dirtydrift ]; then printf 'drift\n' >> tracked.txt; fi
+if [ "$scenario" = signal ]; then kill -TERM $$; fi
+printf '\n== verdict ==\n'
+printf '  clean\n'
+[ "$scenario" = nonzero ] && exit 7
+exit 0
+'''
+
+
+class QualifyIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="cell qualify ")
+        self.root = Path(self.temp.name)
+        (self.root / "tools").mkdir()
+        shutil.copy2(SOURCE, self.root / "tools/qualify.py")
+        (self.root / "tools/check.sh").write_text(FAKE_GATE)
+        (self.root / "tools/check.sh").chmod(0o755)
+        (self.root / "tracked.txt").write_text("stable\n")
+        (self.root / ".gitignore").write_text(".cell-cache/\n")
+        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=self.root, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=self.root, check=True)
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "fixture"], cwd=self.root, check=True)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def run_qualify(self, scenario: str = "complete", *options: str, env: dict[str, str] | None = None):
+        report = self.root / "artifacts with spaces" / "report.json"
+        command = [str(self.root / "tools/qualify.py"), "--report", str(report), *options]
+        run_env = os.environ.copy()
+        run_env["FAKE_SCENARIO"] = scenario
+        if env:
+            run_env.update(env)
+        result = subprocess.run(command, cwd=self.root, text=True, capture_output=True, env=run_env)
+        return result, json.loads(report.read_text())
+
+    def test_complete_clean_report(self):
+        result, report = self.run_qualify()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(report["verdict"], "qualified")
+        self.assertEqual(report["gate"]["returncode"], 0)
+        self.assertEqual(report["test_counts"], {"library": 12, "cli": None, "runtime": None})
+        self.assertEqual(len(report["stages"]), 10)
+        self.assertTrue(Path(report["artifacts"]["log"]).read_text().endswith("  clean\n"))
+
+    def test_partial_and_strict_skip(self):
+        ordinary, report = self.run_qualify("partial")
+        self.assertEqual((ordinary.returncode, report["verdict"]), (0, "partial"))
+        strict, report = self.run_qualify("partial", "--strict")
+        self.assertEqual(strict.returncode, 1)
+        self.assertIn("strict qualification forbids skipped checks", report["errors"])
+
+    def test_disclosures_and_release_rejection(self):
+        ordinary, report = self.run_qualify("disclosed")
+        self.assertEqual((ordinary.returncode, report["verdict"]), (0, "disclosed"))
+        self.assertEqual(report["disclosed_defects"]["pinned_leaks"][0]["count"], 3)
+        release, report = self.run_qualify("disclosed", "--release")
+        self.assertEqual(release.returncode, 1)
+        self.assertIn("release qualification forbids disclosed defects", report["errors"])
+
+    def test_clean_release(self):
+        result, report = self.run_qualify("complete", "--release")
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(report["release_ready"])
+
+    def test_nonzero_and_early_build_failure(self):
+        result, report = self.run_qualify("nonzero")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(report["gate"]["returncode"], 7)
+        result, report = self.run_qualify("early")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("build", [stage["name"] for stage in report["stages"] if stage["ran"]])
+        self.assertEqual(report["test_counts"]["library"], None)
+
+    def test_source_drift_and_dirty_release(self):
+        result, report = self.run_qualify("drift")
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(report["source"]["drifted"])
+        subprocess.run(["git", "checkout", "--", "tracked.txt"], cwd=self.root, check=True)
+        (self.root / "untracked.txt").write_text("dirty\n")
+        result, report = self.run_qualify("complete", "--release")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("release qualification requires clean input", report["errors"])
+
+    def test_content_change_to_already_dirty_path_is_drift(self):
+        (self.root / "tracked.txt").write_text("already dirty\n")
+        result, report = self.run_qualify("dirtydrift")
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(report["source"]["before"]["dirty"])
+        self.assertTrue(report["source"]["drifted"])
+
+    def test_signal_and_missing_stage(self):
+        result, report = self.run_qualify("signal")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(report["gate"]["returncode"], -15)
+        declared = next(stage for stage in report["stages"] if stage["name"].startswith("declared signatures"))
+        self.assertEqual(declared["outcome"], "incomplete")
+        result, report = self.run_qualify("missing")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("declared signatures (C is the reference)", report["missing_required_stages"])
+
+    def test_missing_tool_versions_are_null(self):
+        absent = str(self.root / "does not exist")
+        result, report = self.run_qualify("complete", env={"ZIG": absent, "CC": absent, "LLVM_BIN": absent})
+        self.assertEqual(result.returncode, 0)
+        self.assertIsNone(report["tools"]["zig"])
+        self.assertIsNone(report["tools"]["clang"])
+        self.assertIsNone(report["tools"]["llvm"])
+
+    def test_default_artifacts_are_ignored(self):
+        result = subprocess.run(
+            [str(self.root / "tools/qualify.py")], cwd=self.root, text=True, capture_output=True,
+            env={**os.environ, "FAKE_SCENARIO": "complete"},
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue((self.root / ".cell-cache/qualification/report.json").is_file())
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=self.root, text=True, capture_output=True, check=True)
+        self.assertEqual(status.stdout, "")
+
+    def test_launch_failure_still_writes_report(self):
+        (self.root / "tools/check.sh").chmod(0o644)
+        result, report = self.run_qualify("complete")
+        self.assertEqual(result.returncode, 1)
+        self.assertIsNone(report["gate"]["returncode"])
+        self.assertIsNotNone(report["gate"]["launch_error"])
+
+
+if __name__ == "__main__":
+    unittest.main()
