@@ -53,8 +53,9 @@ copy T         // value / trivial copy (Swift struct default)
 ```
 
 Ownership defaults to `owned` when omitted, in every position, so a bare
-`f(x)` is a move. Move, aliasing, escape, immutable-assignment, and call-site
-agreement rules are enforced; `arc` retain/release is not. See *Status*.
+`f(x)` is a move. Move, aliasing, escape, immutable-assignment and call-site
+agreement rules are enforced, and so is `arc` retain/release in the C backend.
+See *Status* for what that does and does not cover.
 
 ## Source file extensions
 
@@ -116,8 +117,8 @@ The parsed surface is enforced and executable, through **three backends**.
 `cell check` typechecks and borrow-checks. `cell emit` produces C that `cc -c`
 accepts for `examples/hello.cell`, `examples/control_flow.cell`, and
 `examples/ownership.cell`; `examples/hello.cell` linked against
-`runtime/cell_rt.c` prints `42`. `examples/arc.cell` does not compile until
-arc boxing exists.
+`runtime/cell_rt.c` prints `42`. `examples/arc.cell` compiles and runs too,
+linked against `examples/arc_host.c`, and prints a live refcount.
 
 `cell emit --target=llvm` and `cell emit --target=mlir` produce textual LLVM IR
 and MLIR by way of a typed IR in `src/cell/hir.zig`. Both are verified by
@@ -135,20 +136,51 @@ convention by hand on AArch64, and every aggregate constructor in
 MLIR backend carries structs too, as `!llvm.struct`, so `examples/hello.cell`
 now runs through all three backends and prints `42` from each.
 
-Ownership rules R2 (use-after-move), R3 (move-out-of-borrow), R5 (shared XOR
-exclusive), R8 (escaping borrow), and R14 (immutable assignment, including
-fields) are enforced, and so is R15: an explicit ownership prefix on a call
-argument must match the parameter's annotation. Retain/release for `arc`,
-loops, generics, `Result<T,E>`, and enum payloads are still designed. `.cell`/`.cel` modules pair with `.body`/`.bod` by stem.
-See `docs/SPEC.md` section 12 and `docs/OWNERSHIP.md`.
+Enforced ownership rules, read off `src/cell/borrowck.zig`'s own header
+rather than from memory: **R1, R2, R3, R3a, R4, R5, R6, R8, R14, R15**, plus
+the first clause of **R10** (an `arc` place may not be made unique, refused at
+four positions). `arc` retain and release are emitted by the C backend, with
+the gaps named honestly in `docs/OWNERSHIP.md` R11 and measured rather than
+guessed. Still designed and not implemented: non-lexical lifetimes, generics,
+`Result<T,E>`, and enum payloads. `.cell`/`.cel` modules pair with
+`.body`/`.bod` by stem. See `docs/SPEC.md` section 12 and `docs/OWNERSHIP.md`.
 
-There are no loops of any kind. `while` is not a keyword, so a loop-shaped
-program is a call plus a discarded block; today `cell check` rejects
-`examples/rejected/while_is_not_a_loop.cell` as `unknown identifier 'while'`.
+**Loops exist.** `while` is a keyword, with `break` and `continue`;
+`examples/loops.cell` runs through all three backends and prints `55` from
+each. An earlier version of this section said the opposite and cited a rejected
+example that no longer exists, which is the kind of claim this project's own
+status-honesty standard exists to prevent. Loops also brought their own
+ownership rule, R2.a, for a move inside a loop body. `for` and `loop` are not
+implemented.
 
 Cell has no measured performance characteristics and no ABI-stability
 guarantee. Memory-safety claims cover only the rules the checker actually
 enforces.
+
+## Checking any of this yourself
+
+`tools/check.sh` is the gate and its exit code is the verdict. Six stages:
+build; unit tests with the count printed; the four corpus contracts in
+`examples/README.md`; LLVM-versus-MLIR verdict agreement on every example;
+that emitted MLIR actually **lowers** (a verdict is not a lowering, and an
+example spent its whole life on the accepted side while emitting text
+`mlir-opt` could never consume); and real execution, where emitted code is
+compiled, linked against the runtime, run, and its answer compared.
+
+```sh
+zig build -Dswift=false     # -Dswift=false is required; see Requirements
+tools/check.sh
+```
+
+To run one program of your own through all three backends,
+`.claude/skills/run-cell-lang/driver.sh --expect <value> yourfile.cell` emits,
+compiles, links, runs and compares for each. It checks the program's exit
+status as well as its output, because a program that prints the right answer
+and then dies is not a pass.
+
+Counts are deliberately not quoted here. The test count moved by more than
+thirty in a single evening, and a number this file cannot keep current is worse
+than no number: run the gate and read its own output.
 
 ## License
 
