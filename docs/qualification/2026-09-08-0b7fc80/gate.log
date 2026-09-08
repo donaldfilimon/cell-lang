@@ -1,0 +1,102 @@
+
+== build ==
+  ok    zig build -Dswift=false
+
+== tests ==
+  ok    zig build test -Dswift=false
+  ....  All 414 tests passed.
+
+== corpus ==
+  ok    all four corpus contracts hold
+
+== backend agreement ==
+  ok    llvm and mlir agree on every example
+
+== mlir lowering ==
+  ok    every emitted MLIR module lowers
+
+== execution ==
+  ok    C    hello -> 42
+  ok    LLVM hello -> 42
+  ok    MLIR hello -> 42
+  ok    C    backends -> 24
+  ok    LLVM backends -> 24
+  ok    MLIR backends -> 24
+  ok    C    loops -> 55
+  ok    LLVM loops -> 55
+  ok    MLIR loops -> 55
+  ok    C    arc -> 13
+  ok    C    owned_string -> 44
+
+== leaks (docs/OWNERSHIP.md R11 disclosed gaps) ==
+  ok    leaks param_never_released -> 2997 leaks (pinned, R11 row 1 @ 78eadb22dd0e943f6f3ed15d8914d58a54e1ed11)
+  ok    leaks struct_arc_field -> 2997 leaks (pinned, R11 row 2 @ 78eadb22dd0e943f6f3ed15d8914d58a54e1ed11)
+  ok    leaks unbound_shared_temp -> 0 leaks (pinned, R11 row 3, CLOSED @ 460b9a3)
+  ok    leaks block_scoped_local -> 2997 leaks (pinned, R11 row 4 @ 78eadb22dd0e943f6f3ed15d8914d58a54e1ed11)
+  ok    leaks reassigned_var -> 3000 leaks (pinned, R11 row 5 @ 78eadb22dd0e943f6f3ed15d8914d58a54e1ed11)
+
+== backend answers ==
+  ....  arc                    C              -> 13
+  ....  arc_return_field       C              -> 7
+  ....  backends               C/LLVM/MLIR    -> 24
+  ....  borrows                C/LLVM/MLIR    -> 
+  ....  exclusive_aggregates   C/LLVM/MLIR    -> 7320
+  ....  hello                  C/LLVM/MLIR    -> 42
+  ....  let_binding_modes      C/LLVM/MLIR    -> 14242
+  ....  loops                  C/LLVM/MLIR    -> 55
+  ....  owned_string           C              -> 44
+  ....  ownership              C              -> 
+  ....  while_is_now_a_loop    C/LLVM/MLIR    -> 10
+  ....  write_through          C/LLVM/MLIR    -> 142
+  ....  write_through_named    C/LLVM/MLIR    -> 122
+  ....  write_through_whole    C/LLVM/MLIR    -> 42
+  ....  14 program(s) compared, 12 of them printing, 7 pinned by EXPECT-OUTPUT
+  ok    every backend that runs an example computes the same answer
+
+== sanitized execution (AddressSanitizer) ==
+  ....  14 program(s) run under AddressSanitizer
+  ok    every runnable example is clean under AddressSanitizer
+
+== declared signatures (C is the reference) ==
+  ....  arc                            C only (both IR backends refuse it)
+  ....  arc_return_field               C only (both IR backends refuse it)
+  ....  backends                       C vs LLVM MLIR
+  ....  bindings                       C vs LLVM MLIR
+  ....  borrows                        C vs LLVM MLIR
+  ....  control_flow                   C vs LLVM MLIR
+  ....  declarations                   C vs LLVM MLIR
+  ....  exclusive_aggregates           C vs LLVM MLIR
+  ....  expressions                    C vs LLVM MLIR
+  ....  hello                          C vs LLVM MLIR
+  ....  let_binding_modes              C vs LLVM MLIR
+  ....  loops                          C vs LLVM MLIR
+  ....  nll_dead_borrow                C vs LLVM MLIR
+  ....  owned_string                   C only (both IR backends refuse it)
+  ....  ownership                      C only (both IR backends refuse it)
+  ....  pattern_matching               C vs LLVM MLIR
+  ok    signatures primitives cell_take_list: MLIR disagrees with C (DISCLOSED, pinned in SIG_DISCLOSED)
+        C    i64|ptr
+        MLIR i64|agg24
+  ok    signatures primitives cell_take_nested: MLIR disagrees with C (DISCLOSED, pinned in SIG_DISCLOSED)
+        C    i64|ptr
+        MLIR i64|agg24
+  ....  primitives                     C vs LLVM MLIR
+  ....  structs_enums                  C vs LLVM MLIR
+  ....  while_is_now_a_loop            C vs LLVM MLIR
+  ....  write_through                  C vs LLVM MLIR
+  ....  write_through_named            C vs LLVM MLIR
+  ....  write_through_whole            C vs LLVM MLIR
+  ....  pairing/geometry               C vs LLVM MLIR
+  ok    signatures signatures/arc_string_return cell_f: LLVM disagrees with C (DISCLOSED, pinned in SIG_DISCLOSED)
+        C    void|sret:{ptr,ptr,ptr}
+        LLVM void|sret:{ptr,i64,i64}
+  ok    signatures signatures/arc_string_return cell_f: MLIR disagrees with C (DISCLOSED, pinned in SIG_DISCLOSED)
+        C    void|sret:{ptr,ptr,ptr}
+        MLIR void|sret:{ptr,i64,i64}
+  ....  signatures/arc_string_return   C vs LLVM MLIR
+  ....  203 function signature(s) compared across 24 example(s), 4 C-only; 4 disagreement(s), 4 of them disclosed and 0 NOT
+  ok    every backend that declares a function declares C's calling convention for it
+
+== verdict ==
+  clean
+

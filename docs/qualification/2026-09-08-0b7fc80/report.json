@@ -1,0 +1,173 @@
+{
+  "artifacts": {
+    "log": "/private/tmp/cell-qualification/gate.log",
+    "report": "/private/tmp/cell-qualification/report.json"
+  },
+  "disclosed_defects": {
+    "abi_signatures": [
+      "ok    signatures primitives cell_take_list: MLIR disagrees with C (DISCLOSED, pinned in SIG_DISCLOSED)",
+      "ok    signatures primitives cell_take_nested: MLIR disagrees with C (DISCLOSED, pinned in SIG_DISCLOSED)",
+      "ok    signatures signatures/arc_string_return cell_f: LLVM disagrees with C (DISCLOSED, pinned in SIG_DISCLOSED)",
+      "ok    signatures signatures/arc_string_return cell_f: MLIR disagrees with C (DISCLOSED, pinned in SIG_DISCLOSED)"
+    ],
+    "pinned_leaks": [
+      {
+        "count": 2997,
+        "fixture": "param_never_released"
+      },
+      {
+        "count": 2997,
+        "fixture": "struct_arc_field"
+      },
+      {
+        "count": 2997,
+        "fixture": "block_scoped_local"
+      },
+      {
+        "count": 3000,
+        "fixture": "reassigned_var"
+      }
+    ]
+  },
+  "errors": [],
+  "failures": [],
+  "gate": {
+    "launch_error": null,
+    "path": "/Users/donaldfilimon/dev/active/cell-lang/tools/check.sh",
+    "returncode": 0
+  },
+  "gate_printed_clean": true,
+  "missing_required_stages": [],
+  "mode": "ordinary",
+  "platform": {
+    "machine": "arm64",
+    "release": "27.0.0",
+    "system": "Darwin"
+  },
+  "release_ready": false,
+  "required_stage_names": [
+    "build",
+    "tests",
+    "corpus",
+    "backend agreement",
+    "mlir lowering",
+    "execution",
+    "leaks (docs/OWNERSHIP.md R11 disclosed gaps)",
+    "backend answers",
+    "sanitized execution (AddressSanitizer)",
+    "declared signatures (C is the reference)"
+  ],
+  "schema_version": 1,
+  "skips": [],
+  "source": {
+    "after": {
+      "branch": "main",
+      "dirty": false,
+      "dirty_fingerprint": "5d4518eb0eab2f21ec97dc62273d1215dbfdc1d54bb1d69c1882b0953e13f0a7",
+      "head": "0b7fc80c1a0ba37ff140219891af0efe908cf0f5",
+      "valid": true
+    },
+    "before": {
+      "branch": "main",
+      "dirty": false,
+      "dirty_fingerprint": "5d4518eb0eab2f21ec97dc62273d1215dbfdc1d54bb1d69c1882b0953e13f0a7",
+      "head": "0b7fc80c1a0ba37ff140219891af0efe908cf0f5",
+      "valid": true
+    },
+    "drifted": false
+  },
+  "stages": [
+    {
+      "completed": true,
+      "failures": [],
+      "name": "build",
+      "outcome": "passed",
+      "ran": true,
+      "skips": []
+    },
+    {
+      "completed": true,
+      "failures": [],
+      "name": "tests",
+      "outcome": "passed",
+      "ran": true,
+      "skips": []
+    },
+    {
+      "completed": true,
+      "failures": [],
+      "name": "corpus",
+      "outcome": "passed",
+      "ran": true,
+      "skips": []
+    },
+    {
+      "completed": true,
+      "failures": [],
+      "name": "backend agreement",
+      "outcome": "passed",
+      "ran": true,
+      "skips": []
+    },
+    {
+      "completed": true,
+      "failures": [],
+      "name": "mlir lowering",
+      "outcome": "passed",
+      "ran": true,
+      "skips": []
+    },
+    {
+      "completed": true,
+      "failures": [],
+      "name": "execution",
+      "outcome": "passed",
+      "ran": true,
+      "skips": []
+    },
+    {
+      "completed": true,
+      "failures": [],
+      "name": "leaks (docs/OWNERSHIP.md R11 disclosed gaps)",
+      "outcome": "passed",
+      "ran": true,
+      "skips": []
+    },
+    {
+      "completed": true,
+      "failures": [],
+      "name": "backend answers",
+      "outcome": "passed",
+      "ran": true,
+      "skips": []
+    },
+    {
+      "completed": true,
+      "failures": [],
+      "name": "sanitized execution (AddressSanitizer)",
+      "outcome": "passed",
+      "ran": true,
+      "skips": []
+    },
+    {
+      "completed": true,
+      "failures": [],
+      "name": "declared signatures (C is the reference)",
+      "outcome": "passed",
+      "ran": true,
+      "skips": []
+    }
+  ],
+  "test_counts": {
+    "cli": null,
+    "library": 414,
+    "runtime": null
+  },
+  "tools": {
+    "clang": "Apple clang version 21.0.0 (clang-2100.3.33.1)",
+    "llvm": "Homebrew LLVM version 23.1.0",
+    "python": "3.14.7",
+    "zig": "0.17.0-dev.2018+ab30a0b9a"
+  },
+  "verdict": "disclosed"
+}
