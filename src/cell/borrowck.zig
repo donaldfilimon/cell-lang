@@ -26,10 +26,20 @@
 //! per statement, and one region around a whole `if` so a borrow taken in the
 //! condition survives the branches and dies with the `if`.
 //!
-//! Where a lexical rejection would be accepted under non-lexical lifetimes the
-//! checker says so in a note, but only when it can prove the holding binding is
-//! never mentioned again. An unprovable case gets no note, because a wrong
-//! "this would be fine under NLL" is worse than a missing one.
+//! **Non-lexical lifetimes for NAMED loans, slices 1 and 2.** A named loan
+//! whose holder is provably never reached again does not block a conflicting
+//! read, move, borrow or assignment: `loanStatusAt` decides, all four conflict
+//! sites route through `findBlockingLoan`, and `dead` is the only status that
+//! accepts. It replaces the note that used to say "this would be accepted
+//! under non-lexical lifetimes", which is now the acceptance itself.
+//!
+//! `dead` needs BOTH a forward scan and a window scan, which see disjoint
+//! regions; the doc comment on `loanStatusAt` argues they are exhaustive over
+//! a loan's live range, and the one on `oracleDead` explains why that argument
+//! is checked at runtime by a second, deliberately stupid predicate rather
+//! than trusted. Slice 3, a taint closure over derived bindings, is
+//! deliberately absent: `let exclusive f = e` makes the loan `ineligible`,
+//! which rejects, and rejecting is always safe here.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -127,6 +137,26 @@ const LoanStatus = enum {
     ineligible,
 };
 
+/// The differential oracle's answer. `not_applicable` is not "dead": it means
+/// the oracle declined, and the assertion is skipped for that loan.
+const OracleVerdict = enum { dead, live, not_applicable };
+
+/// The oracle's name closure. A set of names, with no scope, no order and no
+/// binding identity: that absence is the point.
+const NameSet = std.StringHashMapUnmanaged(void);
+
+/// Whether an expression sits in the one whitelisted position. Propagated DOWN
+/// the walk by `oracleFindExpr`, rather than recovered by peeling upward the
+/// way the checker's `argPropagatesName` does. Same whitelist, different
+/// mechanism, which is the point of having two.
+const ArgContext = enum {
+    /// A direct argument of a call, or an ownership keyword or `&`/`&mut`
+    /// sigil still wrapping one. R8 stops the callee keeping what it is given.
+    call_arg,
+    /// Everything else.
+    other,
+};
+
 /// A block currently being walked, with the index of the statement in it that
 /// is being checked. Used to decide whether a named loan is ever read again.
 const OpenBlock = struct {
@@ -192,6 +222,10 @@ pub const Checker = struct {
     /// function; a body reports at each returned expression (the use) and
     /// the flag stops that return from also being a move-out-of-borrow.
     fn_return_borrow: ?LoanKind = null,
+    /// The function whose body is being walked. Read only by the differential
+    /// oracle, which needs the whole body and the parameter list at once,
+    /// which the region-walking state above deliberately does not keep.
+    current_fn: ?*const ast.FnDef = null,
 
     const ScopeMark = struct {
         bindings: usize,
@@ -258,6 +292,8 @@ pub const Checker = struct {
 
     fn checkFn(self: *Checker, span: Span, f: *const ast.FnDef) Error!void {
         self.fn_return_borrow = null;
+        self.current_fn = f;
+        defer self.current_fn = null;
         if (f.return_type) |*rt| {
             if (typeIsBorrow(rt)) |kind| {
                 self.fn_return_borrow = kind;
@@ -595,7 +631,12 @@ pub const Checker = struct {
         // R5 applied to a write. The spec fixes the wording for reads only;
         // a write is strictly stronger than a read, so an outstanding loan of
         // either kind blocks it.
-        if (self.findConflictingLoan(place, .exclusive)) |loan| {
+        //
+        // THE FOURTH SITE. `readPlace`, `movePlace` and `createLoan` all
+        // consulted the NLL predicate and this one did not, so an assignment
+        // was rejected by a loan the other three had already stopped
+        // rejecting. Three enumerated, a fourth missed.
+        if (try self.findBlockingLoan(place, .exclusive)) |loan| {
             try self.diagnostics.err(
                 self.allocator,
                 place.span,
@@ -889,7 +930,7 @@ pub const Checker = struct {
             try self.reportUseAfterMove(d, place.span);
             return;
         }
-        if (self.findConflictingLoan(place, .shared)) |loan| {
+        if (try self.findBlockingLoan(place, .shared)) |loan| {
             if (loan.kind == .exclusive) {
                 try self.diagnostics.err(
                     self.allocator,
@@ -897,7 +938,6 @@ pub const Checker = struct {
                     try self.msg("cannot use '{s}' while it is exclusively borrowed", .{place.display}),
                 );
                 try self.noteLoanScope(loan);
-                try self.maybeNoteNll(loan, place.span);
             }
         }
     }
@@ -932,7 +972,7 @@ pub const Checker = struct {
         }
 
         // R6: a live loan anywhere on the path blocks the move.
-        if (self.findConflictingLoan(place, .exclusive)) |loan| {
+        if (try self.findBlockingLoan(place, .exclusive)) |loan| {
             const message = if (loan.path.len > place.path.len)
                 try self.msg(
                     "cannot move '{s}': its field '{s}' is borrowed",
@@ -942,7 +982,6 @@ pub const Checker = struct {
                 try self.msg("cannot move '{s}' while it is borrowed", .{place.display});
             try self.diagnostics.err(self.allocator, place.span, message);
             try self.noteLoanScope(loan);
-            try self.maybeNoteNll(loan, place.span);
             return;
         }
 
@@ -973,7 +1012,7 @@ pub const Checker = struct {
             return;
         }
 
-        if (self.findConflictingLoan(place, kind)) |loan| {
+        if (try self.findBlockingLoan(place, kind)) |loan| {
             // R4: two shared loans of the same place are fine, and the only
             // pair `findConflictingLoan` lets through.
             try self.diagnostics.err(
@@ -985,7 +1024,6 @@ pub const Checker = struct {
                 ),
             );
             try self.noteLoanScope(loan);
-            try self.maybeNoteNll(loan, place.span);
             return;
         }
 
@@ -1046,18 +1084,9 @@ pub const Checker = struct {
         return null;
     }
 
-    /// The first active loan that conflicts with taking `kind` on `place`.
-    /// Shared against shared never conflicts (R4); everything else does.
-    fn findConflictingLoan(self: *const Checker, place: Place, kind: LoanKind) ?Loan {
-        for (self.block_loans.items) |loan| {
-            if (loanConflicts(loan, place, kind)) return loan;
-        }
-        for (self.temp_loans.items) |loan| {
-            if (loanConflicts(loan, place, kind)) return loan;
-        }
-        return null;
-    }
-
+    /// Whether `loan` conflicts with taking `kind` on `place`, ignoring
+    /// whether the loan is still live. Shared against shared never conflicts
+    /// (R4); everything else does. `findBlockingLoan` adds the liveness half.
     fn loanConflicts(loan: Loan, place: Place, kind: LoanKind) bool {
         if (loan.binding != place.binding) return false;
         // R6: disjoint field paths never conflict.
@@ -1235,13 +1264,168 @@ pub const Checker = struct {
     /// Anything at a block level nested inside the loan's block is reached
     /// through (a)'s full-statement counting of the enclosing statement, so
     /// only the loan's own block has a gap for (b) to fill.
-    fn loanStatusAt(self: *const Checker, loan: Loan) LoanStatus {
+    fn loanStatusAt(self: *Checker, loan: Loan, at: Span) Error!LoanStatus {
         // A temporary loan dies with its statement or its `if`, so the lexical
         // model already ends it as early as NLL would.
         if (!loan.lexical) return .ineligible;
         const holder = loan.holder orelse return .ineligible;
         if (self.windowPropagates(loan, holder)) return .ineligible;
         if (self.nameUsedFrom(holder, loan.block_index)) return .live;
+        // The differential oracle, armed in every safety-checked build, so
+        // the whole test suite and the whole example corpus exercise it
+        // without a single test being written for it. See `oracleDead`.
+        if (std.debug.runtime_safety) {
+            switch (try self.oracleDead(loan, holder, at)) {
+                .dead, .not_applicable => {},
+                .live => {
+                    std.debug.print(
+                        "borrowck NLL differential oracle disagreed\n" ++
+                            "  holder: '{s}'\n" ++
+                            "  loan of '{s}' at line {d} column {d}\n" ++
+                            "  loanStatusAt: dead (an ACCEPTANCE)\n" ++
+                            "  oracleDead:   live\n" ++
+                            "The precise predicate accepted a program the " ++
+                            "conservative one holds live. Trust the oracle: " ++
+                            "this is the enumeration failure the oracle exists " ++
+                            "to catch, and shipping it is a use-after-free.\n",
+                        .{ holder, loan.display, loan.span.line, loan.span.column },
+                    );
+                    @panic("borrowck: NLL differential oracle disagreed on a loan the checker called dead");
+                },
+            }
+        }
+        return .dead;
+    }
+
+    /// The first loan that conflicts with taking `kind` on `place` AND that
+    /// non-lexical lifetimes still consider live. A conflicting loan whose
+    /// status is `dead` is skipped, and that skip IS the acceptance: the
+    /// caller sees no conflict and reports nothing.
+    ///
+    /// A dead loan is deliberately left in `block_loans` rather than removed.
+    /// Removing it would be equivalent but would make the acceptance depend on
+    /// the order conflicts happen to be checked in; leaving it makes every
+    /// site ask the same question independently. It is also monotone: `dead`
+    /// means the holder is mentioned nowhere from here on, so a loan that is
+    /// dead at this statement is dead at every later one in the same block.
+    fn findBlockingLoan(self: *Checker, place: Place, kind: LoanKind) Error!?Loan {
+        for (self.block_loans.items) |loan| {
+            if (!loanConflicts(loan, place, kind)) continue;
+            if (try self.loanStatusAt(loan, place.span) == .dead) continue;
+            return loan;
+        }
+        // A temporary is never `lexical`, so it is always `ineligible` and is
+        // never skipped. It is routed through the same predicate anyway so
+        // there is one place that decides what ends a loan early.
+        for (self.temp_loans.items) |loan| {
+            if (!loanConflicts(loan, place, kind)) continue;
+            if (try self.loanStatusAt(loan, place.span) == .dead) continue;
+            return loan;
+        }
+        return null;
+    }
+
+    /// THE DIFFERENTIAL ORACLE, and the primary defence for the acceptance
+    /// above. It answers the same question as `loanStatusAt` and is written
+    /// to be wrong only in the safe direction.
+    ///
+    /// WHY A SECOND PREDICATE AT ALL. "The loan is dead here" is a claim over
+    /// all forward paths, and the way this compiler has repeatedly got such
+    /// claims wrong is by enumerating some forms of a construct and asserting
+    /// a property of all of them. `loanStatusAt` is exactly that shape: two
+    /// scans, each with a region it cannot see, meeting at a boundary. So it
+    /// is checked against a predicate built the opposite way, which enumerates
+    /// nothing about program structure:
+    ///
+    /// 1. Take the transitive closure of names, starting from the holder, over
+    ///    the WHOLE function body, ignoring scopes, blocks, statement order
+    ///    and control flow entirely. A binding joins the closure when its
+    ///    `let` initializer or `assign` value mentions a name already in it.
+    /// 2. The loan is dead only if no name in the closure occurs anywhere
+    ///    after the loan's own span.
+    ///
+    /// It greps a function rather than walking its regions, so it has no
+    /// region to forget. `let exclusive f = e` puts `f` in the closure and
+    /// `grow(exclusive f, ...)` then holds the loan live no matter where the
+    /// two statements sit relative to each other.
+    ///
+    /// **DEVIATION FROM THE BRIEF, DELIBERATE AND REPORTED.** The brief
+    /// specifies step 2 as "no name in the closure appears anywhere after the
+    /// loan's `let`", full stop. That is exactly right for a predicate with an
+    /// empty whitelist, and it CONTRADICTS the call-argument whitelist: in
+    /// `let exclusive e = &mut buf; grow(exclusive e, shared 1); read(&buf)`
+    /// the holder does appear after the `let`, so the oracle would fire on the
+    /// very shape the whitelist exists to accept. Both halves of the oracle
+    /// therefore honor the same whitelist, in step 1 as well as step 2 (if the
+    /// closure ignored it, `let copy n = read(shared e)` would taint `n` and
+    /// any later use of `n` would fire). What stays independent is the
+    /// implementation: `oracleFindExpr` propagates an argument CONTEXT down a
+    /// single walk and reports occurrence offsets, where the checker peels an
+    /// argument and returns a boolean. A whitelist bug is shared; a region,
+    /// order or control-flow bug is not, and those are the failures that
+    /// actually happen here.
+    ///
+    /// **KNOWN HOLE, and why it is a `not_applicable` rather than a fix.**
+    /// The oracle is blind to shadowing, which makes it more conservative
+    /// everywhere except one case: a loan in an inner block whose holder name
+    /// is ALSO an outer binding used after that block. The checker never scans
+    /// outside the loan's block, correctly, because the loan cannot outlive
+    /// it; the oracle scans the whole function and would see the outer use.
+    /// Rather than teach the oracle about scopes, which is the knowledge it
+    /// exists not to have, it declines to answer when the holder name is
+    /// declared more than once in the function.
+    ///
+    /// **SECOND KNOWN HOLE, narrower and stated rather than hidden.** A
+    /// program that uses a name OUTSIDE the block that declared it is invalid
+    /// (typecheck reports an unknown identifier), but this oracle would see
+    /// that use, call the loan live, and panic before the diagnostic is
+    /// printed. It needs the name to be declared exactly once, used out of
+    /// scope, AND to hold a loan the checker reaches a conflict on. The
+    /// failure is a loud panic on an already-broken program, not a wrong
+    /// answer on a valid one, which is the direction to fail in.
+    /// **WHERE THE WHITELIST APPLIES, AND WHERE IT MUST NOT.** The whitelist
+    /// answers "can this mention have put the reference somewhere I cannot
+    /// see", not "is the holder still used here". Those are the same question
+    /// only BEHIND the conflict:
+    ///
+    /// * Between the loan's `let` and `at`, a direct call argument is fine.
+    ///   The loan was correctly live during that call, the call ended, and R8
+    ///   says nothing kept the reference.
+    /// * At or after `at`, ANY mention keeps the loan live, call argument or
+    ///   not, because it is a use of a loan the caller is about to end.
+    ///
+    /// A first version of this function whitelisted call arguments in both
+    /// regions, and it was caught by running it: with the match-guard hole
+    /// deliberately reintroduced into `exprUsesName`, the checker accepted
+    /// `match 1 { _ if use_it(shared e) > 0 => 1, _ => 2 }` after a
+    /// conflicting borrow and this oracle AGREED, because the use sits in a
+    /// call argument. Splitting at `at` makes it disagree, which is the whole
+    /// reason the oracle exists.
+    fn oracleDead(
+        self: *Checker,
+        loan: Loan,
+        holder: []const u8,
+        at: Span,
+    ) Error!OracleVerdict {
+        const f = self.current_fn orelse return .not_applicable;
+        const body = f.body orelse return .not_applicable;
+        if (oracleDeclarationCount(f, holder) != 1) return .not_applicable;
+
+        var names: NameSet = .empty;
+        defer names.deinit(self.allocator);
+        try names.put(self.allocator, holder, {});
+
+        var changed = true;
+        while (changed) {
+            changed = false;
+            try oracleTaintStmts(self.allocator, body, &names, &changed);
+        }
+
+        // `+ 1` makes it strictly after: the loan's own span is the borrowed
+        // place, which is not the holder, but the bound is stated exactly
+        // rather than left to that coincidence.
+        const after = loan.span.start +| 1;
+        if (oracleFindStmts(body, &names, after, at.start) != null) return .live;
         return .dead;
     }
 
@@ -1263,22 +1447,6 @@ pub const Checker = struct {
             if (stmtPropagatesName(s, holder)) return true;
         }
         return false;
-    }
-
-    /// OWNERSHIP.md 0.3 asks the checker to say when a rejection is its own
-    /// conservatism. Only a named lexical loan can be the cause, and only when
-    /// `loanStatusAt` proves the loan dead: an unprovable case gets no note.
-    fn maybeNoteNll(self: *Checker, loan: Loan, at: Span) Error!void {
-        if (self.loanStatusAt(loan) != .dead) return;
-        const holder = loan.holder.?;
-        try self.diagnostics.note(
-            self.allocator,
-            at,
-            try self.msg(
-                "this would be accepted under non-lexical lifetimes: '{s}' is never used again, but Cell ends a named borrow at the end of its block",
-                .{holder},
-            ),
-        );
     }
 
     /// Whether `name` appears anywhere from the statement being checked to the
@@ -1606,6 +1774,306 @@ fn argPropagatesName(arg: *const ast.Expr, name: []const u8) bool {
             else => return exprPropagatesName(cursor, name),
         }
     }
+}
+
+// ── the differential oracle ─────────────────────────────────────────────
+//
+// A second implementation of "is this loan dead", written so conservatively
+// that it cannot have a missing case, and asserted against the precise one in
+// every safety-checked build. `Checker.oracleDead` carries the argument for
+// why it exists, the one deviation from its brief, and its one known hole.
+//
+// Everything below ignores scopes, blocks, statement order and control flow.
+// It is a grep with a fixpoint, not an analysis.
+
+/// How many times `name` is DECLARED in `f`: parameters, `let` statements at
+/// any depth, and match-arm binding patterns. The oracle declines when this is
+/// not exactly 1, because shadowing is the one thing its scope blindness gets
+/// wrong in the unsafe direction for the ASSERTION (never for the language).
+fn oracleDeclarationCount(f: *const ast.FnDef, name: []const u8) usize {
+    var n: usize = 0;
+    for (f.params) |p| {
+        if (std.mem.eql(u8, p.name, name)) n += 1;
+    }
+    if (f.body) |body| n += oracleDeclCountStmts(body, name);
+    return n;
+}
+
+fn oracleDeclCountStmts(stmts: []const ast.Stmt, name: []const u8) usize {
+    var n: usize = 0;
+    for (stmts) |*s| {
+        switch (s.kind) {
+            .let => |l| {
+                if (std.mem.eql(u8, l.name, name)) n += 1;
+                if (l.value) |v| n += oracleDeclCountExpr(&v, name);
+            },
+            .expr => |e| n += oracleDeclCountExpr(&e, name),
+            .return_stmt => |opt| if (opt) |e| {
+                n += oracleDeclCountExpr(&e, name);
+            },
+            .assign => |a| {
+                n += oracleDeclCountExpr(&a.target, name);
+                n += oracleDeclCountExpr(&a.value, name);
+            },
+            .while_stmt => |w| {
+                n += oracleDeclCountExpr(&w.cond, name);
+                n += oracleDeclCountStmts(w.body, name);
+            },
+            .break_stmt, .continue_stmt => {},
+        }
+    }
+    return n;
+}
+
+fn oracleDeclCountExpr(e: *const ast.Expr, name: []const u8) usize {
+    return switch (e.kind) {
+        .ident, .int, .float, .string, .bool => 0,
+        .call => |c| blk: {
+            var n = oracleDeclCountExpr(c.callee, name);
+            for (c.args) |*a| n += oracleDeclCountExpr(a, name);
+            break :blk n;
+        },
+        .binary => |b| oracleDeclCountExpr(b.left, name) + oracleDeclCountExpr(b.right, name),
+        .unary => |u| oracleDeclCountExpr(u.operand, name),
+        .field => |f| oracleDeclCountExpr(f.base, name),
+        .annotated => |a| oracleDeclCountExpr(a.value, name),
+        .struct_lit => |sl| blk: {
+            var n: usize = 0;
+            for (sl.fields) |*f| n += oracleDeclCountExpr(&f.value, name);
+            break :blk n;
+        },
+        .list_lit => |items| blk: {
+            var n: usize = 0;
+            for (items) |*item| n += oracleDeclCountExpr(item, name);
+            break :blk n;
+        },
+        .block => |stmts| oracleDeclCountStmts(stmts, name),
+        .if_expr => |i| blk: {
+            var n = oracleDeclCountExpr(i.cond, name) + oracleDeclCountExpr(i.then_body, name);
+            if (i.else_body) |eb| n += oracleDeclCountExpr(eb, name);
+            break :blk n;
+        },
+        .match_expr => |m| blk: {
+            var n = oracleDeclCountExpr(m.scrutinee, name);
+            for (m.arms) |arm| {
+                if (arm.pattern.kind == .binding and
+                    std.mem.eql(u8, arm.pattern.kind.binding, name)) n += 1;
+                if (arm.guard) |g| n += oracleDeclCountExpr(g, name);
+                n += oracleDeclCountExpr(arm.body, name);
+            }
+            break :blk n;
+        },
+    };
+}
+
+/// A `strict_from` past every possible offset, so the whitelist applies
+/// everywhere. Step 1 of the oracle uses it: the closure asks whether a value
+/// could have CAPTURED a reference, and a direct call argument provably
+/// cannot, whatever its position. Only step 2 has a conflict point to split
+/// on.
+const oracle_never_strict: u32 = std.math.maxInt(u32);
+
+/// Step 1 of the oracle: one sweep of the taint closure. A `let` name or an
+/// `assign` target joins `names` when the value mentions a name already in it
+/// outside the whitelisted position. Runs to a fixpoint in `oracleDead`, so
+/// statement order does not matter.
+fn oracleTaintStmts(
+    gpa: std.mem.Allocator,
+    stmts: []const ast.Stmt,
+    names: *NameSet,
+    changed: *bool,
+) Error!void {
+    for (stmts) |*s| {
+        switch (s.kind) {
+            .let => |l| {
+                if (l.value) |v| {
+                    if (oracleFindExpr(&v, names, .other, 0, oracle_never_strict) != null) {
+                        try oracleAdd(gpa, names, l.name, changed);
+                    }
+                    try oracleTaintExpr(gpa, &v, names, changed);
+                }
+            },
+            .assign => |a| {
+                if (oracleFindExpr(&a.value, names, .other, 0, oracle_never_strict) != null) {
+                    if (ast.rootName(&a.target)) |n| try oracleAdd(gpa, names, n, changed);
+                }
+                try oracleTaintExpr(gpa, &a.target, names, changed);
+                try oracleTaintExpr(gpa, &a.value, names, changed);
+            },
+            .expr => |e| try oracleTaintExpr(gpa, &e, names, changed),
+            .return_stmt => |opt| if (opt) |e| {
+                try oracleTaintExpr(gpa, &e, names, changed);
+            },
+            .while_stmt => |w| {
+                try oracleTaintExpr(gpa, &w.cond, names, changed);
+                try oracleTaintStmts(gpa, w.body, names, changed);
+            },
+            .break_stmt, .continue_stmt => {},
+        }
+    }
+}
+
+/// Reaches the `let` and `assign` statements nested inside expressions. Every
+/// block in this language is an expression, so without this the closure would
+/// stop at the first `if`.
+fn oracleTaintExpr(
+    gpa: std.mem.Allocator,
+    e: *const ast.Expr,
+    names: *NameSet,
+    changed: *bool,
+) Error!void {
+    switch (e.kind) {
+        .ident, .int, .float, .string, .bool => {},
+        .call => |c| {
+            try oracleTaintExpr(gpa, c.callee, names, changed);
+            for (c.args) |*a| try oracleTaintExpr(gpa, a, names, changed);
+        },
+        .binary => |b| {
+            try oracleTaintExpr(gpa, b.left, names, changed);
+            try oracleTaintExpr(gpa, b.right, names, changed);
+        },
+        .unary => |u| try oracleTaintExpr(gpa, u.operand, names, changed),
+        .field => |f| try oracleTaintExpr(gpa, f.base, names, changed),
+        .annotated => |a| try oracleTaintExpr(gpa, a.value, names, changed),
+        .struct_lit => |sl| {
+            for (sl.fields) |*f| try oracleTaintExpr(gpa, &f.value, names, changed);
+        },
+        .list_lit => |items| {
+            for (items) |*item| try oracleTaintExpr(gpa, item, names, changed);
+        },
+        .block => |stmts| try oracleTaintStmts(gpa, stmts, names, changed),
+        .if_expr => |i| {
+            try oracleTaintExpr(gpa, i.cond, names, changed);
+            try oracleTaintExpr(gpa, i.then_body, names, changed);
+            if (i.else_body) |eb| try oracleTaintExpr(gpa, eb, names, changed);
+        },
+        .match_expr => |m| {
+            try oracleTaintExpr(gpa, m.scrutinee, names, changed);
+            for (m.arms) |arm| {
+                if (arm.guard) |g| try oracleTaintExpr(gpa, g, names, changed);
+                try oracleTaintExpr(gpa, arm.body, names, changed);
+            }
+        },
+    }
+}
+
+fn oracleAdd(
+    gpa: std.mem.Allocator,
+    names: *NameSet,
+    name: []const u8,
+    changed: *bool,
+) Error!void {
+    const gop = try names.getOrPut(gpa, name);
+    if (!gop.found_existing) changed.* = true;
+}
+
+/// Step 2 of the oracle: the byte offset of the first occurrence of a tainted
+/// name at or after `min_start`, in a position that is not a direct call
+/// argument. Null when there is none.
+///
+/// The context travels DOWN: a call's argument enters as `.call_arg`, only an
+/// ownership keyword and a `&`/`&mut` sigil keep it, and every other node
+/// resets it. That is a different mechanism from the checker's peel-upward
+/// `argPropagatesName`, which is the point.
+fn oracleFindStmts(
+    stmts: []const ast.Stmt,
+    names: *const NameSet,
+    min_start: u32,
+    strict_from: u32,
+) ?u32 {
+    for (stmts) |*s| {
+        if (oracleFindStmt(s, names, min_start, strict_from)) |x| return x;
+    }
+    return null;
+}
+
+fn oracleFindStmt(
+    s: *const ast.Stmt,
+    names: *const NameSet,
+    min_start: u32,
+    strict_from: u32,
+) ?u32 {
+    return switch (s.kind) {
+        .let => |l| if (l.value) |v| oracleFindExpr(&v, names, .other, min_start, strict_from) else null,
+        .expr => |e| oracleFindExpr(&e, names, .other, min_start, strict_from),
+        .return_stmt => |opt| if (opt) |e| oracleFindExpr(&e, names, .other, min_start, strict_from) else null,
+        .assign => |a| oracleFindExpr(&a.target, names, .other, min_start, strict_from) orelse
+            oracleFindExpr(&a.value, names, .other, min_start, strict_from),
+        .while_stmt => |w| oracleFindExpr(&w.cond, names, .other, min_start, strict_from) orelse
+            oracleFindStmts(w.body, names, min_start, strict_from),
+        .break_stmt, .continue_stmt => null,
+    };
+}
+
+fn oracleFindExpr(
+    e: *const ast.Expr,
+    names: *const NameSet,
+    ctx: ArgContext,
+    min_start: u32,
+    /// The conflict's own offset. At or after it the whitelist stops applying:
+    /// a use is a use. See `oracleDead` for why the two regions differ.
+    strict_from: u32,
+) ?u32 {
+    return switch (e.kind) {
+        .ident => |n| if (!names.contains(n) or e.span.start < min_start)
+            null
+        else if (ctx == .call_arg and e.span.start < strict_from)
+            null
+        else
+            e.span.start,
+        .int, .float, .string, .bool => null,
+        .call => |c| blk: {
+            // The callee is not an argument of itself.
+            if (oracleFindExpr(c.callee, names, .other, min_start, strict_from)) |x| break :blk x;
+            for (c.args) |*a| {
+                if (oracleFindExpr(a, names, .call_arg, min_start, strict_from)) |x| break :blk x;
+            }
+            break :blk null;
+        },
+        // The two node kinds that keep the context.
+        .annotated => |a| oracleFindExpr(a.value, names, ctx, min_start, strict_from),
+        .unary => |u| oracleFindExpr(
+            u.operand,
+            names,
+            if (u.op == .ref_shared or u.op == .ref_exclusive) ctx else .other,
+            min_start,
+            strict_from,
+        ),
+        .binary => |b| oracleFindExpr(b.left, names, .other, min_start, strict_from) orelse
+            oracleFindExpr(b.right, names, .other, min_start, strict_from),
+        .field => |f| oracleFindExpr(f.base, names, .other, min_start, strict_from),
+        .struct_lit => |sl| blk: {
+            for (sl.fields) |*f| {
+                if (oracleFindExpr(&f.value, names, .other, min_start, strict_from)) |x| break :blk x;
+            }
+            break :blk null;
+        },
+        .list_lit => |items| blk: {
+            for (items) |*item| {
+                if (oracleFindExpr(item, names, .other, min_start, strict_from)) |x| break :blk x;
+            }
+            break :blk null;
+        },
+        .block => |stmts| oracleFindStmts(stmts, names, min_start, strict_from),
+        .if_expr => |i| blk: {
+            if (oracleFindExpr(i.cond, names, .other, min_start, strict_from)) |x| break :blk x;
+            if (oracleFindExpr(i.then_body, names, .other, min_start, strict_from)) |x| break :blk x;
+            if (i.else_body) |eb| {
+                if (oracleFindExpr(eb, names, .other, min_start, strict_from)) |x| break :blk x;
+            }
+            break :blk null;
+        },
+        .match_expr => |m| blk: {
+            if (oracleFindExpr(m.scrutinee, names, .other, min_start, strict_from)) |x| break :blk x;
+            for (m.arms) |arm| {
+                if (arm.guard) |g| {
+                    if (oracleFindExpr(g, names, .other, min_start, strict_from)) |x| break :blk x;
+                }
+                if (oracleFindExpr(arm.body, names, .other, min_start, strict_from)) |x| break :blk x;
+            }
+            break :blk null;
+        },
+    };
 }
 
 /// Borrow-check `module`, rendering every diagnostic to `writer`. Deliberately
@@ -1982,19 +2450,183 @@ test "R5: reading a field of the owner through a live exclusive borrow is reject
     );
 }
 
-test "0.3: a rejection that NLL would accept says so, and one it would not stays silent" {
-    // `e` is never mentioned again, so only the lexical scope keeps the loan
-    // alive here. The R5 test above uses `e` afterwards and gets no such note.
-    try expectDiagnostics(prelude ++
+test "NLL slice 1: a named loan whose holder is mentioned nowhere again is accepted" {
+    // This test was a REJECTION carrying a note that said NLL would accept it.
+    // It is now that acceptance. `e` is mentioned nowhere after its own `let`,
+    // so the loan is dead by the time `read(&buf)` wants a shared borrow.
+    try expectAccepted(prelude ++
         \\pub fn main() {
         \\    let owned buf = Buffer { data: [], len: 0 }
         \\    let exclusive e = &mut buf
         \\    read(&buf)
         \\}
+    );
+
+    // MUTATION 1, the forward half. One later use of the holder and the same
+    // program is rejected again. Without this the acceptance would pass even
+    // if the predicate never read the forward scan at all.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    read(&buf)
+        \\    use_it(e)
+        \\}
     ,
         \\t.cell:12:11: error: cannot borrow 'buf' as shared: it is already borrowed as exclusive
         \\t.cell:11:28: note: the exclusive borrow starts here and lasts to the end of this block
-        \\t.cell:12:11: note: this would be accepted under non-lexical lifetimes: 'e' is never used again, but Cell ends a named borrow at the end of its block
+        \\
+    );
+
+    // MUTATION 2, the window half. One earlier mention in a value position,
+    // which copies the loan into a holder used later, and it is rejected
+    // again. `f` stays `ineligible` rather than being followed: slice 3 is
+    // deliberately absent.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    let exclusive f = e
+        \\    read(&buf)
+        \\    use_it(f)
+        \\}
+    ,
+        \\t.cell:13:11: error: cannot borrow 'buf' as shared: it is already borrowed as exclusive
+        \\t.cell:11:28: note: the exclusive borrow starts here and lasts to the end of this block
+        \\
+    );
+}
+
+test "NLL slice 2: a holder passed as a direct call argument is dead after that call" {
+    // The shape users actually hit. The mention of `e` between the loan and
+    // the conflict is a direct call argument, which R8 proves cannot propagate
+    // the reference anywhere, so the window scan lets it through.
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    grow(exclusive e, shared 1)
+        \\    read(&buf)
+        \\}
+    );
+
+    // MUTATION 1, the forward half.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    grow(exclusive e, shared 1)
+        \\    read(&buf)
+        \\    use_it(e)
+        \\}
+    ,
+        \\t.cell:13:11: error: cannot borrow 'buf' as shared: it is already borrowed as exclusive
+        \\t.cell:11:28: note: the exclusive borrow starts here and lasts to the end of this block
+        \\
+    );
+
+    // MUTATION 2, the window half: the SAME mention of `e`, moved out of the
+    // whitelisted position into a `let` initializer. The whitelist is what
+    // separates these two programs, and nothing else about them differs.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    let copy n = use_it(e) + e.len
+        \\    read(&buf)
+        \\}
+    ,
+        \\t.cell:13:11: error: cannot borrow 'buf' as shared: it is already borrowed as exclusive
+        \\t.cell:11:28: note: the exclusive borrow starts here and lasts to the end of this block
+        \\
+    );
+}
+
+test "NLL: the acceptance reaches all four conflict sites, including assignment" {
+    // `checkAssign` was the one conflict site that never consulted the NLL
+    // predicate. Three sites enumerated, a fourth missed. Each of these four
+    // programs is rejected by the lexical model and accepted here, and each
+    // exercises a different site: createLoan, readPlace, movePlace, and the
+    // assignment.
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    read(&buf)
+        \\}
+    );
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    let copy n = buf.len
+        \\}
+    );
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    take(buf)
+        \\}
+    );
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    var owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    buf.len = 1
+        \\}
+    );
+}
+
+test "NLL: a use of the holder on the far side of a while back edge keeps the loan live" {
+    // The forward scan counts the ENCLOSING statement in full and recurses
+    // into a `while`'s condition and body, so a use that only a second
+    // iteration reaches still reads as "used". Without that this would be
+    // accepted and the second iteration would alias.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    while read(&buf) > 0 {
+        \\        let copy n = use_it(e)
+        \\    }
+        \\}
+    ,
+        \\t.cell:12:17: error: cannot borrow 'buf' as shared: it is already borrowed as exclusive
+        \\t.cell:11:28: note: the exclusive borrow starts here and lasts to the end of this block
+        \\
+    );
+}
+
+test "NLL soundness rests on R8: a borrow still cannot escape by return or struct field" {
+    // NAMED FOR THE INVARIANT ON PURPOSE. The call-argument whitelist in
+    // `argPropagatesName` is the entire reason slice 2 can accept anything,
+    // and it is sound only because a callee has nowhere to put what it is
+    // handed: R8 refuses a returned borrow and a borrow in a struct field,
+    // and Cell has no lifetime parameters, no references inside aggregates
+    // and no closures. If lifetime parameters ever land, this test fails, and
+    // when it does the NLL acceptance must be revisited with it rather than
+    // this test being updated to match the new behaviour.
+    try expectDiagnostics(prelude ++
+        \\pub fn peek(shared b: Buffer) -> shared Buffer {
+        \\    return b
+        \\}
+    ,
+        \\t.cell:10:12: error: cannot return a shared borrow: Cell has no lifetime annotations, so the borrow cannot be proven to outlive the call
+        \\t.cell:10:12: note: return an 'owned' or 'arc' value instead
+        \\
+    );
+    try expectDiagnostics(
+        \\pub struct View {
+        \\    exclusive buf: Buffer
+        \\}
+    ,
+        // "a exclusive" is the message `checkStructFields` actually prints:
+        // it interpolates `LoanKind.word()` with a fixed article. Pinned as
+        // it is rather than fixed here, so this change touches no diagnostic
+        // text it does not own.
+        \\t.cell:1:1: error: cannot store a exclusive borrow in field 'buf': Cell has no lifetime annotations, so the borrow cannot be proven to outlive the value
+        \\t.cell:1:1: note: store an 'owned' or 'arc' value instead
         \\
     );
 }

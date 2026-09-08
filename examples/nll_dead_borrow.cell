@@ -1,0 +1,76 @@
+// EXPECT: currently-accepted
+//
+// Non-lexical lifetimes for NAMED loans, slices 1 and 2 (docs/OWNERSHIP.md
+// 0.3). Every program here was REJECTED before the NLL predicate landed, and
+// the rejection carried a note saying NLL would accept it. The note is gone
+// because it is now the acceptance.
+//
+// A named loan lives to the end of its block only while its holder can still
+// be reached. `src/cell/borrowck.zig`'s `loanStatusAt` proves the holder is
+// mentioned nowhere from here on, and all four conflict sites skip a loan that
+// is dead: a new borrow, a read, a move and an assignment.
+//
+// The companion is `examples/rejected/aliasing.cell`, which is the same shape
+// with the holder used afterwards. It must stay rejected: NLL rejects it too.
+// Slice 3 is deliberately absent, so `let exclusive f = e` still rejects; see
+// this file's last function.
+
+pub struct Buffer { copy len: Int }
+
+pub fn read(shared b: Buffer) -> Int { return b.len }
+pub fn grow(exclusive b: Buffer, shared extra: Int) { }
+pub fn take(owned b: Buffer) { }
+
+// Slice 1: the holder is mentioned nowhere after its own `let`, so a second
+// borrow of the same place is fine.
+pub fn dead_on_arrival() {
+    let owned buf = Buffer { len: 0 }
+    let exclusive e = &mut buf
+    let copy n = read(&buf)
+}
+
+// Slice 2: the holder IS mentioned in between, as a direct argument of a call.
+// R8 forbids `grow` returning the borrow or storing it in a struct field, and
+// Cell has no lifetime parameters, no references inside aggregates and no
+// closures, so the reference cannot have gone anywhere. The loan is dead after
+// the call.
+pub fn dead_after_a_call() {
+    let owned buf = Buffer { len: 0 }
+    let exclusive e = &mut buf
+    grow(exclusive e, shared 1)
+    let copy n = read(&buf)
+}
+
+// The other three conflict sites, each rejected by the lexical model.
+pub fn dead_at_a_read() {
+    let owned buf = Buffer { len: 0 }
+    let exclusive e = &mut buf
+    let copy n = buf.len
+}
+
+pub fn dead_at_a_move() {
+    let owned buf = Buffer { len: 0 }
+    let exclusive e = &mut buf
+    take(buf)
+}
+
+// The assignment site is written as a whole-binding assignment rather than
+// `buf.len = 1` on purpose: the LLVM backend lowers a field-path assignment
+// and the MLIR backend refuses it, and this file is in the corpus those two
+// backends must agree on.
+pub fn dead_at_an_assignment() {
+    var owned buf = Buffer { len: 0 }
+    let exclusive e = &mut buf
+    buf = Buffer { len: 1 }
+}
+
+// What stays rejected, and must: `f` is a second holder of the same loan and
+// `f` is used afterwards, so the loan is live. The window scan makes any
+// mention of the holder outside a call argument `ineligible` rather than
+// following it, which is slice 3's job and is not implemented.
+pub fn still_rejected_because_the_loan_was_copied() {
+    let owned buf = Buffer { len: 0 }
+    let exclusive e = &mut buf
+    let exclusive f = e
+    grow(exclusive f, shared 1)
+}

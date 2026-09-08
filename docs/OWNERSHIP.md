@@ -60,26 +60,93 @@ earlier draft listed span support as a prerequisite; it is done.
   scope.
 - **Live**: not dead, and not the source of an incompatible active loan.
 
-### 0.3 Borrow scope: the lexical choice
+### 0.3 Borrow scope: lexical, with a non-lexical end for named loans
 
-**A loan lives from its creation to the end of the innermost enclosing block.**
-Cell uses lexical borrow scopes, not non-lexical lifetimes.
+**A loan lives from its creation to the end of the innermost enclosing block,
+or until its holder can no longer be reached, whichever comes first.**
 
-Two exceptions narrow it, and both make the common case work without analysis:
+Three exceptions narrow the lexical bound, and the first two make the common
+case work without analysis:
 
 1. A borrow created as a call argument (`f(shared x)`, `f(&x)`) ends when that
    call statement completes. It does not survive to the end of the block.
 2. A borrow created inside an `if` condition or a `match` scrutinee ends when
    that expression finishes.
+3. **A NAMED loan ends as soon as its holder is provably never reached again.**
+   This is the non-lexical rule, and it is enforced: `src/cell/borrowck.zig`'s
+   `loanStatusAt` decides it, and all four conflict sites (a new borrow, a
+   read, a move, an assignment) skip a loan it calls dead.
 
-The choice is deliberate. Lexical scoping is decidable by a single pass with a
-scope stack, needs no control-flow graph, and can be implemented against the
-AST as it stands. NLL is more permissive and strictly better for users, and it
-is the right target once there is a CFG. Every program accepted under lexical
-scoping is still accepted under NLL, so tightening now and relaxing later never
-breaks source compatibility. When a rejection would be accepted under NLL, say
-so in a `note`, so a user knows the rejection is the checker's conservatism and
-not their bug.
+```cell
+pub fn main() {
+    let owned buf = Buffer { len: 0 }
+    let exclusive e = &mut buf
+    grow(exclusive e, shared 1)
+    let copy n = read(&buf)         // accepted: `e` is dead after the call
+}
+```
+
+`examples/nll_dead_borrow.cell` is the corpus form of this, one function per
+conflict site.
+
+#### What "provably never reached again" means, exactly
+
+Two conditions, both required. Neither can see what the other sees, and
+together they cover a loan's whole live range:
+
+- **Forward.** The holder is mentioned nowhere from the statement being checked
+  to the end of the block that owns the loan. The current statement counts in
+  FULL, and so does any statement containing an inner block, so a use nested
+  anywhere inside the current statement, and a use only a second loop iteration
+  reaches, both read as "used".
+- **Window.** Between the loan's own `let` and the statement being checked, at
+  the loan's own block level, the holder is mentioned only as a **direct
+  argument of a call** (optionally under an ownership keyword or a `&`/`&mut`
+  sigil). Every other mention -- a `let` initializer, either side of an
+  assignment, a `match` scrutinee or guard, a struct-literal field, a list
+  element, an `if`/`match`/block value position -- ends the analysis in
+  `ineligible`, which rejects.
+
+The whitelist is stated as the complement on purpose. It does not enumerate the
+positions that propagate a reference and assume the rest are safe; it names the
+one position that provably cannot, and rejects everything else. **Rejecting is
+always safe here. Only acceptance needs proof.**
+
+#### Why a direct call argument cannot propagate a reference
+
+R8. A callee may not return a `shared` or `exclusive` borrow and may not store
+one in a struct field. Cell has no lifetime parameters, no references inside
+aggregates, and no closures, so a callee has nowhere to put what it is handed.
+`src/cell/borrowck.zig` carries a test named for this invariant; **if lifetime
+parameters ever land, that test fails and this rule must be revisited with
+it.**
+
+#### Why this needs no control-flow graph
+
+The same R8 argument. A loan value cannot escape the block that created it, so
+its region is already bounded by the holder's lexical block, and the
+non-lexical rule only shrinks that bound. "Is there a forward path from here
+that still reaches this loan" is therefore answerable syntactically in this
+language. An earlier revision of this document said revisiting 0.3 was gated on
+a real control-flow graph; that was wrong, and the checker was not ported to
+one.
+
+`src/cell/liveness.zig` was measured against this and rejected: it is
+SLOT-level where the borrow checker is PLACE-level (`buf` versus `buf.len`),
+and its own doc comment records an unclosed allocation-order drift whose
+failure direction is "a live slot reads as dead", which for a borrow checker
+means accepting too much. It stays reserved for R16's drop pass.
+
+#### What is deliberately NOT implemented
+
+A **taint closure over derived bindings**. `let exclusive f = e` copies the loan
+into a second holder, and the checker does not follow it: any such mention
+makes the loan `ineligible`, so the program is rejected. That is conservative,
+not unsound, and `examples/rejected/aliasing.cell` plus the last function of
+`examples/nll_dead_borrow.cell` pin it.
+
+Every program accepted under the older, purely lexical rule is still accepted,
+so this relaxation cannot break source compatibility.
 
 ### 0.4 What the checker walks
 
@@ -561,10 +628,25 @@ anything.
 |---|---|
 | A Cell body never releases its own `arc` parameter (no parameter is dropped), so every call-site retain into one leaks a reference | by construction; `examples/arc_host.c` is the ABI-correct contrast, and `examples/arc.cell` reports 0 leaks because of it |
 | A struct holding an `arc` field is never dropped, so rule 4's retain leaks | `record` shapes are excluded from `hasDropCall` |
-| An `arc` value unboxed for a `shared` parameter without ever being bound (`inspect(shared fresh())`) drops its handle on the floor | `leaks`: **2998 leaks / 63968 bytes** over 1000 iterations |
 | An `arc` local declared inside a block OR A MATCH ARM is never released, because release is function-scoped and both are popped before the drop pass runs; inside a `while` body that is unbounded | `leaks`: **2997 leaks / 63936 bytes** over 1000 iterations for the block form |
 | Reassigning an `arc` `var` leaks the previous box (`var arc v = "one"` then `v = "two"`), the same class as the R3a-revival leak R16 documents for `owned` | `leaks`: **3 leaks / 64 bytes** for a single reassignment |
 | An `owned` String or list PLACE bound as `arc` (**the reverse direction**; `arc` into `owned` is refused outright by R10 above) is not boxed at all, and is left as a C type error rather than a silent double free | see retain rule 1 above. Re-measured: `let arc b = a` with an `owned` String `a` still emits `cell_arc_t b = a;` and `cc` rejects it, `initializing 'cell_arc_t' with an expression of incompatible type 'cell_string_t'` |
+
+**CLOSED, and the row is gone from the table above rather than left in it with
+a strikethrough.** An `arc` value unboxed for a `shared` parameter without ever
+being bound (`inspect(shared fresh())`) used to drop its handle on the floor,
+measured at 2998 leaks over 1000 iterations. `460b9a3` fixed it: the emitted C
+now hoists the handle into the statement expression and releases it before the
+result is yielded. Measured at **0 leaks**, with `examples/arc.cell` still
+printing 13 at 0 leaks, so nothing regressed to buy it.
+
+**Where these numbers now live.** Every count in the table above used to come
+from an ad-hoc measurement that existed in no file, which made them
+unreproducible and, in one case, quietly stale. They are now pinned by
+`tools/check.sh`'s `== leaks ==` stage against fixtures under `examples/leaks/`,
+as constants carrying the commit they were measured at. The closed row is
+pinned at 0, so any nonzero reading re-opens it. **Read the gate, not this
+table, for a current number**; the table is here to say what each gap IS.
 
 ### What the search covered, which is the honest form of the claim
 
@@ -853,8 +935,13 @@ Ordered so each step is testable and none depends on a later one. Steps marked
    control-flow graph, by consuming borrowck's existing conservative move
    tracking directly (function-scoped, `let`/`var` locals only, structs
    excluded); see R16 above for exactly what landed and what did not.
-   Revisiting 0.3 in favor of NLL is still gated on a real control-flow
-   graph, which nothing here builds.
+   **Revisiting 0.3 in favor of NLL is DONE for named loans, and it needed no
+   control-flow graph.** An earlier version of this step claimed it was gated
+   on one. R8 is what makes the claim decidable syntactically: a loan value
+   cannot escape the block that created it, so its region is already bounded by
+   the holder's lexical block and the non-lexical rule only shrinks it. See 0.3
+   for the two conditions, the call-argument whitelist, and the taint closure
+   over derived bindings that is deliberately still missing.
 
 Steps 1 through 3 would give Cell a real move checker. Everything after that is
 the harder half.
