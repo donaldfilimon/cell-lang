@@ -54,6 +54,20 @@
 #                       new leak in a program that used to be clean, means
 #                       codegen regressed. Either way the fix belongs in
 #                       src/, never in the pinned number.
+#   8. backend answers  every example with a runnable `main`, through every
+#                       backend that emits it, compared on its OUTPUT. Stage 4
+#                       compares VERDICTS, and verdict agreement is not answer
+#                       agreement: three backends can accept one program and
+#                       compute three different things, and the gate said
+#                       "llvm and mlir agree on every example" while the LLVM
+#                       backend discarded every write through an `exclusive`
+#                       borrow and printed 737 where the other two printed 142.
+#                       Stage 6 could not have caught it either, because it
+#                       runs a fixed list of four programs. This stage needs no
+#                       list, so an example is covered the day it lands, and an
+#                       example may declare `// EXPECT-OUTPUT:` to pin the
+#                       answer itself, since three backends agreeing is not the
+#                       same as three backends being right.
 #
 # TRAPS THIS SCRIPT IS WRITTEN AGAINST, each one having actually bitten:
 #
@@ -386,6 +400,188 @@ else
     run_c_leaks unbound_shared_temp examples/arc_host.c "$LEAK_UNBOUND_SHARED_TEMP" "R11 row 3, CLOSED @ 460b9a3"
     run_c_leaks block_scoped_local "" "$LEAK_BLOCK_SCOPED_LOCAL" "R11 row 4 @ ${LEAKS_MEASURED_AT}"
     run_c_leaks reassigned_var "" "$LEAK_REASSIGNED_VAR" "R11 row 5 @ ${LEAKS_MEASURED_AT}"
+fi
+
+# ------------------------------------------- 8. cross-backend answer agreement --
+# A VERDICT IS NOT AN ANSWER, and stage 4 only ever compared verdicts. It asks
+# each backend whether it ACCEPTS a program; it never asks whether the accepted
+# programs compute the same thing. So this gate could report "llvm and mlir
+# agree on every example" while two of them printed different numbers, and it
+# did: examples/write_through.cell prints 142 from the C and MLIR backends and
+# printed 737 from the LLVM one, because the LLVM call site passed the address
+# of a spilled COPY for every borrow and each write through an `exclusive`
+# parameter was silently discarded. Both backends accepted it, so stage 4 was
+# green; stage 6 runs a fixed list of four programs and none of them writes
+# through a borrow; and the two examples that come closest, ownership.cell and
+# borrows.cell, are SILENT by design and would have compared nothing even if
+# they had been run. A silent program cannot catch a wrong answer.
+#
+# So this stage runs EVERY example that has a `main` with a body, through every
+# backend that emits it, and compares stdout AND exit status across backends.
+# Unlike stage 6 it keeps no hand-maintained list of expected numbers, so a new
+# example is covered the day it lands rather than the day someone remembers to
+# add a row to a loop up there.
+#
+# Agreement alone would still pass three identically-wrong backends, so an
+# example may declare its own answer in a `// EXPECT-OUTPUT:` line and every
+# backend is checked against that too. The declaration lives in the example,
+# beside the program that produces it, for the same reason stage 5 reads the
+# mlir pipeline out of the emitted file rather than keeping a copy here: a
+# second copy drifts, and then the gate pins something nobody ships.
+#
+# An example whose bodyless declarations need C definitions gets them from
+# `examples/<stem>_host.c`, the convention arc_host.c and write_through_host.c
+# already share, linked into all three legs.
+#
+# Two failure modes are told apart deliberately. An emit REFUSAL is designed
+# behaviour that stage 4 already pins, so this stage simply skips that
+# backend's leg. An emit that SUCCEEDS and then fails to compile or link is a
+# FAILURE: that is stage 5's lesson carried to the other two backends, since
+# accepted text that cannot be built is not an accepted program.
+printf '\n== backend answers ==\n'
+answers_before=$fails
+answers_compared=0
+answers_printing=0
+
+if [ ! -x "$LLVM_BIN/mlir-opt" ] || [ ! -x "$LLVM_BIN/mlir-translate" ] || [ ! -x "$LLVM_BIN/llc" ]; then
+    skip "the MLIR leg of the answer comparison (mlir-opt/mlir-translate/llc not found in $LLVM_BIN)"
+    answers_mlir=no
+else
+    answers_mlir=yes
+fi
+
+for f in examples/*.cell; do
+    n=$(basename "$f" .cell)
+
+    # Only a `main` WITH A BODY produces a program. The rest of the corpus
+    # emits no C `main`, so its link stops at `_main`, and that is by design
+    # rather than a codegen defect. Reading the source is deterministic;
+    # grepping a linker error for `_main` instead would let a REAL link failure
+    # hide behind the expected one.
+    grep -q '^pub fn main() *{' "$f" || continue
+
+    # A host is compiled ONCE, here, and the object linked into all three
+    # legs. Handing the .c to each leg instead means three compiles, and two of
+    # those link lines carry no `-I runtime`, so the host's own
+    # `#include "cell_rt.h"` fails there and the example reads as an
+    # LLVM/MLIR build failure that is really a missing include path. Measured,
+    # not imagined: that is exactly what the first run of this stage reported.
+    host=""
+    if [ -f "examples/${n}_host.c" ]; then
+        if cc -c -I runtime "examples/${n}_host.c" -o "$TMP/ans_${n}_host.o" 2>"$TMP/ans_${n}_host.log"; then
+            host="$TMP/ans_${n}_host.o"
+        else
+            fail "answers $n: examples/${n}_host.c does not compile"
+            sed -n '1,4p' "$TMP/ans_${n}_host.log"
+            continue
+        fi
+    fi
+
+    # The example's own declared answer, when it states one. Absent is allowed:
+    # cross-backend agreement is still checked, and most of this corpus
+    # predates the convention.
+    want=$(sed -n 's|^// EXPECT-OUTPUT: ||p' "$f" | head -1)
+
+    ran=""
+    out_c=""; st_c=""
+    out_l=""; st_l=""
+    out_m=""; st_m=""
+
+    # -- C. Emits its own `main`, so it links without the driver.
+    if $CELL emit "$f" > "$TMP/ans_$n.c" 2>/dev/null; then
+        if cc -I runtime "$TMP/ans_$n.c" $host "$TMP/rt.o" -o "$TMP/ans_${n}_c" 2>"$TMP/ans_${n}_c.log"; then
+            out_c=$("$TMP/ans_${n}_c"); st_c=$?
+            ran="$ran C"
+        else
+            fail "answers $n: C emitted but did not build"
+            sed -n '1,4p' "$TMP/ans_${n}_c.log"
+        fi
+    fi
+
+    # -- LLVM. Also emits its own `main`.
+    if $CELL emit --target=llvm "$f" > "$TMP/ans_$n.ll" 2>/dev/null; then
+        if cc -Wno-override-module -x ir "$TMP/ans_$n.ll" -c -o "$TMP/ans_${n}_l.o" 2>"$TMP/ans_${n}_l.log" \
+            && cc "$TMP/ans_${n}_l.o" $host "$TMP/rt.o" -o "$TMP/ans_${n}_l" 2>>"$TMP/ans_${n}_l.log"; then
+            out_l=$("$TMP/ans_${n}_l"); st_l=$?
+            ran="$ran LLVM"
+        else
+            fail "answers $n: LLVM emitted but did not build"
+            sed -n '1,4p' "$TMP/ans_${n}_l.log"
+        fi
+    fi
+
+    # -- MLIR. Emits cell_main only, so it needs the driver stage 6 wrote.
+    if [ "$answers_mlir" = yes ] && $CELL emit --target=mlir "$f" > "$TMP/ans_$n.mlir" 2>/dev/null; then
+        if "$LLVM_BIN/mlir-opt" "$TMP/ans_$n.mlir" \
+                --expand-strided-metadata --finalize-memref-to-llvm --convert-cf-to-llvm \
+                --convert-func-to-llvm --convert-arith-to-llvm --reconcile-unrealized-casts \
+                -o "$TMP/ans_${n}_low.mlir" 2>"$TMP/ans_${n}_m.log" \
+            && "$LLVM_BIN/mlir-translate" --mlir-to-llvmir "$TMP/ans_${n}_low.mlir" -o "$TMP/ans_${n}_m.ll" 2>>"$TMP/ans_${n}_m.log" \
+            && "$LLVM_BIN/llc" -filetype=obj "$TMP/ans_${n}_m.ll" -o "$TMP/ans_${n}_m.o" 2>>"$TMP/ans_${n}_m.log" \
+            && cc "$TMP/ans_${n}_m.o" "$TMP/drv.c" $host "$TMP/rt.o" -o "$TMP/ans_${n}_m" 2>>"$TMP/ans_${n}_m.log"; then
+            out_m=$("$TMP/ans_${n}_m"); st_m=$?
+            ran="$ran MLIR"
+        else
+            fail "answers $n: MLIR emitted but did not lower, translate or link"
+            sed -n '1,4p' "$TMP/ans_${n}_m.log"
+        fi
+    fi
+
+    [ -z "$ran" ] && continue
+    answers_compared=$((answers_compared + 1))
+
+    # The reference is whichever backend ran first, C when it ran at all. The
+    # C backend is the oldest and the one examples/README.md quotes numbers
+    # from, so naming it in a disagreement reads the right way round.
+    case "$ran" in
+        *C*) ref_out=$out_c; ref_st=$st_c; ref=C ;;
+        *LLVM*) ref_out=$out_l; ref_st=$st_l; ref=LLVM ;;
+        *) ref_out=$out_m; ref_st=$st_m; ref=MLIR ;;
+    esac
+
+    # stdout AND exit status. A program that prints the right answer and then
+    # dies is not a passing program: 9f19b39 exists because that once read as
+    # green.
+    for b in $ran; do
+        case $b in
+            C) this_out=$out_c; this_st=$st_c ;;
+            LLVM) this_out=$out_l; this_st=$st_l ;;
+            MLIR) this_out=$out_m; this_st=$st_m ;;
+        esac
+        if [ "$this_out" != "$ref_out" ] || [ "$this_st" != "$ref_st" ]; then
+            fail "answers $n: $b printed '$this_out' (exit $this_st), $ref printed '$ref_out' (exit $ref_st)"
+        fi
+    done
+
+    # The declared answer, when the example states one. Backends that are all
+    # wrong in the same way still agree with each other, and this is the only
+    # check in the stage that can tell that case apart.
+    if [ -n "$want" ]; then
+        for b in $ran; do
+            case $b in
+                C) this_out=$out_c ;;
+                LLVM) this_out=$out_l ;;
+                MLIR) this_out=$out_m ;;
+            esac
+            [ "$this_out" = "$want" ] || \
+                fail "answers $n: $b printed '$this_out', the file declares EXPECT-OUTPUT '$want'"
+        done
+    fi
+
+    [ -n "$ref_out" ] && answers_printing=$((answers_printing + 1))
+    printf '  ....  %-22s %-14s -> %s\n' "$n" "$(echo $ran | tr ' ' '/')" "$ref_out"
+done
+
+# A stage that compared nothing must SAY so rather than reporting a green it
+# did not earn, and one that compared only silent programs has proved exactly
+# as much. That is the same silence this stage exists to end, one level up.
+printf '  ....  %d program(s) compared, %d of them printing\n' "$answers_compared" "$answers_printing"
+if [ "$answers_compared" -eq 0 ]; then
+    fail "the answer comparison ran against nothing at all"
+elif [ "$answers_printing" -eq 0 ]; then
+    fail "every program compared was silent, so nothing was actually compared"
+elif [ $fails -eq $answers_before ]; then
+    pass "every backend that runs an example computes the same answer"
 fi
 
 # ---------------------------------------------------------------- verdict --
