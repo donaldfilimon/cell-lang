@@ -201,6 +201,14 @@ const Local = struct {
     /// `ownership` check because a parameter can itself be `owned` and
     /// must still never be dropped.
     droppable: bool,
+    /// True for a parameter alone, and it is NOT the negation of
+    /// `droppable`: a match-arm binding is undroppable too, and the two
+    /// must not be confused when deciding whether a returned `arc` needs a
+    /// retain. A parameter's reference was retained by the caller and is
+    /// handed straight back (R11 rule 3, no retain); a match-arm binding is
+    /// a bitwise copy of a scrutinee this function may itself be about to
+    /// release, so returning it without a retain dangles.
+    is_param: bool = false,
 };
 
 /// A resolved call target. `symbol` is null when the callee is a computed
@@ -454,7 +462,7 @@ pub const Generator = struct {
         for (f.params) |p| {
             // Decision: a parameter is never dropped (see the module doc
             // comment), regardless of its own ownership annotation.
-            try self.pushLocal(p.name, try self.lowerType(&p.ty, p.ownership), p.ownership, false);
+            try self.pushLocal(p.name, try self.lowerType(&p.ty, p.ownership), p.ownership, false, true);
         }
 
         try self.writeSignature(f);
@@ -550,7 +558,7 @@ pub const Generator = struct {
                     try self.emitArgLike(&v, ty, indent);
                 }
                 try out.writeAll(";\n");
-                try self.pushLocal(l.name, ty, l.ownership, true);
+                try self.pushLocal(l.name, ty, l.ownership, true, false);
                 // -Wunused-variable is part of -Wall.
                 if (!stmtsUse(rest, l.name)) {
                     try self.writeIndent(indent);
@@ -637,6 +645,7 @@ pub const Generator = struct {
         while (i > 0) {
             i -= 1;
             const local = self.locals.items[i];
+            if (self.isShadowedAt(i)) continue;
             if (!local.droppable) continue;
             if (local.ownership != .owned and local.ownership != .arc) continue;
             if (!hasDropCall(local.ty.shape)) continue;
@@ -644,6 +653,37 @@ pub const Generator = struct {
             try out.append(self.arena, local);
         }
         return out.items;
+    }
+
+    /// True when a LATER binding reuses this one's name, so the identifier
+    /// `emitDropFor` would write no longer resolves to this binding in the
+    /// emitted C.
+    ///
+    /// `emitDropFor` spells a drop by NAME, which silently assumes every
+    /// visible binding has a distinct one. Shadowing breaks that, and it
+    /// breaks it in the worst direction: both entries emit the same
+    /// `cell_arc_drop(s)`, both resolve to the INNER `s`, the inner box is
+    /// released twice and the outer one is never released at all. That is a
+    /// double free, measured under AddressSanitizer, not a theoretical one.
+    ///
+    /// The check is deliberately about ALL later bindings rather than only
+    /// droppable ones: what decides the question is which declaration the C
+    /// identifier resolves to, and a match-arm binding or a parameter shadows
+    /// a name just as effectively as a `let` does. Note the reverse walk
+    /// reaches the innermost binding first, so the innermost one is the only
+    /// one that is ever nameable, and it is the one kept.
+    ///
+    /// Suppressing the outer drop leaks the outer box. That is the correct
+    /// side of this backend's asymmetry, and the same choice `pushLocal`
+    /// already makes when it cannot positively confirm a binding id.
+    /// `cell check` only WARNS about shadowing, so nothing upstream prevents
+    /// this from arising.
+    fn isShadowedAt(self: *const Generator, index: usize) bool {
+        const name = self.locals.items[index].name;
+        for (self.locals.items[index + 1 ..]) |later| {
+            if (eq(later.name, name)) return true;
+        }
+        return false;
     }
 
     /// The end-of-function-body drop point. Nested block/if/match/while
@@ -672,12 +712,13 @@ pub const Generator = struct {
     fn emitReturnStmt(self: *Generator, opt: ?ast.Expr, indent: usize) EmitError!void {
         const out = self.writer;
         const to_drop = try self.pendingDrops();
+        const retain = if (opt) |v| try self.returnedArcNeedsRetain(&v) else false;
         if (to_drop.len == 0) {
             try self.writeIndent(indent);
             try out.writeAll("return");
             if (opt) |v| {
                 try out.writeAll(" ");
-                try self.emitExpr(&v, indent);
+                try self.emitReturnValue(&v, retain, indent);
             }
             try out.writeAll(";\n");
             return;
@@ -687,28 +728,7 @@ pub const Generator = struct {
             try self.writeIndent(indent);
             try self.writeDecl(self.current_ret_ty, temp);
             try out.writeAll(" = ");
-            // The one retain outside `emitArcConversion` (task 4b). R11's
-            // release rule 2 excepts "the one being returned", and this pass
-            // has no such exception: borrowck never makes an `arc` place
-            // dead (`isDuplicable`, R10 by design), so a returned `arc`
-            // local is always still in `to_drop` and would be released
-            // between the temporary's initialization and the `return`,
-            // handing the caller a box whose count already reached zero.
-            // Retaining here is exactly balanced rather than a leak: the
-            // clone takes the count 1 -> 2 and the drop immediately below
-            // takes it back to 1, and that surviving reference is the one
-            // the caller now owns and must release. A returned `arc`
-            // PARAMETER never reaches this branch, because a parameter is
-            // not droppable and so a function returning only its parameter
-            // has an empty `to_drop` and takes the byte-for-byte path
-            // above. That is R11 rule 3, still holding by construction.
-            if (self.returnedArcNeedsRetain(&v, to_drop)) {
-                try out.writeAll("cell_arc_clone(");
-                try self.emitExpr(&v, indent);
-                try out.writeAll(")");
-            } else {
-                try self.emitExpr(&v, indent);
-            }
+            try self.emitReturnValue(&v, retain, indent);
             try out.writeAll(";\n");
             for (to_drop) |local| try self.emitDropFor(indent, local);
             try self.writeIndent(indent);
@@ -720,20 +740,73 @@ pub const Generator = struct {
         }
     }
 
-    /// True when `v` names an `arc` local that this return is about to drop.
-    /// Only a bare identifier counts: a field path such as `s.name` roots in
-    /// a `record`, which `hasDropCall` excludes from dropping entirely, so
-    /// there is no release for a retain to balance.
-    fn returnedArcNeedsRetain(self: *Generator, v: *const ast.Expr, to_drop: []const Local) bool {
-        _ = self;
-        const name = switch (unwrapAnnotated(v).kind) {
-            .ident => |n| n,
-            else => return false,
-        };
-        for (to_drop) |local| {
-            if (local.ty.shape == .arc and eq(local.name, name)) return true;
+    /// The returned expression, wrapped in the retain when one is owed.
+    ///
+    /// Factored out because BOTH of `emitReturnStmt`'s branches need it and
+    /// only one of them used to have it. The `to_drop.len == 0` branch was
+    /// written to emit "exactly the C this backend always emitted, byte for
+    /// byte", and that guarantee still holds for every return that owes no
+    /// retain, which is every return in this repository's corpus except the
+    /// `arc` ones. It does not, and must not, hold for a returned `arc`: a
+    /// function with nothing to drop can still return a reference it does
+    /// not own, and an `arc` FIELD is exactly that case.
+    fn emitReturnValue(self: *Generator, v: *const ast.Expr, retain: bool, indent: usize) EmitError!void {
+        if (!retain) return try self.emitExpr(v, indent);
+        try self.writer.writeAll("cell_arc_clone(");
+        try self.emitExpr(v, indent);
+        try self.writer.writeAll(")");
+    }
+
+    /// True when returning `v` owes an `arc` retain (R11 release rule 3: a
+    /// returned `arc` is returned ALREADY RETAINED, and the caller owns that
+    /// reference and must release it).
+    ///
+    /// The rule is stated as an exception rather than as a list, because a
+    /// list is what got this wrong the first time. **Retain every returned
+    /// `arc` place except a parameter returned directly.** A parameter is
+    /// the one reference this frame received pre-retained from its caller
+    /// and hands straight back, so cloning it would leak. Everything else
+    /// belongs to something that outlives this return or that this return is
+    /// about to release:
+    ///
+    ///   - a LOCAL is always still in `pendingDrops`, because borrowck never
+    ///     makes an `arc` place dead (`isDuplicable`, R10 by design), so the
+    ///     drop would run between the return temporary and the `return`.
+    ///     Retaining is exactly balanced: 1 -> 2 -> 1.
+    ///   - a FIELD (`s.name`, `s->name`) belongs to the record, which this
+    ///     backend never drops. An earlier version of this function declined
+    ///     a `.field` root, reasoning that the record is never released so
+    ///     there is no release to balance. That reasoned about the wrong
+    ///     quantity: what matters is the reference the CALLER is about to
+    ///     release, not the one this frame holds. `pub fn peek(shared s:
+    ///     Session) -> arc String { return s.name }` emitted a bare
+    ///     `return s->name;` and died under AddressSanitizer with a
+    ///     heap-use-after-free in `cell_arc_drop`. Retaining leaks the
+    ///     record's own reference instead, which is the correct side.
+    ///   - a MATCH-ARM binding is a bitwise copy of a scrutinee this
+    ///     function may itself be dropping, so it is a local in every way
+    ///     that matters here even though `droppable` is false for it. This
+    ///     is why the exception tests `is_param` rather than `!droppable`.
+    fn returnedArcNeedsRetain(self: *Generator, v: *const ast.Expr) Alloc!bool {
+        const place = unwrapAnnotated(v);
+        if (!isPlace(place)) return false;
+        const ty = try self.inferExpr(place);
+        if (ty.shape != .arc) return false;
+        switch (place.kind) {
+            .ident => |n| {
+                var i = self.locals.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (eq(self.locals.items[i].name, n)) return !self.locals.items[i].is_param;
+                }
+                // Not a binding this function declared. Nothing here can be
+                // releasing it, so a retain would only leak; but nothing
+                // here can vouch for it either. Unknown identifiers already
+                // lower to `void*` rather than to a guess, so leave it.
+                return false;
+            },
+            else => return true,
         }
-        return false;
     }
 
     /// The declared type of a `let`. An annotation wins; otherwise the
@@ -910,7 +983,7 @@ pub const Generator = struct {
             // borrowck's own hardcoded assumption for this binding (R7 is
             // not implemented there either); it has no effect while
             // `droppable` is false.
-            try self.pushLocal(name, scrut_ty, .owned, false);
+            try self.pushLocal(name, scrut_ty, .owned, false, false);
             if (!exprUses(arm.body, name)) {
                 try self.writeIndent(indent);
                 try self.writer.print("(void){s};\n", .{name});
@@ -1715,6 +1788,7 @@ pub const Generator = struct {
         ty: CType,
         ownership: ast.Ownership,
         droppable: bool,
+        is_param: bool,
     ) Alloc!void {
         const id = self.next_binding_id;
         self.next_binding_id += 1;
@@ -1760,6 +1834,7 @@ pub const Generator = struct {
             .ownership = ownership,
             .id = id,
             .droppable = may_drop,
+            .is_param = is_param,
         });
     }
 
@@ -2702,6 +2777,79 @@ test "an owned String place bound as arc is left as a loud C type error" {
     try expectContains(e.text, "cell_string_free(&a);");
 }
 
+test "a returned arc FIELD is retained when the function drops nothing" {
+    var e = try emitSource(
+        \\pub struct Session {
+        \\  arc name: String
+        \\  copy id: Int
+        \\}
+        \\pub fn peek(shared s: Session) -> arc String {
+        \\  return s.name
+        \\}
+    );
+    defer e.deinit();
+    // The `pendingDrops` empty branch of `emitReturnStmt`, which used not to
+    // consult the retain rule at all. R11 release rule 3 is categorical: a
+    // returned `arc` is returned ALREADY RETAINED. Without the clone this
+    // hands the caller the record's own reference, the caller releases it,
+    // and the record is left pointing at a freed box: reproduced under
+    // AddressSanitizer as a heap-use-after-free in `cell_arc_drop`.
+    try expectContains(e.text, "  return cell_arc_clone(s->name);");
+}
+
+test "a returned arc FIELD is retained when the function also drops a local" {
+    var e = try emitSource(
+        \\pub struct Session {
+        \\  arc name: String
+        \\  copy id: Int
+        \\}
+        \\pub fn peek(shared s: Session) -> arc String {
+        \\  let arc extra = "x"
+        \\  return s.name
+        \\}
+    );
+    defer e.deinit();
+    // The other branch. Both are asserted because the first version of this
+    // rule declined a `.field` root inside `returnedArcNeedsRetain` itself,
+    // so BOTH branches emitted the bare field and only one of them was even
+    // reached by the earlier tests.
+    try expectContains(e.text,
+        \\  cell_arc_t _cell_t0 = cell_arc_clone(s->name);
+        \\  cell_arc_drop(extra);
+        \\  return _cell_t0;
+    );
+}
+
+test "a shadowed arc local is dropped once, naming the inner binding" {
+    var e = try emitSource(
+        \\pub fn shadowed(shared k: Int) -> Int {
+        \\  let arc s = "outer"
+        \\  if (k > 0) {
+        \\    let arc s = "inner"
+        \\    return 1
+        \\  }
+        \\  return 2
+        \\}
+    );
+    defer e.deinit();
+    // `emitDropFor` spells a drop by NAME, so two visible bindings sharing
+    // one name emitted two identical `cell_arc_drop(s)` calls, both
+    // resolving to the INNER `s`: a double free of the inner box and a leak
+    // of the outer one. Measured under AddressSanitizer before the fix.
+    // Suppressing the unnameable outer drop leaks it instead, which is the
+    // correct side of this backend's asymmetry. Note `cell check` only WARNS
+    // about shadowing, so nothing upstream prevents this source.
+    try expectContains(e.text,
+        \\    int64_t _cell_t0 = 1;
+        \\    cell_arc_drop(s);
+        \\    return _cell_t0;
+    );
+    try expectAbsent(e.text,
+        \\    cell_arc_drop(s);
+        \\    cell_arc_drop(s);
+    );
+}
+
 test "an owned String call result bound as arc IS boxed" {
     var e = try emitSource(
         \\pub fn make() -> String;
@@ -2963,4 +3111,89 @@ test "an arc program's retains and releases balance when compiled and run" {
         return error.ProgramCrashed;
     }
     try std.testing.expectEqualStrings("7\n", run_result.stdout);
+}
+
+test "a returned arc field survives the caller releasing it, compiled and run" {
+    // The execution counterpart to the two emitted-text field tests. It is
+    // the one that would have caught the defect: the bare `return s->name;`
+    // compiled clean under `-Wall -Wextra -Werror` and passed `cell check`,
+    // so only running it and reading the count back distinguishes a correct
+    // retain from a missing one.
+    //
+    // The printed 4 decomposes as: `label` boxes the literal (1); the struct
+    // literal clones it into the `arc` field (2); `peek` returns
+    // `cell_arc_clone(s->name)` (3); the call site clones again for the
+    // `arc` parameter (4), which is the count the host reports before
+    // releasing its own reference (3). Delete the field retain and every
+    // number after the first drops by one, so this prints 3.
+    //
+    // What this does NOT show, and the reason `examples/arc.cell` rather
+    // than this file is the leak evidence: the record's own reference is
+    // never released, because this backend does not drop a `record` shape.
+    // So this program ends with the box alive at count 1. That is the
+    // disclosed struct-field leak, and it is the correct side of the
+    // asymmetry: before the retain, the same program left the record
+    // pointing at a box the caller had already freed.
+    var e = try emitSource(
+        \\pub struct Session {
+        \\  arc name: String
+        \\  copy id: Int
+        \\}
+        \\pub fn print_int(copy value: Int);
+        \\pub fn observe(arc name: String) -> Int;
+        \\pub fn peek(shared s: Session) -> arc String {
+        \\  return s.name
+        \\}
+        \\pub fn main() {
+        \\  let arc label = "session"
+        \\  let owned sess = Session { name: label, id: 1 }
+        \\  let arc got = peek(shared sess)
+        \\  let copy n = observe(arc got)
+        \\  print_int(n)
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "return cell_arc_clone(s->name);");
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.c", .data = e.text });
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const root = cwd_buf[0..cwd_len];
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{root});
+    defer gpa.free(include);
+    const rt_c = try std.fmt.allocPrint(gpa, "{s}/runtime/cell_rt.c", .{root});
+    defer gpa.free(rt_c);
+    const host_c = try std.fmt.allocPrint(gpa, "{s}/examples/arc_host.c", .{root});
+    defer gpa.free(host_c);
+
+    const cc_result = try std.process.run(gpa, io, .{
+        .argv = &.{ "cc", "-std=c11", "-Wall", "-Wextra", "body.c", host_c, rt_c, "-I", include, "-o", "body" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(cc_result.stdout);
+    defer gpa.free(cc_result.stderr);
+    if (!cc_result.term.success()) {
+        std.debug.print("cc rejected emitted C:\n{s}\n--- source ---\n{s}\n", .{ cc_result.stderr, e.text });
+        return error.CcRejectedEmittedC;
+    }
+
+    const run_result = try std.process.run(gpa, io, .{
+        .argv = &.{"./body"},
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(run_result.stdout);
+    defer gpa.free(run_result.stderr);
+    if (!run_result.term.success()) {
+        std.debug.print(
+            "emitted program did not exit cleanly:\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ run_result.stdout, run_result.stderr },
+        );
+        return error.ProgramCrashed;
+    }
+    try std.testing.expectEqualStrings("4\n", run_result.stdout);
 }
