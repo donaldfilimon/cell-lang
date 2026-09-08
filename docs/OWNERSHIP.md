@@ -427,8 +427,10 @@ making an `arc` place UNIQUE is refused. See
 `examples/rejected/arc_to_owned.cell`.
 
 The refusal is enforced by `cell check` and, **measured rather than assumed**,
-by `cell emit` as well: `src/main.zig:164` calls `cell.check` before
-`emitFor`, and `cell emit --target=c examples/rejected/arc_to_owned.cell`
+by `cell emit` as well: `src/main.zig`'s `emit` branch calls `cell.check`
+before `emitFor` (grep for `cell.check`, and do not trust a line number here:
+this citation said `:164` and was already stale when written, because an
+unrelated comment expansion in `98b2a01` had moved the call to `:170`), and `cell emit --target=c examples/rejected/arc_to_owned.cell`
 exits 1 with this diagnostic and writes no C. An earlier revision of this
 paragraph said `cell emit` does not run borrowck "true of every rule in this
 file"; that is false for the CLI command. It is true of the LIBRARY entry point
