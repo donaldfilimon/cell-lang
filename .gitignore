@@ -2,3 +2,13 @@
 zig-out/
 .zig-cache/
 .remember/
+
+# Generated mirror of .claude/skills/, written by the multi-CLI skill sync.
+# NOT tracked, deliberately. It is a transformed copy: the sync rewrites
+# `.claude/` to `.Codex/` in the prose, and no `.Codex/` directory exists here,
+# so every command in the mirrored SKILL.md is a dead path while the original
+# works. Tracking it would publish broken instructions on a public repo and
+# create a second copy that drifts from the one under .claude/. Sibling projects
+# abbey and wdbx track zero .agents files; abi tracks them because it OWNS the
+# sync mechanism, which is a different situation.
+.agents/
