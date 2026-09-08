@@ -72,6 +72,19 @@ by planning. Task reports below will record actual commits and validation.
   acceptance rows and the distinction between local and global release
   qualification. These obligations remain open.
 
+- Nested ARC-field classification gap CLOSED. The classifier now carries the
+  written ownership keyword into recursion at three places: field annotations,
+  the qualified `.ref` spelling, and struct-field recursion. Each of the three
+  was fault-injected separately and each is caught by the new named test
+  `a boxed record hides in a copy field until the classifier reads field
+  ownership` (425 tests, was 424). Measured rather than assumed: `arc Point`
+  emits `cell_arc_t point;` and `arc Int` emits `int64_t n;`, so the boundary
+  mirrors codegen's `applyOwnership` primitive check instead of rejecting every
+  ARC annotation. Controls that must keep passing and do: primitive ARC nested
+  in a copy field, `arc` over an enum, `copy n: arc Int`, and scalar-only
+  record copy fields. Still outstanding and unchanged: general copy bindings,
+  list elements, and complete structural copyability.
+
 ## Active task
 
 Return ownership metadata in `2026-09-08-return-ownership.md`, starting at

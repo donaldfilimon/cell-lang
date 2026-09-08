@@ -1202,7 +1202,7 @@ pub const Checker = struct {
                                     "field",
                                     f.name,
                                 )) continue;
-                                switch (try self.resourceShape(&fld.ty)) {
+                                switch (try self.fieldResourceShape(&fld)) {
                                     .no_resources => switch (try self.ownedMoveSource(&f.value)) {
                                         .unknown => |s| {
                                             try self.refuseUnknownMove(s, "store", "in", "field", f.name);
@@ -2897,7 +2897,7 @@ pub const Checker = struct {
                 continue;
             }
             if (f.ownership == .copy) {
-                switch (try self.resourceShape(&f.ty)) {
+                switch (try self.fieldResourceShape(&f)) {
                     .no_resources => {},
                     .resources, .unknown => {
                         try self.diagnostics.err(
@@ -2921,26 +2921,87 @@ pub const Checker = struct {
 
     const ResourceShape = enum { no_resources, resources, unknown };
 
+    /// Whether an ownership keyword can change how a declared type is
+    /// represented. This mirrors codegen's `applyOwnership`, whose first line
+    /// is `if (base.shape.isPrimitive()) return base;` and whose `.arc` arm is
+    /// otherwise `CType.arc`. The two are one rule written in two files, so a
+    /// change to `Shape.isPrimitive` belongs here as well.
+    const Representation = enum { primitive, aggregate, unknown };
+
+    fn representationOf(self: *Checker, ty: *const ast.TypeExpr) Error!Representation {
+        return switch (ty.*) {
+            .unit => .primitive,
+            .list, .optional, .result => .aggregate,
+            // A written ownership keyword does not change what the type under
+            // it IS, only how this position holds it, so ask the payload.
+            .ref => |ref| try self.representationOf(ref.inner),
+            .name => |name| blk: {
+                if (types.fromPrimitiveName(name)) |primitive| {
+                    break :blk if (primitive == .string) .aggregate else .primitive;
+                }
+                if (self.enums.contains(name)) break :blk .primitive;
+                if (self.structs.contains(name)) break :blk .aggregate;
+                break :blk .unknown;
+            },
+        };
+    }
+
     fn resourceShape(self: *Checker, ty: *const ast.TypeExpr) Error!ResourceShape {
+        // `.owned` is the neutral answer: it is the one keyword that never
+        // changes representation, so this asks the type's own shape.
+        return self.resourceShapeOwned(ty, .owned);
+    }
+
+    /// The shape of a declared struct field, which is the type AND the keyword
+    /// written in front of it. Reading only the type is what let a boxed
+    /// scalar-only record hide inside a `copy` field.
+    fn fieldResourceShape(self: *Checker, field: *const ast.Field) Error!ResourceShape {
+        return self.resourceShapeOwned(&field.ty, field.ownership);
+    }
+
+    fn resourceShapeOwned(
+        self: *Checker,
+        ty: *const ast.TypeExpr,
+        own: ast.Ownership,
+    ) Error!ResourceShape {
         var visiting: std.StringHashMapUnmanaged(void) = .empty;
         defer visiting.deinit(self.allocator);
-        return self.resourceShapeInner(ty, &visiting);
+        return self.resourceShapeInner(ty, own, &visiting);
     }
 
     fn resourceShapeInner(
         self: *Checker,
         ty: *const ast.TypeExpr,
+        own: ast.Ownership,
         visiting: *std.StringHashMapUnmanaged(void),
     ) Error!ResourceShape {
+        // An `arc` over a non-primitive payload is a `cell_arc_t` handle, and
+        // a handle is a resource however scalar the thing it points at: the
+        // header carries a refcount, so duplicating it makes a second owner
+        // that never retained. `arc Point` emits `cell_arc_t point;` while
+        // `arc Int` emits `int64_t n;` (both measured), which is why this
+        // cannot be "every `arc` is a resource" -- that would reject
+        // primitive ARC, which the language keeps by value on purpose.
+        if (own == .arc) {
+            switch (try self.representationOf(ty)) {
+                .primitive => {},
+                .aggregate => return .resources,
+                .unknown => return .unknown,
+            }
+        }
         return switch (ty.*) {
             .unit => .no_resources,
             .list => .resources,
-            .optional => |inner| try self.resourceShapeInner(inner, visiting),
+            .optional => |inner| try self.resourceShapeInner(inner, own, visiting),
             .result => |result| combineResourceShapes(
-                try self.resourceShapeInner(result.ok, visiting),
-                try self.resourceShapeInner(result.err, visiting),
+                try self.resourceShapeInner(result.ok, own, visiting),
+                try self.resourceShapeInner(result.err, own, visiting),
             ),
-            .ref => |ref| try self.resourceShapeInner(ref.inner, visiting),
+            // A `.ref` carries its OWN keyword, which is how the qualified
+            // spelling `copy point: arc Point` writes the same box that
+            // `arc point: Point` does. Hand the inner type that keyword, not
+            // the one from the enclosing position.
+            .ref => |ref| try self.resourceShapeInner(ref.inner, ref.ownership, visiting),
             .name => |name| blk: {
                 if (types.fromPrimitiveName(name)) |primitive| {
                     break :blk if (primitive == .string) .resources else .no_resources;
@@ -2954,7 +3015,9 @@ pub const Checker = struct {
                 for (def.fields) |field| {
                     shape = combineResourceShapes(
                         shape,
-                        try self.resourceShapeInner(&field.ty, visiting),
+                        // Each field's own keyword, so a nested `arc` record
+                        // is seen through an outer `copy`.
+                        try self.resourceShapeInner(&field.ty, field.ownership, visiting),
                     );
                 }
                 break :blk shape;
@@ -6312,6 +6375,46 @@ test "copy fields reject resource and unknown shapes but preserve scalar records
         \\pub enum Color { Red, Blue }
         \\pub struct Point { copy x: Int copy color: Color }
         \\pub struct Wrapper { copy point: Point }
+    );
+}
+
+test "a boxed record hides in a copy field until the classifier reads field ownership" {
+    // The gap the owning-field slice left open. `arc Point` is NOT `Point`:
+    // it emits `cell_arc_t point;` while `Point` emits two `int64_t`s, both
+    // measured. A classifier that recursed on the declared TYPE and skipped
+    // the KEYWORD saw a scalar-only record and let a `copy` field shallow-copy
+    // a refcount header, which is a second owner that never retained.
+    try expectDiagnostics(
+        \\pub enum Color { Red, Blue }
+        \\pub struct Point { copy x: Int copy y: Int }
+        \\pub struct ArcRecord { arc point: Point }
+        \\pub struct BadNestedArc { copy holder: ArcRecord }
+        \\pub struct BadQualifiedArc { copy point: arc Point }
+        \\pub struct ArcString { arc name: String }
+        \\pub struct BadNestedArcString { copy s: ArcString }
+    ,
+        \\t.cell:4:1: error: cannot declare copy field 'holder': its type may own resources and copying its header would create two owners
+        \\t.cell:4:1: note: use an 'owned' or 'arc' field; resource-bearing copy fields are unsupported
+        \\t.cell:5:1: error: cannot declare copy field 'point': its type may own resources and copying its header would create two owners
+        \\t.cell:5:1: note: use an 'owned' or 'arc' field; resource-bearing copy fields are unsupported
+        \\t.cell:7:1: error: cannot declare copy field 's': its type may own resources and copying its header would create two owners
+        \\t.cell:7:1: note: use an 'owned' or 'arc' field; resource-bearing copy fields are unsupported
+        \\
+    );
+    // The controls that keep this from being "reject every arc". Primitive
+    // ARC is by value under the language contract: `arc Int` emits `int64_t`
+    // and an enum is a distinct integer type, so neither is a handle and
+    // neither may be refused. `copy n: arc Int` is the qualified spelling of
+    // the same thing and must agree with the annotated one.
+    try expectAccepted(
+        \\pub enum Color { Red, Blue }
+        \\pub struct Point { copy x: Int copy y: Int }
+        \\pub struct PrimitiveArc { arc n: Int }
+        \\pub struct OkPrimitiveArc { copy h: PrimitiveArc }
+        \\pub struct EnumArc { arc c: Color }
+        \\pub struct OkEnumArc { copy e: EnumArc }
+        \\pub struct OkScalarRecord { copy p: Point }
+        \\pub struct OkQualifiedPrimitiveArc { copy n: arc Int }
     );
 }
 

@@ -1313,9 +1313,27 @@ or result wrappers:
 > `err: 'copy' is not valid for 'Buffer': it owns a field of type '[Byte]'`
 
 This declaration-time check fails closed and preserves scalar and recursively
-resource-free copy fields. Other `copy` positions still rely on the annotation
-without deriving copyability, so resource-owning copy bindings remain an
-unchecked correctness hole.
+resource-free copy fields.
+
+**The classifier reads the keyword, not only the type**, and the first version
+did not. `arc Point` and `Point` are different representations of the same
+declared type: measured, the first emits `cell_arc_t point;` and the second two
+`int64_t`s. A classifier that recursed on the type alone saw a scalar-only
+record inside `arc`, called the enclosing struct resource-free, and let a `copy`
+field shallow-copy a refcount header, producing a second owner that never
+retained. Field annotations and the qualified `.ref` spelling (`copy point: arc
+Point`) both now carry their keyword into the recursion.
+
+The exemption is exact rather than convenient: `arc` over a **primitive** stays
+by value, because the language contract says so and the emitter agrees --
+`arc Int` emits `int64_t`, and an enum is a distinct integer type. So the rule
+mirrors codegen's `applyOwnership`, whose first line returns the base type
+unchanged when the shape is primitive. The two are one rule in two files; change
+one and the other is wrong.
+
+Other `copy` positions still rely on the annotation without deriving
+copyability, so resource-owning copy bindings remain an unchecked correctness
+hole, and list elements remain a separate transfer and release gap.
 
 ---
 
