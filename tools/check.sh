@@ -113,7 +113,11 @@ LEAK_STRUCT_ARC_FIELD=2997
 # This is the one row whose count matches docs/OWNERSHIP.md's own prose
 # exactly (2998 leaks / 63968 bytes), because that measurement used the same
 # string length this fixture does.
-LEAK_UNBOUND_SHARED_TEMP=2998
+# CLOSED 2026-09-07 by 460b9a3: the temporary is now hoisted into the statement
+# expression and released, so this row measures 0 rather than 2998. It stays
+# in the gate BECAUSE it is closed: pinned at 0, any nonzero reading here is a
+# regression that re-opens R11 row 3.
+LEAK_UNBOUND_SHARED_TEMP=0
 # R11 row 4: an `arc` local declared inside a block is never released
 # (function-scoped release, block-scoped binding); the "block form" row.
 LEAK_BLOCK_SCOPED_LOCAL=2997
@@ -379,7 +383,7 @@ else
 
     run_c_leaks param_never_released "" "$LEAK_PARAM_NEVER_RELEASED" "R11 row 1 @ ${LEAKS_MEASURED_AT}"
     run_c_leaks struct_arc_field "" "$LEAK_STRUCT_ARC_FIELD" "R11 row 2 @ ${LEAKS_MEASURED_AT}"
-    run_c_leaks unbound_shared_temp examples/arc_host.c "$LEAK_UNBOUND_SHARED_TEMP" "R11 row 3 @ ${LEAKS_MEASURED_AT}"
+    run_c_leaks unbound_shared_temp examples/arc_host.c "$LEAK_UNBOUND_SHARED_TEMP" "R11 row 3, CLOSED @ 460b9a3"
     run_c_leaks block_scoped_local "" "$LEAK_BLOCK_SCOPED_LOCAL" "R11 row 4 @ ${LEAKS_MEASURED_AT}"
     run_c_leaks reassigned_var "" "$LEAK_REASSIGNED_VAR" "R11 row 5 @ ${LEAKS_MEASURED_AT}"
 fi
