@@ -1089,11 +1089,58 @@ pub const Generator = struct {
 
                 // The initializer names WHICH OBJECT, never whether this
                 // binding refers to it. `pointerTo` is the only thing that
-                // sets `pointer`, and it always sets `pointee` beside it, so
-                // `.?` here cannot fire on a type this module built.
+                // sets `pointer` (it is the sole `.pointer = true` in this
+                // file) and it always sets `pointee` beside it, so `.?` here
+                // cannot fire on a type this module built.
                 const base = if (inferred.pointer) inferred.pointee.?.* else inferred;
 
-                if (isNamedLoan(&v, own)) return try self.applyOwnership(base, own);
+                // A borrow binding refers to the lender's object, and the
+                // declared mode says how.
+                if ((own == .exclusive or own == .shared) and isNamedLoan(&v, own)) {
+                    return try self.applyOwnership(base, own);
+                }
+
+                // A BY-VALUE BINDING OF AN OWNING HEADER IS NOT A COPY, AND
+                // THIS BACKEND HAS NO DEEP ONE TO EMIT. Turning a reference
+                // into a value duplicates the header, and for `cell_string_t`,
+                // `cell_slice_t` and `cell_arc_t` the header owns a heap
+                // buffer that the duplicate then also names. What that costs
+                // depends only on who frees first, and both answers are bad:
+                //
+                //     var owned name = make_text()
+                //     let owned s = &mut name
+                //
+                // is a LOAN on borrowck's side, not a move (`checkLetInit`
+                // clause 1 fires on the sigil and returns before the `.owned`
+                // move logic), so `name` is still dropped at scope exit. An
+                // `owned` binding of a droppable shape is dropped too, and the
+                // two `cell_string_free`s free one buffer. Measured: a
+                // by-value `s` here is an AddressSanitizer double free at exit
+                // 134, and `&var`, and `[T]` through `cell_slice_free`, are
+                // the same program. `var copy s = &mut name` needs no drop to
+                // get there: `reset(exclusive s)` releases the shared buffer
+                // through the duplicate and the lender is left dangling.
+                //
+                // So the reference SPELLING is kept for these, which is what
+                // this backend emitted before the rule above existed, and it
+                // is kept because it is LOUD rather than because it is right:
+                // `cell_string_free(&s)` against a `cell_string_t **` is a
+                // `cc` error at `-Werror`, and where it does compile the
+                // binding aliases its lender instead of copying it, which is
+                // wrong for `copy` and safe only by accident. A silent double
+                // free is the one outcome that is not acceptable here.
+                //
+                // The correct lowering is a deep copy at R12's copy sites
+                // (`cell_string_clone` and a slice equivalent), and refusing
+                // the ones that cannot be spelled belongs in `borrowck.zig`,
+                // which is what actually decides that `let owned s = &mut x`
+                // borrows rather than moves. Neither is contained here.
+                //
+                // Records, enums and primitives are unaffected: `hasDropCall`
+                // is false for them, so `let copy snap = <a borrow>` is a real
+                // value copy, which is the whole of defect 3.
+                if (inferred.pointer and hasDropCall(base.shape)) return inferred;
+
                 return base;
             }
         }
@@ -5084,4 +5131,67 @@ test "isNamedLoan mirrors borrowck.checkLetInit over every initializer shape" {
             return error.WrongVerdict;
         }
     }
+}
+
+test "a by-value binding of an owning header keeps the loud reference spelling" {
+    // THE FOURTH DEFECT, DEMONSTRATED RATHER THAN SHIPPED. The first version of
+    // the `letType` rule above derived the type from the annotation for EVERY
+    // mode, which turned these three from a `cc` error into a silent double
+    // free: `let owned s = &mut name` is a LOAN on borrowck's side rather than
+    // a move, so the lender is still dropped, and an `owned` binding of a
+    // droppable shape is dropped too. Measured at that intermediate revision,
+    // all three were `AddressSanitizer: attempting double-free` at exit 134,
+    // and the last of them PRINTED CORRECTLY before the change.
+    //
+    // Keeping the pointer is not a claim that the pointer is right. It is the
+    // spelling this backend already had, and it is loud: `cell_string_free(&s)`
+    // against a `cell_string_t **` is a `-Werror` error, which the gate's
+    // sanitizer stage compiles at.
+    var e = try emitSource(
+        \\pub fn make_text() -> String;
+        \\pub fn fresh() -> [Int];
+        \\pub fn reset(exclusive s: String);
+        \\pub fn main() {
+        \\  var owned name = make_text()
+        \\  let owned s = &mut name
+        \\  var owned list = fresh()
+        \\  let owned xs = &mut list
+        \\  var owned other = make_text()
+        \\  var copy c = &mut other
+        \\  reset(exclusive c)
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_string_t *s = &name;");
+    try expectContains(e.text, "cell_slice_t *xs = &list;");
+    try expectContains(e.text, "cell_string_t *c = &other;");
+    // The shallow copies that would be silent double frees.
+    try expectAbsent(e.text, "cell_string_t s = *&name;");
+    try expectAbsent(e.text, "cell_slice_t xs = *&list;");
+    try expectAbsent(e.text, "cell_string_t c = *&other;");
+}
+
+test "the owning-header guard is keyed on the drop call, so records still copy" {
+    // The guard's boundary, both sides in one module. A record has no drop
+    // call, so a by-value binding of a borrowed record is a real copy and
+    // defect 3 stays fixed; a String has one, so the same spelling keeps the
+    // reference. Pinned together because widening the guard to every shape
+    // would silently reinstate the alias this whole change removes, and
+    // narrowing it to none would reinstate the double free above.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn make_text() -> String;
+        \\pub fn grow(exclusive b: Buffer);
+        \\pub fn main() {
+        \\  var owned buf = Buffer { len: 1 }
+        \\  let exclusive v = &mut buf
+        \\  let copy snap = v
+        \\  grow(exclusive v)
+        \\  var owned name = make_text()
+        \\  let copy text = &mut name
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_Buffer snap = *v;");
+    try expectContains(e.text, "cell_string_t *text = &name;");
 }
