@@ -199,6 +199,23 @@ const Builder = struct {
     /// excluded from `exits` for the same reason the match-panic block is:
     /// nothing ever runs it, so it is not a real function exit a drop pass
     /// should visit.
+    ///
+    /// **This check is ONE-HOP and not transitive, and a consumer must know
+    /// that.** It asks only whether this join has zero predecessors. A join
+    /// whose only predecessor is itself unreachable -- a guard that always
+    /// diverges, say -- has a predecessor count of one and is handed back as
+    /// live. So a block reachable from here is not thereby reachable from
+    /// `entry`, and a consumer that needs real reachability must compute it
+    /// rather than infer it from a non-null `cur`.
+    ///
+    /// The direction is the safe one and that is why it is left: a genuinely
+    /// dead join is treated as live, which is exactly the pre-check behaviour
+    /// for every case, so nothing regressed. It over-approximates
+    /// reachability, and over-approximating is what a drop pass and a
+    /// liveness pass both want. `src/cell/liveness.zig` tolerates it
+    /// deliberately and says so in its own module doc comment. This caveat
+    /// lived only in a task report until 2026-09-07; it belongs here, next to
+    /// the code that has it.
     fn deadJoinOrLive(self: *Builder, join_id: u32) ?u32 {
         if (self.blocks.items[join_id].preds.items.len == 0) {
             self.seal(join_id, .unreachable_);
@@ -208,6 +225,19 @@ const Builder = struct {
     }
 
     // -- statements -----------------------------------------------------
+    //
+    // A NOTE FOR WHOEVER BUILDS ON THIS GRAPH, recorded 2026-09-07 from a
+    // review of `lowerMatch`. That function was fixed so a guarded catch-all
+    // gets a single decision point, and so a join with no real predecessors is
+    // sealed rather than handed back as `cur`. The same shape exists in
+    // principle for `lowerIf`'s branches: an arm or branch body is lowered
+    // even when the edge into it was never added, because lowering walks the
+    // HIR tree rather than following edges. It is not a defect today -- a body
+    // lowered into a block nothing enters contributes blocks that no path
+    // reaches, and both `deadJoinOrLive` above and a liveness fixpoint
+    // over-approximate harmlessly past it. It is written down because a
+    // consumer that assumes "every block in the graph is reachable" would be
+    // wrong, and that assumption is easy to make and hard to see.
 
     fn lowerStmts(self: *Builder, stmts: []const hir.Stmt) CfgError!void {
         for (stmts) |stmt| {
