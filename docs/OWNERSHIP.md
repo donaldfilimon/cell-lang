@@ -562,7 +562,7 @@ anything.
 | An `arc` value unboxed for a `shared` parameter without ever being bound (`inspect(shared fresh())`) drops its handle on the floor | `leaks`: **2998 leaks / 63968 bytes** over 1000 iterations |
 | An `arc` local declared inside a block OR A MATCH ARM is never released, because release is function-scoped and both are popped before the drop pass runs; inside a `while` body that is unbounded | `leaks`: **2997 leaks / 63936 bytes** over 1000 iterations for the block form |
 | Reassigning an `arc` `var` leaks the previous box (`var arc v = "one"` then `v = "two"`), the same class as the R3a-revival leak R16 documents for `owned` | `leaks`: **3 leaks / 64 bytes** for a single reassignment |
-| An `owned` String or list PLACE bound as `arc` is not boxed at all, and is left as a C type error rather than a silent double free | see retain rule 1 above |
+| An `owned` String or list PLACE bound as `arc` (**the reverse direction**; `arc` into `owned` is refused outright by R10 above) is not boxed at all, and is left as a C type error rather than a silent double free | see retain rule 1 above. Re-measured: `let arc b = a` with an `owned` String `a` still emits `cell_arc_t b = a;` and `cc` rejects it, `initializing 'cell_arc_t' with an expression of incompatible type 'cell_string_t'` |
 
 ### What the search covered, which is the honest form of the claim
 
