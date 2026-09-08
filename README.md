@@ -92,13 +92,13 @@ zig build
 zig build -Dswift=false -Dcxx=false
 
 # run the CLI
-zig build run -- version
-zig build run -- check examples/hello.cell
-zig build run -- dump  examples/ownership.cell
-zig build run -- emit  examples/hello.cell
+zig build run -Dswift=false -- version
+zig build run -Dswift=false -- check examples/hello.cell
+zig build run -Dswift=false -- dump  examples/ownership.cell
+zig build run -Dswift=false -- emit  examples/hello.cell
 
 # tests
-zig build test
+zig build test -Dswift=false
 ```
 
 Two notes on the build, both worth knowing before you trust a green result:
@@ -176,18 +176,33 @@ enforces.
 
 ## Checking any of this yourself
 
-`tools/check.sh` is the gate and its exit code is the verdict. Six stages:
-build; unit tests with the count printed; the four corpus contracts in
-`examples/README.md`; LLVM-versus-MLIR verdict agreement on every example;
-that emitted MLIR actually **lowers** (a verdict is not a lowering, and an
-example spent its whole life on the accepted side while emitting text
-`mlir-opt` could never consume); and real execution, where emitted code is
-compiled, linked against the runtime, run, and its answer compared.
+`tools/check.sh` is the local compiler gate and its exit code is the verdict.
+Its ten stages cover build, unit tests, corpus contracts, backend acceptance
+agreement, MLIR lowering, execution, disclosed leak fixtures, backend answers,
+AddressSanitizer execution, and declared ABI signatures. Signature-only
+fixtures participate in lowering validation. A clean gate can retain explicitly
+pinned defects; those disclosures are separate from release qualification.
 
 ```sh
 zig build -Dswift=false     # -Dswift=false is required; see Requirements
 tools/check.sh
 ```
+
+For a structured report and preserved log, run:
+
+```sh
+python3 tools/qualify.py --strict
+# Optional output destination; defaults to .cell-cache/qualification/
+python3 tools/qualify.py --strict --report /private/tmp/cell-report.json
+```
+
+The report records the source revision and content fingerprint before and
+after the run, tool versions, observed test counts, actual stages, skips,
+disclosures and process status. `--strict` rejects skipped checks and missing
+stages. `--release` adds clean-input and zero-disclosure requirements to this
+local gate. `local_gate_ready` describes that local result; `release_ready`
+remains false until complete feature, platform and extracted-package evidence
+is evaluated. This command cannot certify the full language or all platforms.
 
 To run one program of your own through all three backends,
 `.claude/skills/run-cell-lang/driver.sh --expect <value> yourfile.cell` emits,
