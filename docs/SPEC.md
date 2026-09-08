@@ -54,15 +54,28 @@ parser-only cases include `T?`, `[T]` as a type, and `use`.
 
 | Status | Constructs |
 |---|---|
-| implemented | 86 |
-| parsed, not enforced | 8 |
-| designed, not implemented | 55 |
-| **total** | **149** |
+| implemented | 96 |
+| partially implemented | 2 |
+| parsed, not enforced | 5 |
+| designed, not implemented | 49 |
+| **total** | **152** |
 
-Counted from the section 12 index, not estimated.
+Counted from the section 12 index on 2026-09-08, not estimated. **Recount rather
+than trusting these numbers**, because they have been wrong before and will be
+again: they said 86 / 8 / 55 / 149 while the table held 96 / 2 / 5 / 49 / 152,
+had no row at all for `partially implemented` when two constructs carried it,
+and one section 12 row had resorted to saying "this row postdates the 0.2 count"
+inline rather than fixing the total. A count in prose is stale the next time
+anyone edits the table below it. The command:
 
-The headline consequence: **the front end, a typechecker, a borrow checker for
-R2/R3/R5/R8/R14, and C lowering for the flagship examples are real.** As of
+```sh
+awk '/^## 12\. Status index/,/^## 13\./' docs/SPEC.md \
+  | grep '^|' | grep -v '^|---' | grep -v 'Construct | Status' \
+  | awk -F'|' '{gsub(/^ +| +$/,"",$3); print $3}' | sort | uniq -c
+```
+
+The headline consequence: **the front end, a typechecker, a borrow checker for R1/R2/R3/R3a/R4/R5/R6/R8/R9/R14/R15 plus one clause of
+R10, and C lowering for the flagship examples are real.** As of
 the working tree the lexer, parser, AST, diagnostics, typechecker, and
 borrowck are wired into `cell check`. `if` / `else`, `match`, blocks, struct
 literals, list literals, and mangled calls lower to C. What is still designed
@@ -1869,8 +1882,9 @@ records the missing lowering.
 | ASCII identifiers | implemented |
 | `_` reserved as a wildcard outside patterns | designed, not implemented |
 | Unicode identifiers | designed, not implemented |
-| Keywords (19) | implemented |
-| Reserved words (`while`, `for`, ...) | designed, not implemented |
+| Keywords (43 in the lexer's table) | implemented |
+| Reserved words that are lexed and NOT implemented (`for`, `loop`, `async`, `await`, `defer`, `impl`, `trait`, ...) | designed, not implemented |
+| `while` | implemented: it was in this row as a reserved word long after loops landed |
 | Decimal integer literal | implemented |
 | Hex / binary / octal literal | designed, not implemented |
 | Underscore digit separator | designed, not implemented |
