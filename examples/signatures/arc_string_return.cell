@@ -1,0 +1,21 @@
+// The `arc` return whose C signature and IR signature are DIFFERENT CALLING
+// CONVENTIONS, isolated so the signature stage has a program to prove it on.
+//
+// Measured: the C backend declares `cell_arc_t cell_f(void)` and clang lowers
+// that to `void @cell_f(ptr sret(%struct.cell_arc))`, a 24-byte
+// `{ptr, ptr, ptr}`. Both other backends declare
+// `void @cell_f(ptr sret(%cell_string))`, a 24-byte `{ptr, i64, i64}`. Same
+// arity, same sret-ness, same size, DIFFERENT TYPE: a C host linked against
+// either IR backend's object hands the callee a buffer it will fill with the
+// wrong struct.
+//
+// The cause is upstream of both emitters and neither can see it: `hir.Fn`
+// carries `ret: Ty` with no ownership mode, so the `arc` is already gone by
+// the time either one reads the return type. docs/OWNERSHIP.md R11 is the
+// document that owns the `arc` gaps; this one is a signature gap, pinned in
+// tools/check.sh stage 10 as a DISCLOSED disagreement.
+//
+// This file has no `main` on purpose: it is a signature fixture, not a
+// program, and nothing here is meant to run.
+pub fn make() -> String;
+pub fn f() -> arc String { return make() }

@@ -116,6 +116,23 @@
 #                       ASan-clean while a real heap-use-after-free was live,
 #                       because no example returned an `arc` field. That is
 #                       what examples/arc_return_field.cell is for.
+#  10. signatures     the C backend's DECLARED SIGNATURES against the other
+#                       two, compared at the ABI level rather than the textual
+#                       one, because runtime/cell_rt.h section 7 is the
+#                       contract and the C backend is its reference
+#                       implementation. Stage 4 compares LLVM against MLIR and
+#                       NOTHING ELSE, so it is blind to both being wrong
+#                       together and to either disagreeing with C, and it was:
+#                       `pub fn f() -> arc String` declares
+#                       `cell_arc_t cell_f(void)` in C, which clang lowers to
+#                       `sret(%struct.cell_arc)`, a 24-byte {ptr,ptr,ptr}, and
+#                       both other backends declare `sret(%cell_string)`, a
+#                       24-byte {ptr,i64,i64}. Same arity, same sret-ness, same
+#                       SIZE, different TYPE: a C host linked against either IR
+#                       backend hands the callee a buffer it fills with the
+#                       wrong struct. Every stage above was green on it, and
+#                       stage 8 could not have caught it either, because the
+#                       program has no `main` and prints nothing.
 #
 # TRAPS THIS SCRIPT IS WRITTEN AGAINST, each one having actually bitten:
 #
@@ -228,6 +245,44 @@ LEAK_BLOCK_SCOPED_LOCAL=2997
 # R11 row 5: reassigning an `arc` `var` leaks the previous box.
 LEAK_REASSIGNED_VAR=3000
 
+# ---- stage 10 disclosed signature disagreements, pinned by defect ---------
+# Each line is `<example key>:<function>:<leg>` naming a place where the C
+# backend's declared ABI and another backend's DISAGREE TODAY, on purpose,
+# because the defect is real, unfixed, and lives in a file this gate does not
+# own. Same contract as the leak constants above and read the same way:
+#
+#   * a disagreement that is pinned here is reported as `(disclosed)` and does
+#     not fail the gate;
+#   * a disagreement that is NOT pinned here FAILS, which is the whole point;
+#   * a pin whose function AGREES again, or which is no longer compared at
+#     all, ALSO FAILS, so a closed gap cannot go unnoticed and a pin cannot
+#     rot into a line nobody reads. When that happens the fix is to delete the
+#     pin and cite the commit that closed it, never to keep it "just in case".
+#
+# DO NOT "fix" a failure here by adding a pin. A new disagreement is a new ABI
+# defect; it belongs in src/ or, if it is genuinely disclosed elsewhere, in a
+# pin that says WHERE it is disclosed, as these four do.
+#
+#   signatures/arc_string_return:cell_f  (LLVM and MLIR)
+#       `hir.Fn` carries `ret: Ty` with no ownership mode, so the `arc` is
+#       gone before either emitter reads the return type and both sret the
+#       bare String. Upstream of both backends, in src/cell/hir.zig; the
+#       fixture's own header comment carries the measurement.
+#
+#   primitives:cell_take_list, primitives:cell_take_nested  (MLIR)
+#       a `shared` list is `const T *` by runtime/cell_rt.h section 7 and the
+#       C backend passes `ptr`; the MLIR backend passes the 24-byte view BY
+#       VALUE. This is the unfixed twin of the `abi.classifyParam` defect that
+#       1fffcf8 fixed for the LLVM backend, it lives in src/cell/mlirmit.zig,
+#       and stage 8's header already describes it in prose for `exclusive
+#       String` without any stage checking it. These two pins are EXPECTED to
+#       flip to "gap closed, un-pin" when that fix lands: read that red as the
+#       prompt it is, not as a regression.
+SIG_DISCLOSED='signatures/arc_string_return:cell_f:LLVM
+signatures/arc_string_return:cell_f:MLIR
+primitives:cell_take_list:MLIR
+primitives:cell_take_nested:MLIR'
+
 fails=0
 skips=0
 
@@ -334,10 +389,13 @@ done
 # carries `ret: Ty` with no ownership mode, so the `arc` is simply absent by
 # the time either emitter reads it.
 #
-# What is MISSING is a stage that compares the C backend's DECLARED
-# SIGNATURES against the other two, the way stage 8 compares printed answers.
-# Until that exists, read a green line here as "llvm and mlir agree", never as
-# "the backends agree". This is the same lesson as stage 5's header (a verdict
+# THAT STAGE NOW EXISTS AND IT IS STAGE 10: it compares the C backend's
+# DECLARED SIGNATURES against the other two, the way stage 8 compares printed
+# answers, and it pins this exact case as a disclosed disagreement against
+# examples/signatures/arc_string_return.cell. Still read a green line HERE as
+# "llvm and mlir agree", never as "the backends agree"; stage 10 is the only
+# line in this script that speaks for all three. This is the same lesson as
+# stage 5's header (a verdict
 # is not a lowering) and stage 8's (verdict agreement is not answer
 # agreement), one level further out: AGREEMENT BETWEEN TWO PARTIES IS NOT
 # CORRECTNESS WHEN A THIRD DEFINES THE CONTRACT, and here the third,
@@ -867,6 +925,485 @@ else
         fail "the sanitizer stage ran against nothing at all"
     elif [ $fails -eq $asan_before ]; then
         pass "every runnable example is clean under AddressSanitizer"
+    fi
+fi
+
+# ------------------------------------------------- 10. declared signatures --
+# TWO PARTIES AGREEING IS NOT CORRECTNESS WHEN A THIRD DEFINES THE CONTRACT.
+# Stage 4 compares the LLVM backend against the MLIR backend and nothing else,
+# so it cannot see them being wrong together, and it cannot see either of them
+# disagreeing with C. runtime/cell_rt.h section 7 is the contract every backend
+# is supposed to honour and the C backend is its reference implementation, so
+# the missing comparison is C against the other two. This stage is it.
+#
+# THE LIVE INSTANCE it was written for, measured rather than imagined:
+#
+#     pub fn make() -> String;
+#     pub fn f() -> arc String { return make() }
+#
+# C declares `cell_arc_t cell_f(void)`, which clang lowers to
+# `void @cell_f(ptr sret(%struct.cell_arc))`, a 24-byte {ptr, ptr, ptr}. Both
+# other backends declare `void @cell_f(ptr sret(%cell_string))`, a 24-byte
+# {ptr, i64, i64}. Same arity, same sret-ness, SAME SIZE, different type: a C
+# host linked against either IR backend's object hands the callee a buffer the
+# callee fills with the wrong struct. Every other stage was green on it. Stage
+# 8 could not have caught it either, because the program has no `main`.
+#
+# HOW THE COMPARISON IS MADE, and why not textually. All three legs are
+# reduced to LLVM IR first: the emitted C through `cc -S -emit-llvm`, the LLVM
+# backend's output as it stands, the MLIR backend's through its own pipeline
+# and mlir-translate. That matters, because clang is the thing that turns a C
+# declaration into a calling convention. Comparing `cell_arc_t cell_f(void)`
+# against `void @cell_f(ptr sret(...))` as TEXT reports a difference that is
+# not one: for a 24-byte return the C ABI uses an sret pointer too, and clang
+# says so where the header does not.
+#
+# WHAT IS COMPARED, per function, per backend, against C:
+#
+#   * the number of parameters after ABI lowering, so an sret pointer counts
+#     as the parameter it is;
+#   * for each parameter position, whether it is passed INDIRECTLY (`sret`,
+#     `byval`) and, when it is, the FULL RESOLVED FIELD LAYOUT of the pointee.
+#     clang does not coerce an indirect type, so field-exact is valid here,
+#     and this is the half that catches the `arc` case above, which size alone
+#     would miss;
+#   * for each DIRECT parameter and for the return, a canonical form: scalars
+#     by name (ptr, i64, i32, i8, i1, float, double), aggregates collapsed
+#     single-element-wise and then reduced to `agg<bytes>`, with an `f` suffix
+#     when every leaf is floating point so an HFA cannot canonicalize onto an
+#     integer aggregate of the same size. Direct aggregates are reduced rather
+#     than compared field by field because CLANG HAS ALREADY COERCED THEM: it
+#     renders every 16-byte aggregate as `[2 x i64]`, so the field structure
+#     is not recoverable from the C leg and comparing it would fail on
+#     spelling. Measured on this corpus, that reduction is what makes
+#     `[2 x i64]` vs `{ptr,i64}` vs `{i8,i64}` agree, correctly, while
+#     `ptr` vs `{ptr,i64,i64}` still disagrees, correctly.
+#
+# WHAT IS DELIBERATELY NOT COMPARED, because a stage that looked stronger than
+# it is would be worse than the hole it replaces:
+#
+#   * `zeroext` / `signext`. These ARE calling convention, not hints, and they
+#     DO differ here: measured on this commit, clang marks nine parameters
+#     that the other backends do not, and the LLVM backend is inconsistent
+#     with ITSELF about it, emitting `zeroext` on a `declare`d `i1` but not on
+#     a `define`d one, and not at all for `i8`. That is a real finding and it
+#     is recorded here rather than gated, because gating it would put nine
+#     pins in a file that already has four and would drown the ABI-shape
+#     signal this stage exists for. It is a named blind spot, not an oversight.
+#   * the field structure of DIRECT aggregates, for the clang-coercion reason
+#     above. Two 16-byte aggregates with different fields compare equal.
+#   * hint attributes (noalias, noundef, dead_on_unwind, writable, align, ...),
+#     parameter names, and linkage. None of those are calling convention.
+#   * functions that are not present in BOTH IRs. clang drops a declaration
+#     nothing references, and the IR backends declare only what they use, so
+#     the comparison is over the intersection and the size of it is reported.
+#     The probe array below exists to shrink that gap: it takes the address of
+#     every function the emitted C declares, which keeps clang from dropping
+#     them and, measured, adds 15 comparisons on examples/primitives.cell
+#     alone, the example where classification matters most.
+#   * anything about what the functions DO. This stage reads declarations. A
+#     backend can agree perfectly here and compute the wrong answer, which is
+#     stage 8's subject, and it can agree here and mis-lower, which is stage
+#     5's.
+#   * any ABI but this machine's. The C leg is whatever `cc` targets, so these
+#     are AArch64/Darwin facts. On another target the same source could
+#     legitimately produce a different, still-consistent set.
+#
+# An unparseable or unresolved type FAILS rather than being skipped: a size
+# this stage guessed wrong would make two different ABIs compare equal, which
+# is the one outcome it exists to prevent.
+#
+# SKIPS. `cc -S -emit-llvm` is the reference leg, so if it does not work the
+# whole stage skips loudly. mlir-opt/mlir-translate missing skips the MLIR leg
+# only, the way stage 8 does. llc is not needed: nothing is run here.
+printf '\n== declared signatures (C is the reference) ==\n'
+sig_before=$fails
+sig_compared=0
+sig_disagree=0
+sig_undisclosed=0
+sig_examples=0
+sig_conly=0
+SIGTAB=$(printf '\t')
+
+cat > "$TMP/sig.awk" <<'SIG_AWK_END'
+# Reduce every `@cell_*` declaration in an LLVM IR file to an ABI-shaped
+# signature: "name<TAB>ret|p0|p1|...". Stage 10's header says what the shape
+# deliberately keeps and deliberately throws away, and why each.
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+
+# Split s on TOP-LEVEL commas into arr[1..n]. Depth-aware, so a comma inside
+# `{ ptr, i64 }` or `sret({ ... })` never splits a parameter in half.
+function tsplit(s, arr,   i, d, cur, n, c) {
+    n = 0; d = 0; cur = ""
+    for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "{" || c == "[" || c == "(" || c == "<") d++
+        else if (c == "}" || c == "]" || c == ")" || c == ">") d--
+        if (c == "," && d == 0) { n++; arr[n] = trim(cur); cur = "" }
+        else cur = cur c
+    }
+    if (trim(cur) != "") { n++; arr[n] = trim(cur) }
+    return n
+}
+
+# Size and alignment, AArch64/Darwin. Anything not listed returns -1 and the
+# caller reports UNPARSEABLE rather than guessing a layout: a wrong size here
+# would make two different ABIs compare equal, which is the one outcome this
+# stage exists to prevent.
+function talign(t,   inner, n, i, a, mx, parts) {
+    t = trim(t)
+    if (t == "ptr" || t == "i64" || t == "double") return 8
+    if (t == "i32" || t == "float") return 4
+    if (t == "i16") return 2
+    if (t == "i8" || t == "i1") return 1
+    if (substr(t, 1, 1) == "[") {
+        inner = substr(t, 2, length(t) - 2)
+        if (inner !~ /^[0-9]+ x /) return -1
+        sub(/^[0-9]+ x /, "", inner)
+        return talign(inner)
+    }
+    if (substr(t, 1, 1) == "{") {
+        inner = trim(substr(t, 2, length(t) - 2))
+        if (inner == "") return 1
+        n = tsplit(inner, parts); mx = 1
+        for (i = 1; i <= n; i++) { a = talign(parts[i]); if (a < 0) return -1; if (a > mx) mx = a }
+        return mx
+    }
+    return -1
+}
+
+function tsize(t,   inner, cnt, n, i, off, a, s, mx, parts) {
+    t = trim(t)
+    if (t == "ptr" || t == "i64" || t == "double") return 8
+    if (t == "i32" || t == "float") return 4
+    if (t == "i16") return 2
+    if (t == "i8" || t == "i1") return 1
+    if (substr(t, 1, 1) == "[") {
+        inner = substr(t, 2, length(t) - 2)
+        if (inner !~ /^[0-9]+ x /) return -1
+        cnt = inner; sub(/ x .*$/, "", cnt)
+        sub(/^[0-9]+ x /, "", inner)
+        s = tsize(inner); if (s < 0) return -1
+        return (cnt + 0) * s
+    }
+    if (substr(t, 1, 1) == "{") {
+        inner = trim(substr(t, 2, length(t) - 2))
+        if (inner == "") return 0
+        n = tsplit(inner, parts); off = 0; mx = 1
+        for (i = 1; i <= n; i++) {
+            a = talign(parts[i]); s = tsize(parts[i])
+            if (a < 0 || s < 0) return -1
+            if (a > mx) mx = a
+            if (off % a != 0) off += a - (off % a)
+            off += s
+        }
+        if (off % mx != 0) off += mx - (off % mx)
+        return off
+    }
+    return -1
+}
+
+# An HFA and an integer aggregate of the SAME SIZE go to different register
+# files, so `agg8` must not be able to mean both.
+function allfp(t,   inner, n, i, parts) {
+    t = trim(t)
+    if (t == "float" || t == "double") return 1
+    if (t ~ /^(ptr|i1|i8|i16|i32|i64)$/) return 0
+    if (substr(t, 1, 1) == "[") { inner = substr(t, 2, length(t) - 2); sub(/^[0-9]+ x /, "", inner); return allfp(inner) }
+    if (substr(t, 1, 1) == "{") {
+        inner = trim(substr(t, 2, length(t) - 2))
+        if (inner == "") return 0
+        n = tsplit(inner, parts)
+        for (i = 1; i <= n; i++) if (!allfp(parts[i])) return 0
+        return 1
+    }
+    return 0
+}
+
+# A one-element aggregate occupies exactly what its element does, and the three
+# emitters spell that three ways: i64, [1 x i64], { i64 }. Collapse, repeatedly.
+function collapse(t,   inner, n, parts) {
+    t = trim(t)
+    while (1) {
+        if (substr(t, 1, 1) == "{") {
+            inner = trim(substr(t, 2, length(t) - 2))
+            if (inner == "") return t
+            delete parts
+            n = tsplit(inner, parts)
+            if (n != 1) return t
+            t = trim(parts[1])
+        } else if (substr(t, 1, 1) == "[") {
+            inner = substr(t, 2, length(t) - 2)
+            if (inner !~ /^1 x /) return t
+            sub(/^1 x /, "", inner)
+            t = trim(inner)
+        } else return t
+    }
+}
+
+# A DIRECTLY passed or returned type. clang has already coerced these into
+# register-shaped types (any 16-byte aggregate becomes [2 x i64]), so the field
+# structure is NOT recoverable from the C leg and comparing it would fail on
+# spelling. Scalars keep their name; aggregates reduce to size plus float-ness.
+function canon(t,   c, s) {
+    c = collapse(t)
+    if (c ~ /^(ptr|i1|i8|i16|i32|i64|float|double|void)$/) return c
+    if (substr(c, 1, 1) == "{" || substr(c, 1, 1) == "[") {
+        s = tsize(c)
+        if (s < 0) return "UNPARSEABLE<" c ">"
+        return "agg" s (allfp(c) ? "f" : "")
+    }
+    return "UNPARSEABLE<" c ">"
+}
+
+# Named struct types, substituted into every use. An INDIRECT type is compared
+# field by field, so the substitution must be complete; a name that never
+# resolves is reported rather than silently dropped with the value names.
+function resolve(t,   pass, i, c, out, tok, changed) {
+    for (pass = 0; pass < 12; pass++) {
+        changed = 0; out = ""; i = 1
+        while (i <= length(t)) {
+            c = substr(t, i, 1)
+            if (c == "%") {
+                tok = "%"; i++
+                while (i <= length(t) && substr(t, i, 1) ~ /[A-Za-z0-9_.$]/) { tok = tok substr(t, i, 1); i++ }
+                if (tok in ty) { out = out ty[tok]; changed = 1 } else { out = out tok }
+            } else { out = out c; i++ }
+        }
+        t = out
+        if (!changed) break
+    }
+    return t
+}
+
+# Drop the words that are HINTS rather than calling convention, and the value
+# names. What survives is the type. zeroext/signext are dropped here too and
+# they are NOT hints; stage 10's header records that as a named blind spot.
+function bareType(s,   i, n, out, w, parts) {
+    gsub(/align +[0-9]+/, " ", s)
+    gsub(/dereferenceable(_or_null)?\([0-9]+\)/, " ", s)
+    gsub(/(captures|initializes|range|memory|alignstack)\([^)]*\)/, " ", s)
+    gsub(/#[0-9]+/, " ", s)
+    gsub(/%[A-Za-z0-9_.$]+/, " ", s)
+    gsub(/,/, " , ", s)
+    n = split(s, parts, /[ \t]+/)
+    out = ""
+    for (i = 1; i <= n; i++) {
+        w = parts[i]
+        if (w == "") continue
+        if (w ~ /^(dead_on_unwind|writable|noalias|noundef|nonnull|nocapture|readonly|readnone|writeonly|inreg|returned|immarg|willreturn|nofree|nosync|nounwind|zeroext|signext|inalloca|swiftself|swifterror|disjoint|dso_local|local_unnamed_addr|internal|private|external|weak|weak_odr|linkonce|linkonce_odr|hidden|protected|available_externally|fastcc|ccc|coldcc|tailcc|swiftcc)$/) continue
+        out = out (out == "" ? "" : " ") w
+    }
+    return out
+}
+
+# An unresolved NAMED type would be deleted by bareType along with the value
+# names, and two different opaque structs would then compare equal. Refuse.
+function unresolved(s) { return (s ~ /%(struct|union|class)\.|%cell_/) }
+
+/^%[A-Za-z0-9_.$]+ = type / {
+    body = $0; sub(/^[^=]*= type /, "", body)
+    ty[$1] = trim(body)
+    next
+}
+
+/^(declare|define)[^@]*@cell_[A-Za-z0-9_]*[ ]*\(/ {
+    line = $0
+    at = index(line, "@cell_")
+    head = substr(line, 1, at - 1)
+    rest = substr(line, at + 1)
+    fname = rest; sub(/[ (].*$/, "", fname)
+
+    # The balanced argument list, so `sret({ ptr, i64, i64 })` survives whole.
+    depth = 0; args = ""; started = 0
+    for (i = index(rest, "("); i <= length(rest); i++) {
+        ch = substr(rest, i, 1)
+        if (ch == "(") { depth++; if (depth == 1) { started = 1; continue } }
+        else if (ch == ")") { depth--; if (depth == 0) break }
+        if (started) args = args ch
+    }
+
+    sub(/^(declare|define) */, "", head)
+    rt = resolve(head)
+    if (unresolved(rt)) { print fname "\tUNRESOLVED-RETURN-TYPE"; next }
+    sig = bareType(rt)
+    sig = (sig == "" ? "void" : canon(sig))
+
+    ra = resolve(args)
+    delete ps
+    np = tsplit(ra, ps)
+    for (i = 1; i <= np; i++) {
+        p = ps[i]
+        if (match(p, /sret\(/) || match(p, /byval\(/)) {
+            kind = (match(p, /sret\(/) ? "sret" : "byval")
+            match(p, /(sret|byval)\(/)
+            st = substr(p, RSTART + RLENGTH); d = 1; inner = ""
+            for (j = 1; j <= length(st); j++) {
+                ch = substr(st, j, 1)
+                if (ch == "(") d++
+                else if (ch == ")") { d--; if (d == 0) break }
+                inner = inner ch
+            }
+            if (unresolved(inner)) { sig = sig "|" kind ":UNRESOLVED"; continue }
+            gsub(/[ \t]/, "", inner)
+            sig = sig "|" kind ":" inner
+        } else if (unresolved(p)) {
+            sig = sig "|UNRESOLVED-PARAM-TYPE"
+        } else {
+            sig = sig "|" canon(bareType(p))
+        }
+    }
+    print fname "\t" sig
+}
+SIG_AWK_END
+
+sig_pinned() { printf '%s\n' "$SIG_DISCLOSED" | grep -qx "$1"; }
+
+# One (function, leg) verdict. Three outcomes, and the third is the one that
+# keeps the pin list honest: a pin that stops disagreeing FAILS.
+sig_verdict() {
+    _key=$1; _fn=$2; _leg=$3; _c=$4; _b=$5
+    _pin="$_key:$_fn:$_leg"
+    if [ "$_c" = "$_b" ]; then
+        if sig_pinned "$_pin"; then
+            fail "signatures $_pin AGREES now: the disclosed gap is CLOSED. Delete the pin from SIG_DISCLOSED and cite the commit that closed it."
+        fi
+        : > "$TMP/sighit_$(printf '%s' "$_pin" | tr '/:' '__')"
+        return
+    fi
+    sig_disagree=$((sig_disagree + 1))
+    : > "$TMP/sighit_$(printf '%s' "$_pin" | tr '/:' '__')"
+    if sig_pinned "$_pin"; then
+        pass "signatures $_key $_fn: $_leg disagrees with C (DISCLOSED, pinned in SIG_DISCLOSED)"
+        printf '        C    %s\n        %-4s %s\n' "$_c" "$_leg" "$_b"
+    else
+        sig_undisclosed=$((sig_undisclosed + 1))
+        fail "signatures $_key $_fn: $_leg declares a DIFFERENT calling convention from C"
+        printf '        C    %s\n        %-4s %s\n' "$_c" "$_leg" "$_b"
+    fi
+}
+
+# join(1) needs both sides sorted in the SAME collation as its own comparison.
+# LC_ALL=C on both sides rather than trusting the ambient locale.
+sig_join() {
+    _key=$1; _leg=$2; _cs=$3; _bs=$4
+    LC_ALL=C join -t"$SIGTAB" "$_cs" "$_bs" > "$TMP/sig_join.txt"
+    # Redirected from a FILE, not a pipe: a `while read` in a pipeline runs in
+    # a subshell and every fails++ inside it would be discarded on exit.
+    while IFS="$SIGTAB" read -r _fn _a _b; do
+        [ -n "$_fn" ] || continue
+        sig_compared=$((sig_compared + 1))
+        case "$_a$_b" in
+            *UNPARSEABLE*|*UNRESOLVED*)
+                fail "signatures $_key $_fn: this stage could not parse a type it must compare exactly (C='$_a' $_leg='$_b'); teach tsize/talign the type rather than letting it compare equal"
+                continue ;;
+        esac
+        sig_verdict "$_key" "$_fn" "$_leg" "$_a" "$_b"
+    done < "$TMP/sig_join.txt"
+}
+
+printf 'int cell__sig_probe_fn(void){return 0;}\n' > "$TMP/sig_probe.c"
+if ! cc -std=c11 -S -emit-llvm -o "$TMP/sig_probe.ll" "$TMP/sig_probe.c" 2>/dev/null; then
+    skip "the declared-signature comparison entirely (cc -S -emit-llvm does not work here, and the C leg is the reference every other leg is compared against)"
+else
+    if [ ! -x "$LLVM_BIN/mlir-opt" ] || [ ! -x "$LLVM_BIN/mlir-translate" ]; then
+        skip "the MLIR leg of the declared-signature comparison (mlir-opt/mlir-translate not found in $LLVM_BIN)"
+        sig_mlir=no
+    else
+        sig_mlir=yes
+    fi
+
+    for f in examples/*.cell examples/pairing/*.cell examples/signatures/*.cell; do
+        # An unmatched glob stays literal in sh rather than vanishing, and a
+        # literal path is not a file.
+        [ -f "$f" ] || continue
+        key=$(printf '%s' "$f" | sed 's|^examples/||; s|\.cell$||')
+        tag=$(printf '%s' "$key" | tr '/' '_')
+
+        # The C leg is the reference. A refusal here is not designed behaviour
+        # the way an LLVM/MLIR refusal is, so it fails rather than skipping.
+        if ! $CELL emit "$f" > "$TMP/sig_$tag.c" 2>/dev/null; then
+            fail "signatures $key: the C backend refused an example the corpus says it accepts"
+            continue
+        fi
+
+        # clang drops a declaration nothing references, and most of this corpus
+        # is bodyless declarations. Taking their addresses keeps them in the
+        # IR. Anchored to the emitted file's own top-level `...cell_x(...);`
+        # lines, so nothing from cell_rt.h and nothing from a function body
+        # can match.
+        {
+            cat "$TMP/sig_$tag.c"
+            printf '\nvoid *cell__sig_probe[] = {\n'
+            sed -n 's/^[A-Za-z_].* \**\(cell_[A-Za-z0-9_]*\)(.*);$/  (void *)\&\1,/p' "$TMP/sig_$tag.c" \
+                | LC_ALL=C sort -u
+            printf '};\n'
+        } > "$TMP/sig_${tag}_probe.c"
+
+        if ! cc -std=c11 -S -emit-llvm -I runtime -o "$TMP/sig_$tag.cll" \
+                "$TMP/sig_${tag}_probe.c" 2>"$TMP/sig_$tag.clog"; then
+            fail "signatures $key: the emitted C did not lower to LLVM IR"
+            sed -n '1,4p' "$TMP/sig_$tag.clog"
+            continue
+        fi
+        awk -f "$TMP/sig.awk" "$TMP/sig_$tag.cll" | LC_ALL=C sort > "$TMP/sig_$tag.csig"
+
+        legs=""
+
+        # -- LLVM. An emit refusal is scalar-first design and stage 4 pins it.
+        if $CELL emit --target=llvm "$f" > "$TMP/sig_$tag.ll" 2>/dev/null; then
+            awk -f "$TMP/sig.awk" "$TMP/sig_$tag.ll" | LC_ALL=C sort > "$TMP/sig_$tag.lsig"
+            sig_join "$key" LLVM "$TMP/sig_$tag.csig" "$TMP/sig_$tag.lsig"
+            legs="$legs LLVM"
+        fi
+
+        # -- MLIR. Lowered and translated, so the comparison is against the
+        # same LLVM-level shape as the other two rather than against MLIR
+        # types. A lowering failure is stage 5's subject, so it is skipped
+        # here rather than failed twice.
+        if [ "$sig_mlir" = yes ] && $CELL emit --target=mlir "$f" > "$TMP/sig_$tag.mlir" 2>/dev/null; then
+            pipeline=$(mlir_pipeline "$TMP/sig_$tag.mlir")
+            if [ -z "$pipeline" ]; then
+                fail "signatures $key: emitted MLIR carries no '// lower with:' line"
+            # Unquoted on purpose: $pipeline is a list of flags and must split.
+            elif "$LLVM_BIN/mlir-opt" "$TMP/sig_$tag.mlir" $pipeline -o "$TMP/sig_${tag}_low.mlir" 2>/dev/null \
+                && "$LLVM_BIN/mlir-translate" --mlir-to-llvmir "$TMP/sig_${tag}_low.mlir" -o "$TMP/sig_${tag}_m.ll" 2>/dev/null; then
+                awk -f "$TMP/sig.awk" "$TMP/sig_${tag}_m.ll" | LC_ALL=C sort > "$TMP/sig_$tag.msig"
+                sig_join "$key" MLIR "$TMP/sig_$tag.csig" "$TMP/sig_$tag.msig"
+                legs="$legs MLIR"
+            fi
+        fi
+
+        sig_examples=$((sig_examples + 1))
+        if [ -z "$legs" ]; then
+            # Both IR backends refused the whole program. Designed behaviour,
+            # counted rather than passed over in silence, because an example
+            # that leaves this list is coverage this stage gained.
+            sig_conly=$((sig_conly + 1))
+            printf '  ....  %-30s C only (both IR backends refuse it)\n' "$key"
+        else
+            printf '  ....  %-30s C vs%s\n' "$key" "$legs"
+        fi
+    done
+
+    # A pin nobody reached is a pin that has rotted: the function was renamed,
+    # the example moved, or the backend stopped emitting it. Failing here is
+    # what keeps SIG_DISCLOSED from silently describing a world that is gone.
+    for pin in $SIG_DISCLOSED; do
+        [ -f "$TMP/sighit_$(printf '%s' "$pin" | tr '/:' '__')" ] || \
+            fail "signatures: the pin '$pin' was never compared this run (renamed, moved, or no longer emitted). Delete it or fix the key."
+    done
+
+    printf '  ....  %d function signature(s) compared across %d example(s), %d C-only; %d disagreement(s), %d of them disclosed and %d NOT\n' \
+        "$sig_compared" "$sig_examples" "$sig_conly" "$sig_disagree" \
+        "$((sig_disagree - sig_undisclosed))" "$sig_undisclosed"
+
+    # A stage that compared nothing has proved nothing and must say so, the
+    # same way stages 8 and 9 do.
+    if [ "$sig_compared" -eq 0 ]; then
+        fail "the declared-signature comparison ran against nothing at all"
+    elif [ $fails -eq $sig_before ]; then
+        pass "every backend that declares a function declares C's calling convention for it"
     fi
 fi
 
