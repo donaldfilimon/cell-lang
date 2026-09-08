@@ -12,6 +12,13 @@ owned String produces an AddressSanitizer double free, process SIGABRT (-6).
 Tag declares `owned name: String`. Both the field and original local hold one
 buffer; the checker reads the initializer and the original local still drops.
 
+Independent follow-up reproduced the same failure for a `copy String` field
+and a `copy [Int]` field: checking, emission and ASan compilation succeeded,
+then extraction/return of the field caused double-free exit 134. A copy field
+annotation is trusted by later duplicability checks, so guarding owned field
+initializers alone cannot close this structural field boundary. Shared and
+exclusive field declarations already fail under R8.
+
 ## Bounded implementation
 
 In borrowck, introduce a total recursive resource-shape classifier over declared
@@ -21,6 +28,13 @@ properties; structs recursively combine all field shapes. Unknown names and
 unproved recursive cycles return unknown. Ownership keywords cannot make a
 resource header trivially copyable. Use existing type definitions rather than
 guessing from expression spelling.
+
+At struct-field declaration checking, use that same classifier to reject a
+`copy` field with resource or unknown shape. Preserve copy fields whose shape
+is proven resource-free, including recursively scalar-only structs. This is
+a conservative boundary pending complete structural copyability; ARC fields
+retain their separate representation and retain/release semantics. Do not
+rely on the initializer guard to protect later field extraction or return.
 
 At the existing declared-owned struct-field initializer choke point, keep the
 R10 check. A no-resource destination retains existing checking, including
@@ -44,6 +58,9 @@ list-typed fields, optional resource fields, borrowed sigil/keyword/call sources
 and unknown/cyclic destination types. Exercise all enum variants of both total
 classifiers. Preserve scalar field identifiers, scalar-only record identifiers,
 fresh String literal/call fields and existing accepted corpus contracts.
+Include copy-field String/list reproductions and nested resource-bearing copy
+field declarations, plus scalar-only copy field controls. R8 shared/exclusive
+field rejection must remain intact.
 
 Recheck the exact retained ASan reproduction: it must now fail cell check before
 emission. Run named regressions and full tools/check.sh with direct captured
