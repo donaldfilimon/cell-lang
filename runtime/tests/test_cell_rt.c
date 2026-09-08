@@ -312,8 +312,33 @@ static void test_arc_string_glue_frees_both_halves(void) {
 
     void *reuse_buf = malloc(buf_cap);
     void *reuse_box = malloc(sizeof(cell_string_t));
-    CHECK(reuse_buf == buf_addr);
-    CHECK(reuse_box == box_addr);
+    bool buf_freed = (reuse_buf == buf_addr);
+    bool box_freed = (reuse_box == box_addr);
+
+    /*
+     * The buffer probe runs first (matching the order the glue itself frees
+     * things, per the comment above), so only ITS result is unconditionally
+     * trustworthy: if the buffer genuinely leaked, no allocator behavior can
+     * make `reuse_buf` come back equal to `buf_addr`, because that block is
+     * still live. Report that leak on its own merits.
+     *
+     * The box probe runs second, and a leaked buffer can make it lie: when
+     * `malloc(buf_cap)` cannot satisfy the request from the buffer's own
+     * free list, it has to look elsewhere, and on this allocator that
+     * observably perturbs the box's size-class free list too (verified
+     * directly: temporarily making the glue leak only the buffer makes
+     * BOTH `buf_freed` and `box_freed` come back false, even though the box
+     * was freed correctly). So the box probe is asserted only once the
+     * buffer probe has proven the buffer side clean; at that point nothing
+     * has disturbed the box's free list and its probe is a clean
+     * discriminator. If the buffer leaked, the box probe is skipped rather
+     * than asserted, so a failure here never blames the box for damage the
+     * buffer's own leak caused; the buffer CHECK below already fails the
+     * suite on its own.
+     */
+    CHECK(buf_freed);
+    if (buf_freed) CHECK(box_freed);
+
     free(reuse_buf);
     free(reuse_box);
 }
@@ -344,8 +369,16 @@ static void test_arc_slice_glue_frees_both_halves(void) {
 
     void *reuse_buf = malloc(buf_bytes);
     void *reuse_box = malloc(sizeof(cell_slice_t));
-    CHECK(reuse_buf == buf_addr);
-    CHECK(reuse_box == box_addr);
+    bool buf_freed = (reuse_buf == buf_addr);
+    bool box_freed = (reuse_box == box_addr);
+
+    /* See the comment on the string version of this test above: the buffer
+       probe's result is unconditionally trustworthy, but a leaked buffer can
+       make the box probe lie, so the box probe is asserted only once the
+       buffer has been proven clean. */
+    CHECK(buf_freed);
+    if (buf_freed) CHECK(box_freed);
+
     free(reuse_buf);
     free(reuse_box);
 }
