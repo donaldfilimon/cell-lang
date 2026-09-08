@@ -74,6 +74,17 @@ FAKE_OPT_FAIL=0 FAKE_TRANSLATE_FAIL=1; export FAKE_OPT_FAIL FAKE_TRANSLATE_FAIL
 if mlir_to_llvm "$test_tmp/in.mlir" '--fake' "$test_tmp/low" "$test_tmp/out.ll" "$test_tmp/lower"; then exit 1; fi
 [ "$MLIR_LOWER_FAILURE" = translate ]
 
+# Stage 10 coverage classification: crashes and post-emit failures must fail
+# and can never be described as C-only. Only two explicit refusals qualify.
+signature_coverage_verdict error refuse unavailable
+[ "$SIG_COVERAGE_FAILURE:$SIG_C_ONLY" = yes:no ]
+signature_coverage_verdict refuse accept opt-failed
+[ "$SIG_COVERAGE_FAILURE:$SIG_C_ONLY" = yes:no ]
+signature_coverage_verdict refuse accept translate-failed
+[ "$SIG_COVERAGE_FAILURE:$SIG_C_ONLY" = yes:no ]
+signature_coverage_verdict refuse refuse unavailable
+[ "$SIG_COVERAGE_FAILURE:$SIG_C_ONLY" = no:yes ]
+
 cat > "$test_tmp/bin/zig" <<'FAKE_ZIG'
 #!/bin/sh
 printf 'injected count failure\n' >&2

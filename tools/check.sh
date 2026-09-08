@@ -358,6 +358,23 @@ mlir_to_llvm() {
     return 0
 }
 
+# Stage 10 may print "C only" only when both IR backends explicitly refused.
+# A crash, unavailable MLIR tools, or accepted MLIR that failed later is a
+# failure/incomplete comparison, never a refusal.
+signature_coverage_verdict() {
+    _llvm_verdict=$1; _mlir_verdict=$2; _mlir_post=$3
+    SIG_C_ONLY=no
+    SIG_COVERAGE_FAILURE=no
+    if [ "$_llvm_verdict" = refuse ] && [ "$_mlir_verdict" = refuse ]; then
+        SIG_C_ONLY=yes
+    fi
+    if [ "$_llvm_verdict" = error ] || [ "$_mlir_verdict" = error ]; then
+        SIG_COVERAGE_FAILURE=yes
+    elif [ "$_mlir_verdict" = accept ] && [ "$_mlir_post" != compared ]; then
+        SIG_COVERAGE_FAILURE=yes
+    fi
+}
+
 if [ "${CELL_GATE_LIBRARY_ONLY:-0}" = 1 ]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -1435,46 +1452,59 @@ else
 
         legs=""
 
-        # -- LLVM. An emit refusal is scalar-first design and stage 4 pins it.
-        if $CELL emit --target=llvm "$f" > "$TMP/sig_$tag.ll" 2>/dev/null; then
+        # -- LLVM. Only exit 1 with a cannot-lower diagnostic is a refusal.
+        backend_emit_verdict llvm "$f" "$TMP/sig_$tag.ll" "$TMP/sig_$tag.lemit"
+        sig_llvm_verdict=$BACKEND_VERDICT
+        if [ "$sig_llvm_verdict" = accept ]; then
             awk -f "$TMP/sig.awk" "$TMP/sig_$tag.ll" | LC_ALL=C sort > "$TMP/sig_$tag.lsig"
             sig_join "$key" LLVM "$TMP/sig_$tag.csig" "$TMP/sig_$tag.lsig"
             legs="$legs LLVM"
+        elif [ "$sig_llvm_verdict" = error ]; then
+            fail "signatures $key: LLVM emit failed unexpectedly (exit $BACKEND_STATUS)"
+            sed -n '1,4p' "$TMP/sig_$tag.lemit"
         fi
 
         # -- MLIR. Lowered and translated, so the comparison is against the
         # same LLVM-level shape as the other two rather than against MLIR
         # types. A lowering failure is stage 5's subject, so it is skipped
         # here rather than failed twice.
+        sig_mlir_verdict=unavailable
+        sig_mlir_post=unavailable
         if [ "$sig_mlir" = yes ]; then
             backend_emit_verdict mlir "$f" "$TMP/sig_$tag.mlir" "$TMP/sig_$tag.memit"
+            sig_mlir_verdict=$BACKEND_VERDICT
         fi
-        if [ "$sig_mlir" = yes ] && [ "$BACKEND_VERDICT" = accept ]; then
+        if [ "$sig_mlir_verdict" = accept ]; then
             pipeline=$(mlir_pipeline "$TMP/sig_$tag.mlir")
             if [ -z "$pipeline" ]; then
+                sig_mlir_post=missing-pipeline
                 fail "signatures $key: emitted MLIR carries no '// lower with:' line"
             # Unquoted on purpose: $pipeline is a list of flags and must split.
             elif ! mlir_to_llvm "$TMP/sig_$tag.mlir" "$pipeline" \
                     "$TMP/sig_${tag}_low.mlir" "$TMP/sig_${tag}_m.ll" "$TMP/sig_$tag"; then
                 if [ "$MLIR_LOWER_FAILURE" = opt ]; then
+                    sig_mlir_post=opt-failed
                 fail "signatures $key: emitted MLIR failed to lower"
                     sed -n '1,4p' "$TMP/sig_$tag.opt"
                 else
+                    sig_mlir_post=translate-failed
                     fail "signatures $key: lowered MLIR failed to translate to LLVM IR"
                     sed -n '1,4p' "$TMP/sig_$tag.translate"
                 fi
             else
+                sig_mlir_post=compared
                 awk -f "$TMP/sig.awk" "$TMP/sig_${tag}_m.ll" | LC_ALL=C sort > "$TMP/sig_$tag.msig"
                 sig_join "$key" MLIR "$TMP/sig_$tag.csig" "$TMP/sig_$tag.msig"
                 legs="$legs MLIR"
             fi
-        elif [ "$sig_mlir" = yes ] && [ "$BACKEND_VERDICT" = error ]; then
+        elif [ "$sig_mlir_verdict" = error ]; then
             fail "signatures $key: MLIR emit failed unexpectedly (exit $BACKEND_STATUS)"
             sed -n '1,4p' "$TMP/sig_$tag.memit"
         fi
 
         sig_examples=$((sig_examples + 1))
-        if [ -z "$legs" ] && { [ "$sig_mlir" != yes ] || [ "$BACKEND_VERDICT" = refuse ]; }; then
+        signature_coverage_verdict "$sig_llvm_verdict" "$sig_mlir_verdict" "$sig_mlir_post"
+        if [ -z "$legs" ] && [ "$SIG_C_ONLY" = yes ]; then
             # Both IR backends refused the whole program. Designed behaviour,
             # counted rather than passed over in silence, because an example
             # that leaves this list is coverage this stage gained.
