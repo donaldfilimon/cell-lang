@@ -316,6 +316,32 @@ done
 # ------------------------------------------------------------ 4. agreement --
 # The two newer backends share an IR, so a disagreement means one of them is
 # wrong. This is the check that caught MLIR accepting a program LLVM refused.
+# THIS STAGE COMPARES LLVM AGAINST MLIR AND NOTHING ELSE, so it is blind to
+# the two backends being wrong TOGETHER, and to either disagreeing with C.
+# Measured 2026-09-08, a live instance rather than a hypothetical:
+#
+#     pub fn make() -> String;
+#     pub fn f() -> arc String { return make() }
+#
+# C declares `cell_arc_t cell_f(void)`, returning by value. LLVM declares
+# `cell_f(ptr sret(%cell_string) %sret)` and MLIR the same with an
+# `llvm.sret` attribute: a different CALLING CONVENTION, not a different
+# spelling. A C host linked against either would pass an argument the callee
+# does not expect. All three accept, so no verdict splits; the two backends
+# agree with each other, so this stage passes.
+#
+# The cause is upstream of the backends and neither can see it: `hir.Fn`
+# carries `ret: Ty` with no ownership mode, so the `arc` is simply absent by
+# the time either emitter reads it.
+#
+# What is MISSING is a stage that compares the C backend's DECLARED
+# SIGNATURES against the other two, the way stage 8 compares printed answers.
+# Until that exists, read a green line here as "llvm and mlir agree", never as
+# "the backends agree". This is the same lesson as stage 5's header (a verdict
+# is not a lowering) and stage 8's (verdict agreement is not answer
+# agreement), one level further out: AGREEMENT BETWEEN TWO PARTIES IS NOT
+# CORRECTNESS WHEN A THIRD DEFINES THE CONTRACT, and here the third,
+# runtime/cell_rt.h, is the one that does.
 printf '\n== backend agreement ==\n'
 disagreements=0
 for f in examples/*.cell examples/pairing/*.cell; do
