@@ -222,6 +222,31 @@ positions asked `placeOf` first and READ anything else, so an `owned` slot
 filled by a `match` double freed. R2.b is where the question is asked of the
 expression instead.
 
+**The fifth entry OVERCLAIMS, and this was measured rather than assumed.** "Moved
+into a `match` arm binding (R7)" is not enforced: `borrowck.zig`'s header does
+not list R7, and the scrutinee is not moved at all.
+
+```cell
+pub fn mk() -> String;
+pub fn take(owned s: String);
+
+pub fn main() {
+    let owned s1 = mk()
+    match s1 { x => take(owned x) }
+}
+```
+
+emits `cell_string_t x = s1;`, then `cell_take(x)` frees the buffer, then
+`cell_string_free(&s1)` frees it again: **AddressSanitizer double free, exit
+134**, measured at `1dd0e6b`. It behaves identically whether the scrutinee is a
+plain place or a value shape (`match (match c { 0 => s1, _ => s1 }) { ... }` is
+also 134), which is what tells it apart from R2.b: R2.b is about a consumption
+site asking the wrong question, and this is a consumption site that asks no
+question. It is **not fixed here**, deliberately. Moving the scrutinee changes
+what `wasMoved` reports for every arm binding, and `codegen.zig`'s
+`pendingDrops` reads exactly that, so it is a separate change with its own
+measurement rather than a rider on this one.
+
 ### R3. Moving out of a borrow is an error
 
 A `shared` or `exclusive` parameter is not owned, so it cannot be moved from,

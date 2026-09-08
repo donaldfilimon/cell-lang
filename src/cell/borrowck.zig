@@ -1,6 +1,7 @@
 //! Borrow and move checker for Cell.
 //!
-//! Implements `docs/OWNERSHIP.md` rules R1, R2, R3, R3a, R4, R5, R6, R8, R9,
+//! Implements `docs/OWNERSHIP.md` rules R1, R2, R2.a, **R2.b**, R3, R3a, R4,
+//! R5, R6, R8, R9,
 //! R14 and R15, plus ONE clause of R10: an `arc` value may not be made UNIQUE,
 //! refused at six consumption sites (an `owned` parameter, an `owned`
 //! binding, an assignment into an `owned` place, an `owned` struct field, a
@@ -14,6 +15,24 @@
 //! Read that function's comment before widening it a fourth time; the three
 //! widenings so far were three different axes and each escaped through the
 //! same permissive default.
+//!
+//! **R2.b** is the general rule that one clause of R10 was a special case of:
+//! an `owned` consumption position is asked of the EXPRESSION, not of a place.
+//! Every site used to call `placeOf` first and fall through to `checkExpr`,
+//! which only READS, so `let owned s2: String = match c { 0 => s1, _ => s1 }`
+//! read `s1`, `pendingDrops` kept both bindings, and one buffer was freed
+//! twice (exit 134, no `arc` anywhere in it). Enforced at the same six sites,
+//! by `ownedMoveSource`, whose `.unknown` is REFUSED and whose branch arms can
+//! never return a movable place. The struct-field and list-element sites
+//! refuse `.unknown` ONLY, leaving a plain place a READ; read the comments
+//! there before changing that, because the choice belongs to R11's record-drop
+//! and element-release gaps rather than to this rule. **NOT covered, and
+//! measured rather than assumed: a `match` SCRUTINEE is not moved at all.**
+//! `match s1 { x => take(owned x) }` frees `s1`'s buffer in the callee and
+//! again at the scope drop, at exit 134, and it does so identically whether
+//! the scrutinee is a plain place or a value shape, so it is a separate R7 gap
+//! and not this one. R2's move list in `docs/OWNERSHIP.md` claims R7 moves it
+//! and overclaims.
 //!
 //! **R9** is both halves of "`arc` grants shared access only": no `exclusive`
 //! borrow of an `arc` place, refused in `createLoan` because that is the ONE
