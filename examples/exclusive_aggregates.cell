@@ -1,0 +1,97 @@
+// An `exclusive` borrow of a NON-STRUCT aggregate must be a POINTER, and a
+// whole-value write through one must land in the CALLER's object.
+//
+// WHY THIS FILE EXISTS SEPARATELY FROM write_through_whole.cell. That file
+// measures the same write through the same borrow, but only for a STRUCT, and
+// the defect this one exists to pin was invisible to it for exactly that
+// reason. `runtime/cell_rt.h` section 7 gives the borrow table four aggregate
+// rows, not one:
+//
+//                shared                    exclusive
+//   String       cell_str_t   by value     cell_string_t *
+//   [T]          cell_slice_t by value     cell_slice_t *
+//   T?           cell_opt_*_t by value     cell_opt_*_t *
+//   record       const cell_B *            cell_B *
+//
+// The MLIR backend implemented that table with one test, `is the type a
+// struct`, and so got the record row right and the other three `exclusive`
+// cells wrong at once. Measured on a probe of eight bodyless declarations, one
+// per cell of the table above: it wrote `func.func private @cell_ex_str(
+// !llvm.struct<(ptr, i64)>)` where the C beside it declares
+// `void cell_ex_str(cell_string_t *)`, and the same by-value spelling for the
+// `[T]` and `T?` rows. A two-word value in x0/x1 where the callee reads a
+// pointer in x0 is not a disagreement about copies; it is the wrong signature.
+// Nothing refused, nothing crashed, and the declaration LOOKED plausible
+// beside a record parameter that really is a pointer. Its own doc comment
+// stated the wrong half as a fact: "a borrowed String is NOT a pointer", which
+// is true of `shared` and false of `exclusive`.
+//
+// The bodies below were a separate symptom of the same fact. Before the fix
+// both backends REFUSED them, MLIR because the by-value parameter made the
+// slot a copy the lender could not see and LLVM only to keep its verdict equal
+// to MLIR's.
+//
+// So the corpus needed a program that borrows each of the three exclusively,
+// writes a whole value through it, and reads an answer back across the C ABI.
+// A declaration that matches proves the spelling; only running the call proves
+// the ABI.
+//
+// WHAT IT PRINTS, and how to read a wrong answer. One integer, `7320`:
+//
+//   String   the host's `first_str` returns a 3-character owning string,
+//            `second_str` a 20-character one, and `str_len` reports what the
+//            caller's variable holds AFTER the write.
+//   [T]      4 elements before, 300 after.
+//   T?       Some(5) before, Some(7000) after.
+//
+// 20 + 300 + 7000 = 7320, and each of the three failure modes is a distinct
+// number rather than a near miss: a lost String write prints 7303, a lost list
+// write 7024, a lost optional write 325. Nothing else in range is reachable,
+// so the printed integer names WHICH row broke rather than merely that one
+// did.
+//
+// THE THREE OBSERVERS TAKE `exclusive` BORROWS TOO, on purpose. Reading
+// through the borrow exercises the pointer argument in the other direction: a
+// backend that passed the aggregate by value would hand `str_len` a copy of
+// the caller's 24 bytes, which reads the correct length and hides the defect
+// on the way out while the write was still being lost on the way in.
+//
+// EXPECT-OUTPUT: 7320
+
+// Makers and observers live in exclusive_aggregates_host.c, because what is
+// under test is the C ABI boundary itself. A Cell body would see whatever it
+// was handed and could not say whether it was the caller's object or a copy.
+pub fn first_str() -> String;
+pub fn second_str() -> String;
+pub fn str_len(exclusive s: String) -> Int;
+
+pub fn first_list() -> [Int];
+pub fn second_list() -> [Int];
+pub fn list_len(exclusive xs: [Int]) -> Int;
+
+pub fn first_opt() -> Int?;
+pub fn second_opt() -> Int?;
+pub fn opt_val(exclusive o: Int?) -> Int;
+
+pub fn print_int(copy value: Int);
+
+// The mutators have Cell BODIES, unlike the makers, and that is the point:
+// what is under test is what the CALLEE emits for `s = second_str()` when `s`
+// is an exclusively borrowed aggregate. Writing into the callee's own copy is
+// the failure this measures, and no C host can stand in for it.
+pub fn reset_str(exclusive s: String) { s = second_str() }
+pub fn reset_list(exclusive xs: [Int]) { xs = second_list() }
+pub fn reset_opt(exclusive o: Int?) { o = second_opt() }
+
+pub fn main() {
+    var owned s: String = first_str()
+    reset_str(exclusive s)
+
+    var owned xs: [Int] = first_list()
+    reset_list(exclusive xs)
+
+    var owned o: Int? = first_opt()
+    reset_opt(exclusive o)
+
+    print_int(copy str_len(exclusive s) + list_len(exclusive xs) + opt_val(exclusive o))
+}

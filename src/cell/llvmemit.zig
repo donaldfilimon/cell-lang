@@ -121,10 +121,6 @@ const Emitter = struct {
     /// C backend spells the same binding `cell_Buffer *e = &buf;` and printed
     /// 38 where this backend printed 37, with no diagnostic from either.
     slot_ptr_to: std.ArrayList(?[]const u8) = .empty,
-    /// Slot -> whether a whole-value write to it is refused. See
-    /// `assignDest`: this is a deliberate verdict alignment with
-    /// `mlirmit.zig`, not a limitation of the lowering here.
-    slot_write_refused: std.ArrayList(bool) = .empty,
     /// Slot -> the type of a whole value written into the slot's STORAGE:
     /// `ptr` for a borrow slot, the binding's ownership-aware type otherwise.
     /// Empty when the binding's type was already refused, which is the one
@@ -347,9 +343,6 @@ const Emitter = struct {
         self.slot_ptr_to.clearRetainingCapacity();
         try self.slot_ptr_to.resize(self.arena, f.bindings.len);
         for (self.slot_ptr_to.items) |*p| p.* = null;
-        self.slot_write_refused.clearRetainingCapacity();
-        try self.slot_write_refused.resize(self.arena, f.bindings.len);
-        for (self.slot_write_refused.items) |*p| p.* = false;
         self.slot_ty.clearRetainingCapacity();
         try self.slot_ty.resize(self.arena, f.bindings.len);
         for (self.slot_ty.items) |*p| p.* = "";
@@ -411,7 +404,6 @@ const Emitter = struct {
             // change closes.
             const is_ref = self.borrowsByPointer(b.ty, b.ownership);
             if (is_ref) self.slot_ptr_to.items[i] = t;
-            self.slot_write_refused.items[i] = is_ref and b.ty.tag() != .struct_type;
             // What the slot's STORAGE holds, which is the address for a borrow
             // and the object otherwise. Recorded here, where the alloca is
             // written, so the store side cannot disagree with the alloca side.
@@ -770,28 +762,17 @@ const Emitter = struct {
         if (place.slot >= self.slots.items.len) {
             return .{ .refuse = "assignment to a binding with no slot" };
         }
-        if (place.slot < self.slot_write_refused.items.len and
-            self.slot_write_refused.items[place.slot])
-        {
-            // REFUSED TO KEEP TWO BACKENDS ON ONE VERDICT, and the lowering
-            // this declines is believed correct.
-            //
-            // `abi.classifyParam` now places `exclusive String`, `exclusive
-            // [T]` and `exclusive T?` as a pointer, matching
-            // `codegen.applyOwnership`, so the machinery above WOULD write
-            // through to the lender exactly as it does for a struct.
-            // `mlirmit.zig` refuses these ("assignment to a borrowed aggregate
-            // this backend passes by value") because it still passes them by
-            // value, and that file is outside this change. Two backends
-            // splitting accept-versus-refuse on one program is what
-            // `tools/check.sh`'s backend-agreement stage exists to catch, and
-            // a split is worse than a shared limitation.
-            //
-            // LIFT BOTH TOGETHER: teach `mlirmit.paramType` the pointer form
-            // and delete this refusal in the same change, with a corpus entry
-            // that writes through an `exclusive String`.
-            return .{ .refuse = "a whole-value write through a borrowed String, list or optional" };
-        }
+        // THE REFUSAL THAT SAT HERE IS GONE, LIFTED WITH ITS TWIN.
+        //
+        // It declined a whole-value write through a borrowed `String`, `[T]`
+        // or `T?` even though the machinery below lowers it, purely to keep
+        // this backend's verdict equal to `mlirmit.zig`'s, which passed those
+        // three by value and so held a copy the lender could never see. That
+        // file asks `abi.classifyParam` now and passes them by pointer, so
+        // both backends write through to the lender and neither has anything
+        // left to refuse. `examples/exclusive_aggregates.cell` is the corpus
+        // entry the note asked for: it writes through all three and prints an
+        // answer a lost write cannot produce.
         if (place.path.len != 0) return .{ .into_place = self.placeDestType(place) };
         if (self.slot_ptr_to.items[place.slot]) |pointee| return .{ .through_slot = pointee };
         return .{ .into_place = self.slotType(place.slot) };
@@ -2614,7 +2595,7 @@ test "a borrow of a value with no address is refused, not bound to a copy" {
     try std.testing.expect(e.bag.hasErrors());
 }
 
-test "an exclusive String is a pointer, and a write through one is refused" {
+test "an exclusive String is a pointer, and a write through one LANDS" {
     // THE THIRD DEFECT, and it lived in the module whose header says every
     // fact in it was measured. `abi.classifyParam` placed `exclusive String`
     // BY VALUE as `[2 x i64]` while `codegen.applyOwnership` emitted
@@ -2623,23 +2604,32 @@ test "an exclusive String is a pointer, and a write through one is refused" {
     // stored a 24-byte `%cell_string` into it: eight bytes past the end of
     // the alloca, plus a write the caller could never see.
     //
-    // The declaration is a pointer now, matching the C. The WRITE is refused
-    // only to keep this backend's verdict equal to mlirmit.zig's, which still
-    // passes these by value; see `assignDest` for the note on lifting both
-    // together.
+    // THE EXPECTATION HERE CHANGED, and the change is the point. This test
+    // used to assert `hasErrors()`: the declaration was already a pointer, but
+    // the WRITE was refused, purely so this backend's verdict matched
+    // `mlirmit.zig`, which still passed these three aggregates by value and
+    // therefore held a copy the lender could not see. That file asks
+    // `abi.classifyParam` now, so both backends pass a pointer and both write
+    // through it, and there is nothing left for either to refuse. The refusal
+    // was never a limitation of the lowering; the comment it carried said so
+    // and asked for exactly this pair of changes in one commit.
     //
     // `make` IS BODYLESS, and that is a correction rather than a tidy-up. It
     // read `-> String { return "abcdefg" }`, which the placement guard now
-    // refuses in its own right, so `hasErrors()` would have gone on passing
-    // while testing nothing about the write this test is named for. Its twin
-    // in `mlirmit.zig` was already bodyless.
+    // refuses in its own right, so the test would have gone on measuring the
+    // wrong thing.
     var e = try emitSource(
         \\pub fn make() -> String;
         \\pub fn reset(exclusive s: String) { s = make() }
     );
     defer e.deinit();
-    try std.testing.expect(e.bag.hasErrors());
+    try std.testing.expect(!e.bag.hasErrors());
     try expectContains(e.text, "define void @cell_reset(ptr %arg0)");
+    // The slot holds the caller's ADDRESS, so the write is two steps: load the
+    // address out of the slot, then store the whole 24-byte owning value
+    // through it. A store INTO `%slot0` would be the lost write this closes.
+    try expectContains(e.text, "%2 = load ptr, ptr %slot0");
+    try expectContains(e.text, "store %cell_string %1, ptr %2");
 
     // Reading through one is still lowered, which is where mlirmit.zig also
     // stands, so the two backends agree on the parameter and on the write.

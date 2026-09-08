@@ -128,20 +128,17 @@ const Emitter = struct {
     /// rejects it outright with "invalid memref element type", so aggregates
     /// use the llvm dialect's own allocation and access ops.
     slot_is_llvm: std.ArrayList(bool) = .empty,
-    /// Slot -> pointee type, when the slot holds an ADDRESS. Borrowed STRUCT
-    /// bindings, parameters and locals alike: an `exclusive` borrow has to
-    /// write through to the caller's object, and a `let exclusive e = &mut
-    /// buf` that stored the struct instead of its address handed every
-    /// subsequent call a copy.
+    /// Slot -> pointee type, when the slot holds an ADDRESS. Every binding the
+    /// ABI passes BY POINTER, parameters and locals alike, and whatever its
+    /// type: an `exclusive` borrow has to write through to the caller's
+    /// object, and a `let exclusive e = &mut buf` that stored the object
+    /// instead of its address handed every subsequent call a copy.
+    ///
+    /// The pointee is the OWNERSHIP-AWARE type. For `String` the two disagree:
+    /// the bare spelling is the 16-byte borrowed view and an `exclusive
+    /// String` points at the 24-byte owning `cell_string_t`, so taking the
+    /// bare one would size every write through the borrow at 16 bytes.
     slot_ptr_to: std.ArrayList(?[]const u8) = .empty,
-    /// Slot -> true when the slot holds a BORROWED aggregate that this backend
-    /// passes BY VALUE, so the slot is a copy and no write to it can reach the
-    /// lender. `String`, `[T]` and `T?` are the cases: `paramType` makes only a
-    /// borrowed struct an `!llvm.ptr`, while `codegen.applyOwnership` makes
-    /// `exclusive String` a `cell_string_t *` and writes through it. A write
-    /// here is therefore refused rather than emitted, per this backend's
-    /// scalar-first contract.
-    slot_borrowed_copy: std.ArrayList(bool) = .empty,
     /// Slot -> the type of a whole value written into the slot's STORAGE:
     /// `!llvm.ptr` for a borrow slot, the binding's ownership-aware type
     /// otherwise. Empty when the binding's type was already refused.
@@ -291,9 +288,6 @@ const Emitter = struct {
         self.slot_ptr_to.clearRetainingCapacity();
         try self.slot_ptr_to.resize(self.arena, f.bindings.len);
         for (self.slot_ptr_to.items) |*v| v.* = null;
-        self.slot_borrowed_copy.clearRetainingCapacity();
-        try self.slot_borrowed_copy.resize(self.arena, f.bindings.len);
-        for (self.slot_borrowed_copy.items) |*v| v.* = false;
         self.slot_ty.clearRetainingCapacity();
         try self.slot_ty.resize(self.arena, f.bindings.len);
         for (self.slot_ty.items) |*v| v.* = "";
@@ -352,19 +346,28 @@ const Emitter = struct {
             // refused and nothing crashed. `examples/nll_dead_borrow.cell` has
             // used this shape since 41abc3b and could not catch it, because
             // its `grow` has an empty body and writes nothing.
-            const borrowed = b.ownership == .shared or b.ownership == .exclusive;
-            const is_ref = borrowed and b.ty.tag() == .struct_type;
-            // A borrowed aggregate this backend passes by VALUE. The write
-            // through it cannot reach the lender, and `emitAssign` refuses
-            // rather than storing into the copy.
-            self.slot_borrowed_copy.items[i] = borrowed and !is_ref and isAggregate(b.ty);
-            const t = (if (is_ref) "!llvm.ptr" else self.mlirTypeOwned(b.ty, b.ownership)) orelse {
+            //
+            // THE `b.ty.tag() == .struct_type` GATE THAT USED TO OPEN THIS IS
+            // GONE, and it was a rule written TYPE-FIRST where the ABI's own
+            // rule is MODE-FIRST. `codegen.applyOwnership` makes EVERY
+            // non-primitive `exclusive` parameter a pointer, `String`, `[T]`
+            // and `T?` included, so asking about structs answered for one
+            // aggregate and asserted the answer for all of them: the other
+            // three passed by value here while the C they must link against
+            // passed `cell_string_t *`, `cell_slice_t *` and
+            // `cell_opt_i64_t *`. The question belongs entirely to
+            // `abi.classifyParam`, which is the module that mirrors
+            // `applyOwnership`, so an aggregate nobody enumerated gets the
+            // ABI's answer rather than this file's guess.
+            const nat = self.mlirTypeOwned(b.ty, b.ownership) orelse {
                 // A binding this backend cannot type is reported once, here,
                 // rather than at each use.
                 try self.unsupported(f.span, "type of a local binding");
                 self.slots.items[i] = "%unsupported";
                 continue;
             };
+            const is_ref = self.borrowsByPointer(b.ty, b.ownership);
+            const t = if (is_ref) "!llvm.ptr" else nat;
             const name = try self.nextSsa();
             self.slots.items[i] = name;
             // What the slot's STORAGE holds: the lender's address for a
@@ -378,7 +381,13 @@ const Emitter = struct {
                 // for a local `emitLet` stores the address of the place the
                 // initializer names.
                 self.slot_is_llvm.items[i] = true;
-                self.slot_ptr_to.items[i] = self.mlirType(b.ty) orelse "!llvm.ptr";
+                // The pointee is `nat`, the OWNERSHIP-AWARE type, not
+                // `mlirType(b.ty)`: the two disagree for `String`, where the
+                // bare spelling is the 16-byte borrowed view and an
+                // `exclusive String` points at the 24-byte owning value. The
+                // bare one would size every write through the borrow at 16
+                // bytes and never copy `cap`.
+                self.slot_ptr_to.items[i] = nat;
                 const one = try self.nextSsa();
                 try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
                 try self.line("{s} = llvm.alloca {s} x !llvm.ptr : (i64) -> !llvm.ptr", .{ name, one });
@@ -607,21 +616,15 @@ const Emitter = struct {
             return .{ .refuse = "assignment to a binding with no slot" };
         }
         if (self.slot_ptr_to.items[place.slot]) |pointee| return .{ .through_slot = pointee };
-        if (self.slot_borrowed_copy.items[place.slot]) {
-            // `exclusive String`, `exclusive [T]` and `exclusive T?`.
-            // `paramType` passes these BY VALUE while
-            // `codegen.applyOwnership` makes them `cell_string_t *` and
-            // friends and writes through the pointer, so the slot here is a
-            // copy the lender cannot see. Emitting the store would be a
-            // silent lost write AND, for `exclusive String`, a 24-byte
-            // owning string stored into a 16-byte borrowed-view slot.
-            //
-            // DISCLOSED: `llvmemit.zig` has the identical hole and ACCEPTS
-            // this shape today, so the first `examples/` entry that writes it
-            // will split the gate's llvm-versus-mlir verdict stage. That is a
-            // reason to fix that backend, not to emit a wrong store here.
-            return .{ .refuse = "assignment to a borrowed aggregate this backend passes by value" };
-        }
+        // THE `exclusive String`/`[T]`/`T?` REFUSAL THAT SAT HERE IS GONE, and
+        // it was never a limitation of the write. It was a limitation of the
+        // PARAMETER: those three passed by value, so the slot held a copy the
+        // lender could not see, and storing into it would have been a silent
+        // lost write. They arrive by pointer now, exactly as the C backend
+        // passes them, so they take the `through_slot` arm above with every
+        // other borrow and nothing here has to know their names. That is the
+        // point of asking the mode rather than the type: an aggregate nobody
+        // listed is handled by the branch above rather than by a list.
         return .into_slot;
     }
 
@@ -1480,31 +1483,62 @@ const Emitter = struct {
         };
     }
 
-    /// The in-memory type of a binding. String is the one type whose size
-    /// depends on ownership: `shared` is a borrowed {ptr, len}, `owned` an
-    /// owning {ptr, len, cap}.
-    /// The type a parameter is written as. A borrowed AGGREGATE is a pointer,
-    /// matching what the C backend declares (`const cell_Buffer *`). Passing
-    /// it by value is a real defect: linking that against the C signature
-    /// reads the pointer as the struct's first field.
+    /// The type a parameter is written as. A borrow the ABI passes BY POINTER
+    /// is `!llvm.ptr`, matching what the C backend declares. Passing one by
+    /// value is a real defect: linking that against the C signature reads the
+    /// pointer as the aggregate's first field.
     ///
-    /// A borrowed String is NOT a pointer: cell_str_t is already a borrowed
-    /// view and passes by value, which cell_rt.h section 2 fixes.
+    /// THE RULE IS THE MODE, NOT THE TYPE, and the sentence that used to sit
+    /// here was the defect written down. It said "a borrowed String is NOT a
+    /// pointer: cell_str_t is already a borrowed view and passes by value",
+    /// which is true of `shared` and false of `exclusive`, and the code under
+    /// it collapsed the two into one `struct_type` test. Three of the eight
+    /// cells in `cell_rt.h` section 7's table were therefore wrong at once:
+    /// `exclusive String` is `cell_string_t *`, `exclusive [T]` is
+    /// `cell_slice_t *` and `exclusive T?` is `cell_opt_*_t *`, while MLIR
+    /// declared all three by value. `borrowsByPointer` asks
+    /// `abi.classifyParam`, so a type nobody enumerated gets the ABI's answer.
     fn paramType(self: *Emitter, ty: hir.Ty, own: hir.Ownership) ?[]const u8 {
-        if (ty.tag() == .struct_type) {
-            switch (own) {
-                .shared, .exclusive => return "!llvm.ptr",
-                else => {},
-            }
-        }
+        if (self.borrowsByPointer(ty, own)) return "!llvm.ptr";
         return self.mlirTypeOwned(ty, own);
     }
 
+    /// Whether `(ty, own)` is a BORROW PASSED BY POINTER: the one parameter
+    /// class whose pointer spelling means "the lender's own object" rather
+    /// than "a copy the callee may do as it likes with".
+    ///
+    /// `abi.renderParam` cannot answer this and must not be asked. It renders
+    /// a borrow's `.direct = "ptr"` and `.indirect` (an aggregate over 16
+    /// bytes in EVERY ownership mode) identically, and the two have opposite
+    /// call-site rules: an indirect argument is a copy the CALLER allocates
+    /// and the callee may scribble on, so handing it the caller's own storage
+    /// would trade a lost write for an unwanted one. Only the classification
+    /// tells them apart. `llvmemit.borrowsByPointer` is the same function for
+    /// the same reason, and the two backends must keep agreeing here or
+    /// `tools/check.sh`'s agreement stage splits.
+    fn borrowsByPointer(self: *Emitter, ty: hir.Ty, own: hir.Ownership) bool {
+        return switch (abi.classifyParam(self.module, ty, own)) {
+            .direct => |spelling| std.mem.eql(u8, spelling, "ptr"),
+            else => false,
+        };
+    }
+
+    /// The in-memory type of a value of `(ty, own)`. `String` is the type
+    /// whose SIZE depends on ownership, and this mirrors `abi.stringStruct`
+    /// one arm for one arm rather than restating it: `shared` is the 16-byte
+    /// borrowed view, and `exclusive`, `owned` and `copy` all name the 24-byte
+    /// owning value. For `exclusive` that is the POINTEE, since the parameter
+    /// itself is a pointer, which is exactly the pair of facts
+    /// `abi.stringStruct` warns has to be read together.
+    ///
+    /// `exclusive` used to be grouped with `shared` here, and that was the
+    /// second half of the same divergence: the write through an `exclusive
+    /// String` borrow was sized at 16 bytes and never copied `cap`.
     fn mlirTypeOwned(self: *Emitter, ty: hir.Ty, own: hir.Ownership) ?[]const u8 {
         if (ty.tag() == .string) {
             return switch (own) {
-                .shared, .exclusive => "!llvm.struct<(ptr, i64)>",
-                .owned, .copy => "!llvm.struct<(ptr, i64, i64)>",
+                .shared => "!llvm.struct<(ptr, i64)>",
+                .exclusive, .owned, .copy => "!llvm.struct<(ptr, i64, i64)>",
                 .arc => null,
             };
         }
@@ -2131,27 +2165,67 @@ test "a borrow consumed BY VALUE is loaded through, not passed as an address" {
     try std.testing.expectEqualStrings("42\n", out);
 }
 
-test "a write to a borrowed aggregate passed BY VALUE is refused, not lost" {
-    // The third axis of the same defect, and the one the reported program
-    // cannot show. `paramType` makes only a borrowed STRUCT an `!llvm.ptr`,
-    // while `codegen.applyOwnership` makes `exclusive String` a
-    // `cell_string_t *` and writes through it. So the slot here is a copy the
-    // caller cannot see, and emitting the store would be a silent lost write
-    // AND a 24-byte owning string stored into a 16-byte borrowed-view slot.
+test "an exclusive String, list and optional are POINTERS, and writes through them LAND" {
+    // THE DEFECT THIS TEST NOW PINS, and it used to pin its opposite.
     //
-    // Refusing is this backend's documented contract. DISCLOSED: llvmemit.zig
-    // has the identical hole and accepts this shape today.
+    // `cell_rt.h` section 7 gives the borrow table four aggregate rows and
+    // `paramType` implemented it with one question, `is the type a struct`. It
+    // therefore got the record row right and the other three `exclusive` cells
+    // wrong at once: `exclusive String` is `cell_string_t *`, `exclusive [T]`
+    // is `cell_slice_t *`, `exclusive T?` is `cell_opt_*_t *`, and all three
+    // were declared BY VALUE here. The write through them was refused rather
+    // than lowered, which was the right verdict reached from the wrong fact:
+    // the slot was a copy the lender could not see, so the store had nowhere
+    // correct to go.
+    //
+    // Both halves are fixed together, so the expectation flips from
+    // `hasErrors()` to a lowered two-step write. `borrowsByPointer` asks
+    // `abi.classifyParam`, which mirrors `codegen.applyOwnership`, so the rule
+    // is the ownership MODE and an aggregate nobody enumerated is answered by
+    // the ABI rather than by a list in this file.
     var e = try emitSource(
         \\pub fn make() -> String;
         \\pub fn setit(exclusive s: String) { s = make() }
     );
     defer e.deinit();
-    try std.testing.expect(e.bag.hasErrors());
-    var found = false;
-    for (e.bag.list.items) |d| {
-        if (std.mem.indexOf(u8, d.message, "passes by value") != null) found = true;
-    }
-    try std.testing.expect(found);
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "func.func @cell_setit(%arg0: !llvm.ptr)");
+    // The pointee is the 24-byte OWNING value, not the 16-byte borrowed view,
+    // which is the second half of the same divergence: a view-sized write
+    // would never copy `cap`.
+    try expectContains(e.text, "llvm.store %4, %5 : !llvm.struct<(ptr, i64, i64)>, !llvm.ptr");
+
+    // The other two rows of the table, which a struct-shaped question missed
+    // for the same reason. Both are checked rather than one, because
+    // enumerating some forms and asserting the property of all of them is the
+    // failure this whole change is about.
+    var l = try emitSource(
+        \\pub fn mk() -> [Int];
+        \\pub fn setl(exclusive xs: [Int]) { xs = mk() }
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.bag.hasErrors());
+    try expectContains(l.text, "func.func @cell_setl(%arg0: !llvm.ptr)");
+
+    var o = try emitSource(
+        \\pub fn mo() -> Int?;
+        \\pub fn seto(exclusive v: Int?) { v = mo() }
+    );
+    defer o.deinit();
+    try std.testing.expect(!o.bag.hasErrors());
+    try expectContains(o.text, "func.func @cell_seto(%arg0: !llvm.ptr)");
+
+    // And the two `shared` rows do NOT move. `cell_str_t` and `cell_opt_i64_t`
+    // really are passed by value in C, so making every aggregate a pointer
+    // would be the same mistake with the sign reversed.
+    var sh = try emitSource(
+        \\pub fn look(shared s: String);
+        \\pub fn peek(shared v: Int?);
+    );
+    defer sh.deinit();
+    try std.testing.expect(!sh.bag.hasErrors());
+    try expectContains(sh.text, "func.func private @cell_look(!llvm.struct<(ptr, i64)>)");
+    try expectContains(sh.text, "func.func private @cell_peek(!llvm.struct<(i8, i64)>)");
 }
 
 test "a borrowed PRIMITIVE parameter still writes its own slot, matching C" {
@@ -2341,9 +2415,9 @@ test "the borrowed-view to owning-String conversion is refused at EVERY position
 test "the guard does not refuse a matching String or a borrowed aggregate" {
     // The other half. This backend performs no AAPCS64 coercion, so there is
     // no `coerceArg` to place the guard around, but there IS the borrow path:
-    // `paramType` renders a borrowed struct `!llvm.ptr` and `emitArg` hands
-    // over the slot. That is a deliberate ABI spelling, not a conversion, and
-    // it must stay invisible to the guard.
+    // `paramType` renders a borrow the ABI passes by pointer as `!llvm.ptr`
+    // and `emitArg` hands over the slot. That is a deliberate ABI spelling,
+    // not a conversion, and it must stay invisible to the guard.
     const cases = [_][]const u8{
         \\pub fn slen(shared s: String) -> Int;
         \\pub fn f() -> Int { return slen(shared "hi") }
