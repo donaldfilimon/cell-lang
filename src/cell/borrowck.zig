@@ -102,9 +102,29 @@ const Loan = struct {
     /// Index into `open_blocks` of the block this loan was created in. Only
     /// meaningful for block-scoped loans.
     block_index: usize = 0,
+    /// Index, within `open_blocks[block_index].stmts`, of the statement that
+    /// created this loan. Only meaningful for block-scoped loans. Together
+    /// with `block_index` it fixes the START of the window the NLL predicate's
+    /// part (b) scans; `open_blocks[block_index].index` is its end.
+    stmt_index: usize = 0,
     /// True for a loan that lasts to the end of its block, false for one that
     /// dies with its statement or its `if`.
     lexical: bool = false,
+};
+
+/// Whether a named loan still holds its referent at the statement being
+/// checked, in the non-lexical sense. Only `dead` is an acceptance; both other
+/// answers reject, so a bug that returns one of them can only cost precision.
+const LoanStatus = enum {
+    /// The holder is provably never reached again, so NLL ends the loan here.
+    dead,
+    /// The holder is mentioned again after this statement.
+    live,
+    /// The predicate cannot answer: the loan is a temporary, or has no holder,
+    /// or the holder was mentioned before this statement in a position that
+    /// may have propagated the reference somewhere this checker does not
+    /// track. Distinguished from `live` only so the reason is legible.
+    ineligible,
 };
 
 /// A block currently being walked, with the index of the statement in it that
@@ -977,6 +997,10 @@ pub const Checker = struct {
             .span = place.span,
             .holder = holder,
             .block_index = if (self.open_blocks.items.len == 0) 0 else self.open_blocks.items.len - 1,
+            .stmt_index = if (self.open_blocks.items.len == 0)
+                0
+            else
+                self.open_blocks.items[self.open_blocks.items.len - 1].index,
             .lexical = lexical,
         };
         if (lexical) {
@@ -1186,14 +1210,67 @@ pub const Checker = struct {
         try self.diagnostics.note(self.allocator, loan.span, text);
     }
 
+    /// Whether a named loan is still holding its referent at the statement
+    /// being checked, in the non-lexical sense. `dead` is the only status
+    /// that is not a rejection, so `dead` is the only one that needs proof;
+    /// `live` and `ineligible` are both safe answers and are never wrong in a
+    /// way that admits a program.
+    ///
+    /// `dead` requires BOTH halves, and each is blind to what the other sees:
+    ///
+    /// **(a) Forward,** `nameUsedFrom`: the holder is not mentioned from the
+    /// current statement to the end of the block that owns the loan. It counts
+    /// the current statement in FULL and recurses into a `while`'s condition
+    /// and body, so a back edge and a use nested inside the current statement
+    /// both read as "used". That full-statement counting is also what covers
+    /// every block nested inside the current statement, at every depth.
+    ///
+    /// **(b) Window,** `windowPropagates`: between the loan's own `let` and
+    /// the current statement, at the loan's OWN block level, the holder is
+    /// mentioned only in positions that provably cannot propagate the
+    /// reference. This is the region (a) structurally cannot see, because (a)
+    /// starts at the current statement and only ever looks forward.
+    ///
+    /// The two regions together are exhaustive over the loan's live range.
+    /// Anything at a block level nested inside the loan's block is reached
+    /// through (a)'s full-statement counting of the enclosing statement, so
+    /// only the loan's own block has a gap for (b) to fill.
+    fn loanStatusAt(self: *const Checker, loan: Loan) LoanStatus {
+        // A temporary loan dies with its statement or its `if`, so the lexical
+        // model already ends it as early as NLL would.
+        if (!loan.lexical) return .ineligible;
+        const holder = loan.holder orelse return .ineligible;
+        if (self.windowPropagates(loan, holder)) return .ineligible;
+        if (self.nameUsedFrom(holder, loan.block_index)) return .live;
+        return .dead;
+    }
+
+    /// Part (b). Scans the statements at the loan's own block level that lie
+    /// strictly between the loan's `let` and the statement being checked.
+    ///
+    /// Returns true, meaning `ineligible`, when the holder is mentioned there
+    /// in any position other than the one whitelisted by `argPropagatesName`.
+    /// Returns true as well when the loan's block is no longer on the stack,
+    /// which cannot happen for a live block loan but must not silently read as
+    /// "nothing propagates" if it ever does.
+    fn windowPropagates(self: *const Checker, loan: Loan, holder: []const u8) bool {
+        if (loan.block_index >= self.open_blocks.items.len) return true;
+        const ob = self.open_blocks.items[loan.block_index];
+        const from = @min(loan.stmt_index + 1, ob.stmts.len);
+        const to = @min(ob.index, ob.stmts.len);
+        if (to <= from) return false;
+        for (ob.stmts[from..to]) |*s| {
+            if (stmtPropagatesName(s, holder)) return true;
+        }
+        return false;
+    }
+
     /// OWNERSHIP.md 0.3 asks the checker to say when a rejection is its own
     /// conservatism. Only a named lexical loan can be the cause, and only when
-    /// the holding binding is provably never mentioned again: an unprovable
-    /// case gets no note.
+    /// `loanStatusAt` proves the loan dead: an unprovable case gets no note.
     fn maybeNoteNll(self: *Checker, loan: Loan, at: Span) Error!void {
-        if (!loan.lexical) return;
-        const holder = loan.holder orelse return;
-        if (self.nameUsedFrom(holder, loan.block_index)) return;
+        if (self.loanStatusAt(loan) != .dead) return;
+        const holder = loan.holder.?;
         try self.diagnostics.note(
             self.allocator,
             at,
@@ -1386,12 +1463,149 @@ fn exprUsesName(e: *const ast.Expr, name: []const u8) bool {
         .match_expr => |m| blk: {
             if (exprUsesName(m.scrutinee, name)) break :blk true;
             for (m.arms) |arm| {
+                // The GUARD, not only the body. An arm has two expression
+                // positions and this scanned one of them, so
+                // `match n { _ if use_it(exclusive e) > 0 => 1, _ => 2 }`
+                // read as "'e' is never used again" and printed a note saying
+                // NLL would accept a program NLL rejects. Under the
+                // acceptance this scan now gates, the same hole would have
+                // ended a loan that is still held inside the guard.
+                if (arm.guard) |g| {
+                    if (exprUsesName(g, name)) break :blk true;
+                }
                 if (exprUsesName(arm.body, name)) break :blk true;
             }
             break :blk false;
         },
         .annotated => |a| exprUsesName(a.value, name),
     };
+}
+
+// ── the NLL predicate's part (b): the window walker ─────────────────────
+//
+// THE WHITELIST IS THE COMPLEMENT, AND THAT IS THE WHOLE POINT. These three
+// functions do not enumerate the positions that propagate a reference and
+// assume everything left over is safe. They enumerate the ONE position that
+// provably cannot propagate one, and treat every other mention as propagating.
+//
+// The one position: a DIRECT argument of a call, after peeling a written
+// ownership keyword (`.annotated`) and a `&`/`&mut` sigil. It is sound because
+// R8 forbids the callee returning the borrow or storing it in a struct field,
+// and Cell has no lifetime parameters, no references inside aggregates and no
+// closures, so a callee has nowhere to put it. If lifetime parameters ever
+// land, the test named for that invariant fails and says so.
+//
+// Every other mention -- a `let` initializer, an `assign` target or value, a
+// `match` scrutinee, a guard, a struct-literal field, a list element, an
+// `if`/`match`/block value position -- lands on the reject side by
+// construction rather than by being remembered. Value positions are exactly
+// the class that produced two of the `arc` use-after-frees this checker has
+// already shipped and fixed.
+//
+// Both switches are exhaustive with NO `else` arm, like `exprUsesName` above,
+// so a new AST node is a compile error here rather than a silent default to
+// "safe".
+
+/// Whether `s` mentions `name` anywhere outside the whitelisted position.
+fn stmtPropagatesName(s: *const ast.Stmt, name: []const u8) bool {
+    return switch (s.kind) {
+        .let => |l| if (l.value) |v| exprPropagatesName(&v, name) else false,
+        .expr => |e| exprPropagatesName(&e, name),
+        .return_stmt => |opt| if (opt) |e| exprPropagatesName(&e, name) else false,
+        // The TARGET counts. `e = &mut b` retargets the holder, and this
+        // checker does not model that (see the report on the retarget gap), so
+        // any assignment naming the holder is `ineligible`.
+        .assign => |a| exprPropagatesName(&a.target, name) or exprPropagatesName(&a.value, name),
+        .while_stmt => |w| blk: {
+            if (exprPropagatesName(&w.cond, name)) break :blk true;
+            for (w.body) |*b| {
+                if (stmtPropagatesName(b, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .break_stmt, .continue_stmt => false,
+    };
+}
+
+/// Whether `e` mentions `name` anywhere outside the whitelisted position.
+/// Every sub-expression here is a non-whitelisted position; only
+/// `argPropagatesName` opens the one exception.
+fn exprPropagatesName(e: *const ast.Expr, name: []const u8) bool {
+    return switch (e.kind) {
+        .ident => |n| std.mem.eql(u8, n, name),
+        .int, .float, .string, .bool => false,
+        .call => |c| blk: {
+            // The CALLEE is not an argument. `e(1)` is not whitelisted.
+            if (exprPropagatesName(c.callee, name)) break :blk true;
+            for (c.args) |*a| {
+                if (argPropagatesName(a, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .binary => |b| exprPropagatesName(b.left, name) or exprPropagatesName(b.right, name),
+        .unary => |u| exprPropagatesName(u.operand, name),
+        .field => |f| exprPropagatesName(f.base, name),
+        .struct_lit => |sl| blk: {
+            for (sl.fields) |*f| {
+                if (exprPropagatesName(&f.value, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .list_lit => |items| blk: {
+            for (items) |*item| {
+                if (exprPropagatesName(item, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .block => |stmts| blk: {
+            for (stmts) |*s| {
+                if (stmtPropagatesName(s, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .if_expr => |i| blk: {
+            if (exprPropagatesName(i.cond, name)) break :blk true;
+            if (exprPropagatesName(i.then_body, name)) break :blk true;
+            if (i.else_body) |eb| {
+                if (exprPropagatesName(eb, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .match_expr => |m| blk: {
+            if (exprPropagatesName(m.scrutinee, name)) break :blk true;
+            for (m.arms) |arm| {
+                if (arm.guard) |g| {
+                    if (exprPropagatesName(g, name)) break :blk true;
+                }
+                if (exprPropagatesName(arm.body, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .annotated => |a| exprPropagatesName(a.value, name),
+    };
+}
+
+/// One call argument, the only whitelisted position. Peels a written
+/// ownership keyword and a `&`/`&mut` sigil; if what is left is exactly a
+/// bare identifier, the mention cannot propagate, whether or not it is
+/// `name`. Anything else falls back to the non-whitelisted walk, so
+/// `f(e.len)`, `f(g(e))`'s outer argument and `f(-e)` are all judged there.
+fn argPropagatesName(arg: *const ast.Expr, name: []const u8) bool {
+    var cursor = arg;
+    while (true) {
+        switch (cursor.kind) {
+            .annotated => |a| cursor = a.value,
+            .unary => |u| switch (u.op) {
+                .ref_shared, .ref_exclusive => cursor = u.operand,
+                else => return exprPropagatesName(cursor, name),
+            },
+            // A bare identifier handed to a callee. Either it is `name`, and
+            // R8 stops the callee keeping it, or it is some other binding and
+            // there is no mention of `name` here at all. Both are `false`.
+            .ident => return false,
+            else => return exprPropagatesName(cursor, name),
+        }
+    }
 }
 
 /// Borrow-check `module`, rendering every diagnostic to `writer`. Deliberately
@@ -1781,6 +1995,46 @@ test "0.3: a rejection that NLL would accept says so, and one it would not stays
         \\t.cell:12:11: error: cannot borrow 'buf' as shared: it is already borrowed as exclusive
         \\t.cell:11:28: note: the exclusive borrow starts here and lasts to the end of this block
         \\t.cell:12:11: note: this would be accepted under non-lexical lifetimes: 'e' is never used again, but Cell ends a named borrow at the end of its block
+        \\
+    );
+}
+
+test "0.3: a holder that was copied into a second borrow behind the conflict is not dead" {
+    // The forward scan alone said "'e' is never used again" here and printed
+    // a note claiming NLL would accept this. NLL REJECTS it: `f` aliases `buf`
+    // through `e`, and `f` is used afterwards. `nameUsedFrom` starts at the
+    // conflicting statement and can never see the `let exclusive f = e`
+    // BEHIND it, which is what the window scan is for.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    let exclusive f = e
+        \\    read(&buf)
+        \\    grow(exclusive f, shared 1)
+        \\}
+    ,
+        \\t.cell:13:11: error: cannot borrow 'buf' as shared: it is already borrowed as exclusive
+        \\t.cell:11:28: note: the exclusive borrow starts here and lasts to the end of this block
+        \\
+    );
+}
+
+test "0.3: a holder used inside a match GUARD is not dead" {
+    // A match arm has two expression positions and the forward scan walked
+    // one. `exprUsesName` recursed into `arm.body` and not `arm.guard`, so
+    // this printed the NLL note, and under the acceptance that predicate now
+    // gates it would have ended a loan the guard still holds.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let exclusive e = &mut buf
+        \\    read(&buf)
+        \\    let copy m = match 1 { _ if use_it(shared e) > 0 => 1, _ => 2 }
+        \\}
+    ,
+        \\t.cell:12:11: error: cannot borrow 'buf' as shared: it is already borrowed as exclusive
+        \\t.cell:11:28: note: the exclusive borrow starts here and lasts to the end of this block
         \\
     );
 }
