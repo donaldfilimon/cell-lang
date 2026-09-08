@@ -13,8 +13,11 @@ cross-file picture that no single source file states.
    parsed versus only designed.
 2. `docs/SPEC.md` section 12, the construct-by-construct status index, and
    `docs/OWNERSHIP.md` for the numbered rules `borrowck.zig` implements
-   (R1, R2, R3, R3a, R4, R5, R6, R8, R14, R15 today; its header comment is
-   the live list).
+   (R1, R2, R3, R3a, R4, R5, R6, R8, **R9**, R14 and R15 today, **plus one
+   clause of R10**: an `arc` value may not be made unique. The rest of R10,
+   move-into-`arc` in particular, is not enforced. Its header comment is the
+   live list and this line has already drifted from it once, dropping R9 and
+   the R10 clause entirely).
 3. The module doc comment of whatever you are about to change. They are long
    on purpose and carry the decision, not just the description:
    `hir.zig` on why lowering is total and tolerant, `cfg.zig` on why a block
@@ -28,16 +31,28 @@ cross-file picture that no single source file states.
 tools/check.sh          # exit code is the verdict
 ```
 
-One command, five stages, and its header comment explains why each stage
-earns its place. `zig build test` alone is not the gate: it does not run a
-single `.cell` program, and `zig build examples` checks only `hello.cell`.
-The stages are build, tests (with the count printed), the four corpus
-contracts from `examples/README.md`, LLVM-vs-MLIR verdict agreement on every
-example, and real execution (emit, compile, link against `runtime/cell_rt.c`,
-run, compare output) of `hello`/`backends`/`loops` through all three backends.
+One command, **nine stages** plus a verdict, and its header comment explains
+why each stage earns its place. `zig build test` alone is not the gate: it
+does not run a single `.cell` program, and `zig build examples` checks only
+`hello.cell`. The stages, in the order the script prints them: build, tests
+(with the count printed), the four corpus contracts from
+`examples/README.md`, backend agreement, MLIR lowering, execution, leaks
+(`docs/OWNERSHIP.md` R11's disclosed gaps, pinned as constants), backend
+answers, and sanitized execution under AddressSanitizer.
 
-`examples/README.md` still says "there is no gate script" and prints the loops
-by hand. That line predates `tools/check.sh`; the script is the same loops.
+**Read the stage list off the script's own output, not off this paragraph.**
+It said "five stages" for days after the gate reached nine, and every stage
+added since was added because a real hole was found: *a verdict is not a
+lowering*, *verdict agreement is not answer agreement*, and R11's leak numbers
+had been unreproducible prose before they became pinned constants. This
+sentence will go stale the same way; `grep -E '^== ' ` on a gate log is the
+authority.
+
+A prior version of this section said `examples/README.md` "still says there is
+no gate script". That was **false when written and is false now** (`grep -c`
+returns 0): that file names `tools/check.sh` as the gate in its own
+"Running the checks" section and keeps the hand loops only to document what
+the four contracts are.
 
 MLIR stages **SKIP loudly** when `mlir-opt`/`mlir-translate`/`llc` are missing,
 and the verdict says the run was weaker. They are in the Homebrew keg, not on
@@ -176,5 +191,10 @@ Design work in flight lives in `docs/superpowers/specs/` and
 from multi-agent passes. Add tests with the code you change, and cite the test
 count rather than a bare green.
 
-This repository has **no git remote**, so work here exists nowhere else until
-it is bundled to `~/at-risk-bundles/`. Re-bundle after meaningful changes.
+**This repository HAS a git remote**, `github.com/donaldfilimon/cell-lang`
+(public), added 2026-09-07. Any line here or elsewhere calling it remoteless is
+stale. That makes `origin` the backup of record for anything **pushed**, and
+only for that: check `git rev-list --count origin/main..main` before deciding a
+bundle is redundant, and re-bundle to `~/at-risk-bundles/` when it is not zero.
+A dirty tree is never covered by either, so capture `git diff HEAD` and the
+untracked files alongside any bundle.
