@@ -36,9 +36,11 @@
 //! is called), so the block ids it assigns land on the same integers
 //! `cfg.build` assigned for the same `hir.Fn`. It does NOT rebuild edges
 //! (the graph already has them); it only rebuilds "what ran where."
-//! `analyze` asserts the two block counts agree, since a silent drift here
-//! would misalign every op list against the wrong `cfg.Block`, and there is
-//! no independent way to catch that ourselves once analysis proceeds. This
+//! `analyze` checks the two block counts agree (`error.GraphMismatch` if
+//! not; see that error's own doc comment for why this is a checked error
+//! and not a `std.debug.assert`), since a silent drift here would misalign
+//! every op list against the wrong `cfg.Block`, and there is no
+//! independent way to catch that ourselves once analysis proceeds. This
 //! duplication is real (two independent traversals of the same shape can
 //! drift if one changes without the other), and it is the price of
 //! `cfg.Block` deliberately not storing statements, as documented there.
@@ -46,6 +48,25 @@
 //! (straight-line, if with and without else, while with a back edge,
 //! break, continue, non-exhaustive match, a fully-diverging if inside a
 //! loop) specifically so a drift would be caught here rather than downstream.
+//!
+//! WHAT THIS DOES NOT CATCH. The block-count check catches a `Walker` that
+//! allocates a different NUMBER of blocks than `cfg.build` did. It cannot
+//! catch a `Walker` that allocates the same number in a different ORDER
+//! (for instance, swapping which of `then_id`/`join_id` is allocated
+//! first in `walkIf`): the counts would still agree, so the check would
+//! not fire, and every op list would silently point at the wrong block
+//! from then on. `cfg.Block` carries no per-block fact (no statement, no
+//! source span, nothing) this module could compare against to catch an
+//! order drift independently; the only real defense against it is that
+//! `Walker`'s allocation order is written to match `cfg.Builder`'s
+//! line-for-line, and the tests below would need to break in a way that
+//! happens to still assert something true for a silent order-swap to slip
+//! through un-noticed here. This is a structural hole, not an oversight
+//! this module chose to leave: it belongs to whoever writes the first
+//! consumer of `Result`, who will need either a stronger correlation
+//! primitive from `cfg.zig` (a per-block token `Walker` and `cfg.Builder`
+//! could both stamp and compare) or enough end-to-end testing against
+//! real compiled output to catch a wrong answer downstream.
 //!
 //! WHAT COUNTS AS A DEF OR A USE, AND WHICH FORMS WERE ACTUALLY BUILT.
 //! Enumerated exhaustively over `hir.Stmt.Kind` and `hir.Expr.Kind`, not
@@ -85,6 +106,14 @@
 //!     `Pattern.Kind` (`wildcard`, `enum_variant`, `int`, `float`, `string`,
 //!     `bool`) introduces a slot; that is the whole `Kind` union, so this
 //!     is complete, not merely the forms that happened to come to mind.
+//!     The `pattern_matches_all` switch below is `else`-armed rather than
+//!     compiler-enforced exhaustive, matching `cfg.zig`'s identical switch
+//!     exactly: a deliberate choice to keep the two in lockstep rather than
+//!     make only this copy safer, since drifting them apart would be its
+//!     own source of the same "same shape, quietly diverged" defect this
+//!     module already works to avoid elsewhere. If `cfg.zig`'s switch is
+//!     ever made exhaustive, change this one the same way in the same
+//!     change.
 //!   - Parameters are never given an explicit def op. A read of a
 //!     parameter before any local def in its function is therefore live-in
 //!     to the entry block by construction, which is the correct fact (a
@@ -148,7 +177,26 @@ const std = @import("std");
 const hir = @import("hir.zig");
 const cfg = @import("cfg.zig");
 
-const LivenessError = std.mem.Allocator.Error;
+const LivenessError = std.mem.Allocator.Error || error{
+    /// `Walker`'s own block count did not match `g.blocks.len`. This can
+    /// only mean the correlation described in the module doc comment
+    /// failed for this `f`/`g` pair: either `g` was not built from `f` (a
+    /// caller error), or `Walker`'s traversal drifted from `cfg.Builder`'s.
+    /// Continuing past this would misalign every op list against the
+    /// wrong `cfg.Block`, which is silent corruption in the worst
+    /// direction this module can produce: a slot that is actually live
+    /// could read as dead in the wrong block, and a consumer trusting
+    /// that frees a value still needed or ends a loan early. This must
+    /// hold in every build mode, including `ReleaseFast`, where a bare
+    /// `std.debug.assert` compiles out and an out-of-bounds index into
+    /// `w.blocks.items` can read unwritten (but in-capacity) arena memory
+    /// that happens to decode as a plausible, empty op list rather than
+    /// trapping -- a wrong answer that reads as a pass. See the module doc
+    /// comment's "WHAT THIS DOES NOT CATCH" for the residual hole this
+    /// check does NOT close (an allocation-order drift that keeps the
+    /// same block count).
+    GraphMismatch,
+};
 
 /// One occurrence of a slot in the op stream: either a definition (the slot
 /// now holds a new value) or a use (a read of whatever value the slot
@@ -203,10 +251,21 @@ pub fn analyze(allocator: std.mem.Allocator, f: *const hir.Fn, g: *const cfg.Gra
     w.cur = entry;
     try w.walkStmts(body);
 
-    // See the module doc comment: a silent drift between this walk and
-    // `cfg.build`'s own would misalign every op list against the wrong
-    // `cfg.Block`, and nothing downstream could detect that on its own.
-    std.debug.assert(w.blocks.items.len == g.blocks.len);
+    // See the module doc comment and `LivenessError.GraphMismatch`: a
+    // silent drift between this walk and `cfg.build`'s own would misalign
+    // every op list against the wrong `cfg.Block`, and nothing downstream
+    // could detect that on its own. This was a `std.debug.assert` until
+    // review demonstrated it compiles out in `ReleaseFast`: a
+    // deliberately-broken walk (one fewer block than `cfg.build` for an
+    // `if`/`else`) still exited 0 with every test green, because the
+    // out-of-bounds read this mismatch enables landed inside the
+    // `ArrayList`'s spare capacity on unwritten arena memory that happened
+    // to decode as an empty op list -- which is what an empty else-arm's
+    // op list should look like anyway, so the wrong answer was
+    // accidentally right. An error return holds in every build mode,
+    // matching the fix `74f8e63` made to the same defect class in the
+    // drop pass.
+    if (w.blocks.items.len != g.blocks.len) return error.GraphMismatch;
 
     const nblocks = g.blocks.len;
     const nslots = f.bindings.len;
@@ -960,4 +1019,41 @@ test "a match arm's binding pattern is a def at the start of its body, not befor
     // into the body (it is defined there, not received from entry).
     try std.testing.expect(!r.live_in[body_b.id][1]);
     try std.testing.expect(hasLastUse(r.last_uses, body_b.id, 1));
+}
+
+test "analyze returns error.GraphMismatch rather than silently misaligning op lists" {
+    // `g` must be `cfg.build`'s own graph for the SAME `f` passed to
+    // `analyze` (see `analyze`'s doc comment). This deliberately violates
+    // that contract the way a caller could by accident -- pairing a
+    // one-block straight-line graph with a four-block if/else function --
+    // to reach `error.GraphMismatch` through a real call rather than by
+    // sabotaging `Walker` internally. See the module doc comment's
+    // `LivenessError.GraphMismatch` for why this must be a checked error
+    // in every build mode rather than a `std.debug.assert`.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var small_bindings = [_]hir.Binding{};
+    var small_stmts = [_]hir.Stmt{retStmt(null)};
+    const f_small = testFn(&small_stmts, &small_bindings);
+    const g_small = (try cfg.build(a, &f_small)).?;
+    try std.testing.expectEqual(@as(usize, 1), g_small.blocks.len);
+
+    var big_bindings = [_]hir.Binding{dummyBinding(0)};
+    var then_body = unitExpr(.{ .block = .{ .stmts = &.{}, .tail = null } });
+    var else_body = unitExpr(.{ .block = .{ .stmts = &.{}, .tail = null } });
+    var cond = boolExpr(true);
+    const if_e = unitExpr(.{ .if_expr = .{
+        .cond = &cond,
+        .then_body = &then_body,
+        .else_body = &else_body,
+    } });
+    var big_stmts = [_]hir.Stmt{exprStmt(if_e)};
+    const f_big = testFn(&big_stmts, &big_bindings);
+    const g_big = (try cfg.build(a, &f_big)).?;
+    try std.testing.expectEqual(@as(usize, 4), g_big.blocks.len);
+
+    // f_big walked against g_small: 4 real blocks vs. a 1-block graph.
+    try std.testing.expectError(error.GraphMismatch, analyze(a, &f_big, &g_small));
 }
