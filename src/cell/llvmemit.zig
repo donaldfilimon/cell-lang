@@ -268,6 +268,10 @@ const Emitter = struct {
     }
 
     fn emitDeclare(self: *Emitter, f: *const hir.Fn) EmitError!void {
+        if (unsupportedReturnOwnership(f.ret, f.ret_ownership)) |what| {
+            try self.unsupported(f.span, what);
+            return;
+        }
         const sret = abi.classifyReturn(self.module, f.ret) == .indirect;
         const ret = abi.renderReturn(self.arena, self.module, f.ret) orelse {
             try self.unsupported(f.span, "declared return type");
@@ -299,6 +303,10 @@ const Emitter = struct {
 
     fn emitFn(self: *Emitter, f: *const hir.Fn) EmitError!void {
         const body = f.body orelse return;
+        if (unsupportedReturnOwnership(f.ret, f.ret_ownership)) |what| {
+            try self.unsupported(f.span, what);
+            return;
+        }
         const uses_sret = abi.classifyReturn(self.module, f.ret) == .indirect;
         const ret = abi.renderReturn(self.arena, self.module, f.ret) orelse {
             try self.unsupported(f.span, "return type");
@@ -313,25 +321,9 @@ const Emitter = struct {
         // function actually writes is the 24-byte owning `%cell_string`. The
         // disagreement was invisible because a String return always takes the
         // sret branch, which stored whatever the body computed without ever
-        // comparing it. A return carries no ownership annotation and codegen
-        // treats `-> String` as owning, so `.owned` is the mode here, exactly
-        // as the `sret(...)` spelling below already assumed.
-        //
-        // DISCLOSED, AND MEASURED RATHER THAN SUSPECTED. `.owned` is hardcoded
-        // because `hir.Fn` records `ret: Ty` and NO ownership mode for a
-        // return, so this backend cannot tell `-> arc String` from
-        // `-> String`. `pub fn f() -> arc String { return make() }` therefore
-        // still emits `define void @cell_f(ptr sret(%cell_string) %sret)`
-        // while the C backend emits `cell_arc_t cell_f(void)`: a wrong return
-        // CONVENTION, which is a different defect from the borrowed-view to
-        // owning-value conversion the guard below closes, and one that cannot
-        // be refused from this file because the fact needed to detect it is
-        // not in the IR. `-> arc String { return "ab" }` IS refused, but only
-        // because the returned VALUE is a `%cell_str`; substituting an owning
-        // value re-opens it. Closing this needs a return ownership mode in
-        // `hir.Fn` and a decision about how `cell_arc_t` is placed, which is
-        // `docs/OWNERSHIP.md` R11 territory. Both backends agree here, so no
-        // verdict splits; both disagree with C.
+        // comparing it. HIR now carries the declared return ownership, and
+        // the guard above refuses nonprimitive shared representations before
+        // this owning ABI path. `.owned` is therefore deliberate here.
         const ret_natural = self.llTypeOwned(f.ret, .owned) orelse ret;
 
         self.temp = 0;
@@ -948,7 +940,13 @@ const Emitter = struct {
             },
             .binary => |b| return self.emitBinary(e, b.op, b.left, b.right),
             .unary => |u| return self.emitUnary(e, u.op, u.operand),
-            .call => |c| return self.emitCall(e, c.symbol, c.args),
+            .call => |c| {
+                if (unsupportedReturnOwnership(e.ty, c.ret_ownership)) |what| {
+                    try self.unsupported(e.span, what);
+                    return Value.void_value;
+                }
+                return self.emitCall(e, c.symbol, c.args);
+            },
             .field => |f| {
                 const base = try self.emitExpr(f.base);
                 if (base.isVoid()) return base;
@@ -1751,6 +1749,20 @@ const Emitter = struct {
             try std.fmt.allocPrint(self.arena, "cannot lower to LLVM IR: {s}", .{what}),
         );
     }
+
+    fn unsupportedReturnOwnership(ty: hir.Ty, ownership: hir.Ownership) ?[]const u8 {
+        const nonprimitive = switch (ty) {
+            .unit, .int, .int32, .uint, .float, .float32, .boolean, .byte, .enum_type => false,
+            .unknown, .string, .optional, .list, .result, .struct_type, .func => true,
+        };
+        if (!nonprimitive) return null;
+        return switch (ownership) {
+            .owned, .copy => null,
+            .arc => "arc return type",
+            .shared => "shared return type",
+            .exclusive => "exclusive return type",
+        };
+    }
 };
 
 fn isFloatType(t: []const u8) bool {
@@ -1901,6 +1913,85 @@ test "arc is still refused with a diagnostic rather than emitted wrongly" {
         if (std.mem.indexOf(u8, d.message, "cannot lower to LLVM IR") != null) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "arc return declarations definitions and calls are refused from HIR ownership" {
+    var declaration = try emitSource(
+        \\pub fn external() -> arc String;
+    );
+    defer declaration.deinit();
+    try expectDiagnosticContains(&declaration.bag, "cannot lower to LLVM IR: arc return type");
+
+    var definition = try emitSource(
+        \\pub fn values() -> arc [Int] { return [] }
+    );
+    defer definition.deinit();
+    try expectDiagnosticContains(&definition.bag, "cannot lower to LLVM IR: arc return type");
+
+    var callee = hir.Expr{ .ty = .unit, .span = .none, .kind = .{ .int_const = 0 } };
+    var statements = [_]hir.Stmt{.{
+        .span = .none,
+        .kind = .{ .ret = .{
+            .ty = .{ .struct_type = "Box" },
+            .span = .none,
+            .kind = .{ .call = .{
+                .symbol = "cell_external",
+                .callee = &callee,
+                .args = &.{},
+                .modes = &.{},
+                .ret_ownership = .arc,
+            } },
+        } },
+    }};
+    var functions = [_]hir.Fn{.{
+        .name = "caller",
+        .symbol = "cell_caller",
+        .param_count = 0,
+        .bindings = &.{},
+        .ret = .{ .struct_type = "Box" },
+        .ret_ownership = .owned,
+        .body = &statements,
+        .is_public = true,
+        .span = .none,
+    }};
+    var structs = [_]hir.Struct{.{ .name = "Box", .fields = &.{}, .is_public = true }};
+    var module = hir.Module{ .path = "direct.hir", .structs = &structs, .enums = &.{}, .fns = &functions };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var buf: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&buf);
+    var bag: diag.Bag = .init("direct.hir", "");
+    defer bag.deinit(allocator);
+    try emitModule(allocator, &module, &writer, &bag);
+    try expectDiagnosticContains(&bag, "cannot lower to LLVM IR: arc return type");
+}
+
+test "return ownership guard preserves primitives and refuses nonprimitive borrows" {
+    var primitive = try emitSource(
+        \\pub fn ai() -> arc Int { return 1 }
+        \\pub fn sb() -> shared Bool;
+        \\pub fn ef() -> exclusive Float;
+        \\pub fn os() -> String;
+        \\pub fn cs() -> copy String;
+    );
+    defer primitive.deinit();
+    try std.testing.expect(!primitive.bag.hasErrors());
+
+    var borrowed = try emitSource(
+        \\pub fn shared_string() -> shared String;
+        \\pub fn exclusive_list() -> exclusive [Int];
+    );
+    defer borrowed.deinit();
+    try expectDiagnosticContains(&borrowed.bag, "shared return type");
+    try expectDiagnosticContains(&borrowed.bag, "exclusive return type");
+}
+
+fn expectDiagnosticContains(bag: *const diag.Bag, needle: []const u8) !void {
+    for (bag.list.items) |d| {
+        if (std.mem.indexOf(u8, d.message, needle) != null) return;
+    }
+    return error.MissingDiagnostic;
 }
 
 /// Compile emitted IR, link it against the real runtime, run it, and return
@@ -2234,9 +2325,9 @@ test "a string pattern compares length, guards null, then calls memcmp" {
     defer e.deinit();
     try std.testing.expect(!e.bag.hasErrors());
     try expectContains(e.text, "declare i32 @memcmp(ptr, ptr, i64)");
-    try expectContains(e.text, "icmp eq i64");           // length first
-    try expectContains(e.text, "icmp eq ptr");           // then the null guard
-    try expectContains(e.text, "call i32 @memcmp(");     // only then memcmp
+    try expectContains(e.text, "icmp eq i64"); // length first
+    try expectContains(e.text, "icmp eq ptr"); // then the null guard
+    try expectContains(e.text, "call i32 @memcmp("); // only then memcmp
 }
 
 test "an empty string pattern needs no memcmp at all" {
@@ -2664,8 +2755,8 @@ test "the borrowed-view to owning-String conversion is refused at EVERY position
     // THE TABLE IS EVIDENCE, NOT THE FIX. The fix is one predicate, `fits`,
     // asked wherever a value meets a destination; six positional checks would
     // have closed six holes and left the seventh. The seventh is here too:
-    // `-> arc String` is the shape whose partial handling started this, and it
-    // refuses for the same reason as the rest.
+    // `-> arc String` is now refused earlier from its return contract, before
+    // this conversion can be considered.
     const cases = [_][]const u8{
         // 1. a literal returned from an owning-String function
         \\pub fn f() -> String { return "ab" }
@@ -2706,7 +2797,8 @@ test "the borrowed-view to owning-String conversion is refused at EVERY position
         // like this stops testing what it claims to.
         var named = false;
         for (e.bag.list.items) |d| {
-            if (std.mem.indexOf(u8, d.message, "%cell_str where %cell_string") != null) named = true;
+            if (std.mem.indexOf(u8, d.message, "%cell_str where %cell_string") != null or
+                (i == 6 and std.mem.indexOf(u8, d.message, "arc return type") != null)) named = true;
         }
         if (!named) {
             std.debug.print("case {d} refused without naming the conversion:\n", .{i + 1});

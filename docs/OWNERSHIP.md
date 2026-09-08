@@ -1006,6 +1006,13 @@ the mode, and the main practical difference from `owned`.
 
 ### R11. Retain and release insertion
 
+HIR preserves a function's declared return ownership and copies it onto direct
+call results. The LLVM and MLIR backends keep primitive returns in their
+existing scalar representation, but refuse nonprimitive `arc`, `shared`, and
+`exclusive` return contracts before choosing an ABI. This closes the former
+`arc String` calling-convention mismatch by explicit refusal; it does not add
+ARC retain/release support to either IR backend.
+
 The checker decides where these go; codegen emits them. The runtime functions
 exist and work: `cell_arc_new`, `cell_arc_clone` (increment), and
 `cell_arc_drop` (decrement, and call the drop function at zero), all in

@@ -214,6 +214,10 @@ const Emitter = struct {
         // an external C ABI symbol is spelled in the func dialect.
         for (self.module.fns) |*f| {
             if (f.body != null) continue;
+            if (unsupportedReturnOwnership(f.ret, f.ret_ownership)) |what| {
+                try self.unsupported(f.span, what);
+                continue;
+            }
             const ret = self.mlirType(f.ret);
             if (ret == null and f.ret.tag() != .unit) {
                 try self.unsupported(f.span, "declared return type");
@@ -289,6 +293,10 @@ const Emitter = struct {
 
     fn emitFn(self: *Emitter, f: *const hir.Fn) EmitError!void {
         const body = f.body orelse return;
+        if (unsupportedReturnOwnership(f.ret, f.ret_ownership)) |what| {
+            try self.unsupported(f.span, what);
+            return;
+        }
         const ret = self.mlirType(f.ret);
         if (ret == null and f.ret.tag() != .unit) {
             try self.unsupported(f.span, "return type");
@@ -320,16 +328,9 @@ const Emitter = struct {
         // spells; a direct return produces the declared result. Empty for a
         // unit return, where there is no value to compare.
         //
-        // DISCLOSED, the same measured residual `llvmemit.zig` records at its
-        // own `ret_natural`: `hir.Fn` carries `ret: Ty` and no ownership mode
-        // for a return, so `.owned` is hardcoded and neither backend can tell
-        // `-> arc String` from `-> String`. `-> arc String { return make() }`
-        // is still accepted by both with an sret convention where the C
-        // backend returns a `cell_arc_t`. That is a wrong return CONVENTION
-        // rather than the value conversion this change closes, and it cannot
-        // be refused from either backend file because the IR does not carry
-        // the fact. Both backends agree, so the gate's agreement stage stays
-        // green; both disagree with C.
+        // HIR carries the declared return ownership. The guard above refuses
+        // nonprimitive shared representations before this owning ABI path, so
+        // the `.owned` spelling here is deliberate for the remaining modes.
         self.ret_natural = if (uses_sret)
             (self.mlirTypeOwned(f.ret, .owned) orelse "")
         else
@@ -838,7 +839,13 @@ const Emitter = struct {
             },
             .binary => |b| return self.emitBinary(e, b.op, b.left, b.right),
             .unary => |u| return self.emitUnary(u.op, u.operand),
-            .call => |c| return self.emitCall(e, c.symbol, c.args),
+            .call => |c| {
+                if (unsupportedReturnOwnership(e.ty, c.ret_ownership)) |what| {
+                    try self.unsupported(e.span, what);
+                    return Value.none;
+                }
+                return self.emitCall(e, c.symbol, c.args);
+            },
             .block => |b| {
                 for (b.stmts) |s| try self.emitStmt(&s);
                 if (b.tail) |t| return self.emitExpr(t);
@@ -1661,6 +1668,20 @@ const Emitter = struct {
             try std.fmt.allocPrint(self.arena, "cannot lower to MLIR: {s}", .{what}),
         );
     }
+
+    fn unsupportedReturnOwnership(ty: hir.Ty, ownership: hir.Ownership) ?[]const u8 {
+        const nonprimitive = switch (ty) {
+            .unit, .int, .int32, .uint, .float, .float32, .boolean, .byte, .enum_type => false,
+            .unknown, .string, .optional, .list, .result, .struct_type, .func => true,
+        };
+        if (!nonprimitive) return null;
+        return switch (ownership) {
+            .owned, .copy => null,
+            .arc => "arc return type",
+            .shared => "shared return type",
+            .exclusive => "exclusive return type",
+        };
+    }
 };
 
 fn isFloat(t: []const u8) bool {
@@ -1925,6 +1946,85 @@ test "arc is still refused, because R11 is not implemented" {
         if (std.mem.indexOf(u8, d.message, "cannot lower to MLIR") != null) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "arc return declarations definitions and calls are refused from HIR ownership" {
+    var declaration = try emitSource(
+        \\pub fn external() -> arc String;
+    );
+    defer declaration.deinit();
+    try expectDiagnosticContains(&declaration.bag, "cannot lower to MLIR: arc return type");
+
+    var definition = try emitSource(
+        \\pub fn values() -> arc [Int] { return [] }
+    );
+    defer definition.deinit();
+    try expectDiagnosticContains(&definition.bag, "cannot lower to MLIR: arc return type");
+
+    var callee = hir.Expr{ .ty = .unit, .span = .none, .kind = .{ .int_const = 0 } };
+    var statements = [_]hir.Stmt{.{
+        .span = .none,
+        .kind = .{ .ret = .{
+            .ty = .{ .struct_type = "Box" },
+            .span = .none,
+            .kind = .{ .call = .{
+                .symbol = "cell_external",
+                .callee = &callee,
+                .args = &.{},
+                .modes = &.{},
+                .ret_ownership = .arc,
+            } },
+        } },
+    }};
+    var functions = [_]hir.Fn{.{
+        .name = "caller",
+        .symbol = "cell_caller",
+        .param_count = 0,
+        .bindings = &.{},
+        .ret = .{ .struct_type = "Box" },
+        .ret_ownership = .owned,
+        .body = &statements,
+        .is_public = true,
+        .span = .none,
+    }};
+    var structs = [_]hir.Struct{.{ .name = "Box", .fields = &.{}, .is_public = true }};
+    var module = hir.Module{ .path = "direct.hir", .structs = &structs, .enums = &.{}, .fns = &functions };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var buf: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&buf);
+    var bag: diag.Bag = .init("direct.hir", "");
+    defer bag.deinit(allocator);
+    try emitModule(allocator, &module, &writer, &bag);
+    try expectDiagnosticContains(&bag, "cannot lower to MLIR: arc return type");
+}
+
+test "return ownership guard preserves primitives and refuses nonprimitive borrows" {
+    var primitive = try emitSource(
+        \\pub fn ai() -> arc Int { return 1 }
+        \\pub fn sb() -> shared Bool;
+        \\pub fn ef() -> exclusive Float;
+        \\pub fn os() -> String;
+        \\pub fn cs() -> copy String;
+    );
+    defer primitive.deinit();
+    try std.testing.expect(!primitive.bag.hasErrors());
+
+    var borrowed = try emitSource(
+        \\pub fn shared_string() -> shared String;
+        \\pub fn exclusive_list() -> exclusive [Int];
+    );
+    defer borrowed.deinit();
+    try expectDiagnosticContains(&borrowed.bag, "shared return type");
+    try expectDiagnosticContains(&borrowed.bag, "exclusive return type");
+}
+
+fn expectDiagnosticContains(bag: *const diag.Bag, needle: []const u8) !void {
+    for (bag.list.items) |d| {
+        if (std.mem.indexOf(u8, d.message, needle) != null) return;
+    }
+    return error.MissingDiagnostic;
 }
 
 test "emitted MLIR verifies, lowers, translates, links and prints the right answer" {
@@ -2422,7 +2522,7 @@ test "the borrowed-view to owning-String conversion is refused at EVERY position
                 u8,
                 d.message,
                 "!llvm.struct<(ptr, i64)> where !llvm.struct<(ptr, i64, i64)>",
-            ) != null) named = true;
+            ) != null or (i == 6 and std.mem.indexOf(u8, d.message, "arc return type") != null)) named = true;
         }
         if (!named) {
             std.debug.print("case {d} refused without naming the conversion:\n", .{i + 1});

@@ -262,13 +262,9 @@ LEAK_REASSIGNED_VAR=3000
 #
 # DO NOT "fix" a failure here by adding a pin. A new disagreement is a new ABI
 # defect; it belongs in src/ or, if it is genuinely disclosed elsewhere, in a
-# pin that says WHERE it is disclosed, as these four do.
-#
-#   signatures/arc_string_return:cell_f  (LLVM and MLIR)
-#       `hir.Fn` carries `ret: Ty` with no ownership mode, so the `arc` is
-#       gone before either emitter reads the return type and both sret the
-#       bare String. Upstream of both backends, in src/cell/hir.zig; the
-#       fixture's own header comment carries the measurement.
+# pin that says WHERE it is disclosed, as these two do. The former LLVM and
+# MLIR `arc_string_return` pins were deleted when HIR began preserving return
+# ownership and both backends explicitly refused that unsupported contract.
 #
 #   primitives:cell_take_list, primitives:cell_take_nested  (MLIR)
 #       a `shared` list is `const T *` by runtime/cell_rt.h section 7 and the
@@ -279,9 +275,7 @@ LEAK_REASSIGNED_VAR=3000
 #       String` without any stage checking it. These two pins are EXPECTED to
 #       flip to "gap closed, un-pin" when that fix lands: read that red as the
 #       prompt it is, not as a regression.
-SIG_DISCLOSED='signatures/arc_string_return:cell_f:LLVM
-signatures/arc_string_return:cell_f:MLIR
-primitives:cell_take_list:MLIR
+SIG_DISCLOSED='primitives:cell_take_list:MLIR
 primitives:cell_take_nested:MLIR'
 
 fails=0

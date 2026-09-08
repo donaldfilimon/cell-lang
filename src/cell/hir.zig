@@ -66,6 +66,40 @@ pub const Field = struct {
     ownership: Ownership,
 };
 
+test "function and call retain declared return ownership" {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+
+    const source =
+        \\pub fn plain() -> String;
+        \\pub fn arc_value() -> arc String;
+        \\pub fn shared_value() -> shared String;
+        \\pub fn exclusive_value() -> exclusive String;
+        \\pub fn copy_value() -> copy String;
+        \\pub fn defined() -> arc String { return arc_value() }
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var lex = lexer.Lexer.init(source, "t.cell");
+    const tokens = try lex.tokenizeAll(allocator);
+    var parser_state = parser.Parser.init(allocator, tokens.items, "t.cell");
+    var ast_module = try parser_state.parseModule();
+    var diagnostics: diag.Bag = .init("t.cell", source);
+    defer diagnostics.deinit(allocator);
+    const module = try lower(allocator, &ast_module, &diagnostics);
+
+    try std.testing.expectEqual(Ownership.owned, module.findFn("plain").?.ret_ownership);
+    try std.testing.expectEqual(Ownership.arc, module.findFn("arc_value").?.ret_ownership);
+    try std.testing.expectEqual(Ownership.shared, module.findFn("shared_value").?.ret_ownership);
+    try std.testing.expectEqual(Ownership.exclusive, module.findFn("exclusive_value").?.ret_ownership);
+    try std.testing.expectEqual(Ownership.copy, module.findFn("copy_value").?.ret_ownership);
+    const defined = module.findFn("defined").?;
+    try std.testing.expectEqual(Ownership.arc, defined.ret_ownership);
+    const returned = defined.body.?[0].kind.ret.?;
+    try std.testing.expectEqual(Ownership.arc, returned.kind.call.ret_ownership);
+}
+
 pub const Struct = struct {
     name: []const u8,
     fields: []Field,
@@ -105,6 +139,8 @@ pub const Fn = struct {
     param_count: u32,
     bindings: []Binding,
     ret: Ty,
+    /// Declared ownership of the return value. An unannotated return is owned.
+    ret_ownership: Ownership,
     /// Null for a bodyless declaration, which is the C-ABI-first form: it
     /// emits a prototype and no definition.
     body: ?[]Stmt,
@@ -229,6 +265,8 @@ pub const Expr = struct {
             callee: *Expr,
             args: []Expr,
             modes: []ArgMode,
+            /// Declared ownership of the call result, or owned when unresolved.
+            ret_ownership: Ownership,
         },
         field: struct { base: *Expr, sel: FieldSel },
         struct_lit: struct { name: []const u8, fields: []Expr },
@@ -317,7 +355,13 @@ const Lowerer = struct {
     depth: u32 = 0,
 
     const ScopeEntry = struct { name: []const u8, slot: u32, depth: u32 };
-    const Sig = struct { name: []const u8, symbol: []const u8, params: []ast.Param, ret: Ty };
+    const Sig = struct {
+        name: []const u8,
+        symbol: []const u8,
+        params: []ast.Param,
+        ret: Ty,
+        ret_ownership: Ownership,
+    };
 
     fn run(self: *Lowerer) LowerError!Module {
         // Pass one: named types and signatures, so order of declaration in the
@@ -349,6 +393,7 @@ const Lowerer = struct {
                     .symbol = try self.symbolFor(f),
                     .params = f.params,
                     .ret = if (f.return_type) |*rt| self.resolve(rt) else types.t_unit,
+                    .ret_ownership = returnOwnership(f.return_type),
                 }),
                 .use_decl => {},
             }
@@ -390,6 +435,7 @@ const Lowerer = struct {
         }
         const param_count: u32 = @intCast(self.bindings.items.len);
         const ret = if (f.return_type) |*rt| self.resolve(rt) else types.t_unit;
+        const ret_ownership = returnOwnership(f.return_type);
 
         var body: ?[]Stmt = null;
         if (f.body) |stmts| {
@@ -402,6 +448,7 @@ const Lowerer = struct {
             .param_count = param_count,
             .bindings = try self.arena.dupe(Binding, self.bindings.items),
             .ret = ret,
+            .ret_ownership = ret_ownership,
             .body = body,
             .is_public = f.is_public,
             .span = span,
@@ -781,7 +828,16 @@ const Lowerer = struct {
                 .callee = callee_expr,
                 .args = lowered_args,
                 .modes = modes,
+                .ret_ownership = if (sig) |s| s.ret_ownership else .owned,
             } },
+        };
+    }
+
+    fn returnOwnership(return_type: ?ast.TypeExpr) Ownership {
+        const ty = return_type orelse return .owned;
+        return switch (ty) {
+            .ref => |r| r.ownership,
+            else => .owned,
         };
     }
 

@@ -631,6 +631,7 @@ fn testFn(body: []hir.Stmt, bindings: []hir.Binding) hir.Fn {
         .param_count = 0,
         .bindings = bindings,
         .ret = .unit,
+        .ret_ownership = .owned,
         .body = body,
         .is_public = false,
         .span = test_span,
