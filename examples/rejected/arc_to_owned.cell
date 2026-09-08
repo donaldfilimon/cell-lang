@@ -16,8 +16,18 @@
 // cell_arc_clone increments a refcount, and the buffer is not what the
 // refcount governs.
 //
-// The `arc` binding itself is fine and stays legal: only the conversion to an
-// `owned` parameter is refused.
+// R10 is refused at FOUR positions, not just this one: an `owned` parameter,
+// an `owned` binding (`let owned ys: [Int] = xs`), an assignment into an
+// `owned` place, and an `owned` struct field. The first three were measured as
+// AddressSanitizer double frees; the fourth is not one only because this
+// backend never drops a `record` shape, and becomes one when struct drops
+// land.
+//
+// Every `arc`-to-`arc` use stays legal, which is what "the conversion is
+// refused" has to be scoped to mean: the `arc` binding below builds the box,
+// `let arc b = a` clones, an `arc` argument to an `arc` parameter clones, and
+// an `arc` argument to a `shared` parameter borrows without cloning. Only
+// making an `arc` place UNIQUE is refused.
 
 pub fn take(owned xs: [Int]) -> Int;
 

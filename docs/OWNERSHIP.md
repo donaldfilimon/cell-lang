@@ -382,7 +382,7 @@ revision can relax the rule without invalidating existing programs.
 | `arc` place to an `arc` parameter | yes | retains; both holders live afterward |
 | `arc` place to a `shared` parameter | yes | borrows the pointee for the call; no retain |
 | `arc` place to an `exclusive` parameter | no | R9 |
-| `arc` place to an `owned` parameter | no | see below. **IMPLEMENTED** in `borrowck.zig`, the only clause of R10 that is |
+| `arc` place to an `owned` parameter | no | see below. **IMPLEMENTED** in `borrowck.zig`, the only clause of R10 that is, and enforced at four positions rather than just this one |
 | `owned` place to an `arc` parameter | yes | moved into a fresh `arc` box; the source is dead by R2 |
 | `shared` or `exclusive` borrow to an `arc` parameter | no | see below |
 | `copy` and `arc` on the same declaration | no | see below |
@@ -398,13 +398,42 @@ C type, `cell_slice_t` by value, so the C backend's unbox emitted
 `-Wall -Wextra -Werror`. `runtime/cell_rt.h` section 7 makes an `owned` callee
 responsible for the eventual free, and `cell_slice_drop_glue` frees the same
 **buffer** again when the box dies. `cell_arc_clone` increments a refcount, and
-the buffer is not what the refcount governs, so no retain can fix it. The
-`arc` binding itself stays legal: only the conversion is refused. See
+the buffer is not what the refcount governs, so no retain can fix it.
+
+**The refusal covers four positions, not one**, and the parameter row above is
+only the first of them. An earlier revision refused the parameter alone and
+said "only the conversion is refused", which was wrong twice over: the word
+`parameter` was missing, and the other three positions were reachable.
+Enumerated and each one measured:
+
+| Position | Before the refusal |
+|---|---|
+| a call argument to an `owned` parameter | ASan double free, exit 134 |
+| `let owned ys: [Int] = xs` | ASan double free, exit 134 |
+| `ys = xs`, writing into an `owned` place | ASan double free, exit 134 |
+| an `owned` struct field in a literal | not a double free **yet**: this backend never drops a `record`, so the field's buffer is freed once by the box's glue and the record merely outlives it. It becomes a double free when struct drops land, so it is refused with the others |
+
+The `owned String` analogue of each was already a loud C type error, because
+`owned String` and `shared String` do not share a C type, and `return xs` from
+a `-> [Int]` function is loud for the same reason. They are refused here too on
+purpose: one rule that holds for every type beats a rule whose enforcement
+depends on which two C types happen to coincide.
+
+**What stays legal**, since "the conversion is refused" has to be scoped to
+mean something: every `arc`-to-`arc` use. `let arc xs = [1, 2, 3]` builds the
+box, `let arc b = a` clones, an `arc` argument to an `arc` parameter clones,
+and an `arc` argument to a `shared` parameter borrows without cloning. Only
+making an `arc` place UNIQUE is refused. See
 `examples/rejected/arc_to_owned.cell`.
 
-The refusal is a `cell check` refusal. `cell emit` does not run borrowck (true
-of every rule in this file, not just this one), so emitting a rejected program
-directly still produces the bad C.
+The refusal is enforced by `cell check` and, **measured rather than assumed**,
+by `cell emit` as well: `src/main.zig:164` calls `cell.check` before
+`emitFor`, and `cell emit --target=c examples/rejected/arc_to_owned.cell`
+exits 1 with this diagnostic and writes no C. An earlier revision of this
+paragraph said `cell emit` does not run borrowck "true of every rule in this
+file"; that is false for the CLI command. It is true of the LIBRARY entry point
+`root.emitFor`, which takes an already-loaded module and runs no checker, so a
+tool calling the library directly is on its own.
 
 > `err: cannot create an 'arc' from a borrow: 'b' is a shared borrow and does not own its value`
 
@@ -545,7 +574,7 @@ literal field, a list element, an assignment's right side, and a `return`,
 each for a bare identifier, a field path including a nested one
 (`o.inner.name`), a parameter, and a shadowed binding.
 
-**Value positions**, the ones version two missed and this version added: an
+**Value positions**, the ones version two missed and version three added: an
 `if`-expression branch, a `match` arm, a block's trailing expression, and each
 of those in initializer, return, and call-argument position, plus a `match`
 scrutinee. A program exercising five of them at once runs clean under
@@ -556,21 +585,57 @@ typecheck gives every `if`-expression the type `()`, so an if-derived value
 cannot flow into a typed parameter or an annotated binding, and the
 un-annotated `let` is the reachable form.
 
+**FORMS OF A MATCH ARM BODY**, added in version four because asserting a
+property of "an arm body" from two of its forms is what reopened a
+use-after-free. All five were written as programs and run, not reasoned about:
+
+| Form | Result |
+|---|---|
+| `b => b`, the binding as the arm's value | reaches `emitValueInto`, cloned |
+| `b => return b` | **parse error**, `return` is not an expression |
+| a trailing `match` as a function's value | **typecheck error**, missing return |
+| `b => { return b }`, a BLOCK arm body | reaches `returnedArcNeedsRetain`, cloned. This is the form that was missed |
+| `b => { if (c) { return b } else { return b } }` | both branches reach it, both cloned |
+| `b => { let arc keep = b ... }` | reaches `emitArgLike`, cloned |
+
+**POSITIONS THAT MAKE AN `arc` PLACE UNIQUE**, added in version four, all
+four enumerated rather than waiting for the next one to be reported: an
+`owned` parameter, an `owned` binding, an assignment into an `owned` place,
+and an `owned` struct field. R10 above refuses all four and tables what each
+one did before the refusal.
+
 **What that is not.** It is not a proof. It is a list of positions that were
 written as programs and run. A position not on that list has not been ruled
 out, and the record of this section is that unexamined positions have twice
 contained a dangling reference.
 
-**One landmine, left deliberately and recorded here as well as in the code.**
-`returnedArcNeedsRetain` spells R11 rule 3's exception as "not droppable",
-which conflates a parameter with a match-arm binding. That is safe today only
-because a match-arm binding cannot reach it: `return` is not an expression in
-this grammar, so an arm body cannot contain one, and a trailing `match` is not
-an implicit return. If either changes, an `arc` match-arm binding returned
-directly will be handed back without a retain while the scrutinee it copies is
-released. Restore a parameter-only test at that point. An earlier revision
-carried a `Local.is_param` field for exactly this, and it was removed because
-it defended nothing reachable.
+**The landmine that was here is now a scar, and the scar is more useful.**
+An earlier revision of this paragraph said `returnedArcNeedsRetain` could
+safely spell R11 rule 3's exception as "not droppable", because a match-arm
+binding could not reach it: `return` is not an expression in this grammar, so
+`b => return b` does not parse, and a trailing `match` is not an implicit
+return. **Both of those facts are true and the conclusion was false.** An arm
+body may be a BLOCK, and a block's contents are statements, so
+
+```cell
+match s { b => { return b } }
+```
+
+parses, passes `cell check`, and reaches that branch; a nested `if` inside such
+a block is a second form. Removing the `Local.is_param` field on that
+derivation reopened a use-after-free that had been fixed. The field is
+restored, the exception is parameter-only again, and both forms have tests.
+
+The general lesson, which is the reason this paragraph is kept rather than
+deleted: **enumerate the forms of a construct before asserting a property of
+all of them.** Two forms of an arm body were checked and a third existed. The
+same failure produced every finding in this section's history.
+
+One cost of the restored field, stated because it is a real trade and not a
+free win: when the scrutinee is an `arc` PARAMETER, the arm binding copies a
+reference the function never releases, so cloning it leaks one instead of
+dangling. Codegen cannot tell that scrutinee apart from a local one here, and
+the asymmetry says take the leak.
 
 A hand-written C callee that honours `cell_rt.h` section 7 and releases its
 `arc` parameter balances exactly; `examples/arc_host.c` is one.

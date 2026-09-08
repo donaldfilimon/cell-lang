@@ -62,6 +62,20 @@ zig test src/root.zig --test-filter "escaping borrow"
 zig test src/cell/borrowck.zig --test-filter "R5"
 ```
 
+**`--test-filter` fails toward a FALSE GREEN here, and more sharply than the usual "a filter matching nothing exits 0".** Re-measured on this toolchain:
+
+```sh
+zig test src/root.zig --test-filter "this-name-does-not-exist-anywhere"
+# EXIT: 0
+# 1/1 root.test_0...OK
+# All 1 tests passed.
+```
+
+It does **not** print `All 0 tests passed`. `src/root.zig:143` is an anonymous `test { std.testing.refAllDecls(@This()); }`, so it has no name for a filter to exclude, always runs, and always passes. A typo'd filter therefore produces a plausible pass with a real count at exit 0. Two consequences, both of which bite:
+
+- **Confirm the NAMED test you asked for appears in the output.** The count is not evidence that your filter matched anything.
+- **The count is always one higher** than the number of named tests that matched, in `src/root.zig`.
+
 `zig test src/main.zig` does not work at all: it fails with `no module named 'cell'`, because the CLI's `@import("cell")` is supplied by `build.zig` (`--dep cell -Mcell=src/root.zig`) along with the runtime C sources the three `extern fn`s need. The CLI tests run only under `zig build test`.
 
 `src/root.zig` pulls in the whole library via `refAllDecls`, including codegen tests that shell out to `cc -c`.
@@ -87,7 +101,7 @@ See `examples/README.md` for the exact shell loops and the per-file demonstratio
 
 Syntax is not implementation. Verify by running the compiler.
 
-- Borrow rules enforced by `src/cell/borrowck.zig` (see its header comment for the exact current set; it is independent of the typechecker). As of now: R1, R2, R3, R3a, R4, R5, R6, R8, R14, R15, plus ONE clause of R10 (an `arc` place may not be passed to an `owned` parameter; the rest of R10, including move-into-`arc`, is still designed only).
+- Borrow rules enforced by `src/cell/borrowck.zig` (see its header comment for the exact current set; it is independent of the typechecker). As of now: R1, R2, R3, R3a, R4, R5, R6, R8, R14, R15, plus ONE clause of R10: an `arc` place may not be made **unique**, refused at four positions (an `owned` parameter, an `owned` binding, an assignment to an `owned` place, and an `owned` struct field). Every `arc`-to-`arc` use stays legal. The rest of R10, including move-into-`arc`, is still designed only.
 - Construct-by-construct status (implemented / parsed not enforced / designed not implemented) is in `docs/SPEC.md` section 12. Cite the file; update counts and tags when behavior changes.
 - `cell check` runs typecheck and borrowck independently into separate `diag.Bag`s; both are printed and either error produces `error.TypeError`.
 - Drop insertion IS present in the C backend as of `7eaca7a`, and only there: `codegen.zig` emits scope drops, deliberately conservative (a parameter, a match-arm binding, a `record` shape and an R3a revival are never dropped) and written to fail toward a leak rather than a double free. The LLVM and MLIR backends emit no drops.
