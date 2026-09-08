@@ -1,0 +1,80 @@
+// EXPECT: currently-rejected
+// Violates: docs/OWNERSHIP.md R10 (an `arc` value may not be made unique),
+// reached through a CALL RESULT rather than through a binding annotation.
+//
+// WHY THIS FILE EXISTS. This program was a LIVE double free, not a masked one.
+// Measured end to end against the compiler before the fix:
+//
+//     cell check                                    exit 0
+//     cc -Wall -Wextra -Werror -fsanitize=address   exit 0
+//     running it                                    exit 134
+//
+//     AddressSanitizer: attempting double-free
+//       cell_slice_free <- cell_slice_drop_glue <- cell_arc_drop <- cell_main
+//
+// `cell_take` frees the buffer with `cell_slice_free(&mine)`, and then
+// `cell_arc_drop(_cell_t4)` on the caller's unbound temporary frees the same
+// buffer again through the box's drop glue. `cell_arc_clone` governs a
+// refcount and the buffer is not what the refcount governs, so no retain can
+// fix it: R10 refuses instead.
+//
+// WHY IT ESCAPED, which is the part worth keeping. R10's refusal had already
+// been widened once, from four PLACE positions to asking about the whole
+// EXPRESSION, which closed the value-shape axis (a `match` or a block tail
+// yielding an `arc` place). That widening is correct and it does not reach
+// this program. Here the `arc`-ness comes from `fresh`'s declared RETURN TYPE,
+// so there is no place to interrogate and no expression shape to look through.
+// Three separate axes cross at an `owned` position and only one had been
+// closed:
+//
+//     expression shape    place versus value          closed by 23353e9
+//     arc source          annotation versus signature closed here
+//     consumption site    four positions versus all   closed here
+//
+// THE UNMASKING, measured rather than reasoned. `23353e9`'s commit message
+// says its fix "lands before any such change and not after", meaning before
+// the unbound-temporary release that would turn a leak into a double free.
+// That is false for this program. Emitting it at `1aacf5d` produces
+// `cell_take((*(const cell_slice_t *)cell_fresh().ptr))` with no drop at all,
+// a leak; emitting it at `460b9a3` already produces the hoisted temporary with
+// `cell_arc_drop(_cell_t4)`. So the mask came off in `460b9a3`, seven commits
+// BEFORE the fix that claimed to be preempting it, and this was a live double
+// free for that whole stretch. (The axis-1 `match` case that `23353e9` did fix
+// was genuinely still masked at `23353e9^`: its value temporary is cloned and
+// never dropped. Two different programs, two different answers, which is why
+// the ordering claim had to be measured per program rather than asserted.)
+//
+// The rule is now asked at SIX consumption sites, not four: an `owned`
+// parameter, an `owned` binding, an assignment into an `owned` place, an
+// `owned` struct field, a list-literal element, and a `return` whose declared
+// return type is not `arc`. And the classifier's verdict is total: a source
+// whose ownership cannot be resolved is refused rather than permitted, because
+// permitting by default is what let each of these three axes through in turn.
+//
+// A sanitizer stage cannot see this file, and that is not a gap: a refused
+// program emits no C, so there is nothing to run. What pins it is the rejected
+// loop in tools/check.sh reading the EXPECT line above. The ASan stage's job
+// is the programs that are still accepted; see examples/arc_return_field.cell.
+//
+// Everything that stays legal is unchanged: `fresh` below returns its own
+// `arc` local through an `arc` return type, which is the arc-to-arc case, and
+// `take(owned <a plain owned place>)` is still accepted. Only making an `arc`
+// value UNIQUE is refused. See examples/rejected/arc_to_owned.cell for the
+// same rule reached through a binding annotation.
+
+pub fn fresh() -> arc [Int] {
+    let arc xs: [Int] = [1, 2, 3]
+    return xs
+}
+
+pub fn take(owned xs: [Int]) -> Int {
+    let owned mine: [Int] = xs
+    return 7
+}
+
+pub fn print_int(copy value: Int);
+
+pub fn main() {
+    let copy n = take(owned fresh())
+    print_int(n)
+}

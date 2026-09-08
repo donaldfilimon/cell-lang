@@ -18,7 +18,9 @@ the place and land at the use site. That file's header comment is the
 authoritative list and moves with the code; believe it over this paragraph.
 NLL is still designed. **R11** retain-release insertion is implemented in the
 C backend, with the gaps R11 itself names; **R10**'s move-into-`arc` is not
-implemented in the checker, which is why one of those gaps exists. **R2.a**
+implemented in the checker, which is why one of those gaps exists. R10's other
+direction, an `arc` value made UNIQUE, IS implemented, at six consumption
+sites and with a total verdict that refuses a source it cannot classify. **R2.a**
 (a move inside a loop) landed with `while`. Stem pairing has
 since landed (SPEC section 1.2).
 
@@ -467,11 +469,12 @@ responsible for the eventual free, and `cell_slice_drop_glue` frees the same
 **buffer** again when the box dies. `cell_arc_clone` increments a refcount, and
 the buffer is not what the refcount governs, so no retain can fix it.
 
-**The refusal covers four positions, not one**, and the parameter row above is
+**The refusal covers six positions, not one**, and the parameter row above is
 only the first of them. An earlier revision refused the parameter alone and
 said "only the conversion is refused", which was wrong twice over: the word
-`parameter` was missing, and the other three positions were reachable.
-Enumerated and each one measured:
+`parameter` was missing, and the other positions were reachable. A later one
+said four, which was the same mistake with a bigger number. Enumerated and each
+one measured:
 
 | Position | Before the refusal |
 |---|---|
@@ -479,6 +482,14 @@ Enumerated and each one measured:
 | `let owned ys: [Int] = xs` | ASan double free, exit 134 |
 | `ys = xs`, writing into an `owned` place | ASan double free, exit 134 |
 | an `owned` struct field in a literal | not a double free **yet**: this backend never drops a `record`, so the field's buffer is freed once by the box's glue and the record merely outlives it. It becomes a double free when struct drops land, so it is refused with the others |
+| a list-literal ELEMENT, `let owned zss: [[Int]] = [xs, xs]` | accepted, and clean at `-Werror`. Not a use-after-free **yet**, only because slice elements are never released; closing that separately disclosed gap detonates it |
+| a `return` whose declared return type is not `arc` | a loud `cc` type error (`cell_slice_t x = cell_arc_clone(...)`), which is protection by a coincidence of two C types and is what this rule's own text objects to. `-> arc T` is untouched: it is the legal arc-to-arc case |
+
+A list element is refused **context free**, since a list literal copies each
+element by value into a buffer the list owns and no element-level annotation
+exists to say otherwise. That over-refuses an `arc` element in a list bound as
+`arc`, which is safe today; over-refusing is the direction this rule takes on
+purpose.
 
 **THE REFUSAL IS ASKED OF THE EXPRESSION, NOT OF A PLACE, AND IT WAS NOT
 ALWAYS.** Each of the four positions above used to ask `placeOf` first and only
@@ -512,13 +523,44 @@ enforcement of this rule, and this document objects elsewhere to a rule whose
 enforcement depends on a coincidence of two types. Borrowck runs independently
 of typecheck, so its own tests pin both forms on their own merits.
 
-**STILL ESCAPING, measured rather than assumed: a CALL RESULT whose return type
-is `arc`.** `take(owned fresh())` with `fresh() -> arc [Int]` is accepted today,
-exit 0. It is a different axis from the one above: the `arc`-ness comes from a
-signature's return type rather than from a binding's annotation, so the
-place-ownership machinery cannot see it at all, and the shared reporter takes a
-place a call result does not have. Not fixed here, and named so the next search
-starts from a stated boundary rather than from an assumed one.
+**THE SECOND AXIS, the arc SOURCE: a CALL RESULT whose return type is `arc`.
+This one was a LIVE double free, not a masked one, and it is now CLOSED.**
+`take(owned fresh())` with `fresh() -> arc [Int]` was accepted at exit 0. The
+`arc`-ness comes from a signature's return type rather than from a binding's
+annotation, so no place and no expression shape carries it, and the widening
+above could not reach it. Measured end to end before the fix: `cell check` exit
+0, `cc -Wall -Wextra -Werror -fsanitize=address` exit 0, running it **exit
+134**, with frames `cell_slice_free` under `cell_slice_drop_glue` under
+`cell_arc_drop` under `cell_main`. Closed by reading the callee's declared
+return type; `examples/rejected/arc_call_to_owned.cell` is the corpus form.
+
+**The ordering claim that covered it was false, and this is the reusable
+part.** `23353e9`'s commit message says its fix "lands before any such change
+and not after", meaning before the unbound-temporary release that would turn a
+leak into a double free. Re-measured per program, because the answer is not the
+same for both:
+
+| Program | at `1aacf5d` | at `460b9a3` | at `23353e9^` |
+|---|---|---|---|
+| `take(owned fresh())`, the call result | no drop, a leak | `cell_arc_drop(_cell_t4)`, **live double free** | live double free |
+| `take(owned match c { 0 => xs, _ => xs })`, the value position | not measured | not measured | cloned, never dropped, genuinely masked |
+
+So the mask came off for the call-result form in `460b9a3`, **seven commits
+before** the fix that claimed to be preempting it, and that program was a live
+double free for the whole stretch. The claim was true of the program `23353e9`
+actually fixed and false of the one it did not, which is why the two had to be
+emitted and read separately rather than reasoned about together.
+
+**THE THIRD AXIS, the consumption SITE, also closed.** Four positions were
+enumerated and a property of every consumption asserted. A list-literal element
+and a `return` are consumptions that were never asked; both are now. The rule is
+asked at SIX sites (see the table below), and the classifier's verdict is
+**total**: a source whose ownership cannot be resolved is `unknown` and REFUSED
+rather than permitted. That is the structural point. The classifier used to
+return an optional place, so any form it did not recognise fell out as "none"
+and was accepted, which made silence mean safe, and silence is exactly what an
+unenumerated form produces. All three axes escaped through that one permissive
+default.
 
 The `owned String` analogue of each was already a loud C type error, because
 `owned String` and `shared String` do not share a C type, and `return xs` from
@@ -656,11 +698,19 @@ for:**
    rather than retained, because no retain can fix a double free of the
    buffer.
 
+6. **An `arc` CALL RESULT passed to an `owned` parameter.** `take(owned
+   fresh())` with `fresh() -> arc [Int]`. Refused by R10's second axis rather
+   than retained, for the same reason as number 5. This is the one that was a
+   live AddressSanitizer double free at exit 134 rather than a masked one; see
+   R10 above for the per-commit measurement and
+   `examples/rejected/arc_call_to_owned.cell` for the corpus form.
+
 Numbers 3 and 4 had one root cause: a value slot is a position with a declared
 type exactly as a parameter, a `let`, or a struct field is, and it was the only
-such position not asking the conversion question. All five were silent at
+such position not asking the conversion question. All six were silent at
 `cell check` and clean under `-Wall -Wextra -Werror`; only running them showed
-anything.
+anything. This list is not the running total: `AGENTS.md`'s **Status honesty**
+section carries that count and is the authority for it.
 
 **Still broken, all of them leaks, each measured rather than asserted:**
 
@@ -680,6 +730,17 @@ now hoists the handle into the statement expression and releases it before the
 result is yielded. Measured at **0 leaks**, with `examples/arc.cell` still
 printing 13 at 0 leaks, so nothing regressed to buy it.
 
+**A SIXTH gap existed and was never in this table. It is closed by REFUSAL, so
+it gets no fixture and changes no constant in the gate.** `let owned ys: [Int] =
+fresh()` and `ys = fresh()`, with `fresh() -> arc [Int]`, emitted
+`(*(const cell_slice_t *)cell_fresh().ptr)` with **no drop at all**: ASan-clean,
+and a leaked box every time. Only the call-ARGUMENT position was the double free
+(see R10 above). All three forms are now refused by R10's second axis, so there
+is no accepted program left that leaks this way and nothing for a
+`examples/leaks/` fixture to measure. The `== leaks ==` stage is unchanged, and
+that is the correct outcome rather than a missing test: a refusal removes the
+program, it does not make the emission safe.
+
 **Where these numbers now live.** Every count in the table above used to come
 from an ad-hoc measurement that existed in no file, which made them
 unreproducible and, in one case, quietly stale. They are now pinned by
@@ -688,40 +749,28 @@ as constants carrying the commit they were measured at. The closed row is
 pinned at 0, so any nonzero reading re-opens it. **Read the gate, not this
 table, for a current number**; the table is here to say what each gap IS.
 
-**Two make-unique positions R10 does NOT enforce, kept safe only by a C type
-error.** R10 above refuses making an `arc` place unique at the positions it
-knows about. Two more exist and reach codegen instead:
-
-| Position | What stops it today |
-|---|---|
-| a list ELEMENT: `let owned zs: [String] = [a, a]` over an `arc a` | the emitted C assigns a `cell_arc_t` into a `cell_string_t` slot and `cc` refuses it |
-| a `return`: `f(arc xs: [Int]) -> [Int] { return xs }` | the emitted C returns a `cell_arc_t` where `cell_slice_t` is declared and `cc` refuses it |
-
-Both pass `cell check`. **A C type error is a real stop and it is loud, which is
-the safe side, but it is not enforcement**: it holds because `cell_arc_t`
-happens to coincide with no other C type, which is exactly the protection R10's
-own text says it deliberately stopped relying on.
-
-**And for the list element that protection DOES NOT HOLD, so the row above is
-wrong as written.** It was measured on a `[String]`, where `cell_arc_t` and
-`cell_string_t` differ and `cc` refuses. For a slice element type they do not
-differ:
+**Two make-unique positions R10 did NOT enforce, now ENFORCED.** This section
+used to describe a list ELEMENT and a `return` as positions kept safe only by a
+C type error, and it recorded a correction to its own first draft: the `cc`
+protection was measured on a `[String]`, where `cell_arc_t` and `cell_string_t`
+differ, and it does not hold for a slice element type, where
 
     let arc xs: [Int] = [1, 2, 3]
     let owned zss: [[Int]] = [xs, xs]
 
-passes `cell check` AND compiles clean at `-Wall -Wextra -Werror`, because the
-unboxed `cell_slice_t` is exactly the element type the buffer wants. Nothing
-stops it at all. This sentence was written while correcting other overclaims and
-is the same failure it was correcting: **one element type was measured and a
-property of the position asserted.** The honest statement is that a list element
-is an unenforced make-unique position, loud for some element types and silent
-for others, and that `arcUniqueSource` is never asked there. Making either COMPILE without
-first extending R10 would reintroduce the double free R10 exists to prevent,
-because the buffer, not the refcount, is what gets freed twice. That is worth
-stating plainly: these two are on the "correctly refused" side of the ledger,
-not the "to be fixed" side, and a reader who mistakes them for defects will
-undo a guard.
+passed `cell check` AND compiled clean at `-Wall -Wextra -Werror`, because the
+unboxed `cell_slice_t` is exactly the element type the buffer wants. That was
+one element type measured and a property of the position asserted, the same
+failure the sentence was written to correct.
+
+Both are now rows in R10's own table above and both are refused by `cell check`.
+The `return` one still additionally produces a `cc` error if it ever reaches
+codegen, which is fine; what changed is that the guard no longer depends on
+which two C types happen to coincide. **A C type error is a real stop and it is
+loud, which is the safe side, but it was never enforcement**, and a reader who
+mistakes either for a defect to be "made to compile" will reintroduce the double
+free R10 exists to prevent, because the buffer, not the refcount, is what gets
+freed twice.
 
 The list-element case additionally used to be SILENT rather than loud. The
 element C type came from the first element rather than the declared element
@@ -765,11 +814,21 @@ use-after-free. All five were written as programs and run, not reasoned about:
 | `b => { if (c) { return b } else { return b } }` | both branches reach it, both cloned |
 | `b => { let arc keep = b ... }` | reaches `emitArgLike`, cloned |
 
-**POSITIONS THAT MAKE AN `arc` PLACE UNIQUE**, added in version four, all
-four enumerated rather than waiting for the next one to be reported: an
-`owned` parameter, an `owned` binding, an assignment into an `owned` place,
-and an `owned` struct field. R10 above refuses all four and tables what each
-one did before the refusal.
+**POSITIONS THAT MAKE AN `arc` VALUE UNIQUE**, added in version four as an
+enumeration of four (an `owned` parameter, an `owned` binding, an assignment
+into an `owned` place, an `owned` struct field) and **corrected in version five,
+because the enumeration was the defect.** Two more consumption sites existed
+that no one had asked at, a list-literal element and a `return`, and a third
+axis existed that no position could see, an `arc`-ness coming from a
+signature's return type rather than a binding's annotation. R10 above now tables
+six sites.
+
+**The structural answer is not a longer list.** Version five replaced the
+optional-place verdict, whose "none" meant permit, with a total verdict whose
+undecidable case means REFUSE. That is what makes the next unenumerated form
+fail closed instead of silently joining this section as version six. Every one
+of the three widenings so far escaped through the same permissive default, and
+enumerating harder was tried three times.
 
 **What that is not.** It is not a proof. It is a list of positions that were
 written as programs and run. A position not on that list has not been ruled

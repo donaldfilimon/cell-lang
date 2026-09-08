@@ -1,12 +1,19 @@
 //! Borrow and move checker for Cell.
 //!
 //! Implements `docs/OWNERSHIP.md` rules R1, R2, R3, R3a, R4, R5, R6, R8, R14
-//! and R15, plus ONE clause of R10: an `arc` place may not be passed to an
-//! `owned` parameter. The rest of R10, in particular move-into-`arc`, is
+//! and R15, plus ONE clause of R10: an `arc` value may not be made UNIQUE,
+//! refused at six consumption sites (an `owned` parameter, an `owned`
+//! binding, an assignment into an `owned` place, an `owned` struct field, a
+//! list-literal element, and a `return` whose declared return type is not
+//! `arc`). The rest of R10, in particular move-into-`arc`, is
 //! still designed only. That single clause is here rather than in codegen
 //! because codegen cannot refuse it: `owned [T]` and `shared [T]` lower to
 //! the SAME C type, so the emitted conversion compiles clean and double frees
-//! the buffer. It is deliberately independent of
+//! the buffer. Its classifier, `arcUniqueSource`, returns a TOTAL verdict:
+//! a source whose ownership it cannot resolve is refused, not permitted.
+//! Read that function's comment before widening it a fourth time; the three
+//! widenings so far were three different axes and each escaped through the
+//! same permissive default. It is deliberately independent of
 //! `typecheck.zig`: it carries its own scope stack, its own signature table,
 //! and imports only `ast.zig` and `diag.zig`, so it neither depends on nor
 //! disturbs the type checker.
@@ -173,6 +180,12 @@ pub const Checker = struct {
 
     fns: std.StringHashMapUnmanaged(ast.FnDef) = .empty,
     structs: std.StringHashMapUnmanaged(ast.StructDef) = .empty,
+    /// Enum definitions, needed for one thing only: `Quadrant.First` parses as
+    /// a `field` whose base is an `ident` that is NOT a binding, so `placeOf`
+    /// returns null for it. R10's classifier has to tell that qualified
+    /// constant apart from `fresh().len`, a field of a temporary whose
+    /// ownership it genuinely cannot resolve.
+    enums: std.StringHashMapUnmanaged(ast.EnumDef) = .empty,
 
     bindings: std.ArrayList(Binding) = .empty,
     /// Marks into `bindings` and `block_loans`, one per open scope.
@@ -222,6 +235,13 @@ pub const Checker = struct {
     /// function; a body reports at each returned expression (the use) and
     /// the flag stops that return from also being a move-out-of-borrow.
     fn_return_borrow: ?LoanKind = null,
+    /// Set while checking a function that declares a return type which is NOT
+    /// `-> arc T`, which by R1 makes the return slot an `owned` one (R10, the
+    /// return position). Null when the function declares no return type at
+    /// all: the value is discarded there, so nothing is made unique and
+    /// refusing would have no memory-safety basis. `-> arc T` is the legal
+    /// `arc`-to-`arc` case and is deliberately not flagged.
+    fn_return_owned: ?[]const u8 = null,
     /// The function whose body is being walked. Read only by the differential
     /// oracle, which needs the whole body and the parameter list at once,
     /// which the region-walking state above deliberately does not keep.
@@ -247,6 +267,7 @@ pub const Checker = struct {
     pub fn deinit(self: *Checker) void {
         self.fns.deinit(self.allocator);
         self.structs.deinit(self.allocator);
+        self.enums.deinit(self.allocator);
         self.bindings.deinit(self.allocator);
         self.scopes.deinit(self.allocator);
         self.dead.deinit(self.allocator);
@@ -278,6 +299,7 @@ pub const Checker = struct {
             switch (item.kind) {
                 .fn_def => |f| try self.fns.put(self.allocator, f.name, f),
                 .struct_def => |s| try self.structs.put(self.allocator, s.name, s),
+                .enum_def => |en| try self.enums.put(self.allocator, en.name, en),
                 else => {},
             }
         }
@@ -292,9 +314,15 @@ pub const Checker = struct {
 
     fn checkFn(self: *Checker, span: Span, f: *const ast.FnDef) Error!void {
         self.fn_return_borrow = null;
+        self.fn_return_owned = null;
         self.current_fn = f;
         defer self.current_fn = null;
         if (f.return_type) |*rt| {
+            const returns_arc = switch (rt.*) {
+                .ref => |r| r.ownership == .arc,
+                .name, .optional, .list, .result, .unit => false,
+            };
+            if (!returns_arc) self.fn_return_owned = f.name;
             if (typeIsBorrow(rt)) |kind| {
                 self.fn_return_borrow = kind;
                 // A bodyless `-> shared T` has no return expression to point
@@ -500,6 +528,26 @@ pub const Checker = struct {
                     return;
                 }
                 if (opt.*) |*e| {
+                    // R10, the return position, and the second of the two
+                    // consumption sites the four-position enumeration never
+                    // asked at. A `-> [Int]` return slot is `owned` by R1, so
+                    // returning an `arc` source unboxes it and hands the
+                    // buffer to a caller that frees it while the box's glue
+                    // frees it again. Today that emission is a loud `cc` type
+                    // error for a list (`cell_slice_t x = cell_arc_clone(...)`
+                    // does not compile), which is protection by coincidence of
+                    // two C types, and R10's own text objects to exactly that.
+                    // `-> arc T` is untouched: `fresh()` returning its own
+                    // `arc` local is the legal arc-to-arc case.
+                    if (self.fn_return_owned) |fn_name| {
+                        if (try self.refuseArcUnique(
+                            try self.arcUniqueSource(e),
+                            "return",
+                            "from",
+                            "function",
+                            fn_name,
+                        )) return;
+                    }
                     if (try self.placeOf(e)) |place| {
                         const note = try self.msg("'{s}' was moved here by returning it", .{place.display});
                         try self.movePlace(place, note);
@@ -560,13 +608,18 @@ pub const Checker = struct {
             }
         }
         if (l.ownership == .owned) {
-            // R10, the `let` position. Asked on the EXPRESSION, so a value
-            // position (`let owned ys: [Int] = match c { 0 => xs, _ => xs }`)
-            // is refused with the plain place form. See `arcUniqueSource`.
-            if (try self.arcUniqueSource(v)) |src| {
-                try self.reportArcNotUnique(src, "bind", "to", "binding", l.name);
-                return;
-            }
+            // R10, the `let` position. Asked of the whole EXPRESSION's
+            // verdict, so a value position
+            // (`let owned ys: [Int] = match c { 0 => xs, _ => xs }`) and a
+            // call result (`let owned ys: [Int] = fresh()`) are both refused.
+            // See `arcUniqueSource`.
+            if (try self.refuseArcUnique(
+                try self.arcUniqueSource(v),
+                "bind",
+                "to",
+                "binding",
+                l.name,
+            )) return;
             if (try self.placeOf(v)) |place| {
                 // The `arc` case already returned above. `let owned ys:
                 // [Int] = xs` with an `arc [Int]` source emitted
@@ -655,11 +708,16 @@ pub const Checker = struct {
 
         // R10, the assignment position: the same double free as the `let`
         // one, reached by writing into an already-declared `owned` place
-        // instead of declaring a new one. Asked on the EXPRESSION, so a value
-        // position is refused with the plain place form.
+        // instead of declaring a new one. Asked of the whole EXPRESSION's
+        // verdict, so a value position and a call result are both refused.
         if (self.placeOwnership(b, place.path) == .owned) {
-            if (try self.arcUniqueSource(&a.value)) |src| {
-                try self.reportArcNotUnique(src, "assign", "to", "place", place.display);
+            if (try self.refuseArcUnique(
+                try self.arcUniqueSource(&a.value),
+                "assign",
+                "to",
+                "place",
+                place.display,
+            )) {
                 self.revive(place);
                 return;
             }
@@ -717,20 +775,50 @@ pub const Checker = struct {
                     if (def) |d| {
                         if (findField(d, f.name)) |fld| {
                             if (fld.ownership == .owned) {
-                                // Asked on the EXPRESSION, so a value position
-                                // in a field is refused with the plain form.
-                                if (try self.arcUniqueSource(&f.value)) |src| {
-                                    try self.reportArcNotUnique(src, "store", "in", "field", f.name);
-                                    continue;
-                                }
+                                // Asked of the whole EXPRESSION's verdict, so
+                                // a value position or a call result in a field
+                                // is refused too.
+                                if (try self.refuseArcUnique(
+                                    try self.arcUniqueSource(&f.value),
+                                    "store",
+                                    "in",
+                                    "field",
+                                    f.name,
+                                )) continue;
                             }
                         }
                     }
                     try self.checkExpr(&f.value);
                 }
             },
+            // R10, the list-element position, and one of the two consumption
+            // sites the four-position enumeration never asked at. A list
+            // literal copies each element BY VALUE into a fresh buffer that
+            // the list owns, so every element is made unique, and there is no
+            // element-level annotation that could say otherwise. Measured
+            // before this: `let owned zss: [[Int]] = [xs, xs]` with an
+            // `arc [Int]` place passed `cell check` and compiled clean at
+            // `-Wall -Wextra -Werror`, emitting the make-unique unbox at each
+            // element. It is not a use-after-free TODAY only because slice
+            // elements are never released, which is itself a disclosed gap;
+            // closing that gap detonates this. Refused with the others rather
+            // than left as a trap for that change.
+            //
+            // The refusal is context free, so it also refuses an `arc` element
+            // in a list bound as `arc`. That over-refuses a program that is
+            // safe today, and it is the safe direction: the buffer, not the
+            // refcount, is what gets freed twice.
             .list_lit => |items| {
-                for (items) |*item| try self.checkExpr(item);
+                for (items) |*item| {
+                    if (try self.refuseArcUnique(
+                        try self.arcUniqueSource(item),
+                        "store",
+                        "in",
+                        "list element",
+                        null,
+                    )) continue;
+                    try self.checkExpr(item);
+                }
             },
             .block => |stmts| try self.checkBlockStmts(stmts),
             .if_expr => |*i| try self.checkIf(i),
@@ -881,11 +969,14 @@ pub const Checker = struct {
             // it is exactly how `take(owned match c { 0 => xs, _ => xs })`
             // escaped a rule that refuses `take(owned xs)`.
             if (mode == .owned) {
-                if (try self.arcUniqueSource(operand)) |src| {
-                    const slot_name = if (param) |p| p.name else null;
-                    try self.reportArcNotUnique(src, "pass", "to", "parameter", slot_name);
-                    continue;
-                }
+                const slot_name = if (param) |p| p.name else null;
+                if (try self.refuseArcUnique(
+                    try self.arcUniqueSource(operand),
+                    "pass",
+                    "to",
+                    "parameter",
+                    slot_name,
+                )) continue;
             }
 
             const place = try self.placeOf(operand);
@@ -1111,99 +1202,235 @@ pub const Checker = struct {
         return true;
     }
 
-    /// The `arc` place an expression would make UNIQUE if it were consumed in
-    /// an `owned` position, or null when there is none. **One function, used
-    /// by all four of R10's positions**, rather than a fifth copy of the
-    /// question at a fifth call site.
+    /// What R10 needs to know about an expression that is about to be
+    /// consumed in an `owned` position, which is to say made UNIQUE.
     ///
-    /// WHY IT EXISTS. R10's refusal used to be spelled as
-    /// `placeOf(e)` followed by `arcPlaceOwnership(place)` at each position,
-    /// which asks only whether the expression IS an `arc` place. A `match` is
-    /// valued and is not a place, so `placeOf` returned null and every one of
-    /// the four positions let it straight through. Measured, before this
-    /// existed:
+    /// **The verdict is total, and the totality is the whole point.** This
+    /// used to be `Error!?Place`, so every expression form the classifier did
+    /// not recognise as `arc` came back `null` and was PERMITTED. That makes
+    /// silence mean "safe", and silence is exactly what an unenumerated form
+    /// produces. Here silence is `.unknown`, which is REFUSED. Acceptance is
+    /// the direction that needs proof: a refusal costs a program that can be
+    /// spelled another way, an acceptance costs a double free.
+    const ArcSource = union(enum) {
+        /// Provably not `arc`. Every arm that returns this states why.
+        not_arc,
+        /// An `arc` place. Nameable, so the diagnostic names it.
+        arc_place: Site,
+        /// `arc` with no place behind it: a call whose declared return type is
+        /// `arc`. The caller's temporary drops that box, so making its pointee
+        /// unique frees the same buffer twice.
+        arc_value: Site,
+        /// Ownership could not be decided here. Refused, not permitted.
+        unknown: Site,
+
+        const Site = struct {
+            /// For `arc_place` and `arc_value`, a name the message quotes.
+            /// For `unknown`, a noun phrase the message does not quote.
+            display: []const u8,
+            span: Span,
+        };
+
+        /// Combine two branch verdicts. An `arc` verdict from any branch wins,
+        /// because any branch may be the one taken; otherwise an `unknown`
+        /// wins over `not_arc` for the same reason.
+        fn join(a: ArcSource, b: ArcSource) ArcSource {
+            return switch (a) {
+                .arc_place => a,
+                .arc_value => switch (b) {
+                    .arc_place => b,
+                    else => a,
+                },
+                .unknown => switch (b) {
+                    .arc_place, .arc_value => b,
+                    else => a,
+                },
+                .not_arc => b,
+            };
+        }
+    };
+
+    /// Classify what an `owned` position would make unique. **One function,
+    /// used by all six of R10's consumption sites**, rather than a seventh
+    /// copy of the question at a seventh call site.
     ///
-    ///     take(owned xs)                         refused, exit 1
-    ///     take(owned match c { 0 => xs, _ => xs })  ACCEPTED, exit 0
+    /// WHY IT EXISTS, and the three axes it has now been widened along. R10's
+    /// refusal was first spelled as `placeOf(e)` followed by an `arc` test, at
+    /// each position separately, which asks only whether the expression IS an
+    /// `arc` place.
     ///
-    /// on the same `arc` binding, for the same semantic operation. The emitted
-    /// C unboxes the arc and hands the box's slice by value to an `owned`
-    /// parameter, which is exactly the shape R10's own text names as the
-    /// double free it exists to prevent. The plain form is masked today only
-    /// because the `cell_arc_clone` in the value temporary keeps the refcount
-    /// off zero; a later change that releases that temporary turns the mask
-    /// into a live double free.
+    /// 1. **Expression shape**, place versus value. A `match` is valued and is
+    ///    not a place, so `placeOf` returned null and all four positions let
+    ///    it through: `take(owned xs)` was refused while
+    ///    `take(owned match c { 0 => xs, _ => xs })` was accepted, for the
+    ///    same binding and the same semantic operation. Closed by looking
+    ///    THROUGH the value positions. Measured at `23353e9^`: the emitted C
+    ///    unboxed the arc into an `owned` parameter, and it was masked rather
+    ///    than crashing, because the `cell_arc_clone` in the value temporary
+    ///    was never released.
+    /// 2. **Arc source**, a binding's annotation versus a signature's return
+    ///    type. `take(owned fresh())` with `fresh() -> arc [Int]` was accepted
+    ///    because no place and no expression shape carries the `arc`-ness.
+    ///    That one was NOT masked: `460b9a3` gave the unbound call temporary
+    ///    its `cell_arc_drop`, so from that commit onward it was an
+    ///    AddressSanitizer double free at exit 134, seven commits before the
+    ///    axis-1 fix claimed to be landing ahead of any such change. Closed by
+    ///    `.call` reading the callee's return type.
+    /// 3. **Consumption site.** Four positions were enumerated and a property
+    ///    of every consumption asserted. A list-literal element and a `return`
+    ///    are consumptions that were never asked. Closed by asking at both.
     ///
-    /// THE SHAPE OF THE MISS, since it is the third time on this axis in this
-    /// file. R10 enumerated four POSITIONS and asserted a property of all
-    /// consumptions. The same axis, place versus value, produced `arc`
-    /// use-after-frees three and four, where an earlier search covered
-    /// return-position PLACES and not VALUE positions. So this looks THROUGH
-    /// the value positions instead of enumerating consumption sites.
+    /// THE SHAPE OF THE MISS, since every one of the three is the same shape:
+    /// a derivation that enumerated some forms of a construct and asserted a
+    /// property of all of them. The structural answer is not a longer
+    /// enumeration, it is a verdict with no permissive default, which is what
+    /// `.unknown` is.
     ///
     /// The switch is exhaustive with no `else` arm, and it is exhaustive over
     /// the FIELDS of each variant it descends into, not only over the variants
-    /// themselves: a `match` visits every arm, an `if` visits both branches.
-    /// Those are two different claims, and treating them as one is what hid a
-    /// match GUARD from `exprUsesName` in this same file.
+    /// themselves: a `match` visits every arm, an `if` visits both branches, a
+    /// `unary` splits on its operator. Those are different claims, and
+    /// treating them as one is what hid a match GUARD from `exprUsesName` in
+    /// this same file.
     ///
     /// `if` and `block` cannot reach a typed `owned` position today, because
     /// typecheck gives both the type `()`. They are handled anyway: an
     /// ownership rule enforced by an accident of the type checker is exactly
     /// the fragility R10's own text objects to elsewhere, and borrowck runs
     /// independently of typecheck, so its own tests reach them.
-    ///
-    /// **NOT COVERED, and measured rather than assumed:** a CALL RESULT whose
-    /// return type is `arc`. `take(owned fresh())` with `fresh() -> arc [Int]`
-    /// is still accepted. It is a different axis: the `arc`-ness comes from a
-    /// signature's return type, not from a binding's annotation, so
-    /// `arcPlaceOwnership` cannot see it at all, and `reportArcNotUnique`
-    /// takes a `Place` a call result does not have. Reported, not fixed here.
-    fn arcUniqueSource(self: *Checker, e: *const ast.Expr) Error!?Place {
+    fn arcUniqueSource(self: *Checker, e: *const ast.Expr) Error!ArcSource {
         if (try self.placeOf(e)) |place| {
-            if (self.arcPlaceOwnership(place)) |_| return place;
-            // A place that is not `arc`. It is still a place, so there is no
-            // value position underneath it to look through.
-            return null;
+            const site: ArcSource.Site = .{ .display = place.display, .span = place.span };
+            const b = self.bindingById(place.binding) orelse
+                // A place whose binding id does not resolve. It should not
+                // happen, and if it does the annotation is unreadable.
+                return .{ .unknown = site };
+            const own = self.placeOwnership(b, place.path) orelse
+                // A field path through a struct definition this checker does
+                // not have. The annotation that decides this lives in that
+                // definition, so it may well be `arc`.
+                return .{ .unknown = site };
+            if (own == .arc) return .{ .arc_place = site };
+            // A place with a declared, resolved, non-`arc` annotation. It is
+            // still a place, so there is no value position underneath it.
+            return .not_arc;
         }
         return switch (e.kind) {
-            // Nothing here can yield a place. A literal and a struct or list
-            // literal are fresh values; a call result is owned by whoever the
-            // signature says (see the NOT COVERED note above); an operator
-            // result is fresh; a `unary` is a borrow or a negation; an `ident`
-            // or `field` reaching here means `placeOf` could not resolve it.
-            .ident, .int, .float, .string, .bool => null,
-            .call, .binary, .unary, .field, .struct_lit, .list_lit => null,
+            // A scalar or string literal is a fresh value with no handle
+            // behind it. `arc` is a property of a binding or a signature, and
+            // a literal has neither.
+            .int, .float, .string, .bool => .not_arc,
+            // A struct or list literal constructs a fresh record or buffer.
+            // Whatever its ELEMENTS are is the list-literal site's question,
+            // asked there; the literal itself is unique by construction.
+            .struct_lit, .list_lit => .not_arc,
+            // Every binary operator in this grammar is arithmetic, comparison
+            // or logic, and yields a fresh scalar.
+            .binary => .not_arc,
+            .unary => |u| switch (u.op) {
+                // A fresh scalar.
+                .neg, .not => .not_arc,
+                // A borrow. The value is a reference to the pointee and not
+                // an `arc` handle, so it cannot be the thing a box frees
+                // twice. Consuming a borrow in an `owned` position is R15's
+                // annotation disagreement and R9's mutation rule, not R10's.
+                .ref_shared, .ref_exclusive => .not_arc,
+            },
+            .call => |c| try self.arcCallResult(c.callee, e.span),
             .annotated => |a| try self.arcUniqueSource(a.value),
+            // An `ident` reaching here means `lookup` failed: the name is not
+            // in scope, so nothing decides its ownership.
+            .ident => |n| .{ .unknown = .{
+                .display = try self.msg("the unresolved name '{s}'", .{n}),
+                .span = e.span,
+            } },
+            // A `field` reaching here is rooted at something that is not a
+            // binding. Two very different things wear that shape, and the
+            // first was found by the gate rather than by reasoning:
+            //
+            //   * `Quadrant.First`, a qualified ENUM VARIANT. The base names a
+            //     type, not a binding, so `placeOf` fails. A variant in this
+            //     grammar carries no payload (see ast.Pattern's comment), so
+            //     it is a unit constant and can never be an `arc` box.
+            //   * `fresh().len`, a field of a temporary. The base's ownership
+            //     was not resolved, so neither is the field's.
+            .field => |f| blk: {
+                if (f.base.kind == .ident and
+                    self.enums.contains(f.base.kind.ident)) break :blk .not_arc;
+                break :blk .{ .unknown = .{
+                    .display = try self.msg("the field '{s}' of a temporary value", .{f.name}),
+                    .span = e.span,
+                } };
+            },
             .if_expr => |i| blk: {
-                if (try self.arcUniqueSource(i.then_body)) |p| break :blk p;
-                if (i.else_body) |eb| {
-                    if (try self.arcUniqueSource(eb)) |p| break :blk p;
-                }
-                break :blk null;
+                const then_v = try self.arcUniqueSource(i.then_body);
+                // A missing `else` yields unit on that path, which is not
+                // `arc` and is not unknown.
+                const else_v: ArcSource = if (i.else_body) |eb|
+                    try self.arcUniqueSource(eb)
+                else
+                    .not_arc;
+                break :blk ArcSource.join(then_v, else_v);
             },
             .match_expr => |m| blk: {
+                var acc: ArcSource = .not_arc;
                 for (m.arms) |arm| {
-                    if (try self.arcUniqueSource(arm.body)) |p| break :blk p;
+                    acc = ArcSource.join(acc, try self.arcUniqueSource(arm.body));
                 }
-                break :blk null;
+                break :blk acc;
             },
-            // A block's value is its trailing expression statement.
+            // A block's value is its trailing expression statement. A block
+            // that ends in anything else (or in nothing) yields unit.
             .block => |stmts| blk: {
-                if (stmts.len == 0) break :blk null;
+                if (stmts.len == 0) break :blk .not_arc;
                 const last = &stmts[stmts.len - 1];
-                if (last.kind != .expr) break :blk null;
+                if (last.kind != .expr) break :blk .not_arc;
                 break :blk try self.arcUniqueSource(&last.kind.expr);
             },
         };
     }
 
-    /// Non-null when `place` is declared `arc`, which R10 treats specially in
-    /// every combination it lists.
-    fn arcPlaceOwnership(self: *const Checker, place: Place) ?Ownership {
-        const b = self.bindingById(place.binding) orelse return null;
-        const own = self.placeOwnership(b, place.path) orelse return null;
-        return if (own == .arc) own else null;
+    /// R10 axis 2: the `arc`-ness of a CALL RESULT, which comes from the
+    /// callee's declared return type rather than from any binding annotation.
+    ///
+    /// `-> arc [Int]` parses as `TypeExpr.ref` with `.arc` ownership, the same
+    /// node `typeIsBorrow` reads for `shared` and `exclusive`. A call whose
+    /// return type is `arc` hands back a box the caller's temporary will
+    /// `cell_arc_drop`; unboxing that temporary into an `owned` position hands
+    /// the same buffer to a holder that frees it, and the glue frees it again.
+    ///
+    /// A callee this checker cannot resolve is `.unknown` and therefore
+    /// refused. `cell check` already errors on an unknown callee in the
+    /// typechecker, so no program that was otherwise accepted is lost; what is
+    /// gained is that a future indirect-call form does not silently inherit a
+    /// permissive default.
+    fn arcCallResult(self: *Checker, callee: *const ast.Expr, span: Span) Error!ArcSource {
+        const name: []const u8 = switch (callee.kind) {
+            .ident => |n| n,
+            else => return .{ .unknown = .{
+                .display = "the result of an indirect call",
+                .span = span,
+            } },
+        };
+        const sig = self.fns.get(name) orelse return .{ .unknown = .{
+            .display = try self.msg("the result of the unresolved callee '{s}'", .{name}),
+            .span = span,
+        } };
+        const rt = sig.return_type orelse
+            // No declared return type: the call yields unit, and unit is not
+            // an `arc` box.
+            return .not_arc;
+        const is_arc = switch (rt) {
+            .ref => |r| r.ownership == .arc,
+            // A plain, optional, list or result type carries no ownership
+            // prefix, so R1 makes it `owned`.
+            .name, .optional, .list, .result, .unit => false,
+        };
+        if (!is_arc) return .not_arc;
+        return .{ .arc_value = .{
+            .display = try self.msg("{s}()", .{name}),
+            .span = span,
+        } };
     }
 
     /// R10: an `arc` place may not be made unique. `verb` and `slot` name the
@@ -1224,30 +1451,58 @@ pub const Checker = struct {
     /// here too is deliberate: one rule that holds for every type beats a
     /// rule whose enforcement depends on which two C types happen to
     /// coincide.
-    fn reportArcNotUnique(
+    /// Returns true when it refused, so the caller can stop treating the
+    /// expression as an ordinary move. `.not_arc` is the ONLY verdict that
+    /// passes; `.unknown` is refused with its own wording, so a reader can
+    /// tell "this is `arc`" from "this could not be proven not to be".
+    fn refuseArcUnique(
         self: *Checker,
-        place: Place,
+        src: ArcSource,
         verb: []const u8,
         prep: []const u8,
         slot: []const u8,
         slot_name: ?[]const u8,
-    ) Error!void {
-        const message = if (slot_name) |n|
-            try self.msg(
-                "cannot {s} 'arc' value '{s}' {s} 'owned' {s} '{s}': ownership is shared and cannot be made unique",
-                .{ verb, place.display, prep, slot, n },
-            )
-        else
-            try self.msg(
-                "cannot {s} 'arc' value '{s}' {s} an 'owned' {s}: ownership is shared and cannot be made unique",
-                .{ verb, place.display, prep, slot },
-            );
-        try self.diagnostics.err(self.allocator, place.span, message);
-        try self.diagnostics.note(
-            self.allocator,
-            place.span,
-            "an 'owned' holder frees the value, and the 'arc' box would free it again",
-        );
+    ) Error!bool {
+        switch (src) {
+            .not_arc => return false,
+            .arc_place, .arc_value => |s| {
+                const message = if (slot_name) |n|
+                    try self.msg(
+                        "cannot {s} 'arc' value '{s}' {s} 'owned' {s} '{s}': ownership is shared and cannot be made unique",
+                        .{ verb, s.display, prep, slot, n },
+                    )
+                else
+                    try self.msg(
+                        "cannot {s} 'arc' value '{s}' {s} an 'owned' {s}: ownership is shared and cannot be made unique",
+                        .{ verb, s.display, prep, slot },
+                    );
+                try self.diagnostics.err(self.allocator, s.span, message);
+                try self.diagnostics.note(
+                    self.allocator,
+                    s.span,
+                    "an 'owned' holder frees the value, and the 'arc' box would free it again",
+                );
+            },
+            .unknown => |s| {
+                const message = if (slot_name) |n|
+                    try self.msg(
+                        "cannot {s} {s} {s} 'owned' {s} '{s}': its ownership cannot be resolved here",
+                        .{ verb, s.display, prep, slot, n },
+                    )
+                else
+                    try self.msg(
+                        "cannot {s} {s} {s} an 'owned' {s}: its ownership cannot be resolved here",
+                        .{ verb, s.display, prep, slot },
+                    );
+                try self.diagnostics.err(self.allocator, s.span, message);
+                try self.diagnostics.note(
+                    self.allocator,
+                    s.span,
+                    "R10 refuses what it cannot prove is not 'arc': an 'arc' value made unique is freed twice",
+                );
+            },
+        }
+        return true;
     }
 
     /// R12 and R10's exemptions, which R2 depends on: a `copy` place is
@@ -3245,6 +3500,162 @@ test "R10 leaves a non-arc owned argument moving exactly as before" {
         \\t.cell:12:10: error: use of 'b' after it was moved
         \\t.cell:11:10: note: 'b' was moved here by the call to 'take'
         \\
+    );
+}
+
+test "R10 axis 2, the arc SOURCE: a call result typed 'arc' is refused at every site" {
+    // THE LIVE DOUBLE FREE THIS CLOSED, and it was live rather than masked.
+    // `fresh() -> arc [Int]` hands back a box; the caller's temporary drops
+    // it; `take(owned ...)` frees the same buffer through the unbox. Measured
+    // end to end before the fix: `cell check` exit 0, `cc -Wall -Wextra
+    // -Werror -fsanitize=address` exit 0, running it exit 134, with frames
+    // cell_slice_free <- cell_slice_drop_glue <- cell_arc_drop <- cell_main.
+    //
+    // It escaped because the `arc`-ness comes from a SIGNATURE's return type
+    // and not from a binding annotation, so neither the place machinery nor
+    // the expression-shape widening of `23353e9` could see it. That is a
+    // different axis from place-versus-value, and `23353e9`'s message claiming
+    // to land "before any such change and not after" was false for it: the
+    // unmasking landed in `460b9a3`, seven commits earlier, measured by
+    // emitting this program at both commits.
+    //
+    // examples/rejected/arc_call_to_owned.cell is the corpus form.
+    try expectDiagnostics(
+        \\pub fn fresh() -> arc [Int];
+        \\pub fn take(owned xs: [Int]) -> Int;
+        \\pub fn main() {
+        \\    let copy n = take(owned fresh())
+        \\}
+    ,
+        \\t.cell:4:29: error: cannot pass 'arc' value 'fresh()' to 'owned' parameter 'xs': ownership is shared and cannot be made unique
+        \\t.cell:4:29: note: an 'owned' holder frees the value, and the 'arc' box would free it again
+        \\
+    );
+    // The `let` position. Before this it emitted no drop at all, so it was a
+    // LEAK rather than a double free: an undocumented sixth leak gap, now
+    // closed by refusal rather than by a release.
+    try expectDiagnostics(
+        \\pub fn fresh() -> arc [Int];
+        \\pub fn main() {
+        \\    let owned ys: [Int] = fresh()
+        \\}
+    ,
+        \\t.cell:3:27: error: cannot bind 'arc' value 'fresh()' to 'owned' binding 'ys': ownership is shared and cannot be made unique
+        \\t.cell:3:27: note: an 'owned' holder frees the value, and the 'arc' box would free it again
+        \\
+    );
+    // Through a value position, so the two widenings compose rather than one
+    // shadowing the other.
+    try expectDiagnostics(
+        \\pub fn fresh() -> arc [Int];
+        \\pub fn take(owned xs: [Int]) -> Int;
+        \\pub fn main() {
+        \\    let copy c = 0
+        \\    let copy n = take(owned match c { 0 => fresh(), _ => fresh() })
+        \\}
+    ,
+        \\t.cell:5:44: error: cannot pass 'arc' value 'fresh()' to 'owned' parameter 'xs': ownership is shared and cannot be made unique
+        \\t.cell:5:44: note: an 'owned' holder frees the value, and the 'arc' box would free it again
+        \\
+    );
+}
+
+test "R10 axis 3, the consumption SITE: a list element and a return were never asked" {
+    // A list literal copies each element by value into a buffer the list owns,
+    // so every element is made unique. `let owned zss: [[Int]] = [xs, xs]`
+    // with an `arc [Int]` place passed `cell check` and compiled clean at
+    // -Werror. It is not a use-after-free today only because slice elements
+    // are never released, which is a separately disclosed gap; closing that
+    // gap detonates this.
+    try expectDiagnostics(
+        \\pub fn main() {
+        \\    let arc xs = [1, 2, 3]
+        \\    let owned zss: [[Int]] = [xs, xs]
+        \\}
+    ,
+        \\t.cell:3:31: error: cannot store 'arc' value 'xs' in an 'owned' list element: ownership is shared and cannot be made unique
+        \\t.cell:3:31: note: an 'owned' holder frees the value, and the 'arc' box would free it again
+        \\t.cell:3:35: error: cannot store 'arc' value 'xs' in an 'owned' list element: ownership is shared and cannot be made unique
+        \\t.cell:3:35: note: an 'owned' holder frees the value, and the 'arc' box would free it again
+        \\
+    );
+    // A `-> [Int]` return slot is `owned` by R1. This one was already refused
+    // downstream, by `cc` rejecting `cell_slice_t x = cell_arc_clone(...)`,
+    // which is protection by a coincidence of two C types and exactly what
+    // R10's own text objects to. Refused here so the rule holds for every
+    // type rather than for the types whose C spellings happen to differ.
+    try expectDiagnostics(
+        \\pub fn f() -> [Int] {
+        \\    let arc xs = [1, 2, 3]
+        \\    return xs
+        \\}
+    ,
+        \\t.cell:3:12: error: cannot return 'arc' value 'xs' from 'owned' function 'f': ownership is shared and cannot be made unique
+        \\t.cell:3:12: note: an 'owned' holder frees the value, and the 'arc' box would free it again
+        \\
+    );
+}
+
+test "R10 refuses a source it cannot prove is not arc, rather than permitting it" {
+    // The structural point of the whole change. The classifier used to return
+    // `?Place`, so any form it did not recognise fell out as `null` and was
+    // PERMITTED: silence meant safe, and silence is what an unenumerated form
+    // produces. Every one of the three widenings was a form that fell into
+    // that default. Now an undecidable source is `.unknown` and refused.
+    //
+    // `cell check` also reports its own `unknown identifier` here, so no
+    // program that was otherwise accepted is lost by this; what is gained is
+    // that the next unenumerated form fails closed.
+    try expectDiagnostics(
+        \\pub fn take(owned xs: [Int]) -> Int;
+        \\pub fn main() {
+        \\    let copy n = take(owned nowhere())
+        \\}
+    ,
+        \\t.cell:3:29: error: cannot pass the result of the unresolved callee 'nowhere' to 'owned' parameter 'xs': its ownership cannot be resolved here
+        \\t.cell:3:29: note: R10 refuses what it cannot prove is not 'arc': an 'arc' value made unique is freed twice
+        \\
+    );
+}
+
+test "R10's widening does not over-refuse a call result, an arc return, or an enum variant" {
+    // The controls for the three arms most likely to fail closed by accident.
+    // An `owned` call result is the whole point of `owned`.
+    try expectAccepted(
+        \\pub fn fresh() -> [Int];
+        \\pub fn take(owned xs: [Int]) -> Int;
+        \\pub fn main() {
+        \\    let copy n = take(owned fresh())
+        \\}
+    );
+    // `-> arc T` returning its own `arc` local is the legal arc-to-arc case,
+    // and it is what the reproducer's `fresh` is made of: refusing it would
+    // have made the double free unreproducible instead of refused.
+    try expectAccepted(
+        \\pub fn fresh() -> arc [Int] {
+        \\    let arc xs: [Int] = [1, 2, 3]
+        \\    return xs
+        \\}
+    );
+    // A qualified enum variant is a `field` whose base is an `ident` that is
+    // not a binding, so `placeOf` fails on it exactly as it fails on
+    // `fresh().len`. Told apart by the enum table, and found by the gate:
+    // examples/pairing/geometry.body returns one, and the first draft of this
+    // change refused it.
+    try expectAccepted(
+        \\pub enum Quadrant { First, Second }
+        \\pub fn q() -> Quadrant {
+        \\    return Quadrant.First
+        \\}
+    );
+    // A plain owned place in the parameter position, the case the whole rule
+    // has to keep accepting.
+    try expectAccepted(
+        \\pub fn take(owned xs: [Int]) -> Int;
+        \\pub fn main() {
+        \\    let owned xs: [Int] = [1, 2, 3]
+        \\    let copy n = take(owned xs)
+        \\}
     );
 }
 

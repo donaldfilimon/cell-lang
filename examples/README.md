@@ -186,8 +186,20 @@ R14 files are rejected, and so is call-site mismatch (R15) since `67529a9`:
 the parser now keeps the argument ownership prefix and borrowck compares it
 against the parameter.
 
-Two of them are not ownership bugs at all. One is currently-rejected for the
-wrong reason (unknown identifier); the other, `unknown_type.cell`, is still
+Two files carry R10, and they differ on the axis that made the rule escape
+twice, so keep both:
+
+- `arc_to_owned.cell`: the `arc`-ness comes from a **binding annotation**
+  (`let arc xs = ...`, then `take(owned xs)`).
+- `arc_call_to_owned.cell`: it comes from a **signature's return type**
+  (`fresh() -> arc [Int]`, then `take(owned fresh())`). This one was a live
+  AddressSanitizer double free at exit 134, not a masked one, and neither the
+  place machinery nor the expression-shape widening that fixed the first file
+  could see it. A refused program emits no C, so the ASan stage cannot run
+  either; the rejected loop's `EXPECT` line is what pins them.
+
+Two other files are not ownership bugs at all. One is currently-rejected for
+the wrong reason (unknown identifier); the other, `unknown_type.cell`, is still
 accepted:
 
 - `silent_literals.cell`: currently-rejected. `0x1F`, `1_000`, and `1e9` each
