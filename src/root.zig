@@ -14,6 +14,7 @@ pub const load_file = @import("cell/load.zig");
 pub const hir = @import("cell/hir.zig");
 pub const abi = @import("cell/abi.zig");
 pub const cfg = @import("cell/cfg.zig");
+pub const liveness = @import("cell/liveness.zig");
 pub const llvmemit = @import("cell/llvmemit.zig");
 pub const mlirmit = @import("cell/mlirmit.zig");
 
