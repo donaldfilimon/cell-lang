@@ -99,17 +99,25 @@ is `[T]`, which SPEC 3.3 says has no representation at all.
 
 `cell check` parses, typechecks, and borrow-checks. A file in `examples/`
 passing means those three stages accepted it. Emit is a separate claim, and
-both halves of it are measured over all fourteen files here rather than a
-chosen few:
+both halves of it are measured over every file here rather than a chosen few:
 
-- **`cc -std=c11 -Wall -Wextra -c`: all fourteen compile.** `arc.cell` was
-  the last one that did not, and now does.
-- **Link and run: six**, namely `hello` (42), `backends` (24), `loops` (55),
-  `while_is_now_a_loop` (10), `ownership` and `borrows` (both silent, exit 0).
-  `arc.cell` links and runs too, printing 13, but needs `arc_host.c` as well:
-  see the `arc.cell` section below. The other seven do not link for one
-  reason and it is not a codegen defect: none declares a `pub fn main()` with
-  a body, so no C `main` is emitted and the link stops at `_main`.
+- **`cc -std=c11 -Wall -Wextra -c`: they all compile.** `arc.cell` was the
+  last one that did not, and now does.
+- **Link and run**, measured 2026-09-08: seven link on their own
+  (`hello` 42, `backends` 24, `loops` 55, `while_is_now_a_loop` 10,
+  `arc_return_field` 7, and `ownership` and `borrows` both silent at exit 0);
+  two more link once their host is added (`arc` 13 with `arc_host.c`,
+  `write_through` 142 with `write_through_host.c`); the rest do not link for
+  one reason, and it is not a codegen defect: they declare no `pub fn main()`
+  with a body, so no C `main` is emitted and the link stops at `_main`.
+
+**Counts are deliberately not stated here as totals.** This section said
+"fourteen" for two days after the corpus reached seventeen, and its
+six-plus-seven arithmetic stopped adding up at the same moment. A count in
+prose is stale the next time anyone adds a file, and this corpus grew by three
+in one evening. `tools/check.sh` runs every contract on this directory as it
+actually is, so **the gate is the authority and this file is the explanation.**
+Run it rather than trusting a number here, including this paragraph's.
 
 `if` / `match` / blocks / struct and list literals lower to C, not placeholder
 comments.

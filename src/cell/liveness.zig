@@ -55,9 +55,15 @@
 //! (for instance, swapping which of `then_id`/`join_id` is allocated
 //! first in `walkIf`): the counts would still agree, so the check would
 //! not fire, and every op list would silently point at the wrong block
-//! from then on. `cfg.Block` carries no per-block fact (no statement, no
-//! source span, nothing) this module could compare against to catch an
-//! order drift independently; the only real defense against it is that
+//! from then on. `cfg.Block` is not empty -- it carries `id`, `succs`,
+//! `preds` and `term` -- but **none of those is a fact this module derives
+//! independently**, and that is what matters for a cross-check. `Walker`
+//! records ops; it never builds a terminator or an edge, so it holds nothing
+//! to compare them against. A correlation check needs two independent
+//! derivations of the same fact, and there is only one here. (An earlier
+//! version of this comment said `Block` "carries no per-block fact, nothing",
+//! which review measured as false; the conclusion below survives, the premise
+//! did not.) The only real defense against an order drift is that
 //! `Walker`'s allocation order is written to match `cfg.Builder`'s
 //! line-for-line, and the tests below would need to break in a way that
 //! happens to still assert something true for a silent order-swap to slip
