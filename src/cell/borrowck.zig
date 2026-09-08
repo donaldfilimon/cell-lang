@@ -775,6 +775,23 @@ pub const Checker = struct {
             };
             switch (m) {
                 .owned => {
+                    // R10: an `arc` place may not be passed to an `owned`
+                    // parameter. This is the one clause of R10 that is
+                    // implemented, and it is here rather than in codegen
+                    // because codegen cannot refuse it: `owned [T]` and
+                    // `shared [T]` are the SAME C type (`cell_slice_t` by
+                    // value), so the emitted unbox
+                    // `take((*(const cell_slice_t *)xs.ptr))` compiles clean
+                    // and is a double free of the BUFFER. `cell_rt.h`
+                    // section 7 makes an `owned` callee responsible for the
+                    // eventual free, and `cell_slice_drop_glue` frees the
+                    // same buffer again when the box dies. A retain cannot
+                    // help: `cell_arc_clone` increments a refcount, and the
+                    // buffer is not what the refcount governs.
+                    if (self.arcPlaceOwnership(place.?)) |_| {
+                        try self.reportArcToOwned(place.?, param, callee_name);
+                        continue;
+                    }
                     const note = if (callee_name) |n|
                         try self.msg(
                             "'{s}' was moved here by the call to '{s}'",
@@ -975,6 +992,49 @@ pub const Checker = struct {
         if (!pathPrefix(loan.path, place.path) and !pathPrefix(place.path, loan.path)) return false;
         if (loan.kind == .shared and kind == .shared) return false;
         return true;
+    }
+
+    /// Non-null when `place` is declared `arc`, which R10 treats specially in
+    /// every combination it lists.
+    fn arcPlaceOwnership(self: *const Checker, place: Place) ?Ownership {
+        const b = self.bindingById(place.binding) orelse return null;
+        const own = self.placeOwnership(b, place.path) orelse return null;
+        return if (own == .arc) own else null;
+    }
+
+    /// R10's `arc` place to an `owned` parameter row, with the message that
+    /// rule already specifies. The note names the underlying gap rather than
+    /// implying the program is close to legal: the rest of R10, in particular
+    /// move-into-`arc`, is not implemented, and `docs/OWNERSHIP.md` R11
+    /// records that the C backend refuses the mirror-image conversion for the
+    /// same reason.
+    fn reportArcToOwned(
+        self: *Checker,
+        place: Place,
+        param: ?ast.Param,
+        callee_name: ?[]const u8,
+    ) Error!void {
+        const message = if (param) |p|
+            try self.msg(
+                "cannot pass 'arc' value '{s}' to 'owned' parameter '{s}': ownership is shared and cannot be made unique",
+                .{ place.display, p.name },
+            )
+        else if (callee_name) |n|
+            try self.msg(
+                "cannot pass 'arc' value '{s}' to an 'owned' parameter of '{s}': ownership is shared and cannot be made unique",
+                .{ place.display, n },
+            )
+        else
+            try self.msg(
+                "cannot pass 'arc' value '{s}' to an 'owned' parameter: ownership is shared and cannot be made unique",
+                .{place.display},
+            );
+        try self.diagnostics.err(self.allocator, place.span, message);
+        try self.diagnostics.note(
+            self.allocator,
+            place.span,
+            "an 'owned' callee frees the value, and the 'arc' box would free it again",
+        );
     }
 
     /// R12 and R10's exemptions, which R2 depends on: a `copy` place is
@@ -1936,6 +1996,56 @@ test "R8: a struct field may not store a shared borrow" {
     ,
         \\t.cell:1:1: error: cannot store a shared borrow in field 'buf': Cell has no lifetime annotations, so the borrow cannot be proven to outlive the value
         \\t.cell:1:1: note: store an 'owned' or 'arc' value instead
+        \\
+    );
+}
+
+test "R10: an arc place may not be passed to an owned parameter" {
+    // Ruled a REFUSAL rather than a retain, and the reason is that a retain
+    // cannot fix it. `owned [T]` and `shared [T]` are the same C type
+    // (`cell_slice_t` by value), so the C backend's unbox emitted
+    // `take((*(const cell_slice_t *)xs.ptr))`, which compiles clean at
+    // -Werror. `runtime/cell_rt.h` section 7 makes an `owned` callee
+    // responsible for the eventual free, and `cell_slice_drop_glue` then
+    // frees the same BUFFER again when the box dies. `cell_arc_clone`
+    // increments a refcount and the buffer is not what the refcount governs,
+    // so the only correct answer is to reject the conversion.
+    try expectDiagnostics(
+        \\pub fn take(owned xs: [Int]) -> Int;
+        \\pub fn main() {
+        \\    let arc xs = [1, 2, 3]
+        \\    let copy n = take(owned xs)
+        \\}
+    ,
+        \\t.cell:4:29: error: cannot pass 'arc' value 'xs' to 'owned' parameter 'xs': ownership is shared and cannot be made unique
+        \\t.cell:4:29: note: an 'owned' callee frees the value, and the 'arc' box would free it again
+        \\
+    );
+}
+
+test "R10 refuses only the owned conversion, not the arc binding itself" {
+    // The guard must not swallow what builds an `arc [T]` in the first place.
+    try expectAccepted(
+        \\pub fn read(shared xs: [Int]) -> Int;
+        \\pub fn main() {
+        \\    let arc xs = [1, 2, 3]
+        \\    let copy n = read(shared xs)
+        \\}
+    );
+}
+
+test "R10 leaves a non-arc owned argument moving exactly as before" {
+    // The refusal sits in front of `movePlace`, so the move path it guards
+    // has to still fire for every other ownership mode.
+    try expectDiagnostics(prelude ++
+        \\pub fn f() {
+        \\    let owned b = Buffer { data: [], len: 0 }
+        \\    take(b)
+        \\    take(b)
+        \\}
+    ,
+        \\t.cell:12:10: error: use of 'b' after it was moved
+        \\t.cell:11:10: note: 'b' was moved here by the call to 'take'
         \\
     );
 }

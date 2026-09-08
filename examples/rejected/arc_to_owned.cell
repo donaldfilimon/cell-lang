@@ -1,0 +1,27 @@
+// EXPECT: currently-rejected
+// Violates: docs/OWNERSHIP.md R10 (an `arc` place may not be passed to an
+// `owned` parameter).
+//
+// Rejected with R10's own message, and this is the one clause of R10 that is
+// implemented. It is a refusal rather than a retain because a retain cannot
+// fix it. `owned [T]` and `shared [T]` are the SAME C type, `cell_slice_t` by
+// value, so the C backend's unbox emitted
+//
+//     cell_take((*(const cell_slice_t *)xs.ptr));
+//     cell_arc_drop(xs);
+//
+// which compiles clean at `-Wall -Wextra -Werror`. runtime/cell_rt.h section 7
+// makes an `owned` callee responsible for the eventual free, and
+// cell_slice_drop_glue frees the same BUFFER again when the box dies.
+// cell_arc_clone increments a refcount, and the buffer is not what the
+// refcount governs.
+//
+// The `arc` binding itself is fine and stays legal: only the conversion to an
+// `owned` parameter is refused.
+
+pub fn take(owned xs: [Int]) -> Int;
+
+pub fn main() {
+    let arc xs = [1, 2, 3]
+    let copy n = take(owned xs)
+}

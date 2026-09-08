@@ -225,14 +225,21 @@ const Local = struct {
     /// `ownership` check because a parameter can itself be `owned` and
     /// must still never be dropped.
     droppable: bool,
-    /// True for a parameter alone, and it is NOT the negation of
-    /// `droppable`: a match-arm binding is undroppable too, and the two
-    /// must not be confused when deciding whether a returned `arc` needs a
-    /// retain. A parameter's reference was retained by the caller and is
-    /// handed straight back (R11 rule 3, no retain); a match-arm binding is
-    /// a bitwise copy of a scrutinee this function may itself be about to
-    /// release, so returning it without a retain dangles.
-    is_param: bool = false,
+};
+
+/// Where a value-position `if`, `match`, or `block` must leave its result,
+/// and the C type of that slot.
+///
+/// The type used to be absent, and its absence was a use-after-free. Each
+/// branch assigned into the destination with a bare `emitExpr`, so an `arc`
+/// place flowing out of a branch (`let arc r = if (c) { a } else { b }`)
+/// aliased the box without retaining it, and scope exit then released both
+/// `r` and `a`. A value slot is a position with a declared type exactly as a
+/// parameter or a `let` is, so it has to answer the same conversion
+/// question, and it cannot answer it without knowing the type.
+const Dest = struct {
+    name: []const u8,
+    ty: CType,
 };
 
 /// A resolved call target. `symbol` is null when the callee is a computed
@@ -486,7 +493,7 @@ pub const Generator = struct {
         for (f.params) |p| {
             // Decision: a parameter is never dropped (see the module doc
             // comment), regardless of its own ownership annotation.
-            try self.pushLocal(p.name, try self.lowerType(&p.ty, p.ownership), p.ownership, false, true);
+            try self.pushLocal(p.name, try self.lowerType(&p.ty, p.ownership), p.ownership, false);
         }
 
         try self.writeSignature(f);
@@ -582,7 +589,7 @@ pub const Generator = struct {
                     try self.emitArgLike(&v, ty, indent);
                 }
                 try out.writeAll(";\n");
-                try self.pushLocal(l.name, ty, l.ownership, true, false);
+                try self.pushLocal(l.name, ty, l.ownership, true);
                 // -Wunused-variable is part of -Wall.
                 if (!stmtsUse(rest, l.name)) {
                     try self.writeIndent(indent);
@@ -809,10 +816,24 @@ pub const Generator = struct {
     ///     `return s->name;` and died under AddressSanitizer with a
     ///     heap-use-after-free in `cell_arc_drop`. Retaining leaks the
     ///     record's own reference instead, which is the correct side.
-    ///   - a MATCH-ARM binding is a bitwise copy of a scrutinee this
-    ///     function may itself be dropping, so it is a local in every way
-    ///     that matters here even though `droppable` is false for it. This
-    ///     is why the exception tests `is_param` rather than `!droppable`.
+    /// The exception is spelled `!droppable`, and an earlier version added a
+    /// `Local.is_param` field to spell it more precisely, on the theory that
+    /// a match-arm binding is undroppable too and must still retain. **That
+    /// field defended nothing and has been removed.** A match-arm binding
+    /// cannot reach this function at all, measured both ways: `return` is not
+    /// an expression in this grammar, so an arm body cannot contain one
+    /// (`error: expected expression`), and a trailing `match` is an
+    /// expression statement rather than a return (`error: missing return in
+    /// function 'f'`). The only bindings that reach the `.ident` branch are
+    /// parameters and `let`/`var` locals.
+    ///
+    /// **The landmine that leaves, stated so it is not rediscovered the hard
+    /// way.** If the parser ever admits `return` inside a match arm, or a
+    /// trailing expression ever becomes an implicit return, a match-arm
+    /// binding of `arc` type reaches this branch, reads `!droppable` as
+    /// "parameter", and is handed back without a retain while the scrutinee
+    /// it copies is released. Restore a parameter-only test at that point.
+    /// `docs/OWNERSHIP.md` R11 carries the same warning.
     fn returnedArcNeedsRetain(self: *Generator, v: *const ast.Expr) Alloc!bool {
         const place = unwrapAnnotated(v);
         if (!isPlace(place)) return false;
@@ -823,7 +844,7 @@ pub const Generator = struct {
                 var i = self.locals.items.len;
                 while (i > 0) {
                     i -= 1;
-                    if (eq(self.locals.items[i].name, n)) return !self.locals.items[i].is_param;
+                    if (eq(self.locals.items[i].name, n)) return self.locals.items[i].droppable;
                 }
                 // Not a binding this function declared. Nothing here can be
                 // releasing it, so a retain would only leak; but nothing
@@ -916,7 +937,7 @@ pub const Generator = struct {
 
     /// Lower a `match` to a scrutinee temporary plus an if/else chain. When
     /// `dest` is set every arm assigns into it instead of running for effect.
-    fn emitMatch(self: *Generator, m: anytype, dest: ?[]const u8, indent: usize) EmitError!void {
+    fn emitMatch(self: *Generator, m: anytype, dest: ?Dest, indent: usize) EmitError!void {
         const out = self.writer;
         const scrut_ty = try self.inferExpr(m.scrutinee);
         const temp = try self.nextTemp();
@@ -991,7 +1012,7 @@ pub const Generator = struct {
         arm: ast.MatchArm,
         temp: []const u8,
         scrut_ty: CType,
-        dest: ?[]const u8,
+        dest: ?Dest,
         indent: usize,
     ) EmitError!void {
         const mark = self.locals.items.len;
@@ -1009,7 +1030,7 @@ pub const Generator = struct {
             // borrowck's own hardcoded assumption for this binding (R7 is
             // not implemented there either); it has no effect while
             // `droppable` is false.
-            try self.pushLocal(name, scrut_ty, .owned, false, false);
+            try self.pushLocal(name, scrut_ty, .owned, false);
             if (!exprUses(arm.body, name)) {
                 try self.writeIndent(indent);
                 try self.writer.print("(void){s};\n", .{name});
@@ -1090,21 +1111,39 @@ pub const Generator = struct {
         const out = self.writer;
         var ty = try self.inferExpr(e);
         if (ty.shape == .unit or ty.shape == .unknown) ty = CType.int64;
-        const dest = try self.nextTemp();
+        const name = try self.nextTemp();
+        const dest: Dest = .{ .name = name, .ty = ty };
 
         try out.writeAll("({\n");
         try self.writeIndent(indent + 1);
-        try self.writeDecl(ty, dest);
+        try self.writeDecl(ty, name);
         try out.print(" = ({s}){{0}};\n", .{ty.text});
         try self.emitValueInto(e, dest, indent + 1);
         try self.writeIndent(indent + 1);
-        try out.print("{s};\n", .{dest});
+        try out.print("{s};\n", .{name});
         try self.writeIndent(indent);
         try out.writeAll("})");
     }
 
     /// Emit `e` as statements that leave its value in `dest`.
-    fn emitValueInto(self: *Generator, e: *const ast.Expr, dest: []const u8, indent: usize) EmitError!void {
+    ///
+    /// The leaf case routes through `emitArcConversion` rather than writing a
+    /// bare assignment, because a value slot is a position with a declared
+    /// type and therefore owes the same `arc` retain that a parameter, a
+    /// `let`, or a struct field does. Two reachable use-after-frees came in
+    /// through here, both silent at `cell check` and clean under
+    /// `-Wall -Wextra -Werror`:
+    ///
+    ///   let arc r = if (c > 0) { a } else { b }   // r aliased a's box
+    ///   return match c { 0 => a, _ => a }         // dropped before return
+    ///
+    /// Only the `arc` conversion is applied, not all of `emitArgLike`. The
+    /// address-of and dereference rules there would newly compile
+    /// cross-branch type mismatches that are C errors today, and one of them
+    /// (`&x` on a branch-local place) would hand out a pointer that dies at
+    /// the branch's closing brace. Fixing an aliasing bug is no reason to
+    /// introduce a different one.
+    fn emitValueInto(self: *Generator, e: *const ast.Expr, dest: Dest, indent: usize) EmitError!void {
         const out = self.writer;
         switch (e.kind) {
             .block => |stmts| {
@@ -1143,8 +1182,11 @@ pub const Generator = struct {
             .annotated => |a| try self.emitValueInto(a.value, dest, indent),
             else => {
                 try self.writeIndent(indent);
-                try out.print("{s} = ", .{dest});
-                try self.emitExpr(e, indent);
+                try out.print("{s} = ", .{dest.name});
+                const have = try self.inferExpr(e);
+                if (!try self.emitArcConversion(e, dest.ty, have, indent)) {
+                    try self.emitExpr(e, indent);
+                }
                 try out.writeAll(";\n");
             },
         }
@@ -1814,7 +1856,6 @@ pub const Generator = struct {
         ty: CType,
         ownership: ast.Ownership,
         droppable: bool,
-        is_param: bool,
     ) Alloc!void {
         const id = self.next_binding_id;
         self.next_binding_id += 1;
@@ -1860,7 +1901,6 @@ pub const Generator = struct {
             .ownership = ownership,
             .id = id,
             .droppable = may_drop,
-            .is_param = is_param,
         });
     }
 
@@ -2876,6 +2916,48 @@ test "a shadowed arc local is dropped once, naming the inner binding" {
     );
 }
 
+test "an arc place flowing out of an if-expression branch is cloned" {
+    var e = try emitSource(
+        \\pub fn f(shared c: Int) {
+        \\  let arc a = "aaa"
+        \\  let arc b = "bbb"
+        \\  let arc r = if (c > 0) { a } else { b }
+        \\}
+    );
+    defer e.deinit();
+    // A VALUE position, not a place position. The retain rules were derived
+    // by searching return-position places, and this escaped all of them: the
+    // branch assigned into the statement expression's temporary with a bare
+    // `emitExpr`, so `r` aliased `a`'s box and scope exit released both.
+    // Reproduced as a heap-use-after-free in `cell_arc_drop`, exit 134,
+    // while `cell check` exited 0 and `cc -Wall -Wextra -Werror` was silent.
+    try expectContains(e.text, "_cell_t0 = cell_arc_clone(a);");
+    try expectContains(e.text, "_cell_t0 = cell_arc_clone(b);");
+}
+
+test "an arc place flowing out of a match arm in return position is cloned" {
+    var e = try emitSource(
+        \\pub fn pick(shared c: Int) -> arc String {
+        \\  let arc a = "aaa"
+        \\  return match c {
+        \\    0 => a,
+        \\    _ => a
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    // The same leak of the same abstraction, one step further in: a `match`
+    // IS valued in return position (an `if` there is rejected by typecheck),
+    // but it is not a PLACE, so `returnedArcNeedsRetain` never fired and
+    // `cell_arc_drop(a)` ran before the `return`. The retain belongs in the
+    // arm, not at the return, because that is where the aliasing happens.
+    try expectContains(e.text, "_cell_t1 = cell_arc_clone(a);");
+    try expectContains(e.text,
+        \\  cell_arc_drop(a);
+        \\  return _cell_t0;
+    );
+}
+
 test "an owned String call result bound as arc IS boxed" {
     var e = try emitSource(
         \\pub fn make() -> String;
@@ -3229,4 +3311,94 @@ test "a returned arc field survives the caller releasing it, compiled and run" {
         return error.ProgramCrashed;
     }
     try std.testing.expectEqualStrings("4\n", run_result.stdout);
+}
+
+test "arc values flowing through if and match branches balance, compiled and run" {
+    // The execution counterpart to the two value-position tests. Both defects
+    // they cover were silent at every stage that is cheap to check: `cell
+    // check` exited 0, `cc -Wall -Wextra -Werror` was silent, and only
+    // running the program showed the heap-use-after-free.
+    //
+    // `pick` returns through a `match` arm and `main` selects through an
+    // `if`, so one program exercises both value paths. Unlike the emitted-text
+    // tests, this source passes `cell check` (exit 0), which is why `chosen`
+    // is never passed to a typed parameter: typecheck gives EVERY
+    // if-expression the type `()`, so an if-derived binding flowing into a
+    // `String` parameter is rejected for an unrelated, pre-existing reason.
+    // The un-annotated `let` is the form that is reachable, and it is the
+    // form the defect was reported in.
+    //
+    // The printed 2 is the strong count `observe` was handed, and it is a
+    // measurement: `a` is boxed at 1, the match arm clones for the return (2),
+    // `pick`'s scope drop takes it back to 1, the call site clones for the
+    // `arc` parameter (2) which is what the host reports before releasing
+    // (1), and the `if` branch then clones into `chosen` (2). The three scope
+    // drops take both boxes to zero; verified separately under `leaks` as
+    // 0 leaks for 0 total leaked bytes and clean under ASan and UBSan.
+    //
+    // Remove the match-arm clone and `pick` returns a box it already freed.
+    // Remove the if-branch clone and `chosen` aliases `got`, so the scope
+    // drops release the same box twice. Either way this aborts instead of
+    // printing, which is what `error.ProgramCrashed` reports.
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn observe(arc name: String) -> Int;
+        \\pub fn pick(shared c: Int) -> arc String {
+        \\  let arc a = "aaa"
+        \\  return match c {
+        \\    0 => a,
+        \\    _ => a
+        \\  }
+        \\}
+        \\pub fn main() {
+        \\  let arc got = pick(shared 0)
+        \\  let copy n = observe(arc got)
+        \\  let arc other = "bbb"
+        \\  let arc chosen = if (1 > 0) { got } else { other }
+        \\  print_int(n)
+        \\}
+    );
+    defer e.deinit();
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.c", .data = e.text });
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const root = cwd_buf[0..cwd_len];
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{root});
+    defer gpa.free(include);
+    const rt_c = try std.fmt.allocPrint(gpa, "{s}/runtime/cell_rt.c", .{root});
+    defer gpa.free(rt_c);
+    const host_c = try std.fmt.allocPrint(gpa, "{s}/examples/arc_host.c", .{root});
+    defer gpa.free(host_c);
+
+    const cc_result = try std.process.run(gpa, io, .{
+        .argv = &.{ "cc", "-std=c11", "-Wall", "-Wextra", "body.c", host_c, rt_c, "-I", include, "-o", "body" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(cc_result.stdout);
+    defer gpa.free(cc_result.stderr);
+    if (!cc_result.term.success()) {
+        std.debug.print("cc rejected emitted C:\n{s}\n--- source ---\n{s}\n", .{ cc_result.stderr, e.text });
+        return error.CcRejectedEmittedC;
+    }
+
+    const run_result = try std.process.run(gpa, io, .{
+        .argv = &.{"./body"},
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(run_result.stdout);
+    defer gpa.free(run_result.stderr);
+    if (!run_result.term.success()) {
+        std.debug.print(
+            "emitted program did not exit cleanly (an unretained alias aborts here):\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ run_result.stdout, run_result.stderr },
+        );
+        return error.ProgramCrashed;
+    }
+    try std.testing.expectEqualStrings("2\n", run_result.stdout);
 }
