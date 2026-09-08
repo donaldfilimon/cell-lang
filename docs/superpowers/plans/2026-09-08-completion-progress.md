@@ -18,8 +18,27 @@ Baseline: `584162a`; user approved implementation 2026-09-08.
 All ten milestones are incomplete. No fresh full-gate result was established
 by planning. Task reports below will record actual commits and validation.
 
+## Task evidence
+
+- Gate integrity: complete, `b603be4..9805d71`, follow-up `9805d71..02d4f0f`.
+  Independent review initially found unclassified LLVM failure in stage 10 and
+  insufficient control-flow coverage. Both were fixed and scoped re-review
+  approved. Targeted harness and shell syntax passed. Full gate log reported
+  414 tests, 14 answer-comparison programs, 14 ASan programs, 203 signatures
+  across 24 examples, four disclosed disagreements, and a clean verdict.
+  The shell wrapper lost the direct exit code by assigning zsh's reserved
+  `status` variable; do not claim preserved exit-code evidence for that run.
+- Gate review minor, deferred: `SIG_COVERAGE_FAILURE` duplicates state already
+  enforced by concrete failing branches. No correctness issue found.
+- Capability matrix: `02d4f0f..e03026e`, independent review pending. Forty-five
+  evidence links resolve. Matrix explicitly records static, unqualified status.
+- Ruling: the agent thread limit prevented fresh implementer creation. Reuse
+  the task implementer with bounded briefs and retain independent read-only
+  reviewers; parent authored the documentation matrix for independent review.
+  Cost if wrong: less context isolation, mitigated by exact diff reviews.
+
 ## Active task
 
-Gate integrity: close signature-only MLIR validation hole, distinguish emitter
-failure from deliberate refusal, fail test-count errors, and fault-inject these
-paths without changing the live corpus.
+Qualification report wrapper, requirements in `2026-09-08-qualification-report.md`.
+Next source task: `2026-09-08-return-ownership.md`. All ten milestones remain
+incomplete; completed gate subtasks do not imply completed language semantics.
