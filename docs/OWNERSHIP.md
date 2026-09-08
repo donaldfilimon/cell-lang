@@ -700,7 +700,23 @@ knows about. Two more exist and reach codegen instead:
 Both pass `cell check`. **A C type error is a real stop and it is loud, which is
 the safe side, but it is not enforcement**: it holds because `cell_arc_t`
 happens to coincide with no other C type, which is exactly the protection R10's
-own text says it deliberately stopped relying on. Making either COMPILE without
+own text says it deliberately stopped relying on.
+
+**And for the list element that protection DOES NOT HOLD, so the row above is
+wrong as written.** It was measured on a `[String]`, where `cell_arc_t` and
+`cell_string_t` differ and `cc` refuses. For a slice element type they do not
+differ:
+
+    let arc xs: [Int] = [1, 2, 3]
+    let owned zss: [[Int]] = [xs, xs]
+
+passes `cell check` AND compiles clean at `-Wall -Wextra -Werror`, because the
+unboxed `cell_slice_t` is exactly the element type the buffer wants. Nothing
+stops it at all. This sentence was written while correcting other overclaims and
+is the same failure it was correcting: **one element type was measured and a
+property of the position asserted.** The honest statement is that a list element
+is an unenforced make-unique position, loud for some element types and silent
+for others, and that `arcUniqueSource` is never asked there. Making either COMPILE without
 first extending R10 would reintroduce the double free R10 exists to prevent,
 because the buffer, not the refcount, is what gets freed twice. That is worth
 stating plainly: these two are on the "correctly refused" side of the ledger,
