@@ -1877,6 +1877,26 @@ pub const Generator = struct {
     /// `shared` view are all boxed, because none of them is a local the drop
     /// pass will also free: the view case copies through
     /// `cell_string_from_str` and owns its characters outright.
+    ///
+    /// THAT ENUMERATION IS INCOMPLETE BY ITS OWN TEST, found by a differential
+    /// sweep on 2026-09-08 and recorded rather than acted on. The test it
+    /// states is "not a local the drop pass will also free", and a `copy`
+    /// local satisfies it: `pendingDrops` skips every ownership that is not
+    /// `.owned` or `.arc`, so a `copy` place is never freed and boxing one
+    /// could not double free. It is nonetheless not boxed, so
+    /// `var arc x: String = mk()` then `x = <copy place>` falls through to a
+    /// loud `cc` type error.
+    ///
+    /// This is the SAFE direction (over-refusal), which is why it is a note
+    /// and not a defect, and it is deliberately left alone: boxing a `copy`
+    /// place would move it into a box the drop pass DOES release, which
+    /// changes what the program frees and therefore what the `== leaks ==`
+    /// constants read. That is the double-free direction, and it wants its own
+    /// slice with its own measurement, not a drive-by.
+    ///
+    /// Worth noticing where this happened: an enumeration went one case short
+    /// inside the very comment that exists to warn about enumerations going
+    /// one case short.
     fn emitArcConversion(
         self: *Generator,
         arg: *const ast.Expr,
