@@ -66,7 +66,9 @@ R2/R3/R5/R8/R14, and C lowering for the flagship examples are real.** As of
 the working tree the lexer, parser, AST, diagnostics, typechecker, and
 borrowck are wired into `cell check`. `if` / `else`, `match`, blocks, struct
 literals, list literals, and mangled calls lower to C. What is still designed
-includes loops, generics, `Result<T,E>`, NLL, and `arc` retain/release. Stem
+includes loops other than `while`, generics, `Result<T,E>`, and NLL. `arc`
+retain/release is implemented in the C backend, with the gaps R11 of
+`docs/OWNERSHIP.md` names. Stem
 pairing (section 1.2) and R15 call-site prefixes (section 0.7) have since
 landed and are not counted in 0.2. `docs/OWNERSHIP.md` is the normative rule
 list; section 12 is the construct-by-construct index.
@@ -604,8 +606,9 @@ whether they are distinct *types* in the source language is **designed, not
 implemented**, because there is no type representation to distinguish them in.
 
 `String` is a length-prefixed `cell_str_t`, matching `runtime/cell_rt.h`.
-Section 10.3 is the ABI table. The remaining string gap is `arc`: a literal
-stays `cell_str_t` and is not boxed.
+Section 10.3 is the ABI table. A literal bound as `arc` is now boxed
+(`cell_arc_from_string(cell_string_from_str(...))`); the remaining string gap
+is `owned`, which still has no coercion from a literal's view.
 
 **Any other type name silently becomes `void*` with no diagnostic.** `Int8`,
 `UInt32`, `Char`, a misspelled `Strng`, and every user-defined struct or enum
@@ -742,9 +745,12 @@ See section 8.3.
 **Status: parsed, not enforced.**
 
 An ownership keyword may prefix a type: `shared Int`, `arc String`,
-`exclusive Buffer`. The parser builds `TypeExpr.ref` and codegen maps every one
-of them to `void*`, discarding the inner type. Measured: `-> arc String` emits
-return type `void*`.
+`exclusive Buffer`. The parser builds `TypeExpr.ref` and codegen lowers it by
+recursing into the inner type under that ownership, exactly as it does for a
+`Param.ownership`. Measured on the current binary: `-> arc String` emits return
+type `cell_arc_t` and `(a: shared Int)` emits `int64_t a`. An earlier draft of
+this paragraph said every such type became `void*`; that is stale. What remains
+unenforced is the canonical-position rule below, not the lowering.
 
 **This creates two spellings for one idea, and the specification picks one.**
 `fn f(shared a: Int)` records ownership on `Param.ownership`, while
@@ -772,12 +778,13 @@ violating examples and diagnostics. This section defines the vocabulary.
 
 **Status of the whole model: partially enforced.** Annotations are accepted by
 the parser and recorded on the AST. `cell check` enforces R2, R3, R5, R8, R14,
-and R15. There is no `arc` retain/release and no NLL. The C backend
-(`codegen.zig`) inserts drops for an unmoved `owned`/`arc` `let`/`var` local,
-function-scoped and conservative on moves; that is R16 partially done, not
-R16 complete -- see `docs/OWNERSHIP.md` R16 for exactly which cases still
+and R15. There is no NLL, and R10's move-into-`arc` is not checked. The C
+backend (`codegen.zig`) inserts drops for an unmoved `owned`/`arc` `let`/`var`
+local, function-scoped and conservative on moves; that is R16 partially done,
+not R16 complete -- see `docs/OWNERSHIP.md` R16 for exactly which cases still
 leak (a value moved on only one path, a struct with owning fields, a `var`
-revived after a move). See 0.6 and 0.7.
+revived after a move). It also inserts R11's `arc` retains, with R11's own
+list of what still leaks. See 0.6 and 0.7.
 
 ### 4.1 The five annotations
 
@@ -845,10 +852,23 @@ The runtime machinery is real and works: `cell_arc_new`, `cell_arc_clone`, and
 `cell_arc_drop` in `runtime/cell_rt.c` do genuine refcount increments and
 decrements and call a drop function at zero, and as of `562f116` **the
 refcounts are atomic**, with the `_Atomic` confined to the `.c` file behind an
-opaque `struct cell_rc_box` so the header still compiles as C++20. Codegen
-never calls any of them. `arc` parameters and returns lower to `cell_arc_t`,
-but a string literal stays `cell_str_t` and is not boxed, so `examples/arc.cell`
-emit fails `cc -c`. Retain/release insertion is **designed, not implemented**.
+opaque `struct cell_rc_box` so the header still compiles as C++20.
+
+**The C backend now calls them.** Every `arc` binding is a `cell_arc_t`,
+whether or not it carries a type annotation; a literal or call result bound as
+`arc` is boxed with `cell_arc_from_string` / `cell_arc_from_slice`; an `arc`
+place passed to an `arc` parameter, bound to a new `arc` binding, or stored in
+a struct field is cloned; and an `arc` place passed to a `shared` parameter is
+deliberately not cloned (OWNERSHIP.md R11, safe by R8).
+`examples/arc.cell` compiles, links and runs, and prints a strong count.
+
+Three gaps remain, all of them leaks rather than use-after-free, and all
+listed in OWNERSHIP.md R11: an `arc` parameter is never released by a Cell
+body, because no parameter is dropped; a struct holding an `arc` field is
+never dropped at all; and an `owned` String or list **place** bound as `arc`
+is not boxed, because R10's move-into-`arc` is unimplemented in the checker
+and boxing an un-moved place would double free it. The LLVM and MLIR backends
+refuse `arc` outright and emit nothing.
 
 #### 4.1.5 `copy`
 
@@ -893,9 +913,10 @@ and omitting it is allowed and inferred from the callee's signature. The
 `cell check` enforces R2, R3, R5, R8, R14, and R15 through
 `src/cell/borrowck.zig`. Codegen lowers `shared` aggregates
 to `const T *`, `exclusive` aggregates to `T *`, and `arc` parameters to
-`cell_arc_t`. It does **not** insert retain or release for `arc`, and it does
-not box a string literal into an arc, so `examples/arc.cell` emit does not
-compile.
+`cell_arc_t`. It boxes a literal or call result bound as `arc`, inserts
+`cell_arc_clone` at OWNERSHIP.md R11's three retain-a-place sites, and emits
+`cell_arc_drop` at scope exit, so `examples/arc.cell` emit compiles, links and
+runs. R11's remaining gaps are listed there and in 4.1.4.
 
 ---
 
@@ -1231,9 +1252,9 @@ return a + b
 The value is optional; the parser stops looking for one at `;` or `}`.
 Typecheck reports a missing return and a return-type mismatch. Borrowck reports
 R8 at the returned expression when the declared return is a `shared` or
-`exclusive` borrow. Codegen maps a declared `arc` return to `cell_arc_t`; a
-body that returns an unboxed string literal is still a lowering gap
-(section 10.4).
+`exclusive` borrow. Codegen maps a declared `arc` return to `cell_arc_t`, and
+a returned `arc` local is retained into the return temporary so the scope drop
+cannot free it before the caller sees it (OWNERSHIP.md R11 release rule 2).
 
 ### 7.5 Expression statements
 
@@ -1577,26 +1598,25 @@ intrinsics (`print`, `print_int`, ...) keep the runtime's own symbol.
 | `examples/hello.cell` | compiles |
 | `examples/control_flow.cell` | compiles |
 | `examples/ownership.cell` | compiles |
-| `examples/arc.cell` | fails: `let arc label = "session"` stays `cell_str_t` while `cell_observe` wants `cell_arc_t` |
+| `examples/arc.cell` | compiles, links against `examples/arc_host.c` and `runtime/cell_rt.c`, and runs, printing 13 |
 
-Declaration-only files emit valid C. Body-bearing emit compiles for the
-flagship examples (hello, control_flow, ownership), not for every example.
-`arc` boxing is the remaining gap on that path, and retain/release insertion
-is a non-goal of this revision.
+Declaration-only files emit valid C. Body-bearing emit compiles for every
+example in `examples/`. `arc.cell` needs a hand-written C host for its two
+bodyless declarations, which `tools/check.sh` supplies through `run_c_host`;
+the others link against the runtime alone.
 
 A module-qualified mangling (`cell_<module>_<name>`) is **designed, not
 implemented**.
 
 ### 10.3 The value model
 
-**Status: implemented for the types the compiler can name, with one arc gap.**
+**Status: implemented for the types the compiler can name.**
 
 `runtime/cell_rt.h` carries an authoritative reference block specifying how
 every Cell type lowers to C. **This specification adopts that block as the
 target ABI.** Codegen now emits `#include "cell_rt.h"` and follows that mapping
-for primitives, strings, slices, optionals, structs, and payload-free enums.
-The remaining gap is `arc`: a parameter or return of mode `arc` is `cell_arc_t`,
-but a string literal is still `cell_str_t` and is not boxed.
+for primitives, strings, slices, optionals, structs, payload-free enums, and
+`arc`.
 
 | Cell | Specified C | What codegen emits today |
 |---|---|---|
@@ -1604,7 +1624,7 @@ but a string literal is still `cell_str_t` and is not boxed.
 | `shared String` | `cell_str_t` (borrowed `ptr`+`len` view) | `cell_str_t` |
 | `owned String` | `cell_string_t` (heap `ptr`+`len`+`cap`, callee frees) | `cell_string_t` |
 | `exclusive String` | `cell_string_t*` | `cell_string_t *` |
-| `arc String` | `cell_arc_t` over a heap `cell_string_t` | `cell_arc_t` on params/returns; a literal stays `cell_str_t` |
+| `arc String` | `cell_arc_t` over a heap `cell_string_t` | `cell_arc_t` everywhere, including a `let` with no annotation; a literal is boxed with `cell_arc_from_string(cell_string_from_str(...))` |
 | `copy String` | `cell_string_t` from `cell_string_clone` | `cell_string_t` (no clone call) |
 | `[T]` | `cell_slice_t { ptr, len, cap }`, type-erased, `elem_size` at each call site | `cell_slice_t` |
 | `T?` | tagged `{ bool has_value; T value; }` | `CELL_DEFINE_OPTIONAL` instance |
@@ -1633,9 +1653,11 @@ the runtime rather than chosen here:
 
 ### 10.4 Ownership at the boundary
 
-**Status: parsed, not enforced for all modes.** `shared` / `exclusive` /
-`owned` / `copy` lower as specified. `arc` parameters and returns are
-`cell_arc_t`, but literals are not boxed and retain/release is not inserted.
+**Status: lowered for all five modes; retain/release enforced for `arc` in the
+C backend only.** `shared` / `exclusive` / `owned` / `copy` lower as
+specified. `arc` is `cell_arc_t` everywhere, literals and call results are
+boxed, and retain/release is inserted per OWNERSHIP.md R11, whose own text
+lists the three cases that still leak.
 
 `runtime/cell_rt.h` section 7 fixes the lowering for each mode, and this
 specification adopts it:
@@ -1656,18 +1678,23 @@ expression compiling.
 
 Today, `shared` aggregates emit `const T *`, `exclusive` aggregates emit
 `T *`, and `owned` / `copy` emit the by-value C type from section 3.1.
-`arc` parameters emit `cell_arc_t`. A `let arc label = "session"` still
-types and emits as `cell_str_t`, so passing it to an `arc` parameter fails
-to compile. Retain/release calls are never inserted.
+`arc` is `cell_arc_t` in every position, and `let arc label = "session"`
+boxes the literal, so passing it to an `arc` parameter compiles and retains.
+An `arc` place passed to a `shared String` parameter is unboxed to a view with
+`cell_string_as_str((const cell_string_t *)x.ptr)` and is not retained, which
+is R11's one deliberate non-retain.
 
 ### 10.5 Return values
 
 **Status: implemented (mapping). Ownership of returns: designed.**
 
 The return type maps by section 3.1, and no `->` clause means `void`. The
-specified rule, not implemented: a returned `owned` value transfers ownership
-to the caller, a returned `arc` value is returned **already retained** so the
-caller must release it, and returning a `shared` or `exclusive` borrow requires
+rule for `arc` is implemented in the C backend: a returned `arc` value is
+returned **already retained**, so the caller must release it, and a returned
+`arc` local is cloned into the return temporary to make that true in the face
+of the scope drop. Still designed, not implemented: a returned `owned` value
+transfers ownership to the caller, and returning a `shared` or `exclusive`
+borrow requires
 a lifetime story this revision does not have and therefore forbids
 (OWNERSHIP.md R8).
 
@@ -1807,13 +1834,13 @@ records the missing lowering.
 | `owned` annotation | implemented |
 | `shared` annotation | implemented |
 | `exclusive` annotation | implemented |
-| `arc` annotation | parsed, not enforced |
+| `arc` annotation | implemented in the C backend (retain, boxing, unbox, and scope release); parsed only for LLVM and MLIR, which refuse `arc` |
 | `copy` annotation | implemented |
 | Default ownership is `owned` | implemented |
 | Call-site ownership prefix | implemented (see 0.7; this row postdates the 0.2 count) |
 | Move checking | implemented |
 | Shared-XOR-exclusive aliasing | implemented |
-| Retain / release insertion for `arc` | designed, not implemented |
+| Retain / release insertion for `arc` | partially implemented, C backend only: all four R11 retain sites and the `shared`-parameter non-retain; release is the drop pass, function-scoped. Three leaks remain, all named in `docs/OWNERSHIP.md` R11: an `arc` parameter is never released by a Cell body, a struct with an `arc` field is never dropped, and an `owned` place bound as `arc` is not boxed because R10's move-into-`arc` is unimplemented |
 | Atomic refcounts in the runtime | implemented |
 | Drop insertion for `owned` | partially implemented: unmoved `owned`/`arc` `let`/`var` locals only, function-scoped, conservative on moves; not structs, not parameters, not a value revived after a move (see `docs/OWNERSHIP.md` R16) |
 | Copyability derivation | designed, not implemented |
@@ -1919,9 +1946,9 @@ records the missing lowering.
 | Mangling on call sites | implemented |
 | Primitive parameter mapping | implemented |
 | `String` as a length-prefixed slice | implemented |
-| Ownership lowering at the boundary | parsed, not enforced |
+| Ownership lowering at the boundary | implemented for all five modes in the C backend (see 10.4) |
 | `const` for `shared` aggregates | implemented |
-| `arc` as `cell_arc_t` | parsed, not enforced |
+| `arc` as `cell_arc_t` | implemented in the C backend, in every position including an un-annotated `let` |
 | `cell_result_t` emission | designed, not implemented |
 | Return-value mapping | implemented |
 | Emitted C compiles for declaration-only files | implemented |

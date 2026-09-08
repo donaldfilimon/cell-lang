@@ -91,7 +91,8 @@ Syntax is not implementation. Verify by running the compiler.
 - Construct-by-construct status (implemented / parsed not enforced / designed not implemented) is in `docs/SPEC.md` section 12. Cite the file; update counts and tags when behavior changes.
 - `cell check` runs typecheck and borrowck independently into separate `diag.Bag`s; both are printed and either error produces `error.TypeError`.
 - Drop insertion IS present in the C backend as of `7eaca7a`, and only there: `codegen.zig` emits scope drops, deliberately conservative (a parameter, a match-arm binding, a `record` shape and an R3a revival are never dropped) and written to fail toward a leak rather than a double free. The LLVM and MLIR backends emit no drops.
-- `arc` retain/release, NLL, generics, `Result<T,E>`, enum payloads, and loops other than `while` are not present.
+- `arc` retain/release IS present in the C backend (and only there): boxing for a literal or call result, `cell_arc_clone` at OWNERSHIP.md R11's three retain-a-place sites, the deliberate non-retain for a `shared` parameter, and the drop pass for release. Three gaps remain and all of them leak rather than dangle: an `arc` parameter is never released by a Cell body (no parameter is dropped), a struct with an `arc` field is never dropped, and an `owned` String or list PLACE bound as `arc` is left as a loud C type error rather than boxed, because R10's move-into-`arc` is unimplemented in `borrowck.zig` and boxing an un-moved place would double free it. `examples/arc.cell` compiles, links against `examples/arc_host.c`, runs, and prints a strong count.
+- NLL, generics, `Result<T,E>`, enum payloads, and loops other than `while` are not present.
 
 ## Codegen and backends
 
@@ -100,7 +101,7 @@ Three emitters selected by `cell emit --target=`:
 - `c` (default): only one that lowers the whole language today (if/else, match, blocks, struct/list literals, mangled calls). Walks AST directly.
 - `llvm`, `mlir`: go through `hir`; deliberately **scalar-first**. Refuse `String`, `[T]`, `T?`, `Result`, `arc` (and most aggregates crossing C boundary) with a `cannot lower` diagnostic at the span. Never emit plausible wrong code.
 
-`examples/backends.cell` (scalar) and now `hello.cell` (with struct) and `loops.cell` execute through all three.
+`examples/backends.cell` (scalar) and now `hello.cell` (with struct) and `loops.cell` execute through all three. `arc.cell` executes through C alone, and needs `examples/arc_host.c` for its two bodyless declarations; `tools/check.sh` runs it with `run_c_host`.
 
 ## Backend toolchain (measured, not assumed)
 
@@ -137,7 +138,7 @@ One unit: `load.zig` (classifies extension, pairs `.body`/`.bod` with same-dir `
 - `src/cell/`: stages live here (`load`, `lexer`, `parser`, `ast`, `typecheck`, `borrowck`, `hir`, `codegen` (AST→C), `llvmemit`, `mlirmit`, `diag`...).
 - `stdlib/prelude.cell`: bodyless declarations only (spec of intended surface; nothing is auto-imported; no module resolution exists yet).
 
-Stem pairing lives in `load.zig`, and its diagnostics are its own, NOT `docs/OWNERSHIP.md` rules: missing module file, ambiguous module (both `.cell` and `.cel` exist), a declaration that already has a body, and body-versus-declaration signature mismatch (parameter count, per-parameter ownership and type, return type). No R-numbered rule is checked there. R8 is the escaping-borrow rule in `borrowck.zig`; R10 and R11 are `arc` retain-release and are designed, not implemented anywhere.
+Stem pairing lives in `load.zig`, and its diagnostics are its own, NOT `docs/OWNERSHIP.md` rules: missing module file, ambiguous module (both `.cell` and `.cel` exist), a declaration that already has a body, and body-versus-declaration signature mismatch (parameter count, per-parameter ownership and type, return type). No R-numbered rule is checked there. R8 is the escaping-borrow rule in `borrowck.zig`. R11 is `arc` retain-release: implemented in `codegen.zig`'s C backend with the gaps listed above, not in `llvmemit.zig` or `mlirmit.zig`, which refuse `arc`. R10 (move-into-`arc`) is designed, not implemented: `borrowck.zig`'s `checkLet` moves an initializer place only for `.owned`, and an `.arc` call argument only `readPlace`s it.
 
 ## Conventions
 

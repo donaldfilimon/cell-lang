@@ -88,13 +88,15 @@ is `[T]`, which SPEC 3.3 says has no representation at all.
 passing means those three stages accepted it. Body-bearing emit compiles for
 `hello.cell`, `control_flow.cell`, and `ownership.cell`: `cell emit
 examples/hello.cell` compiles with `cc -c`, and linked against
-`runtime/cell_rt.c` it prints `42`. `examples/arc.cell` does not compile until
-arc boxing exists. `if` / `match` / blocks / struct and list literals lower
-to C, not placeholder comments.
+`runtime/cell_rt.c` it prints `42`. `examples/arc.cell` compiles and runs too,
+but it needs one extra source: see the `arc.cell` section below. `if` / `match`
+/ blocks / struct and list literals lower to C, not placeholder comments.
 
-Still not implemented: loops, generics, `Result<T,E>`, enum payloads, hex /
-underscore / exponent literals, and `arc` retain/release. Stem pairing and
-`while`/`break`/`continue` are implemented; `for` and `loop` are not.
+Still not implemented: loops other than `while`, generics, `Result<T,E>`, enum
+payloads, and hex / underscore / exponent literals. `arc` retain/release is
+implemented in the C backend, with the gaps `docs/OWNERSHIP.md` R11 names.
+Stem pairing and `while`/`break`/`continue` are implemented; `for` and `loop`
+are not.
 
 ## The top-level examples
 
@@ -109,11 +111,37 @@ underscore / exponent literals, and `arc` retain/release. Stem pairing and
 | `structs_enums.cell` | struct layout emission and per-field ownership |
 | `declarations.cell` | bodyless declarations, the C-ABI-first form |
 | `ownership.cell` | all five ownership modes; R2/R3/R5/R8/R14 enforced |
-| `arc.cell` | the `arc` mode and what the runtime already provides |
+| `arc.cell` | the `arc` mode: boxing, call-site retains, the `shared` non-retain, and scope release. Prints `13`, a refcount measurement. Needs `arc_host.c`, below |
 | `backends.cell` | the cross-backend agreement case: scalar-only, carried by C, LLVM and MLIR alike, and all three print `24` |
 | `borrows.cell` | every borrow spelling (`shared`/`&`, `exclusive`/`&mut`/`&var`/`&exclusive`) and the keyword-wins rule for mixing |
 | `loops.cell` | `while`, both spellings, plus `break` and `continue`; prints 55 through all three backends |
 | `while_is_now_a_loop.cell` | the same program that once passed and silently did nothing, now looping correctly; its header records all four meanings it has had |
+
+## Running `arc.cell`, the one example with a C host
+
+`arc.cell` declares `observe` and `inspect` without bodies, because what it
+demonstrates is the `arc` and `shared` calling conventions at the C boundary.
+`examples/arc_host.c` defines them, and `observe` reads
+`cell_arc_strong_count`, which no Cell body can reach. That is why the example
+is not self-contained: without the host it would prove the emitted program does
+not crash, not that the retains balance.
+
+```sh
+./zig-out/bin/cell emit examples/arc.cell > /tmp/arc.c
+cc -std=c11 -Wall -Wextra -Werror -I runtime    /tmp/arc.c examples/arc_host.c runtime/cell_rt.c -o /tmp/arc && /tmp/arc
+# 13
+```
+
+13 is a measurement, not arithmetic: `observe` returns the strong count it was
+handed (3 each time, the original plus the `alias` handle plus that call's own
+retain) and `inspect` returns the borrowed view's length, 7. Under `leaks` the
+program reports `0 leaks for 0 total leaked bytes`, because the host releases
+its `arc` parameter as `runtime/cell_rt.h` section 7 requires. A Cell body
+would not: the C backend drops no parameter, so a Cell-bodied `arc` parameter
+leaks its caller's retain. `tools/check.sh` runs this case through
+`run_c_host`.
+
+The LLVM and MLIR backends refuse this file, identically and on purpose.
 
 ## The future corpus
 

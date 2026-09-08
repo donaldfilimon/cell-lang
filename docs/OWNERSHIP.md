@@ -16,8 +16,10 @@ exclusive), R8 (escaping borrow), R14 (assignment through an immutable place,
 including fields), and R15 (call-site annotation agreement). Diagnostics name
 the place and land at the use site. That file's header comment is the
 authoritative list and moves with the code; believe it over this paragraph.
-R10/R11 retain-release insertion and NLL are still designed. **R2.a** (a move
-inside a loop) landed with `while`. Stem pairing has
+NLL is still designed. **R11** retain-release insertion is implemented in the
+C backend, with the gaps R11 itself names; **R10**'s move-into-`arc` is not
+implemented in the checker, which is why one of those gaps exists. **R2.a**
+(a move inside a loop) landed with `while`. Stem pairing has
 since landed (SPEC section 1.2).
 
 ---
@@ -431,9 +433,47 @@ call cannot outlive the caller's own reference, so the caller's retain already
 covers it. This is the one optimization the rule set builds in, and it is safe
 precisely because of R8.
 
-**Blocked on codegen, not on the front end.** `arc T` currently maps to `void*`
-rather than to `cell_arc_t` (SPEC 10.3), so there is no value of the right
-shape to pass to any of these functions.
+**Retain is implemented in the C backend; release is the drop pass, and the
+two do not yet meet everywhere.** An earlier draft of this paragraph said
+`arc T` mapped to `void*` and that no value of the right shape existed to pass
+to these functions. That is stale: `arc T` is `cell_arc_t` (SPEC 10.3), an
+`arc` binding is a `cell_arc_t` whether or not it carries a type annotation,
+and `src/cell/codegen.zig` emits all four retains and the scope releases.
+`examples/arc.cell` compiles, links against `runtime/cell_rt.c`, runs, and
+prints a strong count that this rule set predicts.
+
+What holds today, in the C backend alone (`llvmemit.zig` and `mlirmit.zig`
+refuse `arc` outright and emit no drops at all):
+
+- Retain rule 1 boxes a literal, a call result, or a `shared` view with
+  `cell_arc_from_string` / `cell_arc_from_slice`. It does **not** box an
+  `owned` String or list PLACE, because those helpers move their argument
+  while `borrowck.zig`'s `checkLet` moves an initializer place only for
+  `.owned` and an `.arc` call argument only reads it. R10's "moved into a
+  fresh `arc` box; the source is dead by R2" is therefore unimplemented in the
+  front end, and until it lands the backend leaves a C type error rather than
+  emitting a silent double free.
+- Retain rules 2, 3, and 4 emit `cell_arc_clone`, at the call site before the
+  call, at the binding, and at the struct field store.
+- The `shared`-parameter non-retain holds, and is asserted by an explicit
+  absence test.
+- Release rule 1 is function-scoped rather than block-scoped, and reverse
+  creation order holds within that scope.
+- Release rule 2's "except the one being returned" is paid for on the retain
+  side instead: a returned `arc` local is cloned into the return temporary, so
+  the drop that follows takes the count back to exactly the reference the
+  caller now owns. This is because an `arc` place is never made dead by
+  borrowck (`isDuplicable`, R10 by design), so the drop pass cannot recognize
+  the exception itself.
+- Release rule 3 holds by construction: a parameter is never dropped.
+
+The gap that leaks, stated plainly rather than left to be discovered: a Cell
+function body never releases its own `arc` parameter, because the C backend
+drops no parameter at all. So each call-site retain into a Cell-bodied `arc`
+parameter leaks one reference, and a struct holding an `arc` field is never
+destroyed, so rule 4's retain leaks too. Both are leaks, never use-after-free.
+A hand-written C callee that honours `cell_rt.h` section 7 and releases its
+`arc` parameter balances exactly; `examples/arc_host.c` is one.
 
 ---
 

@@ -74,6 +74,42 @@
 //! a `std.debug.assert` against `Checker.bindingName` on every call (a
 //! no-op in release builds), so a future edit that breaks the lockstep
 //! fails loudly in tests instead of silently mis-dropping a binding.
+//!
+//! ## Arc retain insertion (task 4b), the other half of the same rule
+//!
+//! `docs/OWNERSHIP.md` R11 pairs a retain with each of those releases, and
+//! `emitArcConversion` emits every one of them. It hangs off `emitArgLike`
+//! because that is already the single place a value is lowered into a
+//! position whose C type is declared: a `let` initializer, a call argument,
+//! a struct literal field, a list element, and an assignment's right side.
+//! All four of R11's retain sites are one of those, so there is no second
+//! place to keep in step. `letType` had to learn about `arc` first: it took
+//! the initializer's inferred type and never the declared ownership, so
+//! `let arc label = "session"` stayed a `cell_str_t` and `applyOwnership`'s
+//! `.arc => CType.arc` was unreachable for it.
+//!
+//! The asymmetry that shaped this pass is the mirror of the drop pass's:
+//! retaining too much leaks, retaining too little is a use after free, so
+//! every judgment call goes toward the retain. The one place that reads as
+//! an exception is not one: an `arc` place passed to a `shared` parameter is
+//! deliberately NOT retained, which R8 makes safe because the borrow cannot
+//! escape the call, and an explicit absence test pins it.
+//!
+//! `emitReturnStmt` carries the only retain outside that helper, and it is
+//! there because the drop pass cannot see R11 release rule 2's "except the
+//! one being returned": borrowck never makes an `arc` place dead
+//! (`isDuplicable`, R10 by design), so a returned `arc` local is always
+//! still in `pendingDrops` and would be released between the return
+//! temporary and the `return` itself. The clone is exactly balanced, not a
+//! leak.
+//!
+//! Known gaps, all of them leaks and none a dangling reference: a Cell body
+//! never releases its own `arc` parameter, because no parameter is dropped,
+//! so every call-site retain into one leaks a reference; a struct holding an
+//! `arc` field is never dropped, so the field's retain leaks; and an `owned`
+//! String or list PLACE bound as `arc` is not boxed at all, because
+//! `cell_arc_from_string` moves its argument while `borrowck.zig` leaves the
+//! source unmoved, and a loud C type error beats a silent double free.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -2761,9 +2797,10 @@ test "a program that allocates and frees an owned local runs clean under cc" {
     // Owned `String` locals cannot appear in this test: constructing one
     // from a string literal hits a pre-existing, unrelated codegen gap
     // (there is no coercion from the literal's `cell_str_t` view into an
-    // owned `cell_string_t` -- see examples/arc.cell's own header comment,
-    // "a string literal stays cell_str_t and is not boxed"), so `cc` would
-    // reject the emitted C for a reason that has nothing to do with drops.
+    // owned `cell_string_t`; task 4b added exactly that coercion for `arc`,
+    // by way of cell_arc_from_string, and deliberately did not touch
+    // `owned`), so `cc` would reject the emitted C for a reason that has
+    // nothing to do with drops.
     // `[Int]` sidesteps it: every ownership mode of a list lowers to the
     // same `cell_slice_t`, so there is no literal-to-owned coercion to be
     // missing.
