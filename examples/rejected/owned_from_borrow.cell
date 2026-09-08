@@ -1,0 +1,63 @@
+// EXPECT: currently-rejected
+// Violates: docs/OWNERSHIP.md R18 (an `owned` binding may not be initialized
+// from a borrow).
+//
+// Every `let` below is the same construct written a different way, and before
+// R18 they got THREE different answers from this compiler. That is the whole
+// reason the rule is one check rather than a list.
+//
+// Measured at `b61a107`, over `var owned list = fresh()` with `[Int]`:
+//
+//     let owned xs = &list             2 frees   exit 134, double free
+//     let owned xs = &mut list         2 frees   exit 134, double free
+//     let owned xs = &var list         2 frees   exit 134, double free
+//     let owned xs = &exclusive list   2 frees   exit 134, double free
+//     let owned xs = shared &list      2 frees   exit 134, double free
+//     let owned xs = exclusive &list   2 frees   exit 134, double free
+//     let xs       = &list             2 frees   exit 134, double free
+//     let owned xs = shared list       1 free    exit 0
+//     let owned xs = exclusive list    1 free    exit 0
+//
+// `&list` and `shared list` emitted BYTE-IDENTICAL C. The initializer lowering
+// was never the defect; the number of scheduled drops was. `checkLetInit`
+// opened with a branch that matched the SIGIL spellings and created a named
+// loan without reading the binding's ownership at all, so the lender was never
+// moved and both it and the binding were dropped. The keyword spellings did
+// not match that branch, fell through to the `owned` move, and silently moved
+// the lender out from under a written `shared` prefix: exit 0, and a different
+// program from the one on the page.
+//
+// The two exit-0 rows are why "refuse the two that crash" would have been the
+// wrong fix. `examples/borrows.cell` states that the sigil and keyword
+// spellings are the same construct, so a fix that leaves them split is wrong
+// even where the split is safe-versus-safe.
+//
+// The last row also matters on its own: R1 makes an omitted annotation
+// `owned`, so `let xs = &list` is this same program and was this same crash.
+// The remedy is to say what was meant -- `let shared xs = &list` or
+// `let exclusive xs = &mut list` -- both of which stay legal and are exercised
+// by examples/let_binding_modes.cell.
+//
+// All nine are reported in one run: the rule refuses the statement and keeps
+// checking, so this file is also the readable proof that the spellings agree.
+// Two of the messages say "a borrow" rather than "a borrow of 'buf'", because
+// `borrowSource` names the place through `placeOf`, which does not see through
+// a sigil nested inside a keyword. That is a diagnostic nicety and not the
+// verdict; the verdict is the same for all nine. src/cell/borrowck.zig's R18
+// test walks the eight spellings against four binding prefixes, 32 programs,
+// and asserts one verdict for every one of them.
+
+pub struct Buffer { copy len: Int }
+
+pub fn main() {
+    var owned buf = Buffer { len: 0 }
+    let owned a = &buf
+    let owned b = &mut buf
+    let owned c = &var buf
+    let owned d = &exclusive buf
+    let owned e = shared buf
+    let owned f = exclusive buf
+    let owned g = shared &buf
+    let owned h = exclusive &buf
+    let i = &buf
+}

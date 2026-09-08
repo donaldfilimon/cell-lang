@@ -2,7 +2,8 @@
 //!
 //! Implements `docs/OWNERSHIP.md` rules R1, R2, R2.a, **R2.b**, R3, R3a, R4,
 //! R5, R6, R8, R9,
-//! R14 and R15, plus ONE clause of R10: an `arc` value may not be made UNIQUE,
+//! R14, R15 and **R18**, plus ONE clause of R10: an `arc` value may not be
+//! made UNIQUE,
 //! refused at six consumption sites (an `owned` parameter, an `owned`
 //! binding, an assignment into an `owned` place, an `owned` struct field, a
 //! list-literal element, and a `return` whose declared return type is not
@@ -33,6 +34,21 @@
 //! the scrutinee is a plain place or a value shape, so it is a separate R7 gap
 //! and not this one. R2's move list in `docs/OWNERSHIP.md` claims R7 moves it
 //! and overclaims.
+//!
+//! **R18** is R3 read in the other direction: R3 refuses moving OUT of a
+//! borrow, and R18 refuses binding an `owned` name TO one. It is the second
+//! defect of this family found at the `let` position and the fourth in the
+//! file, so the shape is worth stating once: an enumeration of the forms the
+//! author had in mind, asserted over every form. `checkLetInit` opened with a
+//! branch that matched `refKind` -- the SIGIL spellings -- and created a loan
+//! without ever reading `l.ownership`, so `let owned xs = &list` returned
+//! before the `.owned` branch could move the lender and both were dropped
+//! (exit 134). The keyword spellings did not match `refKind`, fell through,
+//! and silently MOVED the lender under a written `shared` prefix, which is
+//! the same defect wearing exit 0. The rule is therefore enforced by ONE
+//! question asked of the whole initializer, `borrowSource`, above every
+//! branch that could answer differently; it is the classifier R14's rebinding
+//! clause already used, and its switch is exhaustive with no `else`.
 //!
 //! **R9** is both halves of "`arc` grants shared access only": no `exclusive`
 //! borrow of an `arc` place, refused in `createLoan` because that is the ONE
@@ -679,8 +695,12 @@ pub const Checker = struct {
         });
     }
 
-    /// The initializer of a `let`. Three shapes matter:
+    /// The initializer of a `let`. Four shapes matter, and the ORDER of the
+    /// first two is the rule rather than a detail:
     ///
+    /// * an `owned` binding initialized from a BORROW is refused (R18). This
+    ///   is asked first, because every branch below it either creates a loan
+    ///   or moves, and both of those are wrong answers for this shape.
     /// * `&x` / `&mut x`, or a bare place under a `shared`/`exclusive`
     ///   annotation, creates a **named** loan that lives to the end of the
     ///   block. This is the loan provenance R5 asks for.
@@ -692,6 +712,73 @@ pub const Checker = struct {
         l: *const @FieldType(ast.Stmt.Kind, "let"),
         v: *const ast.Expr,
     ) Error!void {
+        // R18, the `let` position, and the ONE question asked about the
+        // initializer's borrow-ness anywhere in this function.
+        //
+        // It is placed ABOVE the loan branch rather than inside it, and that
+        // placement is the fix. The loan branch used to open this function and
+        // never consulted `l.ownership` at all: `let owned xs = &list` became
+        // a named loan and RETURNED, so the `.owned` branch below -- which
+        // would have moved the lender -- was never reached. The lender was
+        // therefore never moved, codegen's `pendingDrops` kept both it and the
+        // binding, and one buffer was freed twice. Measured at `b61a107`:
+        // `cell check` exit 0, `cc -fsanitize=address` exit 0, running it
+        // `AddressSanitizer: attempting double-free` at exit 134.
+        //
+        // The classifier is `borrowSource`, which R14's rebinding clause
+        // already uses, and reusing it is deliberate. The alternative was a
+        // list of borrow SPELLINGS to reject, and a list is exactly the
+        // reasoning failure this defect is an instance of: the old branch
+        // matched `refKind`, which is the sigil forms, so `&list` and
+        // `&mut list` crashed while `shared list` and `exclusive list` reached
+        // the move below and silently moved the lender under a written
+        // `shared` prefix -- a second wrong answer wearing exit 0.
+        // `borrowSource`'s switch is exhaustive with no `else`, so a new
+        // expression kind fails to COMPILE here rather than falling through
+        // permissively, and a new borrow spelling is refused without a second
+        // edit at this site.
+        if (l.ownership == .owned) {
+            switch (try self.borrowSource(v)) {
+                .not_borrow => {},
+                // `.unresolved` is deliberately NOT refused here, and the
+                // reason is that this position already refuses its useful
+                // half: R2.b's `ownedMoveSource` is total at this same site
+                // and reports `refuseUnknownMove` for a field of a temporary
+                // and an unresolved name. What is left over is a call whose
+                // callee this checker cannot resolve, which borrowck sees for
+                // an undeclared function that typecheck reports separately.
+                // Refusing it here would make borrowck report a SECOND,
+                // borrow-flavoured error for a program whose real defect is
+                // an unknown name. The residual is stated rather than hidden:
+                // an indirect call returning a borrow would slip through, and
+                // this grammar has no function values for one to be written
+                // with.
+                .unresolved => {},
+                .borrow => |s| {
+                    try self.diagnostics.err(
+                        self.allocator,
+                        s.span,
+                        try self.msg(
+                            "cannot bind {s} to the 'owned' binding '{s}': a borrow does not confer ownership",
+                            .{ s.display, l.name },
+                        ),
+                    );
+                    try self.diagnostics.note(
+                        self.allocator,
+                        s.span,
+                        try self.msg(
+                            "R18: an 'owned' binding is destroyed at the end of its scope (R16), so binding one to a borrow frees the lender's value twice; write 'let shared {s}' or 'let exclusive {s}' to hold the borrow",
+                            .{ l.name, l.name },
+                        ),
+                    );
+                    // The initializer is still walked, so a use-after-move or
+                    // a conflicting loan inside it is reported alongside this
+                    // rather than hidden behind it.
+                    try self.checkExpr(v);
+                    return;
+                },
+            }
+        }
         if (refKind(v)) |r| {
             if (try self.placeOf(r.operand)) |place| {
                 try self.createLoan(place, r.kind, true, l.name);
@@ -1892,9 +1979,15 @@ pub const Checker = struct {
                 .neg, .not => .no_owned_place,
                 // A borrow does not own its referent, so consuming it hands
                 // over nothing that a drop would free twice. Consuming a
-                // borrow in an `owned` position is R3's move-out-of-a-borrow
-                // and R15's annotation disagreement, both of which run
-                // elsewhere and neither of which is this question.
+                // borrow in an `owned` position is R18 at a `let`, R3's
+                // move-out-of-a-borrow at a move, and R15's annotation
+                // disagreement at a call; all three run elsewhere and none of
+                // them is this question.
+                //
+                // CORRECTED: this comment used to name only R3 and R15 and
+                // say "both of which run elsewhere". At the `let` position
+                // nothing ran, and that sentence is exactly the assumption
+                // the double free lived in. R18 is the check that now does.
                 .ref_shared, .ref_exclusive => .no_owned_place,
             },
             // A struct or list literal builds a FRESH record or buffer, so the
@@ -2442,10 +2535,17 @@ pub const Checker = struct {
     /// alone is enough.
     ///
     /// The declared annotation catches `var exclusive e = &mut a`. The holder
-    /// scan catches `var owned e = &mut a`, which `checkLetInit` also turns
-    /// into a named loan: it creates one whenever the initializer is a `&`
-    /// form, REGARDLESS of the annotation, so reading the annotation alone
-    /// would be exactly the enumeration this file has been caught by before.
+    /// scan catches a binding whose annotation is not a borrow but which
+    /// `checkLetInit` still turned into a named loan, because that branch
+    /// creates one whenever the initializer is a `&` form REGARDLESS of the
+    /// annotation, so reading the annotation alone would be exactly the
+    /// enumeration this file has been caught by before.
+    ///
+    /// The witness used to be `var owned e = &mut a`, which R18 now refuses at
+    /// the `let` itself, so no loan is created for it and the holder scan can
+    /// no longer see one. `var copy c = &mut a` and `var arc c = &mut a` still
+    /// reach the loan branch, so the scan is still load-bearing rather than
+    /// dead; the test below moved onto the `copy` spelling for that reason.
     ///
     /// The scan is by NAME, which the loan record is keyed on, so a shadowed
     /// name can match a loan that is not this binding's. That direction is
@@ -3568,6 +3668,125 @@ test "R3 accepts returning a copy field of a shared borrow" {
     try expectAccepted(prelude ++
         \\pub fn read_only(shared b: Buffer) -> Int {
         \\    return b.len
+        \\}
+    );
+}
+
+test "R18: an owned binding cannot be initialized from a sigil borrow" {
+    // The live double free this rule closes, in its smallest form. Measured
+    // at `b61a107` BEFORE the rule existed: `cell check` exit 0, the emitted C
+    // carrying TWO `cell_slice_free` calls for one buffer, and running it
+    // under AddressSanitizer `attempting double-free` at exit 134.
+    try expectDiagnostics(prelude ++
+        \\pub fn main() {
+        \\    var owned buf = Buffer { data: [], len: 0 }
+        \\    let owned e = &buf
+        \\    grow(exclusive buf, 1)
+        \\}
+    ,
+        \\t.cell:11:19: error: cannot bind a borrow of 'buf' to the 'owned' binding 'e': a borrow does not confer ownership
+        \\t.cell:11:19: note: R18: an 'owned' binding is destroyed at the end of its scope (R16), so binding one to a borrow frees the lender's value twice; write 'let shared e' or 'let exclusive e' to hold the borrow
+        \\
+    );
+}
+
+test "R18: every borrow spelling reaches the same verdict, including the two that did not crash" {
+    // THE POINT OF THE RULE. `examples/borrows.cell` states that the sigil and
+    // keyword spellings are the same construct, and before this rule they were
+    // not treated as one: `&buf` and `&mut buf` were exit-134 double frees
+    // while `shared buf` and `exclusive buf` silently MOVED the lender under a
+    // written `shared` prefix and exited 0. A fix that left them split would
+    // be wrong even where the split is safe-versus-safe, so the table asserts
+    // one verdict rather than two.
+    //
+    // The binding prefix is varied too, because R1 makes an omitted annotation
+    // `owned`: `let e = &buf` is the same program as `let owned e = &buf` and
+    // was the same crash.
+    const prefixes = [_][]const u8{ "let owned", "let", "var owned", "var" };
+    const spellings = [_][]const u8{
+        "&buf",
+        "&mut buf",
+        "&var buf",
+        "&exclusive buf",
+        "shared buf",
+        "exclusive buf",
+        "shared &buf",
+        "exclusive &buf",
+    };
+    for (prefixes) |prefix| {
+        for (spellings) |spelling| {
+            var src_buf: [1024]u8 = undefined;
+            const src = try std.fmt.bufPrint(&src_buf,
+                \\{s}pub fn main() {{
+                \\    var owned buf = Buffer {{ data: [], len: 0 }}
+                \\    {s} e = {s}
+                \\}}
+            , .{ prelude, prefix, spelling });
+
+            var h: Harness = .init();
+            defer h.deinit();
+            var out_buf: [4096]u8 = undefined;
+            const out = try h.run(src, &out_buf, false);
+            if (std.mem.indexOf(u8, out, "a borrow does not confer ownership") == null) {
+                std.debug.print(
+                    "\n`{s} e = {s}` was NOT refused by R18. Diagnostics:\n{s}\n",
+                    .{ prefix, spelling, out },
+                );
+                return error.SpellingNotRefused;
+            }
+        }
+    }
+}
+
+test "R18 refuses a borrow reached through a branch and a callee that returns one" {
+    // `borrowSource` descends into both arms of an `if` and both sides of a
+    // `match`, and reads a callee's declared return type. Neither is a
+    // spelling anyone would think to enumerate, and both are refused because
+    // the question is asked of the classifier rather than of a list.
+    //
+    // Two things this test pins that are not the rule itself. The error is
+    // reported at the BRANCH that supplies the borrow (column 31, the `&buf`
+    // inside the `then` arm) rather than at the `if`, because the diagnostic
+    // carries the classified sub-expression's span. And R8 fires first on the
+    // declaration `-> shared Buffer`: a function returning a borrow cannot be
+    // declared in this language at all, so `borrowSource`'s call arm is
+    // reachable only in a module R8 has already refused. That is stated here
+    // rather than left to look like coverage the rule does not have.
+    try expectDiagnostics(prelude ++
+        \\pub fn lend(shared b: Buffer) -> shared Buffer;
+        \\pub fn main() {
+        \\    var copy c = 0
+        \\    var owned buf = Buffer { data: [], len: 0 }
+        \\    let owned e = if c == 0 { &buf } else { &buf }
+        \\    let owned f = lend(shared buf)
+        \\}
+    ,
+        \\t.cell:9:1: error: cannot return a shared borrow: Cell has no lifetime annotations, so the borrow cannot be proven to outlive the call
+        \\t.cell:9:1: note: return an 'owned' or 'arc' value instead
+        \\t.cell:13:31: error: cannot bind a borrow of 'buf' to the 'owned' binding 'e': a borrow does not confer ownership
+        \\t.cell:13:31: note: R18: an 'owned' binding is destroyed at the end of its scope (R16), so binding one to a borrow frees the lender's value twice; write 'let shared e' or 'let exclusive e' to hold the borrow
+        \\t.cell:14:19: error: cannot bind the borrow returned by 'lend' to the 'owned' binding 'f': a borrow does not confer ownership
+        \\t.cell:14:19: note: R18: an 'owned' binding is destroyed at the end of its scope (R16), so binding one to a borrow frees the lender's value twice; write 'let shared f' or 'let exclusive f' to hold the borrow
+        \\
+    );
+}
+
+test "R18 leaves an owned binding of a value alone" {
+    // The neighbours the rule must not eat, and the reason it is asked only of
+    // an `owned` binding whose initializer classifies as a BORROW: a literal,
+    // a fresh aggregate, a call returning a value, and a move of an owned
+    // place are all still legal, and so are the `shared` and `exclusive`
+    // bindings that hold a borrow properly.
+    try expectAccepted(prelude ++
+        \\pub fn make() -> Buffer;
+        \\pub fn main() {
+        \\    let owned a = Buffer { data: [], len: 0 }
+        \\    let owned b = make()
+        \\    let owned c = b
+        \\    var owned buf = Buffer { data: [], len: 0 }
+        \\    let shared s = &buf
+        \\    let n = read(shared buf)
+        \\    let m = s.len
         \\}
     );
 }
@@ -5218,14 +5437,21 @@ test "R14: a var-bound exclusive borrow may not be retargeted" {
 
 test "R14's rebinding clause reads the loan, not only the annotation" {
     // `checkLetInit` creates a named loan whenever the initializer is a `&`
-    // form, REGARDLESS of the annotation, so a binding written `var owned`
-    // can hold one. Asking only about the declared mode would be exactly the
-    // enumeration this file keeps being caught by; `holdsBorrow` asks both.
+    // form, REGARDLESS of the annotation, so a binding whose declared mode is
+    // not a borrow can hold one. Asking only about the declared mode would be
+    // exactly the enumeration this file keeps being caught by; `holdsBorrow`
+    // asks both.
+    //
+    // The witness is `var copy` rather than the `var owned` this test used to
+    // write, because R18 now refuses `var owned e = &mut buf` at the `let`
+    // and no loan is created for it. `copy` still reaches the loan branch, so
+    // the clause under test still has a live case; the `owned` spelling is
+    // pinned by the R18 test below instead. Both halves stay covered.
     try expectDiagnostics(prelude ++
         \\pub fn main() {
         \\    let owned buf = Buffer { data: [], len: 0 }
         \\    let owned other = Buffer { data: [], len: 0 }
-        \\    var owned e = &mut buf
+        \\    var copy e = &mut buf
         \\    e = &mut other
         \\}
     ,

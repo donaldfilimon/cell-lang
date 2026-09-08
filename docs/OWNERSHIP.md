@@ -24,7 +24,9 @@ C backend, with the gaps R11 itself names; **R10**'s move-into-`arc` is not
 implemented in the checker, which is why one of those gaps exists. R10's other
 direction, an `arc` value made UNIQUE, IS implemented, at six consumption
 sites and with a total verdict that refuses a source it cannot classify. **R2.a**
-(a move inside a loop) landed with `while`. **R2.b** (an `owned` position is
+(a move inside a loop) landed with `while`. **R18** (an `owned` binding may not
+be initialized from a borrow) landed after a live double free that every borrow
+SPELLING reached differently. **R2.b** (an `owned` position is
 asked of the EXPRESSION, and a value that may yield a place on some paths is
 refused rather than read) landed after four live double frees; it is the
 general rule R10's first axis was a special case of. Stem pairing has
@@ -263,6 +265,80 @@ pub fn steal(exclusive b: Buffer) -> Buffer {
 The same applies to `shared`, with `shared borrow` in the message. Returning a
 field of a borrow (`return b.data`) is the same error, reported on the field
 path. `ast.rootName(&expr)` gives the binding to name in the message.
+
+R3 is the move direction. **R18 below is the same principle read the other
+way**: a borrow cannot hand ownership to a binding either.
+
+### R18. An `owned` binding may not be initialized from a borrow
+
+An `owned` binding takes ownership and is destroyed at the end of its scope
+(R16). A borrow does not confer ownership, so the two cannot be combined: the
+lender is still live, still owns its value, and is still dropped, and the
+binding is dropped as well.
+
+```cell
+pub fn fresh() -> [Int];
+
+pub fn main() {
+    var owned list = fresh()
+    let owned xs = &list
+}
+```
+
+> `err: cannot bind a borrow of 'list' to the 'owned' binding 'xs': a borrow does not confer ownership`
+>
+> `note: R18: an 'owned' binding is destroyed at the end of its scope (R16), so binding one to a borrow frees the lender's value twice; write 'let shared xs' or 'let exclusive xs' to hold the borrow`
+
+**This was a live double free, and the numbering is late because the rule is.**
+Measured at `b61a107`: `cell check` exit 0, the emitted C carrying
+`cell_slice_free(&xs)` and `cell_slice_free(&list)` for one buffer,
+`cc -fsanitize=address` exit 0, and running it
+`AddressSanitizer: attempting double-free` at **exit 134**.
+
+**Asked of the whole initializer, and of every spelling.** R13.0 says the sigil
+and keyword borrows are spellings of one construct, and before this rule they
+got three different answers:
+
+| `let owned xs = ...` | drops emitted | result |
+|---|---|---|
+| `&list`, `&mut list`, `&var list`, `&exclusive list` | 2 | exit 134, double free |
+| `shared &list`, `exclusive &list` | 2 | exit 134, double free |
+| `let xs = &list` (R1 default) | 2 | exit 134, double free |
+| `shared list`, `exclusive list` | 1 | exit 0, and the lender silently MOVED |
+
+`&list` and `shared list` emitted byte-identical C, so the initializer lowering
+was never the defect; the number of scheduled drops was. `checkLetInit` opened
+with a branch matching `refKind` -- the sigils -- that created a loan without
+reading the binding's ownership, and returned before the `owned` move could
+run. The keyword spellings missed that branch, fell through, and moved the
+lender out from under a written `shared` prefix, which is the same defect
+wearing exit 0.
+
+The last two rows are why the rule refuses **all** of them. A fix that left
+them split would be wrong even where the split is safe-versus-safe: the
+language says they are one construct.
+
+**Enforced by one question, not a list.** `src/cell/borrowck.zig` asks
+`borrowSource` -- the classifier R14's rebinding clause already uses -- once,
+above every branch that could answer differently. Its switch is exhaustive with
+no `else`, so a new expression kind fails to compile rather than falling
+through permissively, and a new borrow spelling is refused without a second
+edit at this site. It also reaches shapes no enumeration would have listed: a
+borrow supplied by one arm of an `if` or a `match`, and a callee whose declared
+return type is a borrow.
+
+**Not covered, stated rather than left to be found.** `.unresolved` is not
+refused at this position, because R2.b's `ownedMoveSource` is total at the same
+site and already reports the useful half of that set. What is left is a callee
+this checker cannot resolve, which typecheck reports as an unknown name; an
+indirect call returning a borrow would slip through, and this grammar has no
+function values to write one with. The rule is also scoped to `owned`: an `arc`
+or `copy` binding initialized from a borrow is R10's and R12's question, and
+neither is asked here.
+
+`examples/rejected/owned_from_borrow.cell` is the corpus form and lists every
+spelling. `examples/let_binding_modes.cell` holds the legal neighbours the rule
+must not eat: `let shared s = &buf` and `let exclusive e = &mut buf`.
 
 ### R2.a. A move inside a loop is a use-after-move on the next iteration
 
@@ -1142,9 +1218,15 @@ documentation rather than implying `copy` is safe.
 **R13.0 -- the borrow sigils are spellings, not annotations.** `&x` spells
 `shared x`; `&mut x`, `&var x` and `&exclusive x` all spell `exclusive x`.
 `refKind` normalizes every one of them to a `LoanKind` before any rule runs, so
-none of R1-R17 has a case for them and R15 compares a sigil-derived mode
+none of R1-R18 has a case for them and R15 compares a sigil-derived mode
 against a parameter exactly as it compares a written keyword. `&var` was
 admitted from the CELL v2.0 surface and required no change to this checker.
+
+**R18 is what this clause costs when a rule forgets it.** `checkLetInit`'s
+first branch keyed on `refKind`, which is the sigil half only, so the two
+spellings this clause calls identical got different answers -- one an exit-134
+double free, the other a silent move. R18 keeps the clause true by asking
+`borrowSource` rather than switching on `ref_shared`/`ref_exclusive` itself.
 
 
 1. A parameter may be annotated before the name (`shared a: Int`) or on the
@@ -1246,12 +1328,18 @@ is refused too.
 
 "Holds a borrow" is asked TWO ways, because neither alone is enough. The
 declared annotation catches `var exclusive e = &mut a`. A scan for a named loan
-whose holder is this binding's name catches `var owned e = &mut a`, which
-`checkLetInit` also turns into a named loan: it creates one whenever the
-initializer is a `&` form, regardless of the annotation. The scan is by name,
-so a shadowed name can match a loan that is not this binding's; that direction
-only ever refuses an assignment, never permits one.
+whose holder is this binding's name catches a binding whose annotation is not a
+borrow but which `checkLetInit` still turned into a named loan: it creates one
+whenever the initializer is a `&` form, regardless of the annotation. The scan
+is by name, so a shadowed name can match a loan that is not this binding's;
+that direction only ever refuses an assignment, never permits one.
 `examples/rejected/borrow_retarget.cell` is the corpus form.
+
+The witness for the second way used to be `var owned e = &mut a`. **R18 now
+refuses that at the `let` itself**, so no loan is created for it and the scan
+cannot see one; `var copy c = &mut a` and `var arc c = &mut a` still reach the
+loan branch, so the scan is still load-bearing and the test moved onto the
+`copy` spelling.
 
 There is still no check that the target is *assignable* at all. Assigning to a
 literal or a call result is accepted and emits nonsense C:
@@ -1338,7 +1426,9 @@ therefore **not complete**: what changed is that Cell no longer leaks
 The model has no runtime ownership tracking, no sentinel value, and no
 poisoning. Every double-free and use-after-free guarantee this document
 describes rests entirely on the static rules above being implemented and
-correct. **Until the checker exists, Cell provides no memory-safety guarantee
+correct. R2 is not the only rule carrying that weight: R2.b, R10's unique
+clause and **R18** each closed a measured double free of their own, and each
+one was a rule R2 was assumed to cover and did not. **Until the checker exists, Cell provides no memory-safety guarantee
 of any kind**, and no document in this repository should say otherwise.
 
 ---

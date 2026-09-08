@@ -5147,6 +5147,14 @@ test "a by-value binding of an owning header keeps the loud reference spelling" 
     // spelling this backend already had, and it is loud: `cell_string_free(&s)`
     // against a `cell_string_t **` is a `-Werror` error, which the gate's
     // sanitizer stage compiles at.
+    //
+    // NOTE, added with OWNERSHIP.md R18: the two `let owned ... = &mut ...`
+    // lines below no longer pass `cell check` at all, because an `owned`
+    // binding may not be initialized from a borrow. This test still emits them
+    // because `emitForTest` runs the parser and this backend WITHOUT borrowck,
+    // which is the point: the guard is defence in depth behind a front-end
+    // refusal, and it must not be deleted on the strength of that refusal.
+    // `var copy c = &mut other`, the third case, is still a legal program.
     var e = try emitSource(
         \\pub fn make_text() -> String;
         \\pub fn fresh() -> [Int];
