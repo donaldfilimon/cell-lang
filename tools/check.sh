@@ -22,7 +22,15 @@
 #                       renders struct types at each use and so never examined
 #                       a declared-but-unused one. Neither backend alone could
 #                       have found that.
-#   5. execution        emitted code is compiled, linked against the real
+#   5. mlir lowering    every example whose MLIR emit SUCCEEDS must actually
+#                       lower. Stage 4 compares VERDICTS, accept or refuse, and
+#                       a verdict says nothing about whether the accepted text
+#                       is well formed. examples/borrows.cell emitted a module
+#                       that declared `@cell_look(%llvm.ptr)` and then called it
+#                       with an `!llvm.struct<(i64)>`, so mlir-opt refused it
+#                       outright, and this gate was green the whole time
+#                       because stage 6 runs only three programs.
+#   6. execution        emitted code is compiled, linked against the real
 #                       runtime, RUN, and its answer checked. Every backend
 #                       defect found in this repo that mattered was invisible
 #                       in the IR and visible only here.
@@ -137,7 +145,53 @@ for f in examples/*.cell examples/pairing/*.cell; do
 done
 [ $disagreements -eq 0 ] && pass "llvm and mlir agree on every example"
 
-# ------------------------------------------------------------- 5. execution --
+# --------------------------------------------------------- 5. mlir lowering --
+# A VERDICT is not a lowering. Stage 4 asks each backend only whether it
+# accepts a program; it never asks mlir-opt whether the accepted text means
+# anything. examples/borrows.cell spent its whole life on the accepted side of
+# that line while emitting a module mlir-opt refused, because stage 6 lowers
+# three programs and borrows.cell is not one of them.
+#
+# The pipeline is NOT written out here. The emitter writes its own into every
+# file it produces, as a `// lower with: mlir-opt ...` comment, so this stage
+# reads it back from the file. A second copy in this script could drift from
+# the backend, and then this stage would be pinning a pipeline nobody ships.
+# When the line is absent the stage FAILS rather than falling back to a
+# remembered default, for the same reason.
+printf '\n== mlir lowering ==\n'
+if [ ! -x "$LLVM_BIN/mlir-opt" ]; then
+    skip "mlir lowering of every example (mlir-opt not found in $LLVM_BIN)"
+else
+    lower_before=$fails
+    for f in examples/*.cell examples/pairing/*.cell; do
+        n=$(basename "$f" .cell)
+        # An emit REFUSAL is designed scalar-first behaviour and stage 4 already
+        # pins it. A CRASH is not, so the two are told apart the way
+        # .claude/skills/run-cell-lang/driver.sh tells them apart, and only what
+        # emitted is lowered.
+        if ! $CELL emit --target=mlir "$f" > "$TMP/low_$n.mlir" 2> "$TMP/low_$n.emit"; then
+            grep -q 'cannot lower' "$TMP/low_$n.emit" || {
+                fail "mlir emit $f (not a 'cannot lower' refusal)"
+                sed -n '1,4p' "$TMP/low_$n.emit"
+            }
+            continue
+        fi
+        pipeline=$(sed -n 's|^// lower with: mlir-opt ||p' "$TMP/low_$n.mlir" | head -1)
+        if [ -z "$pipeline" ]; then
+            fail "$f: emitted MLIR carries no '// lower with:' line to read the pipeline from"
+            continue
+        fi
+        # Unquoted on purpose: $pipeline is a list of flags and must split.
+        "$LLVM_BIN/mlir-opt" "$TMP/low_$n.mlir" $pipeline -o "$TMP/low_$n.out" \
+            > /dev/null 2> "$TMP/low_$n.err" || {
+            fail "mlir-opt $f"
+            sed -n '1,4p' "$TMP/low_$n.err"
+        }
+    done
+    [ $fails -eq $lower_before ] && pass "every emitted MLIR module lowers"
+fi
+
+# ------------------------------------------------------------- 6. execution --
 # Emit, compile, link against the real runtime, RUN, check the answer.
 printf '\n== execution ==\n'
 

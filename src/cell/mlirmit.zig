@@ -704,6 +704,93 @@ const Emitter = struct {
         }
     }
 
+    /// The slot an argument expression names, when it names one.
+    ///
+    /// `.unary` with `ref_shared` or `ref_exclusive` is transparent here, the
+    /// same way `emitUnary` forwards those two ops straight to their operand
+    /// and the same way `llvmemit.zig` unwraps them. That is not tidiness: the
+    /// five borrow spellings this language defines as identical do NOT reach
+    /// codegen as one shape. `look(shared buf)` arrives as `.ref` because
+    /// `hir.lower` consumes the written prefix, while `look(&buf)`,
+    /// `grow(&mut buf)`, `grow(&var buf)` and `grow(&exclusive buf)` arrive
+    /// wrapped. A caller that matched only the bare `.ref` would pass the
+    /// caller's object for one spelling and a copy for the other four, which is
+    /// exactly the divergence `examples/borrows.cell` exists to forbid.
+    fn placeSlot(self: *Emitter, e: *const hir.Expr) ?u32 {
+        var current = e;
+        while (true) {
+            switch (current.kind) {
+                .unary => |u| {
+                    if (u.op != .ref_shared and u.op != .ref_exclusive) return null;
+                    current = u.operand;
+                },
+                .ref => |slot| {
+                    if (slot >= self.slots.items.len) return null;
+                    // A borrowed parameter's slot holds the caller's ADDRESS,
+                    // not the object, so its slot name is not the address of an
+                    // aggregate. `emitExpr` already returns that pointer with
+                    // `ptr_to` set, and the caller handles it before asking.
+                    if (self.slot_ptr_to.items[slot] != null) return null;
+                    // A scalar lives in a memref.alloca, whose name is a memref
+                    // value rather than an !llvm.ptr.
+                    if (!self.slot_is_llvm.items[slot]) return null;
+                    return slot;
+                },
+                else => return null,
+            }
+        }
+    }
+
+    /// Emit one call argument, already shaped for the parameter it will fill.
+    /// `want` is null for a callee with no signature, where there is nothing to
+    /// shape it to and the natural value is all there is.
+    fn emitArg(self: *Emitter, arg: *const hir.Expr, want: ?[]const u8) EmitError!Value {
+        // A place passed to a pointer parameter is answered BEFORE the value is
+        // emitted, because emitting it would `llvm.load` an aggregate nothing
+        // then reads. Its slot IS the object's address, an `llvm.alloca`, which
+        // is what the C backend spells `&buf`, and passing it is what keeps an
+        // `exclusive` borrow writing through to the caller's object rather than
+        // to a copy the callee's mutations die with.
+        if (want) |w| {
+            if (std.mem.eql(u8, w, "!llvm.ptr")) {
+                if (self.placeSlot(arg)) |slot| {
+                    return .{ .text = self.slots.items[slot], .ty = "!llvm.ptr" };
+                }
+            }
+        }
+
+        const v = try self.emitExpr(arg);
+        if (v.isNone()) return v;
+        const w = want orelse return v;
+        if (std.mem.eql(u8, v.ty, w)) return v;
+
+        if (std.mem.eql(u8, w, "!llvm.ptr")) {
+            // Already an address: a borrowed aggregate forwarded onwards.
+            if (v.ptr_to != null) return .{ .text = v.text, .ty = "!llvm.ptr", .ptr_to = v.ptr_to };
+
+            // A temporary with no home of its own. Give it one and hand over
+            // its address. Nothing can observe a write back through it, so the
+            // copy costs no correctness the way it would for a place.
+            const one = try self.nextSsa();
+            try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
+            const tmp = try self.nextSsa();
+            try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ tmp, one, v.ty });
+            try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ v.text, tmp, v.ty });
+            return .{ .text = tmp, .ty = "!llvm.ptr" };
+        }
+
+        // Any other mismatch. No construct produces one today, so rather than
+        // emit a reinterpreting spill nobody has ever measured, say so at the
+        // span: refusing is this backend's contract, and a silent mismatch is
+        // exactly what produced the defect this function was written to fix.
+        try self.unsupported(arg.span, try std.fmt.allocPrint(
+            self.arena,
+            "an argument of type {s} cannot lower to a parameter declared {s}",
+            .{ v.ty, w },
+        ));
+        return Value.none;
+    }
+
     fn emitCall(
         self: *Emitter,
         e: *const hir.Expr,
@@ -716,8 +803,22 @@ const Emitter = struct {
         };
 
         var vals = try self.arena.alloc(Value, args.len);
+        const modes = switch (e.kind) {
+            .call => |c| c.modes,
+            else => &[_]hir.ArgMode{},
+        };
         for (args, 0..) |a, i| {
-            vals[i] = try self.emitExpr(&a);
+            // Place the argument the way the CALLEE's parameter is DECLARED,
+            // not the way the value happened to be computed. `paramType` is the
+            // same function that printed the declaration, so the two can no
+            // longer disagree; when this did not exist, a `shared Buffer`
+            // parameter was declared `!llvm.ptr` and then called with an
+            // `!llvm.struct<(i64)>`, and mlir-opt refused the module.
+            const want: ?[]const u8 = if (i < modes.len)
+                self.paramType(a.ty, modes[i].param)
+            else
+                null;
+            vals[i] = try self.emitArg(&a, want);
             if (vals[i].isNone()) return Value.none;
         }
 
@@ -1447,6 +1548,66 @@ test "a borrowed struct is a pointer here too, matching the C backend" {
     try std.testing.expect(!e.bag.hasErrors());
     try expectContains(e.text, "func.func @cell_read(%arg0: !llvm.ptr)");
     try expectContains(e.text, "llvm.getelementptr");
+}
+
+test "a borrowed struct is a pointer at the CALL SITE too, in all five spellings" {
+    // The test above pinned the DECLARATION and stopped there, so the call site
+    // went on loading the pointee and passing it by value. Every emitted call
+    // contradicted its own callee, mlir-opt refused the module outright with
+    // "'func.call' op operand type mismatch", and examples/borrows.cell shipped
+    // that way behind a green gate: tools/check.sh compared emit VERDICTS, and
+    // an accepted module that cannot lower is still an accepted module. The
+    // LLVM backend got the same program right, which is how the divergence was
+    // found, because the two backends share hir.
+    //
+    // All five spellings are asserted, not one. `look(shared buf)` reaches
+    // emitCall as .ref, while `look(&buf)` and the three unique-borrow sigils
+    // reach it wrapped in .unary{ref_shared|ref_exclusive}, which emitUnary
+    // forwards straight through. A fix that matched only the bare .ref would
+    // pass the address for the keyword and a lost-mutation COPY for the sigils,
+    // and examples/borrows.cell exists precisely to prove the five identical.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn look(shared b: Buffer) { }
+        \\pub fn grow(exclusive b: Buffer) { }
+        \\pub fn main() {
+        \\  var owned buf = Buffer { len: 0 }
+        \\  look(shared buf)
+        \\  look(&buf)
+        \\  grow(exclusive buf)
+        \\  grow(&mut buf)
+        \\  grow(&var buf)
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "func.func @cell_look(%arg0: !llvm.ptr)");
+    try expectContains(e.text, "func.func @cell_grow(%arg0: !llvm.ptr)");
+
+    // The exact text the defect produced, pinned so it cannot come back.
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "(!llvm.struct<(i64)>) -> ()") == null);
+
+    // Every call passes the SAME operand: the one slot `buf` lives in. This is
+    // the assertion that catches a fix which handles some spellings and not
+    // others, which a bare "mlir-opt stopped complaining" never would.
+    const slot = "%0";
+    var calls: usize = 0;
+    var it = std.mem.splitScalar(u8, e.text, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " ");
+        if (!std.mem.startsWith(u8, trimmed, "call @cell_")) continue;
+        calls += 1;
+        const want = try std.fmt.allocPrint(
+            e.arena.allocator(),
+            "({s}) : (!llvm.ptr) -> ()",
+            .{slot},
+        );
+        if (std.mem.indexOf(u8, trimmed, want) == null) {
+            std.debug.print("call does not pass {s} as !llvm.ptr:\n{s}\nin:\n{s}\n", .{ slot, trimmed, e.text });
+            return error.BorrowArgumentNotAPointer;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), calls);
 }
 
 test "an unused struct with an unrepresentable field is still refused" {
