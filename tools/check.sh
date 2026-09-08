@@ -134,15 +134,51 @@
 #   * macOS's `leaks` tool is not always installed (CI, a minimal machine), and
 #     the leaks stage below SKIPS loudly rather than passing silently when it
 #     is absent, for the same reason as the MLIR tools above.
-#   * `leaks -atExit` can UNDER-count by exactly one instance for a program
-#     whose leaked allocation is still referenced by a stale CPU register or
-#     stack slot at exit, a real false negative and not this script's bug (one
-#     agent measured `leaks` reporting 0 for a case that genuinely leaked one
-#     reference). The counts pinned below were re-measured 8 times each and
-#     were IDENTICAL every time, so they are stable-but-possibly-undercounting
-#     numbers, not flaky ones; if a future re-measurement is not reproducible
-#     run to run, say so in the report rather than pinning whichever number
-#     came up first.
+#   * `leaks -atExit` UNDER-counts by exactly ONE ITERATION'S ALLOCATIONS for
+#     a program whose most recent allocation is still referenced by a stale CPU
+#     register or stack slot at exit. A real false negative, not this script's
+#     bug. Note the unit: it is one iteration, which is THREE allocations in
+#     these fixtures, not the number three and not "one instance". A fixture
+#     that allocates a different amount per iteration will be off by that
+#     amount instead.
+#
+#     PROVEN 2026-09-08, by two measurements rather than by argument, and the
+#     first one falsified the competing explanation that used to live in
+#     examples/leaks/block_scoped_local.cell (that the last iteration's box was
+#     released by a function-scoped drop):
+#
+#       1. An interposed malloc counter, via a `-include` header redefining
+#          malloc/free around the emitted C and runtime, reports
+#          ALLOC=3000 FREE=0 LIVE=3000 for param_never_released,
+#          struct_arc_field and block_scoped_local, and ALLOC=3003 FREE=3
+#          LIVE=3000 for reassigned_var. Two of those three emit ZERO release
+#          calls of any kind, so nothing is released and no drop can explain a
+#          count that is short.
+#       2. Re-linking the same emitted C behind a stack-clobbering epilogue (a
+#          recursive function memset-ing a 4 KB volatile buffer, called after
+#          the program) makes `leaks` report the true 3000.
+#
+#     SO ALL FOUR FIXTURES LEAK EXACTLY 3000 UNITS. The constants below differ
+#     only in what `leaks` can SEE, and a reader must not conclude that
+#     struct_arc_field leaks less than reassigned_var. reassigned_var reads the
+#     full 3000 only because it allocates 3003 and frees the most recent 3,
+#     which is precisely the group the other three still hold a stale reference
+#     to.
+#
+#     THE HAZARD THIS CREATES, and it is the reason all of the above is written
+#     down: the artifact is STACK-LAYOUT-SENSITIVE. A codegen change that adds
+#     or removes a local in the emitted C can flip a constant 2997 -> 3000 or
+#     3000 -> 2997 without changing what the program leaks. This stage would
+#     then report a RISE ("regression") or a DROP ("good, re-pin"), and the
+#     second is the honesty hazard, because someone re-pins believing a leak
+#     closed. RULE: a delta of exactly one iteration's allocations is this
+#     artifact and must be confirmed with the malloc counter before any
+#     re-pinning. Any other delta is semantic and should be chased.
+#
+#     The counts pinned below were re-measured 8 times each and were IDENTICAL
+#     every time, so they are stable-but-undercounting numbers, not flaky ones;
+#     if a future re-measurement is not reproducible run to run, say so in the
+#     report rather than pinning whichever number came up first.
 
 set -u
 
@@ -160,10 +196,13 @@ trap 'rm -rf "$TMP"' EXIT
 # used a different string literal in one case, which changes byte totals but
 # not leak counts): re-measured fresh so the constant and the fixture that
 # produces it live in the same place. Re-measured 8 times each and identical
-# every time; see tools/check.sh's header trap note on `leaks -atExit`
-# under-counting by one via a stale stack/register reference, which is why
-# three of these read 999-worth of leaked units rather than the 1000 the
-# source loop actually runs.
+# every time; see this script's header trap note on `leaks -atExit`
+# under-counting by ONE ITERATION'S ALLOCATIONS via a stale stack/register
+# reference, which is why three of these read 2997 rather than the 3000 that
+# 1000 iterations at three allocations each actually leak. All four fixtures
+# leak exactly 3000; only visibility differs. Do NOT re-pin a constant that
+# moved by exactly 3 without confirming with the malloc counter that header
+# note describes: that delta is the measurement artifact, not a closed leak.
 #
 # When one of these changes because a gap in docs/OWNERSHIP.md R11 closed:
 # update the constant AND that document's row, and cite the new commit here.
