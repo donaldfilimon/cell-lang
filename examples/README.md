@@ -215,6 +215,13 @@ R14 files are rejected, and so is call-site mismatch (R15) since `67529a9`:
 the parser now keeps the argument ownership prefix and borrowck compares it
 against the parameter.
 
+`owned_from_borrow.cell` carries R18, an `owned` binding initialized from a
+borrow, and it is one file rather than nine because the point is that the nine
+spellings agree. Before R18 they did not: six were AddressSanitizer double
+frees at exit 134 and two exited 0 while silently moving the lender under a
+written `shared` prefix. A refused program emits no C, so the ASan stage cannot
+pin this either; the `EXPECT` line is what does.
+
 Two files carry R10, and they differ on the axis that made the rule escape
 twice, so keep both:
 
