@@ -118,18 +118,19 @@ lowering, execution and resource cleanup are separate capabilities. See
 [completion program](docs/superpowers/plans/2026-09-08-full-language-completion.md)
 for the approved parity and release target.
 
-`cell check` typechecks and borrow-checks. `cell emit` produces C that `cc -c`
-accepts for `examples/hello.cell`, `examples/control_flow.cell`, and
-`examples/ownership.cell`; `examples/hello.cell` linked against
-`runtime/cell_rt.c` prints `42`. `examples/arc.cell` compiles and runs too,
-linked against `examples/arc_host.c`, and prints a live refcount.
+`cell check` typechecks and borrow-checks. The retained fixture contracts say
+that C emission compiles for `examples/hello.cell`,
+`examples/control_flow.cell`, and `examples/ownership.cell`; the recorded
+execution expectations are `42` for `examples/hello.cell` and a live refcount
+for `examples/arc.cell` linked with `examples/arc_host.c`. A current
+qualification report, rather than these present source descriptions, is the
+evidence that those contracts pass on a particular revision and machine.
 
 `cell emit --target=llvm` and `cell emit --target=mlir` produce textual LLVM IR
-and MLIR by way of a typed IR in `src/cell/hir.zig`. Both are verified by
-**running** their output, not by reading it: `examples/backends.cell` compiles,
-links against the runtime and prints `24` through all three backends, and the
-LLVM path also builds `examples/hello.cell` into a native executable that
-prints `42`.
+and MLIR by way of a typed IR in `src/cell/hir.zig`. Their retained execution
+contracts expect `examples/backends.cell` to print `24` through all three
+backends and `examples/hello.cell` to print `42`. The gate tests those outputs;
+this paragraph does not claim a fresh run.
 
 Both newer backends are deliberately **scalar-first**, with selected aggregate
 operations. Support depends on ownership, expression position and ABI placement,
@@ -161,9 +162,9 @@ Still designed and not implemented: generics, `Result<T,E>`, and enum
 payloads. `.cell`/`.cel` modules pair with
 `.body`/`.bod` by stem. See `docs/SPEC.md` section 12 and `docs/OWNERSHIP.md`.
 
-**Loops exist.** `while` is a keyword, with `break` and `continue`;
-`examples/loops.cell` runs through all three backends and prints `55` from
-each. An earlier version of this section said the opposite and cited a rejected
+**Loops exist.** `while` is a keyword, with `break` and `continue`; the retained
+`examples/loops.cell` contract expects `55` from all three backends. An earlier
+version of this section said the opposite and cited a rejected
 example that no longer exists, which is the kind of claim this project's own
 status-honesty standard exists to prevent. Loops also brought their own
 ownership rule, R2.a, for a move inside a loop body. `for` and `loop` are not

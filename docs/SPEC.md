@@ -487,12 +487,13 @@ and the block that followed was a separate expression statement, evaluated and
 discarded. A program written in the belief that Cell has loops compiled and did
 nothing.
 
-Measured now: `cell check examples/rejected/while_is_not_a_loop.cell` reports
-`error: expected expression` with the caret on `while`, and exits 1. That file
-records the whole sequence, including the middle state where it was rejected by
-name resolution rather than by this rule.
+The former rejection fixture was named
+`examples/rejected/while_is_not_a_loop.cell`; while loops have since landed and
+that path no longer exists. Its retained accepted successor is
+[`examples/while_is_now_a_loop.cell`](../examples/while_is_now_a_loop.cell),
+which records the history and current execution contract.
 
-**Reserving a word does not implement it.** The measurement above is historical:
+**Reserving a word does not implement it.** The example above is historical:
 `while`, `break` and `continue` now have parser and execution paths (section
 7.6). Other reserved words require their own grammar and semantic work; see
 [FEATURES.md](FEATURES.md) and the approved completion program.
