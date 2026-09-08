@@ -1055,6 +1055,24 @@ pub const Checker = struct {
         // implemented, so the scrutinee is read, not moved.
         try self.checkExpr(m.scrutinee);
 
+        // The scrutinee's STRUCT TYPE, carried to an arm binding below. Not
+        // R7, and it does not touch ownership: it is only what
+        // `placeOwnership` needs one level down, so a field of an arm binding
+        // has an annotation to read at all.
+        //
+        // Same reason as the borrow propagation in `checkLet`, found the same
+        // way. R9's verdict is total, so an unreadable annotation REFUSES, and
+        // an arm binding declared with `struct_name = null` made
+        // `use_bytes(&mut x.data)` inside `match src { x => ... }` fail with
+        // "the ownership of the field 'data' of 'x' cannot be resolved here".
+        // Resolving it can only turn `.unresolved` into a verdict read off a
+        // real annotation; it never turns silence into acceptance.
+        const scrutinee_struct: ?[]const u8 = blk: {
+            const p = try self.placeOf(m.scrutinee) orelse break :blk null;
+            const sb = self.bindingById(p.binding) orelse break :blk null;
+            break :blk self.placeStructName(sb, p.path);
+        };
+
         var entry = try self.dead.clone(self.allocator);
         defer entry.deinit(self.allocator);
         var merged = try self.dead.clone(self.allocator);
@@ -1073,7 +1091,7 @@ pub const Checker = struct {
                     .name = arm.pattern.kind.binding,
                     .ownership = .owned,
                     .mutable = false,
-                    .struct_name = null,
+                    .struct_name = scrutinee_struct,
                     .decl_span = arm.pattern.span,
                 });
             }
@@ -4724,6 +4742,43 @@ test "R9's value position is checked at BOTH sites, not only the unary one" {
     ,
         \\t.cell:11:10: error: cannot borrow 'fresh()' as exclusive: 'arc' grants shared access only
         \\t.cell:11:10: note: mutation through 'arc' needs interior mutability, which Cell does not have yet
+        \\
+    );
+}
+
+test "a match arm binding inherits the scrutinee's struct type" {
+    // Not R7, which is still unimplemented: only the struct TYPE, which is
+    // what `placeOwnership` needs one level down. An arm binding declared with
+    // no struct name made this ordinary field borrow undecidable, and R9's
+    // total verdict turns undecidable into refused. Found by probing for the
+    // same residual the `checkLet` propagation had already closed once.
+    try expectAccepted(prelude ++
+        \\pub fn use_bytes(exclusive d: [Byte]) { }
+        \\pub fn main() {
+        \\    var owned src = Buffer { data: [], len: 0 }
+        \\    match src {
+        \\        x => use_bytes(&mut x.data)
+        \\    }
+        \\}
+    );
+}
+
+test "R9 reaches an arc field through a match arm binding" {
+    // The other half of the propagation, and the reason it is not a weakening:
+    // resolving the arm binding's type turns a vague "cannot be resolved here"
+    // into R9's own verdict, read off a real annotation. Both refuse; only one
+    // says why.
+    try expectDiagnostics(prelude ++
+        \\pub struct Holder { arc h: Buffer }
+        \\pub fn main() {
+        \\    var owned src = Holder { h: Buffer { data: [], len: 0 } }
+        \\    match src {
+        \\        x => grow(&mut x.h, shared 1)
+        \\    }
+        \\}
+    ,
+        \\t.cell:13:24: error: cannot borrow 'x.h' as exclusive: 'arc' grants shared access only
+        \\t.cell:13:24: note: mutation through 'arc' needs interior mutability, which Cell does not have yet
         \\
     );
 }

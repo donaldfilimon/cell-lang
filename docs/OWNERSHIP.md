@@ -454,6 +454,16 @@ where `b` is `arc` mutates the shared value and is refused; `b = other` where
 `b` is a `var arc` REBINDS the handle, does not touch the shared value, and
 stays legal (it is R11's leak of the previous box, not R9's rule).
 
+**R9 prints its own message for a write through a MUTABLE `arc` holder only**,
+which today means a `var arc` binding. `let arc b` then `b.n = 2`, and an
+`arc n: Buffer` parameter then `n.len = 1`, are both refused too, but by R14's
+immutability check, which runs first and reports `cannot assign to immutable
+binding`. Measured, both of them. The program is refused either way and no
+mutation escapes; what varies is which rule explains it. Stating it here rather
+than letting "R9 owns writes through `arc`" be read as more than it is, since
+an overclaimed guarantee is exactly what this rule's implementation was
+answering.
+
 **The classifier is total and walks the whole chain**, the binding plus every
 field segment, and a step whose annotation cannot be read is REFUSED rather
 than permitted. That is the same discipline R10's `arcUniqueSource` had to
@@ -462,6 +472,21 @@ a permissive default, and silence is what an unenumerated form produces. One
 consequence bounds the over-refusal: a one-segment write such as
 `b.len = b.len + 1` through an `exclusive b: Buffer` asks only about the
 binding, so no struct has to resolve and the unresolved case cannot reach it.
+
+**The unresolved case is REAL and it has had to be closed twice already**, both
+times by teaching a declaration the struct type it was dropping, never by
+weakening the verdict. `let exclusive e = &mut buf` carried no struct name, so
+`&mut e.data` was undecidable; `checkLet` now propagates the referent's type
+across the borrow. A `match` arm binding carried none either, so
+`match src { x => use_bytes(&mut x.data) }` was undecidable; `checkMatch` now
+propagates the scrutinee's type to the binding (the TYPE only, not the
+ownership, so this is not R7). **Residual, stated rather than left to be
+rediscovered:** an `if` or a block yielding a struct into an UNANNOTATED `let`
+still leaves the binding with no struct type, so an exclusive borrow of one of
+its fields is refused with "cannot be resolved here". Write the type
+(`let owned s: Session = ...`) and it resolves. If a valid program starts
+failing that way, the fix is another propagation like these two, not a
+permissive default.
 
 **What was measured before this landed**, every one at `cell check` exit 0
 against `zig-out/bin/cell` built at `b3698a7`, and every emitted C accepted at
