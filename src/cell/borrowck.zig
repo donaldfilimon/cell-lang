@@ -505,6 +505,16 @@ pub const Checker = struct {
         }
         if (l.ownership == .owned) {
             if (try self.placeOf(v)) |place| {
+                // R10, the `let` position. `let owned ys: [Int] = xs` with an
+                // `arc [Int]` source emitted `cell_slice_t ys = *(...)xs.ptr;`
+                // followed by BOTH `cell_slice_free(&ys)` and the box's own
+                // glue: an AddressSanitizer double free, silent at
+                // `cell check` and clean at `-Werror`. The parameter guard
+                // did not reach here.
+                if (self.arcPlaceOwnership(place)) |_| {
+                    try self.reportArcNotUnique(place, "bind", "to", "binding", l.name);
+                    return;
+                }
                 const note = try self.msg(
                     "'{s}' was moved here by binding it to '{s}'",
                     .{ place.display, l.name },
@@ -580,6 +590,16 @@ pub const Checker = struct {
         }
 
         if (try self.placeOf(&a.value)) |src| {
+            // R10, the assignment position: the same double free as the
+            // `let` one, reached by writing into an already-declared `owned`
+            // place instead of declaring a new one.
+            if (self.placeOwnership(b, place.path) == .owned) {
+                if (self.arcPlaceOwnership(src)) |_| {
+                    try self.reportArcNotUnique(src, "assign", "to", "place", place.display);
+                    self.revive(place);
+                    return;
+                }
+            }
             const note = try self.msg(
                 "'{s}' was moved here by assigning it to '{s}'",
                 .{ src.display, place.display },
@@ -619,7 +639,29 @@ pub const Checker = struct {
             // R2's move list does not include struct or list literals, so
             // their elements are read rather than moved. See the report.
             .struct_lit => |*sl| {
-                for (sl.fields) |*f| try self.checkExpr(&f.value);
+                // R10, the struct-field position. This one is not a double
+                // free TODAY, only because this backend never drops a
+                // `record` shape, so the field's buffer is freed once by the
+                // box's glue and the record simply outlives it. It is the
+                // same illegal conversion, and it becomes a double free the
+                // moment struct drops land, so it is refused with the others
+                // rather than left as a trap for that change.
+                const def = self.structs.get(sl.name);
+                for (sl.fields) |*f| {
+                    if (def) |d| {
+                        if (findField(d, f.name)) |fld| {
+                            if (fld.ownership == .owned) {
+                                if (try self.placeOf(&f.value)) |src| {
+                                    if (self.arcPlaceOwnership(src)) |_| {
+                                        try self.reportArcNotUnique(src, "store", "in", "field", f.name);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    try self.checkExpr(&f.value);
+                }
             },
             .list_lit => |items| {
                 for (items) |*item| try self.checkExpr(item);
@@ -794,7 +836,8 @@ pub const Checker = struct {
                     // help: `cell_arc_clone` increments a refcount, and the
                     // buffer is not what the refcount governs.
                     if (self.arcPlaceOwnership(place.?)) |_| {
-                        try self.reportArcToOwned(place.?, param, callee_name);
+                        const slot_name = if (param) |p| p.name else null;
+                        try self.reportArcNotUnique(place.?, "pass", "to", "parameter", slot_name);
                         continue;
                     }
                     const note = if (callee_name) |n|
@@ -1007,38 +1050,47 @@ pub const Checker = struct {
         return if (own == .arc) own else null;
     }
 
-    /// R10's `arc` place to an `owned` parameter row, with the message that
-    /// rule already specifies. The note names the underlying gap rather than
-    /// implying the program is close to legal: the rest of R10, in particular
-    /// move-into-`arc`, is not implemented, and `docs/OWNERSHIP.md` R11
-    /// records that the C backend refuses the mirror-image conversion for the
-    /// same reason.
-    fn reportArcToOwned(
+    /// R10: an `arc` place may not be made unique. `verb` and `slot` name the
+    /// position, so every one of them reads as the same rule.
+    ///
+    /// It is a REFUSAL and not a retain, and that is not a stylistic call.
+    /// `owned [T]` and `shared [T]` lower to the SAME C type (`cell_slice_t`
+    /// by value), so the C backend's unbox compiles clean at
+    /// `-Wall -Wextra -Werror` and then `runtime/cell_rt.h` section 7 makes
+    /// the `owned` holder free the buffer while `cell_slice_drop_glue` frees
+    /// the same buffer again when the box dies. `cell_arc_clone` increments a
+    /// refcount, and the buffer is not what the refcount governs, so no
+    /// retain can fix it. Measured as an AddressSanitizer double free at the
+    /// parameter, `let` and assignment positions alike.
+    ///
+    /// The `owned String` analogue is a loud C type error instead, because
+    /// `owned String` and `shared String` do NOT share a C type. Refusing it
+    /// here too is deliberate: one rule that holds for every type beats a
+    /// rule whose enforcement depends on which two C types happen to
+    /// coincide.
+    fn reportArcNotUnique(
         self: *Checker,
         place: Place,
-        param: ?ast.Param,
-        callee_name: ?[]const u8,
+        verb: []const u8,
+        prep: []const u8,
+        slot: []const u8,
+        slot_name: ?[]const u8,
     ) Error!void {
-        const message = if (param) |p|
+        const message = if (slot_name) |n|
             try self.msg(
-                "cannot pass 'arc' value '{s}' to 'owned' parameter '{s}': ownership is shared and cannot be made unique",
-                .{ place.display, p.name },
-            )
-        else if (callee_name) |n|
-            try self.msg(
-                "cannot pass 'arc' value '{s}' to an 'owned' parameter of '{s}': ownership is shared and cannot be made unique",
-                .{ place.display, n },
+                "cannot {s} 'arc' value '{s}' {s} 'owned' {s} '{s}': ownership is shared and cannot be made unique",
+                .{ verb, place.display, prep, slot, n },
             )
         else
             try self.msg(
-                "cannot pass 'arc' value '{s}' to an 'owned' parameter: ownership is shared and cannot be made unique",
-                .{place.display},
+                "cannot {s} 'arc' value '{s}' {s} an 'owned' {s}: ownership is shared and cannot be made unique",
+                .{ verb, place.display, prep, slot },
             );
         try self.diagnostics.err(self.allocator, place.span, message);
         try self.diagnostics.note(
             self.allocator,
             place.span,
-            "an 'owned' callee frees the value, and the 'arc' box would free it again",
+            "an 'owned' holder frees the value, and the 'arc' box would free it again",
         );
     }
 
@@ -2023,7 +2075,60 @@ test "R10: an arc place may not be passed to an owned parameter" {
         \\}
     ,
         \\t.cell:4:29: error: cannot pass 'arc' value 'xs' to 'owned' parameter 'xs': ownership is shared and cannot be made unique
-        \\t.cell:4:29: note: an 'owned' callee frees the value, and the 'arc' box would free it again
+        \\t.cell:4:29: note: an 'owned' holder frees the value, and the 'arc' box would free it again
+        \\
+    );
+}
+
+test "R10: an arc place may not be bound to an owned binding" {
+    // The escape the parameter guard did not reach. `let owned ys: [Int] = xs`
+    // emitted `cell_slice_t ys = *(const cell_slice_t *)xs.ptr;` and then BOTH
+    // `cell_slice_free(&ys)` and the box's own glue freed the same buffer:
+    // AddressSanitizer double free, exit 134, while `cell check` exited 0 and
+    // `-Wall -Wextra -Werror` was silent.
+    try expectDiagnostics(
+        \\pub fn main() {
+        \\    let arc xs = [1, 2, 3]
+        \\    let owned ys: [Int] = xs
+        \\}
+    ,
+        \\t.cell:3:27: error: cannot bind 'arc' value 'xs' to 'owned' binding 'ys': ownership is shared and cannot be made unique
+        \\t.cell:3:27: note: an 'owned' holder frees the value, and the 'arc' box would free it again
+        \\
+    );
+}
+
+test "R10: an arc place may not be assigned to an owned place" {
+    // The same double free reached by writing into an already-declared
+    // `owned` place rather than declaring a new one. Found by enumerating the
+    // positions rather than by review, which is the point of enumerating.
+    try expectDiagnostics(
+        \\pub fn main() {
+        \\    let arc xs = [1, 2, 3]
+        \\    var owned ys: [Int] = [9]
+        \\    ys = xs
+        \\}
+    ,
+        \\t.cell:4:10: error: cannot assign 'arc' value 'xs' to 'owned' place 'ys': ownership is shared and cannot be made unique
+        \\t.cell:4:10: note: an 'owned' holder frees the value, and the 'arc' box would free it again
+        \\
+    );
+}
+
+test "R10: an arc place may not be stored in an owned struct field" {
+    // Not a double free today, and refused anyway: this backend never drops a
+    // `record` shape, so the field's buffer is freed once by the box's glue
+    // and the record merely outlives it. It is the same illegal conversion
+    // and becomes a double free the moment struct drops land.
+    try expectDiagnostics(
+        \\pub struct Buf { owned data: [Int]  copy len: Int }
+        \\pub fn main() {
+        \\    let arc xs = [1, 2, 3]
+        \\    let owned b = Buf { data: xs, len: 3 }
+        \\}
+    ,
+        \\t.cell:4:31: error: cannot store 'arc' value 'xs' in 'owned' field 'data': ownership is shared and cannot be made unique
+        \\t.cell:4:31: note: an 'owned' holder frees the value, and the 'arc' box would free it again
         \\
     );
 }

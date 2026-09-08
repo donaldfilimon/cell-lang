@@ -246,6 +246,24 @@ const Local = struct {
     /// `ownership` check because a parameter can itself be `owned` and
     /// must still never be dropped.
     droppable: bool,
+    /// True for a parameter alone. It is NOT the negation of `droppable`,
+    /// and the difference is a use-after-free, measured twice.
+    ///
+    /// A match-arm binding is undroppable too, and it is a bitwise copy of a
+    /// scrutinee this function may itself be about to release, so returning
+    /// it without a retain dangles. An earlier revision REMOVED this field
+    /// after deriving that a match-arm binding could not reach
+    /// `returnedArcNeedsRetain`. That derivation tested two forms of an arm
+    /// body, `b => b` and a trailing `match`, and missed the third: an arm
+    /// body may be a BLOCK, and a block's contents are statements, so
+    /// `match s { b => { return b } }` parses, passes `cell check`, and
+    /// reached the ident branch. Enumerate the forms of a construct before
+    /// asserting a property of all of them.
+    ///
+    /// `pushLocal` also clears `droppable` when it cannot positively confirm
+    /// a binding id, so `!droppable` conflates three unrelated conditions and
+    /// only one of them is R11 rule 3's exception.
+    is_param: bool = false,
 };
 
 /// Where a value-position `if`, `match`, or `block` must leave its result,
@@ -514,7 +532,7 @@ pub const Generator = struct {
         for (f.params) |p| {
             // Decision: a parameter is never dropped (see the module doc
             // comment), regardless of its own ownership annotation.
-            try self.pushLocal(p.name, try self.lowerType(&p.ty, p.ownership), p.ownership, false);
+            try self.pushLocal(p.name, try self.lowerType(&p.ty, p.ownership), p.ownership, false, true);
         }
 
         try self.writeSignature(f);
@@ -610,7 +628,7 @@ pub const Generator = struct {
                     try self.emitArgLike(&v, ty, indent);
                 }
                 try out.writeAll(";\n");
-                try self.pushLocal(l.name, ty, l.ownership, true);
+                try self.pushLocal(l.name, ty, l.ownership, true, false);
                 // -Wunused-variable is part of -Wall.
                 if (!stmtsUse(rest, l.name)) {
                     try self.writeIndent(indent);
@@ -837,24 +855,28 @@ pub const Generator = struct {
     ///     `return s->name;` and died under AddressSanitizer with a
     ///     heap-use-after-free in `cell_arc_drop`. Retaining leaks the
     ///     record's own reference instead, which is the correct side.
-    /// The exception is spelled `!droppable`, and an earlier version added a
-    /// `Local.is_param` field to spell it more precisely, on the theory that
-    /// a match-arm binding is undroppable too and must still retain. **That
-    /// field defended nothing and has been removed.** A match-arm binding
-    /// cannot reach this function at all, measured both ways: `return` is not
-    /// an expression in this grammar, so an arm body cannot contain one
-    /// (`error: expected expression`), and a trailing `match` is an
-    /// expression statement rather than a return (`error: missing return in
-    /// function 'f'`). The only bindings that reach the `.ident` branch are
-    /// parameters and `let`/`var` locals.
+    ///   - a MATCH-ARM binding is a bitwise copy of a scrutinee this
+    ///     function may itself be dropping, so it is a local in every way
+    ///     that matters here even though `droppable` is false for it. This
+    ///     is why the exception tests `is_param` and NOT `!droppable`.
     ///
-    /// **The landmine that leaves, stated so it is not rediscovered the hard
-    /// way.** If the parser ever admits `return` inside a match arm, or a
-    /// trailing expression ever becomes an implicit return, a match-arm
-    /// binding of `arc` type reaches this branch, reads `!droppable` as
-    /// "parameter", and is handed back without a retain while the scrutinee
-    /// it copies is released. Restore a parameter-only test at that point.
-    /// `docs/OWNERSHIP.md` R11 carries the same warning.
+    /// **That last case was once thought unreachable, and removing the
+    /// distinction on that belief reopened a use-after-free.** An arm body
+    /// can be a BLOCK, and a block's contents are statements, so
+    /// `match s { b => { return b } }` parses and reaches here; a nested `if`
+    /// inside such a block is a second form. The two forms that ARE rejected
+    /// (`b => return b`, since `return` is not an expression, and a trailing
+    /// `match`, which is not a return) are the two the earlier derivation
+    /// tested. Both regression forms now have tests.
+    ///
+    /// **The cost of restoring it, stated rather than left implicit.** When
+    /// the scrutinee is an `arc` PARAMETER, the arm binding copies a
+    /// reference this function never releases, so a bare return would have
+    /// been correct and the clone leaks one reference instead. That is the
+    /// safe side of the asymmetry and the trade is deliberate: the same
+    /// binding shape dangles when the scrutinee is a local, and codegen
+    /// cannot tell the two apart here without tracking the scrutinee's own
+    /// place through the arm.
     fn returnedArcNeedsRetain(self: *Generator, v: *const ast.Expr) Alloc!bool {
         const place = unwrapAnnotated(v);
         if (!isPlace(place)) return false;
@@ -865,7 +887,7 @@ pub const Generator = struct {
                 var i = self.locals.items.len;
                 while (i > 0) {
                     i -= 1;
-                    if (eq(self.locals.items[i].name, n)) return self.locals.items[i].droppable;
+                    if (eq(self.locals.items[i].name, n)) return !self.locals.items[i].is_param;
                 }
                 // Not a binding this function declared. Nothing here can be
                 // releasing it, so a retain would only leak; but nothing
@@ -1051,7 +1073,7 @@ pub const Generator = struct {
             // borrowck's own hardcoded assumption for this binding (R7 is
             // not implemented there either); it has no effect while
             // `droppable` is false.
-            try self.pushLocal(name, scrut_ty, .owned, false);
+            try self.pushLocal(name, scrut_ty, .owned, false, false);
             if (!exprUses(arm.body, name)) {
                 try self.writeIndent(indent);
                 try self.writer.print("(void){s};\n", .{name});
@@ -1877,6 +1899,7 @@ pub const Generator = struct {
         ty: CType,
         ownership: ast.Ownership,
         droppable: bool,
+        is_param: bool,
     ) Alloc!void {
         const id = self.next_binding_id;
         self.next_binding_id += 1;
@@ -1922,6 +1945,7 @@ pub const Generator = struct {
             .ownership = ownership,
             .id = id,
             .droppable = may_drop,
+            .is_param = is_param,
         });
     }
 
@@ -2844,6 +2868,56 @@ test "a returned arc parameter is neither retained nor released" {
     try expectAbsent(e.text, "cell_arc_drop");
 }
 
+test "a returned arc match-arm binding is retained: return inside a BLOCK arm body" {
+    var e = try emitSource(
+        \\pub fn f() -> arc String {
+        \\  let arc s = "aaa"
+        \\  match s { b => { return b } }
+        \\  return s
+        \\}
+    );
+    defer e.deinit();
+    // THE REGRESSION TEST. `Local.is_param` was removed after a derivation
+    // concluded that a match-arm binding could not reach
+    // `returnedArcNeedsRetain`. That derivation checked `b => return b`
+    // (rejected: `return` is not an expression) and a trailing `match`
+    // (rejected: not a return), and missed this third form: an arm body may
+    // be a BLOCK, and a block's contents are statements. `cell check` exits 0
+    // here, the emitted C compiled at -Werror, and the binding was returned
+    // without a retain while `cell_arc_drop(s)` freed the box.
+    // AddressSanitizer: heap-use-after-free, exit 134.
+    try expectContains(e.text,
+        \\    cell_arc_t _cell_t1 = cell_arc_clone(b);
+        \\    cell_arc_drop(s);
+        \\    return _cell_t1;
+    );
+}
+
+test "a returned arc match-arm binding is retained: nested if inside a block arm body" {
+    var e = try emitSource(
+        \\pub fn f(shared c: Int) -> arc String {
+        \\  let arc s = "aaa"
+        \\  match s {
+        \\    b => { if (c > 0) { return b } else { return b } }
+        \\  }
+        \\  return s
+        \\}
+    );
+    defer e.deinit();
+    // The second reachable form of the same escape. Both branches of the
+    // nested `if` are returns of the arm binding, and both were bare.
+    try expectContains(e.text,
+        \\      cell_arc_t _cell_t1 = cell_arc_clone(b);
+        \\      cell_arc_drop(s);
+        \\      return _cell_t1;
+    );
+    try expectContains(e.text,
+        \\      cell_arc_t _cell_t2 = cell_arc_clone(b);
+        \\      cell_arc_drop(s);
+        \\      return _cell_t2;
+    );
+}
+
 test "an owned String place bound as arc is left as a loud C type error" {
     var e = try emitSource(
         \\pub fn make() -> String;
@@ -3417,6 +3491,76 @@ test "arc values flowing through if and match branches balance, compiled and run
     if (!run_result.term.success()) {
         std.debug.print(
             "emitted program did not exit cleanly (an unretained alias aborts here):\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ run_result.stdout, run_result.stderr },
+        );
+        return error.ProgramCrashed;
+    }
+    try std.testing.expectEqualStrings("2\n", run_result.stdout);
+}
+
+test "a returned arc match-arm binding survives its scrutinee's release, run" {
+    // The execution counterpart to the two block-arm-body tests. Without the
+    // retain this aborts: `cell_arc_drop(s)` takes the box to zero and the
+    // caller then clones a freed handle, which is where AddressSanitizer
+    // reported the heap-use-after-free.
+    //
+    // The printed 2 is a measurement. `s` is boxed at 1, the arm binding is a
+    // bitwise copy of it, the return clones (2), `f`'s scope drop of `s`
+    // takes it back to 1, the call site clones for the `arc` parameter (2),
+    // which is what the host reports before releasing (1), and `got`'s scope
+    // drop takes it to zero.
+    var e = try emitSource(
+        \\pub fn observe(arc name: String) -> Int;
+        \\pub fn print_int(copy value: Int);
+        \\pub fn f() -> arc String {
+        \\  let arc s = "aaa"
+        \\  match s { b => { return b } }
+        \\  return s
+        \\}
+        \\pub fn main() {
+        \\  let arc got = f()
+        \\  let copy n = observe(arc got)
+        \\  print_int(n)
+        \\}
+    );
+    defer e.deinit();
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.c", .data = e.text });
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const root = cwd_buf[0..cwd_len];
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{root});
+    defer gpa.free(include);
+    const rt_c = try std.fmt.allocPrint(gpa, "{s}/runtime/cell_rt.c", .{root});
+    defer gpa.free(rt_c);
+    const host_c = try std.fmt.allocPrint(gpa, "{s}/examples/arc_host.c", .{root});
+    defer gpa.free(host_c);
+
+    const cc_result = try std.process.run(gpa, io, .{
+        .argv = &.{ "cc", "-std=c11", "-Wall", "-Wextra", "body.c", host_c, rt_c, "-I", include, "-o", "body" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(cc_result.stdout);
+    defer gpa.free(cc_result.stderr);
+    if (!cc_result.term.success()) {
+        std.debug.print("cc rejected emitted C:\n{s}\n--- source ---\n{s}\n", .{ cc_result.stderr, e.text });
+        return error.CcRejectedEmittedC;
+    }
+
+    const run_result = try std.process.run(gpa, io, .{
+        .argv = &.{"./body"},
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(run_result.stdout);
+    defer gpa.free(run_result.stderr);
+    if (!run_result.term.success()) {
+        std.debug.print(
+            "emitted program did not exit cleanly (an unretained arm binding aborts here):\nstdout:\n{s}\nstderr:\n{s}\n",
             .{ run_result.stdout, run_result.stderr },
         );
         return error.ProgramCrashed;
