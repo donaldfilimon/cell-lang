@@ -5584,3 +5584,49 @@ test "a shared String parameter borrowed for a shared parameter is not converted
     try expectContains(e.text, "cell_inspect(cell_string_as_str(&s))");
     try expectAbsent(e.text, "cell_string_from_str");
 }
+
+test "a copy String destination converts, and the leak that follows is pinned here" {
+    // THE ONE DELIBERATE DECISION IN THIS RULE, pinned rather than left in a
+    // report. `copy` means an independent value, and `cell_string_from_str`
+    // is exactly the deep copy R12 asks for at a copy site, so converting is
+    // right. What is missing is the drop: `pendingDrops` takes only `.owned`
+    // and `.arc`, so the copy is never freed.
+    //
+    // That leak is not introduced here and is not about literals. `var copy s
+    // = make()` leaks today for the same reason, so the choice is between a
+    // deep copy that leaks and a `cc` error, and this backend's stated
+    // asymmetry puts a leak on the acceptable side and a double free on the
+    // other. Measured under AddressSanitizer: clean, exit 0.
+    var e = try emitSource(
+        \\pub fn f() {
+        \\  let copy s: String = "ab"
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_string_t s = cell_string_from_str(cell_str_from_parts(\"ab\", 2));");
+    try expectOccurrences(e.text, "cell_string_free", 0);
+}
+
+test "a list element is a ninth position, and it inherits the conversion by routing" {
+    // THE THESIS OF THE FUNNEL, stated as a test rather than as a claim in a
+    // doc comment. This position is in no table: the defect was recorded with
+    // six, a value slot at a `let` and at a `return` made eight, and a
+    // `[String]` element was never enumerated at any point. It converts
+    // anyway, because `emitListLit` lowers each item through `emitArgLike`
+    // against the DECLARED element type and `emitArgLike` asks the funnel.
+    //
+    // Each element is a real heap copy, and `cell_slice_free` frees the
+    // buffer and not the elements, so this leaks. Same side of the same
+    // asymmetry as the `copy` case above, and pre-existing: an element of an
+    // `owned [String]` was never dropped by anything.
+    var e = try emitSource(
+        \\pub fn f() {
+        \\  let owned xs: [String] = ["a", "bb"]
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "= cell_string_from_str(cell_str_from_parts(\"a\", 1));");
+    try expectContains(e.text, "= cell_string_from_str(cell_str_from_parts(\"bb\", 2));");
+    try expectContains(e.text, "cell_slice_alloc(sizeof(cell_string_t), 2)");
+    try expectOccurrences(e.text, "cell_slice_free(&xs);", 1);
+}
