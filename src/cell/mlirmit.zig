@@ -50,9 +50,29 @@
 //! that will be a different and larger claim, and it will need its own
 //! evidence.
 //!
-//! SCOPE. Scalars and payload-free enums. Structs, String, `[T]`, `T?`,
-//! `Result` and `arc` emit a `cannot lower` diagnostic at their span rather
-//! than plausible-looking wrong IR.
+//! SCOPE, and it is per-OPERATION rather than per-TYPE. This paragraph used
+//! to read "Structs, String, `[T]`, `T?`, `Result` and `arc` emit a
+//! `cannot lower` diagnostic", which was a blanket claim about types and was
+//! measurably false: `examples/hello.cell` declares a struct and prints 42
+//! through this backend.
+//!
+//! Measured 2026-09-08 rather than remembered. ACCEPTED: struct parameters,
+//! struct literals and field reads, `owned String` parameters, and, since
+//! `a6c41e8`, `exclusive String`/`[T]`/`T?` parameters and whole-value writes
+//! through them. STILL REFUSED with `cannot lower to MLIR`: the borrowed-view
+//! to owning-`String` conversion (because no backend here can call a
+//! `static inline` runtime helper), non-empty list literals, and `arc`
+//! locals.
+//!
+//! So the boundary is a list of operations that shrinks, not a property of
+//! the types. Probe the emitter rather than trusting this paragraph, and
+//! WHEN YOU PROBE, READ THE DIAGNOSTIC, NOT THE EXIT CODE. Writing this
+//! comment, a probe of `f(shared b: B) -> Int { return b.n }` came back
+//! non-zero and was nearly recorded here as "structs are refused"; the error
+//! was borrowck's `cannot move out of 'b.n'`, which fires for every backend
+//! and says nothing about this one. Grep for `cannot lower to MLIR`.
+//!
+//! Refusals still never emit plausible-looking wrong IR: that part held.
 
 const std = @import("std");
 const Io = std.Io;
