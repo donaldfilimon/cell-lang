@@ -41,7 +41,9 @@ by planning. Task reports below will record actual commits and validation.
   Original report and log are retained under `docs/qualification/2026-09-08-0b7fc80/`.
   Independent review requires artifact-path collision/source protection,
   correct dirty deletion/rename sampling, and an exit-zero truncation test.
-  These review fixes are pending; this run is not evidence for later commits.
+  Review fixes landed in `3e50928` and `337fd01`; independent re-review is
+  checking hard-link protection, including artifacts outside the repository.
+  The recorded real run is not evidence for these later commits.
 - Confirmed current defect: an owning String place copied into a struct field
   and consumed by a freeing C host produces an ASan double free (SIGABRT).
   The minimized reproduction passed checking and emission at compiler 584162a.
@@ -51,9 +53,21 @@ by planning. Task reports below will record actual commits and validation.
   reviewers; parent authored the documentation matrix for independent review.
   Cost if wrong: less context isolation, mitigated by exact diff reviews.
 
+- Owning struct-field safety: implementation `337fd01..6b6a8ee`, independent
+  specification review approved with a non-blocking request for scalar and
+  scalar-record initializer controls; quality review remains in progress.
+  Implementer reports direct
+  full-gate exit 0, 419 library tests, 151 borrow-checker tests, and rejection
+  of the retained double-free reproduction before emission. Resource-bearing
+  copy fields reject at declaration; owning resource fields require fresh
+  values. General copy bindings and list elements remain separate gaps.
+- Contract completeness: `927fa93` records missing independently testable
+  acceptance rows and the distinction between local and global release
+  qualification. These obligations remain open.
+
 ## Active task
 
-Qualification wrapper review fixes, requirements in `2026-09-08-qualification-report.md`.
-Next source task: `2026-09-08-owned-field-alias.md`, then return ownership metadata
-in `2026-09-08-return-ownership.md`. All ten milestones remain
-incomplete; completed gate subtasks do not imply completed language semantics.
+Return ownership metadata in `2026-09-08-return-ownership.md`, starting at
+`6b6a8ee`. Independent owning-field and qualification-wrapper reviews run
+alongside that disjoint implementation. All ten milestones remain incomplete;
+completed gate subtasks do not imply completed language semantics.
