@@ -531,7 +531,7 @@ anything.
 | A Cell body never releases its own `arc` parameter (no parameter is dropped), so every call-site retain into one leaks a reference | by construction; `examples/arc_host.c` is the ABI-correct contrast, and `examples/arc.cell` reports 0 leaks because of it |
 | A struct holding an `arc` field is never dropped, so rule 4's retain leaks | `record` shapes are excluded from `hasDropCall` |
 | An `arc` value unboxed for a `shared` parameter without ever being bound (`inspect(shared fresh())`) drops its handle on the floor | `leaks`: **2998 leaks / 63968 bytes** over 1000 iterations |
-| An `arc` local declared inside a block is never released, because release is function-scoped; inside a `while` body that is unbounded | `leaks`: **2997 leaks / 63936 bytes** over 1000 iterations |
+| An `arc` local declared inside a block OR A MATCH ARM is never released, because release is function-scoped and both are popped before the drop pass runs; inside a `while` body that is unbounded | `leaks`: **2997 leaks / 63936 bytes** over 1000 iterations for the block form |
 | Reassigning an `arc` `var` leaks the previous box (`var arc v = "one"` then `v = "two"`), the same class as the R3a-revival leak R16 documents for `owned` | `leaks`: **3 leaks / 64 bytes** for a single reassignment |
 | An `owned` String or list PLACE bound as `arc` is not boxed at all, and is left as a C type error rather than a silent double free | see retain rule 1 above |
 
