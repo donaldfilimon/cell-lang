@@ -1,0 +1,81 @@
+// A write through an `exclusive` borrow must land in the CALLER's object.
+//
+// WHY THIS FILE EXISTS. The LLVM backend passed the address of a SPILLED COPY
+// for every borrow, so `grow(exclusive buf)` incremented a temporary that died
+// at the call and the caller's `buf` never changed. Nothing crashed, nothing
+// refused, nothing warned: the program printed the wrong number. That is worse
+// than a compiler that falls over, and it survived a green gate because the
+// gate compared emit VERDICTS between backends (both accepted this) and
+// executed four programs, none of which wrote through a borrow. Every silent
+// class of defect needs a corpus entry that PRINTS, because a silent program
+// cannot catch a wrong answer, and `ownership.cell` and `borrows.cell` are
+// both silent by design.
+//
+// WHAT IT PRINTS, and how to read a wrong answer. One integer, `142`:
+//
+//   the last two digits   `buf.len`, starting at 37 and incremented once by
+//                         each of the five unique-borrow spellings. 42 means
+//                         all five wrote through; 41 means exactly one lost
+//                         its write; 37 means none of them landed.
+//   the hundreds digit    how many DISTINCT addresses the seven calls handed
+//                         to the C side. 1 is correct: every spelling passes
+//                         the caller's own object. 7 means every call site
+//                         made its own copy, which is what the defect did.
+//
+// So the pre-fix LLVM backend printed `737` and the C backend printed `142`.
+// The two `shared` calls are in the count because a shared borrow that copies
+// is invisible by value: reading a copy answers the same as reading the
+// original, and only the address distinguishes them.
+//
+// WHY THE MUTATOR HAS NO BODY HERE. Writing `b.len = b.len + 1` in Cell would
+// pin only the C and LLVM backends: the MLIR backend refuses assignment
+// through a field path today ("cannot lower to MLIR"), and this file would
+// then disagree with itself across backends and fail the gate's agreement
+// stage for a reason that has nothing to do with what it is testing. Declaring
+// `grow` and `look` without bodies moves the mutation to `write_through_host.c`
+// and leaves this file testing exactly one thing: which address the CALL SITE
+// hands over. All three backends emit that call, so all three are measured.
+// The callee half is pinned by a unit test in src/cell/llvmemit.zig that runs
+// the Cell-bodied version and expects 42.
+//
+// EXPECT-OUTPUT: 142
+
+pub struct Buffer { copy len: Int }
+
+pub fn print_int(copy value: Int);
+
+// Defined in write_through_host.c: records the address it was handed, then
+// `b->len += 1`. `runtime/cell_rt.h` section 7 and docs/OWNERSHIP.md R1 both
+// define `exclusive` as the callee mutating the CALLER's value, so this
+// increment is only visible to `main` if the address is `main`'s own.
+pub fn grow(exclusive b: Buffer);
+
+// Records the address and reads nothing. `shared` promises the callee will not
+// free or mutate, and says nothing about copying, which is exactly why a copy
+// here was invisible until the addresses were counted.
+pub fn look(shared b: Buffer);
+
+// The number of distinct addresses recorded so far.
+pub fn distinct() -> Int;
+
+pub fn main() {
+    var owned buf = Buffer { len: 37 }
+
+    // All five unique-borrow spellings, which examples/borrows.cell declares
+    // identical. They are NOT identical on the way to a backend: `exclusive
+    // buf` arrives as a bare reference because the parser's written prefix is
+    // consumed during lowering, while the four sigil forms arrive wrapped in a
+    // unary borrow node. A backend that handles one and not the others splits
+    // the group silently, and the arithmetic above is what makes that visible.
+    grow(exclusive buf)
+    grow(&mut buf)
+    grow(&var buf)
+    grow(&exclusive buf)
+    grow(exclusive &buf)
+
+    // Both shared spellings, for the same reason.
+    look(shared buf)
+    look(&buf)
+
+    print_int(buf.len + 100 * distinct())
+}
