@@ -125,6 +125,16 @@ const Emitter = struct {
     /// `assignDest`: this is a deliberate verdict alignment with
     /// `mlirmit.zig`, not a limitation of the lowering here.
     slot_write_refused: std.ArrayList(bool) = .empty,
+    /// Slot -> the type of a whole value written into the slot's STORAGE:
+    /// `ptr` for a borrow slot, the binding's ownership-aware type otherwise.
+    /// Empty when the binding's type was already refused, which is the one
+    /// case `storeValue` declines silently because a diagnostic already stands
+    /// against that binding.
+    ///
+    /// Recorded rather than re-derived. `emitFn` decides a slot's shape once,
+    /// and every previous defect in this file came from a second derivation of
+    /// the same question drifting from the first.
+    slot_ty: std.ArrayList([]const u8) = .empty,
     current_fn: []const u8 = "",
     /// The return type as the body computes it, and as the ABI writes it.
     /// They differ whenever the ABI coerces, e.g. a 16-byte non-HFA struct is
@@ -300,7 +310,33 @@ const Emitter = struct {
         };
         // The natural in-memory type of the return, which is what the body
         // computes. It differs from `ret` whenever the ABI coerces.
-        const ret_natural = self.llType(f.ret) orelse ret;
+        //
+        // OWNERSHIP-AWARE, and that correction is load-bearing. This read
+        // `llType(f.ret)`, the bare spelling, which for a String return is the
+        // 16-byte borrowed view `%cell_str` while the sret buffer this
+        // function actually writes is the 24-byte owning `%cell_string`. The
+        // disagreement was invisible because a String return always takes the
+        // sret branch, which stored whatever the body computed without ever
+        // comparing it. A return carries no ownership annotation and codegen
+        // treats `-> String` as owning, so `.owned` is the mode here, exactly
+        // as the `sret(...)` spelling below already assumed.
+        //
+        // DISCLOSED, AND MEASURED RATHER THAN SUSPECTED. `.owned` is hardcoded
+        // because `hir.Fn` records `ret: Ty` and NO ownership mode for a
+        // return, so this backend cannot tell `-> arc String` from
+        // `-> String`. `pub fn f() -> arc String { return make() }` therefore
+        // still emits `define void @cell_f(ptr sret(%cell_string) %sret)`
+        // while the C backend emits `cell_arc_t cell_f(void)`: a wrong return
+        // CONVENTION, which is a different defect from the borrowed-view to
+        // owning-value conversion the guard below closes, and one that cannot
+        // be refused from this file because the fact needed to detect it is
+        // not in the IR. `-> arc String { return "ab" }` IS refused, but only
+        // because the returned VALUE is a `%cell_str`; substituting an owning
+        // value re-opens it. Closing this needs a return ownership mode in
+        // `hir.Fn` and a decision about how `cell_arc_t` is placed, which is
+        // `docs/OWNERSHIP.md` R11 territory. Both backends agree here, so no
+        // verdict splits; both disagree with C.
+        const ret_natural = self.llTypeOwned(f.ret, .owned) orelse ret;
 
         self.temp = 0;
         self.label = 0;
@@ -314,6 +350,9 @@ const Emitter = struct {
         self.slot_write_refused.clearRetainingCapacity();
         try self.slot_write_refused.resize(self.arena, f.bindings.len);
         for (self.slot_write_refused.items) |*p| p.* = false;
+        self.slot_ty.clearRetainingCapacity();
+        try self.slot_ty.resize(self.arena, f.bindings.len);
+        for (self.slot_ty.items) |*p| p.* = "";
         self.ret_natural = ret_natural;
         self.ret_abi = ret;
         self.sret = if (uses_sret) "%sret" else null;
@@ -373,8 +412,21 @@ const Emitter = struct {
             const is_ref = self.borrowsByPointer(b.ty, b.ownership);
             if (is_ref) self.slot_ptr_to.items[i] = t;
             self.slot_write_refused.items[i] = is_ref and b.ty.tag() != .struct_type;
+            // What the slot's STORAGE holds, which is the address for a borrow
+            // and the object otherwise. Recorded here, where the alloca is
+            // written, so the store side cannot disagree with the alloca side.
+            self.slot_ty.items[i] = if (is_ref) "ptr" else t;
             try self.out.print("  {s} = alloca {s}\n", .{ name, if (is_ref) "ptr" else t });
         }
+        // THE PARAMETER PROLOGUE IS EXEMPT FROM `storeValue`, deliberately, and
+        // it is one of only two places in this file that are. `%argN` is not a
+        // computed value: it is the ABI's spelling of one, already coerced by
+        // the caller, and the four stores below write it into correctly sized
+        // memory whose type may legitimately differ (a `[2 x i64]` argument
+        // into a `%cell_str` slot is what clang itself emits). Nothing here
+        // converts between a borrowed view and an owning value, which is the
+        // one thing the guard exists to catch. The other exemption is
+        // `coerceArg`, for the same reason in the other direction.
         for (f.params(), 0..) |p, i| {
             const natural = self.llTypeOwned(p.ty, p.ownership) orelse continue;
             switch (abi.classifyParam(self.module, p.ty, p.ownership)) {
@@ -427,6 +479,90 @@ const Emitter = struct {
         try self.out.writeAll("}\n\n");
     }
 
+    // -- the placement guard -------------------------------------------------
+
+    /// THE GUARD. A computed value may be placed only where a value of its own
+    /// rendered type is expected; anything else is refused at the span.
+    ///
+    /// WHY ONE PREDICATE RATHER THAN A CHECK PER CONSTRUCT. `str` and `String`
+    /// are two different runtime types: a literal is the 16-byte borrowed view
+    /// `%cell_str`, an owned `String` is the 24-byte owning `%cell_string`, and
+    /// turning the first into the second is a real call to
+    /// `cell_string_from_str` that copies the characters. This backend cannot
+    /// make that call (see the header: every aggregate constructor in
+    /// `runtime/cell_rt.h` is `static inline` and has no symbol), so it must
+    /// refuse. It did not. It ACCEPTED the conversion at six separate
+    /// positions and emitted a 16-byte store into 24 bytes of storage, leaving
+    /// `cap` uninitialized and `.ptr` aimed at a static literal that the drop
+    /// path would eventually free.
+    ///
+    /// Six positional checks would have closed six holes and left the seventh
+    /// open, which is the reasoning failure `AGENTS.md` records sixteen times
+    /// over: enumerate some forms of a construct, assert the property of all of
+    /// them. So the question is asked ONCE, of type identity, at the moment a
+    /// value meets a destination, and a position nobody anticipated fails
+    /// closed instead of writing somewhere plausible.
+    ///
+    /// WHAT IT MUST NOT SEE. The ABI legitimately re-spells a value on its way
+    /// into a register or a hidden buffer: a 16-byte non-HFA struct is computed
+    /// as `%cell_str` and PASSED as `[2 x i64]`, and a 24-byte one is passed as
+    /// a `ptr` to a caller-owned copy. Those are `coerceArg` and the parameter
+    /// prologue, and they are compared against the NATURAL type before the
+    /// coercion rather than after it. After it is too late and it is a real
+    /// hole rather than a theoretical one: `coerceArg(v, "ptr")` returns
+    /// `.ty = "ptr"` whatever it was handed, so a guard placed downstream of it
+    /// would compare `ptr` against `ptr`, pass, and let `g(owned "ab")` spill
+    /// a 16-byte alloca for a callee that reads 24 bytes out of it.
+    fn fits(
+        self: *Emitter,
+        span: hir.Span,
+        val_ty: []const u8,
+        dest_ty: []const u8,
+        what: []const u8,
+    ) EmitError!bool {
+        if (std.mem.eql(u8, val_ty, dest_ty)) return true;
+        try self.unsupported(span, try std.fmt.allocPrint(
+            self.arena,
+            "a value of type {s} where {s} is expected, in {s}" ++
+                " (converting between a borrowed view and an owning value needs" ++
+                " a runtime call this backend cannot emit)",
+            .{ val_ty, dest_ty, what },
+        ));
+        return false;
+    }
+
+    /// The ONE place a computed value is written to memory. Every store of a
+    /// language-level value goes through here, so the guard cannot be bypassed
+    /// by adding a position; the only raw stores left in this file are the
+    /// parameter prologue and `coerceArg`, both of them ABI coercions marked as
+    /// such at their site.
+    ///
+    /// The store is written with the DESTINATION's type, not the value's. They
+    /// are equal by the time it runs, and naming the destination is what makes
+    /// that obvious to the next reader.
+    fn storeValue(
+        self: *Emitter,
+        span: hir.Span,
+        val: Value,
+        dest_ty: []const u8,
+        dest: []const u8,
+        what: []const u8,
+    ) EmitError!void {
+        // An empty destination type means the BINDING was already refused, in
+        // `emitFn`, where its alloca became an `i8` placeholder. A second
+        // diagnostic at every write to it would bury the first, and the module
+        // is non-emittable either way.
+        if (dest_ty.len == 0) return;
+        if (!try self.fits(span, val.ty, dest_ty, what)) return;
+        try self.out.print("  store {s} {s}, ptr {s}\n", .{ dest_ty, val.text, dest });
+    }
+
+    /// The type of a whole value written into a slot's storage.
+    fn slotType(self: *Emitter, slot: u32) []const u8 {
+        if (slot >= self.slot_ty.items.len) return "";
+        return self.slot_ty.items[slot];
+    }
+
     // -- statements ---------------------------------------------------------
 
     fn emitStmt(self: *Emitter, stmt: *const hir.Stmt) EmitError!void {
@@ -449,18 +585,24 @@ const Emitter = struct {
                         return;
                     };
                     const addr = (try self.borrowAddress(&v)) orelse return;
-                    try self.out.print(
-                        "  store ptr {s}, ptr {s}\n",
-                        .{ addr, self.slots.items[l.slot] },
+                    try self.storeValue(
+                        v.span,
+                        .{ .text = addr, .ty = "ptr" },
+                        self.slotType(l.slot),
+                        self.slots.items[l.slot],
+                        "a borrow binding",
                     );
                     return;
                 }
                 if (l.value) |v| {
                     const val = try self.emitExpr(&v);
                     if (!val.isVoid()) {
-                        try self.out.print(
-                            "  store {s} {s}, ptr {s}\n",
-                            .{ val.ty, val.text, self.slots.items[l.slot] },
+                        try self.storeValue(
+                            v.span,
+                            val,
+                            self.slotType(l.slot),
+                            self.slots.items[l.slot],
+                            "a binding's initializer",
                         );
                     }
                 }
@@ -474,25 +616,29 @@ const Emitter = struct {
                     return;
                 }
                 const val = try self.emitExpr(&a.value);
-                const dest = try self.placeAddress(&a.place);
                 if (val.isVoid()) return;
-                if (dest_kind == .through_slot) {
-                    const pointee = dest_kind.through_slot;
-                    if (!std.mem.eql(u8, val.ty, pointee)) {
-                        // Borrowck refuses moving out of a borrow, so nothing
-                        // reaches here with a mismatched value today. Saying so
-                        // is still cheaper than the store: a pointer written
-                        // where an aggregate belongs is precisely the class of
-                        // defect this file was opened to remove.
-                        try self.unsupported(stmt.span, try std.fmt.allocPrint(
-                            self.arena,
-                            "a value of type {s} written through a borrow of {s}",
-                            .{ val.ty, pointee },
-                        ));
-                        return;
-                    }
+                const dest = try self.placeAddress(&a.place);
+                switch (dest_kind) {
+                    // The two live arms carry the destination's type, so the
+                    // write through a borrow and the write into a place are
+                    // now checked by the same predicate rather than by one
+                    // hand-written comparison that only the borrow case had.
+                    .into_place => |dest_ty| try self.storeValue(
+                        a.value.span,
+                        val,
+                        dest_ty,
+                        dest,
+                        "an assignment",
+                    ),
+                    .through_slot => |pointee| try self.storeValue(
+                        a.value.span,
+                        val,
+                        pointee,
+                        dest,
+                        "a write through a borrow",
+                    ),
+                    .refuse => unreachable, // handled above
                 }
-                try self.out.print("  store {s} {s}, ptr {s}\n", .{ val.ty, val.text, dest });
             },
             .expr => |e| _ = try self.emitExpr(&e),
             .while_loop => |w| {
@@ -541,10 +687,26 @@ const Emitter = struct {
                     const val = try self.emitExpr(&e);
                     if (val.isVoid()) {
                         try self.out.writeAll("  ret void\n");
+                    } else if (!try self.fits(e.span, val.ty, self.ret_natural, "a return value")) {
+                        // ONE check for all three return conventions below,
+                        // asked before the branch rather than inside it. The
+                        // sret arm is where `return "ab"` from a `-> String`
+                        // used to write a 16-byte borrowed view into the
+                        // caller's 24-byte owning buffer, and it was the arm
+                        // with no comparison of any kind.
+                        //
+                        // The block still gets a terminator. A diagnostic
+                        // should not also leave invalid IR behind, even in a
+                        // module nobody will lower.
+                        if (std.mem.eql(u8, self.ret_abi, "void")) {
+                            try self.out.writeAll("  ret void\n");
+                        } else {
+                            try self.out.print("  ret {s} zeroinitializer\n", .{self.ret_abi});
+                        }
                     } else if (self.sret) |dest| {
                         // The value goes into the caller's buffer, and the
                         // function itself returns nothing.
-                        try self.out.print("  store {s} {s}, ptr {s}\n", .{ val.ty, val.text, dest });
+                        try self.out.print("  store {s} {s}, ptr {s}\n", .{ self.ret_natural, val.text, dest });
                         try self.out.writeAll("  ret void\n");
                     } else if (!std.mem.eql(u8, self.ret_abi, self.ret_natural)) {
                         // The ABI returns a coerced form, e.g. a 16-byte
@@ -579,11 +741,14 @@ const Emitter = struct {
     /// writing somewhere plausible. `mlirmit.assignDest` is the same shape for
     /// the same reason.
     const AssignDest = union(enum) {
-        /// `placeAddress` names the right address and the value's own type is
-        /// what gets stored. An owned or `copy` binding, a borrowed primitive,
-        /// or a FIELD write through a borrow, which `placeAddress` already
-        /// walks through the slot's pointer.
-        into_place,
+        /// `placeAddress` names the right address. An owned or `copy` binding,
+        /// a borrowed primitive, or a FIELD write through a borrow, which
+        /// `placeAddress` already walks through the slot's pointer. Carries the
+        /// DESTINATION's type, which the value must match exactly: it used to
+        /// carry nothing and the store simply used the value's own type, so
+        /// `s = "cd"` on an owned `String` local wrote sixteen bytes into
+        /// twenty-four with nothing to compare against.
+        into_place: []const u8,
         /// A whole-value write through a borrow. Carries the pointee type,
         /// which the value must match exactly.
         through_slot: []const u8,
@@ -618,9 +783,25 @@ const Emitter = struct {
             // that writes through an `exclusive String`.
             return .{ .refuse = "a whole-value write through a borrowed String, list or optional" };
         }
-        if (place.path.len != 0) return .into_place;
+        if (place.path.len != 0) return .{ .into_place = self.placeDestType(place) };
         if (self.slot_ptr_to.items[place.slot]) |pointee| return .{ .through_slot = pointee };
-        return .into_place;
+        return .{ .into_place = self.slotType(place.slot) };
+    }
+
+    /// The type of a whole value written to a place: the LAST field selected,
+    /// with its declared ownership, or the slot's own storage when nothing is
+    /// selected.
+    ///
+    /// The field's ownership is read rather than assumed, the same way
+    /// `emitFn` renders a struct definition, because `owned name: String` and
+    /// `shared name: String` are different sizes and only the declaration
+    /// says which one a field is.
+    fn placeDestType(self: *Emitter, place: *const hir.Place) []const u8 {
+        const sel = place.path[place.path.len - 1];
+        const s = self.module.findStruct(sel.struct_name) orelse return "";
+        if (sel.index >= s.fields.len) return "";
+        const f = s.fields[sel.index];
+        return self.llTypeOwned(f.ty, f.ownership) orelse "";
     }
 
     /// The address a borrow binding's initializer names, or null having
@@ -858,7 +1039,7 @@ const Emitter = struct {
 
         const left = try self.emitExpr(left_e);
         if (left.isVoid()) return Value.void_value;
-        try self.out.print("  store i1 {s}, ptr {s}\n", .{ left.text, dest });
+        try self.storeValue(left_e.span, left, "i1", dest, "a short-circuit operand");
 
         const rhs_label = try self.nextLabel("sc.rhs");
         const end_label = try self.nextLabel("sc.end");
@@ -871,7 +1052,7 @@ const Emitter = struct {
         try self.out.print("{s}:\n", .{rhs_label});
         const right = try self.emitExpr(right_e);
         if (!right.isVoid()) {
-            try self.out.print("  store i1 {s}, ptr {s}\n", .{ right.text, dest });
+            try self.storeValue(right_e.span, right, "i1", dest, "a short-circuit operand");
         }
         try self.out.print("  br label %{s}\n", .{end_label});
 
@@ -1072,6 +1253,24 @@ const Emitter = struct {
             // one. It is gone with `Value.ptr_to`, and a borrow that really is
             // wanted by pointer took the `argPlaceAddress` path above.
             if (i < modes.len) {
+                // GUARD FIRST, COERCE SECOND, and the order is the whole point.
+                //
+                // `coerceArg` re-spells a value for the ABI, and for an
+                // `.indirect` parameter it spills to an alloca and returns
+                // `.ty = "ptr"` WHATEVER it was handed. A guard downstream of
+                // it therefore compares `ptr` against `ptr` and passes, which
+                // is not a theoretical hole: `owned String` is 24 bytes and so
+                // is passed indirectly, so `g(owned "ab")` would spill a
+                // 16-byte `%cell_str` alloca and hand its address to a callee
+                // that reads 24 bytes out of it. Comparing against the
+                // parameter's NATURAL type, before any coercion, is what makes
+                // the legitimate re-spellings invisible to the guard while the
+                // conversion this backend cannot perform is not.
+                const natural = self.llTypeOwned(a.ty, modes[i].param) orelse {
+                    try self.unsupported(a.span, "an argument whose parameter type this backend cannot render");
+                    return Value.void_value;
+                };
+                if (!try self.fits(a.span, v.ty, natural, "a call argument")) return Value.void_value;
                 if (abi.renderParam(self.arena, self.module, a.ty, modes[i].param)) |want| {
                     v = try self.coerceArg(v, want);
                 }
@@ -1144,7 +1343,7 @@ const Emitter = struct {
         fields: []const hir.Expr,
     ) EmitError!Value {
         const ty = try std.fmt.allocPrint(self.arena, "%cell_{s}", .{name});
-        _ = self.module.findStruct(name) orelse {
+        const decl = self.module.findStruct(name) orelse {
             try self.unsupported(e.span, try std.fmt.allocPrint(
                 self.arena,
                 "struct literal for undeclared type '{s}'",
@@ -1158,10 +1357,25 @@ const Emitter = struct {
         for (fields, 0..) |f, i| {
             const v = try self.emitExpr(&f);
             if (v.isVoid()) return Value.void_value;
+            // A FIELD IS A DESTINATION TOO, and it was the position with the
+            // least to say for itself: the insertvalue was written with the
+            // VALUE's type at the field's index, so `B { name: "ab" }` for
+            // `owned name: String` inserted a `%cell_str` into a slot the
+            // struct definition above spells `%cell_string`.
+            if (i >= decl.fields.len) {
+                try self.unsupported(f.span, "more initializers than the struct declares fields");
+                return Value.void_value;
+            }
+            const field = decl.fields[i];
+            const want = self.llTypeOwned(field.ty, field.ownership) orelse {
+                try self.unsupported(f.span, "struct field type");
+                return Value.void_value;
+            };
+            if (!try self.fits(f.span, v.ty, want, "a struct literal field")) return Value.void_value;
             const tmp = try self.nextTemp();
             try self.out.print(
                 "  {s} = insertvalue {s} {s}, {s} {s}, {d}\n",
-                .{ tmp, ty, acc, v.ty, v.text, i },
+                .{ tmp, ty, acc, want, v.text, i },
             );
             acc = tmp;
         }
@@ -1200,7 +1414,7 @@ const Emitter = struct {
         self.terminated = false;
         const then_val = try self.emitExpr(then_e);
         if (produces_value and !then_val.isVoid()) {
-            try self.out.print("  store {s} {s}, ptr {s}\n", .{ then_val.ty, then_val.text, dest });
+            try self.storeValue(then_e.span, then_val, dest_ty, dest, "an if branch's value");
         }
         if (!self.terminated) try self.out.print("  br label %{s}\n", .{end_label});
 
@@ -1209,7 +1423,7 @@ const Emitter = struct {
             self.terminated = false;
             const else_val = try self.emitExpr(eb);
             if (produces_value and !else_val.isVoid()) {
-                try self.out.print("  store {s} {s}, ptr {s}\n", .{ else_val.ty, else_val.text, dest });
+                try self.storeValue(eb.span, else_val, dest_ty, dest, "an else branch's value");
             }
             if (!self.terminated) try self.out.print("  br label %{s}\n", .{end_label});
         }
@@ -1388,14 +1602,17 @@ const Emitter = struct {
             // A binding pattern binds the scrutinee into its own slot.
             if (arm.pattern.kind == .binding) {
                 const slot = arm.pattern.kind.binding;
-                try self.out.print(
-                    "  store {s} {s}, ptr {s}\n",
-                    .{ scrutinee.ty, scrutinee.text, self.slots.items[slot] },
+                try self.storeValue(
+                    arm.span,
+                    scrutinee,
+                    self.slotType(slot),
+                    self.slots.items[slot],
+                    "a match binding pattern",
                 );
             }
             const body_val = try self.emitExpr(arm.body);
             if (produces_value and !body_val.isVoid()) {
-                try self.out.print("  store {s} {s}, ptr {s}\n", .{ body_val.ty, body_val.text, dest });
+                try self.storeValue(arm.body.span, body_val, dest_ty, dest, "a match arm's value");
             }
             if (!self.terminated) try self.out.print("  br label %{s}\n", .{end_label});
 
@@ -2362,8 +2579,14 @@ test "an exclusive String is a pointer, and a write through one is refused" {
     // only to keep this backend's verdict equal to mlirmit.zig's, which still
     // passes these by value; see `assignDest` for the note on lifting both
     // together.
+    //
+    // `make` IS BODYLESS, and that is a correction rather than a tidy-up. It
+    // read `-> String { return "abcdefg" }`, which the placement guard now
+    // refuses in its own right, so `hasErrors()` would have gone on passing
+    // while testing nothing about the write this test is named for. Its twin
+    // in `mlirmit.zig` was already bodyless.
     var e = try emitSource(
-        \\pub fn make() -> String { return "abcdefg" }
+        \\pub fn make() -> String;
         \\pub fn reset(exclusive s: String) { s = make() }
     );
     defer e.deinit();
@@ -2380,4 +2603,122 @@ test "an exclusive String is a pointer, and a write through one is refused" {
     try expectContains(ok.text, "define i64 @cell_peek(ptr %arg0)");
     // One word for the address, not a 16-byte view of a 24-byte object.
     try expectContains(ok.text, "%slot0 = alloca ptr");
+}
+
+test "the borrowed-view to owning-String conversion is refused at EVERY position" {
+    // THE FOURTH DEFECT, and the one this file's own contract forbade. A
+    // literal is a 16-byte borrowed `%cell_str`; an owned `String` is a
+    // 24-byte owning `%cell_string`; turning the first into the second is a
+    // call to `cell_string_from_str` that copies the characters. That symbol
+    // cannot be called from here, so the conversion has to be refused.
+    //
+    // It was not. Measured at 2298fa9, all six programs below passed
+    // `cell check` and emitted IR, and `pub fn f() { let owned s: String =
+    // "ab" }` produced:
+    //
+    //     %slot0 = alloca %cell_string     ; 24 bytes
+    //     store %cell_str %1, ptr %slot0   ; 16 bytes written
+    //
+    // leaving `cap` uninitialized and `.ptr` aimed at a static literal. The
+    // conversion HAD been noticed once, for `-> arc String`, and the same
+    // question was never asked of its siblings.
+    //
+    // THE TABLE IS EVIDENCE, NOT THE FIX. The fix is one predicate, `fits`,
+    // asked wherever a value meets a destination; six positional checks would
+    // have closed six holes and left the seventh. The seventh is here too:
+    // `-> arc String` is the shape whose partial handling started this, and it
+    // refuses for the same reason as the rest.
+    const cases = [_][]const u8{
+        // 1. a literal returned from an owning-String function
+        \\pub fn f() -> String { return "ab" }
+        ,
+        // 2. a literal in a `let owned` initializer
+        \\pub fn f() { let owned s: String = "ab" }
+        ,
+        // 3. the same in a `var owned`
+        \\pub fn f() { var owned s: String = "ab" }
+        ,
+        // 4. a literal passed to an `owned String` parameter
+        \\pub fn g(owned s: String);
+        \\pub fn f() { g(owned "ab") }
+        ,
+        // 5. a literal in an owning-String struct field
+        \\pub struct B { owned name: String }
+        \\pub fn f() { let owned b = B { name: "ab" } }
+        ,
+        // 6. a literal ASSIGNED to an owning-String local. `make` is bodyless
+        //    on purpose: a literal in the initializer would refuse there and
+        //    mask the assignment, which is the position under test.
+        \\pub fn make() -> String;
+        \\pub fn f() { var owned s: String = make() s = "cd" }
+        ,
+        // 7. the seventh shape, the one that was half-handled.
+        \\pub fn f() -> arc String { return "ab" }
+        ,
+    };
+    for (cases, 0..) |src, i| {
+        var e = try emitSource(src);
+        defer e.deinit();
+        if (!e.bag.hasErrors()) {
+            std.debug.print("case {d} was ACCEPTED:\n{s}\nemitted:\n{s}\n", .{ i + 1, src, e.text });
+            return error.ConversionAccepted;
+        }
+        // The diagnostic must name BOTH types. "cannot lower" alone would pass
+        // against a refusal for some unrelated reason, which is how a table
+        // like this stops testing what it claims to.
+        var named = false;
+        for (e.bag.list.items) |d| {
+            if (std.mem.indexOf(u8, d.message, "%cell_str where %cell_string") != null) named = true;
+        }
+        if (!named) {
+            std.debug.print("case {d} refused without naming the conversion:\n", .{i + 1});
+            for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
+            return error.RefusalDoesNotNameTheConversion;
+        }
+    }
+}
+
+test "the guard does not refuse the ABI's own re-spellings, or a matching String" {
+    // The other half of a total guard, and the half that makes it safe to
+    // have one. `coerceArg` and the parameter prologue legitimately change a
+    // value's spelling on its way into a register or a hidden buffer, and the
+    // guard must not see any of it. That is why the call-argument check
+    // compares against the parameter's NATURAL type BEFORE the coercion:
+    // `coerceArg(v, "ptr")` returns `.ty = "ptr"` whatever it was handed, so a
+    // check placed after it would compare `ptr` to `ptr` and let case 4 of the
+    // table above straight through.
+    const cases = [_][]const u8{
+        // A borrowed view into a borrowed-view parameter, coerced to [2 x i64].
+        \\pub fn slen(shared s: String) -> Int;
+        \\pub fn f() -> Int { return slen(shared "hi") }
+        ,
+        // A borrowed-view binding: no conversion, so no refusal.
+        \\pub fn f() { let shared s: String = "ab" }
+        ,
+        // An OWNING String from a call into an owning binding, which is the
+        // pairing that already agrees and must keep lowering.
+        \\pub fn make() -> String;
+        \\pub fn f() { let owned s: String = make() }
+        ,
+        // A 24-byte struct passed indirectly: natural type matches, then
+        // coerceArg spills it to a `ptr`.
+        \\pub struct Big { copy a: Int, copy b: Int, copy c: Int }
+        \\pub fn take(copy v: Big) -> Int { return v.a }
+        \\pub fn f() -> Int { let owned b = Big { a: 1, b: 2, c: 3 } return take(copy b) }
+        ,
+        // An HFA struct, which the ABI passes as [2 x double].
+        \\pub struct Point { copy x: Float, copy y: Float }
+        \\pub fn getx(copy p: Point) -> Float { return p.x }
+        \\pub fn f() -> Float { return getx(copy Point { x: 1.0, y: 2.0 }) }
+        ,
+    };
+    for (cases, 0..) |src, i| {
+        var e = try emitSource(src);
+        defer e.deinit();
+        if (e.bag.hasErrors()) {
+            std.debug.print("case {d} was REFUSED:\n{s}\n", .{ i + 1, src });
+            for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
+            return error.LegitimateProgramRefused;
+        }
+    }
 }

@@ -142,6 +142,19 @@ const Emitter = struct {
     /// here is therefore refused rather than emitted, per this backend's
     /// scalar-first contract.
     slot_borrowed_copy: std.ArrayList(bool) = .empty,
+    /// Slot -> the type of a whole value written into the slot's STORAGE:
+    /// `!llvm.ptr` for a borrow slot, the binding's ownership-aware type
+    /// otherwise. Empty when the binding's type was already refused.
+    ///
+    /// Recorded where the alloca is written rather than re-derived at each
+    /// store. `storeSlot` used to write with the VALUE's type and never
+    /// consulted the slot at all, so `let owned s: String = "ab"` emitted a
+    /// 16-byte `llvm.store` into a 24-byte alloca and nothing in the module
+    /// contradicted anything.
+    slot_ty: std.ArrayList([]const u8) = .empty,
+    /// The return type the BODY must produce, which for an sret function is
+    /// the pointee of the caller's buffer rather than a func result.
+    ret_natural: []const u8 = "",
     /// String literals become llvm.mlir.global constants, emitted at module
     /// scope once the bodies that reference them are known.
     strings: std.ArrayList(StringGlobal) = .empty,
@@ -281,9 +294,32 @@ const Emitter = struct {
         self.slot_borrowed_copy.clearRetainingCapacity();
         try self.slot_borrowed_copy.resize(self.arena, f.bindings.len);
         for (self.slot_borrowed_copy.items) |*v| v.* = false;
+        self.slot_ty.clearRetainingCapacity();
+        try self.slot_ty.resize(self.arena, f.bindings.len);
+        for (self.slot_ty.items) |*v| v.* = "";
 
         const uses_sret = abi.classifyReturn(self.module, f.ret) == .indirect;
         self.sret = if (uses_sret) "%sret" else null;
+        // What a `return` must produce. An sret function writes the OWNING
+        // pointee of the caller's buffer, which for a String return is the
+        // 24-byte `(ptr, i64, i64)` and not the borrowed view `mlirType`
+        // spells; a direct return produces the declared result. Empty for a
+        // unit return, where there is no value to compare.
+        //
+        // DISCLOSED, the same measured residual `llvmemit.zig` records at its
+        // own `ret_natural`: `hir.Fn` carries `ret: Ty` and no ownership mode
+        // for a return, so `.owned` is hardcoded and neither backend can tell
+        // `-> arc String` from `-> String`. `-> arc String { return make() }`
+        // is still accepted by both with an sret convention where the C
+        // backend returns a `cell_arc_t`. That is a wrong return CONVENTION
+        // rather than the value conversion this change closes, and it cannot
+        // be refused from either backend file because the IR does not carry
+        // the fact. Both backends agree, so the gate's agreement stage stays
+        // green; both disagree with C.
+        self.ret_natural = if (uses_sret)
+            (self.mlirTypeOwned(f.ret, .owned) orelse "")
+        else
+            (ret orelse "");
         try self.out.print("  func.func @{s}(", .{f.symbol});
         if (uses_sret) {
             const nat = self.mlirTypeOwned(f.ret, .owned) orelse "!llvm.struct<()>";
@@ -331,6 +367,10 @@ const Emitter = struct {
             };
             const name = try self.nextSsa();
             self.slots.items[i] = name;
+            // What the slot's STORAGE holds: the lender's address for a
+            // borrow, the object otherwise. Recorded beside the alloca so the
+            // store side cannot drift from the allocation side.
+            self.slot_ty.items[i] = if (is_ref) "!llvm.ptr" else t;
             if (is_ref) {
                 // Keep the LENDER's ADDRESS: an `exclusive` borrow must write
                 // through to the borrowed object, and copying would drop every
@@ -354,9 +394,21 @@ const Emitter = struct {
                 try self.line("{s} = memref.alloca() : memref<{s}>", .{ name, t });
             }
         }
+        // The parameter prologue goes through the guard here, unlike its
+        // counterpart in `llvmemit.zig`, and that asymmetry is real rather than
+        // an oversight: this backend passes natural types and performs no
+        // AAPCS64 coercion, so `%argN` already has the slot's own type and the
+        // comparison is free. If it ever fails, `paramType` and the binding
+        // loop have disagreed about one parameter, which is a defect worth a
+        // diagnostic rather than a silent store.
         for (f.params(), 0..) |p, i| {
             const t = self.paramType(p.ty, p.ownership) orelse continue;
-            try self.storeSlot(@intCast(i), t, try std.fmt.allocPrint(self.arena, "%arg{d}", .{i}));
+            try self.storeSlot(
+                f.span,
+                @intCast(i),
+                .{ .text = try std.fmt.allocPrint(self.arena, "%arg{d}", .{i}), .ty = t },
+                "a parameter's incoming value",
+            );
         }
 
         for (body) |stmt| try self.emitStmt(&stmt);
@@ -378,12 +430,60 @@ const Emitter = struct {
         try self.out.writeAll("  }\n");
     }
 
+    /// THE GUARD. A computed value may be placed only where a value of its own
+    /// rendered type is expected; anything else is refused at the span.
+    ///
+    /// The same predicate, for the same reason, as `llvmemit.fits`, and it is
+    /// in both files in one change on purpose. `str` and `String` are two
+    /// runtime types, a borrowed 16-byte `(ptr, i64)` view and an owning
+    /// 24-byte `(ptr, i64, i64)` value, and converting the first into the
+    /// second is a call to `cell_string_from_str` that copies the characters.
+    /// Neither backend can emit that call, so both must refuse it, and they
+    /// must refuse it on the SAME programs: `tools/check.sh`'s agreement stage
+    /// exists because two backends splitting accept-versus-refuse on one
+    /// program is worse than a shared limitation.
+    ///
+    /// One predicate rather than a check per construct. Six positional checks
+    /// would close six holes and leave the seventh open, which is the reasoning
+    /// failure `AGENTS.md` records sixteen times: enumerate some forms of a
+    /// construct, assert the property of all of them.
+    fn fits(
+        self: *Emitter,
+        span: hir.Span,
+        val_ty: []const u8,
+        dest_ty: []const u8,
+        what: []const u8,
+    ) EmitError!bool {
+        if (std.mem.eql(u8, val_ty, dest_ty)) return true;
+        try self.unsupported(span, try std.fmt.allocPrint(
+            self.arena,
+            "a value of type {s} where {s} is expected, in {s}" ++
+                " (converting between a borrowed view and an owning value needs" ++
+                " a runtime call this backend cannot emit)",
+            .{ val_ty, dest_ty, what },
+        ));
+        return false;
+    }
+
     /// Store `value` into slot `i`, using whichever dialect owns that slot.
-    fn storeSlot(self: *Emitter, i: u32, ty: []const u8, value: []const u8) EmitError!void {
+    ///
+    /// The DESTINATION type comes from `slot_ty` now, not from the caller. It
+    /// used to be the caller's, which meant the store simply asserted whatever
+    /// the value happened to be and no store in this file could ever disagree
+    /// with its own slot. Every write of a language-level value into a binding
+    /// goes through here, so the guard is not something a new position can
+    /// forget to call.
+    fn storeSlot(self: *Emitter, span: hir.Span, i: u32, val: Value, what: []const u8) EmitError!void {
+        if (i >= self.slot_ty.items.len) return;
+        const ty = self.slot_ty.items[i];
+        // Empty means the BINDING was already refused, in `emitFn`. A second
+        // diagnostic at every write to it would bury the first.
+        if (ty.len == 0) return;
+        if (!try self.fits(span, val.ty, ty, what)) return;
         if (i < self.slot_is_llvm.items.len and self.slot_is_llvm.items[i]) {
-            try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ value, self.slots.items[i], ty });
+            try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ val.text, self.slots.items[i], ty });
         } else {
-            try self.line("memref.store {s}, {s}[] : memref<{s}>", .{ value, self.slots.items[i], ty });
+            try self.line("memref.store {s}, {s}[] : memref<{s}>", .{ val.text, self.slots.items[i], ty });
         }
     }
 
@@ -440,11 +540,24 @@ const Emitter = struct {
                     const val = try self.emitExpr(&e);
                     if (val.isNone()) {
                         try self.line("return", .{});
+                    } else if (!try self.fits(e.span, val.ty, self.ret_natural, "a return value")) {
+                        // ONE check for both return conventions, asked before
+                        // the branch rather than inside it. The sret arm is
+                        // where `return "ab"` from a `-> String` wrote a
+                        // 16-byte borrowed view into the caller's 24-byte
+                        // owning buffer, and it had no comparison at all: it
+                        // stored with `val.ty`, so the store agreed with
+                        // whatever it was given.
+                        //
+                        // A terminator is still written. A diagnostic should
+                        // not also leave a block without one, even in a module
+                        // nobody will lower.
+                        try self.line("return", .{});
                     } else if (self.sret) |dest| {
-                        try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ val.text, dest, val.ty });
+                        try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ val.text, dest, self.ret_natural });
                         try self.line("return", .{});
                     } else {
-                        try self.line("return {s} : {s}", .{ val.text, val.ty });
+                        try self.line("return {s} : {s}", .{ val.text, self.ret_natural });
                     }
                 } else {
                     try self.line("return", .{});
@@ -524,20 +637,11 @@ const Emitter = struct {
         if (val.isNone()) return;
 
         switch (dest) {
-            .into_slot => try self.storeSlot(place.slot, val.ty, val.text),
+            .into_slot => try self.storeSlot(value.span, place.slot, val, "an assignment"),
             .through_slot => |pointee| {
-                if (!std.mem.eql(u8, val.ty, pointee)) {
-                    // Borrowck refuses moving out of a borrow, so no construct
-                    // reaches here with a mismatched value today. Saying so is
-                    // still cheaper than the store: a pointer written where a
-                    // struct belongs is exactly the defect above, one level in.
-                    try self.unsupported(stmt.span, try std.fmt.allocPrint(
-                        self.arena,
-                        "a value of type {s} written through a borrow of {s}",
-                        .{ val.ty, pointee },
-                    ));
-                    return;
-                }
+                // The same predicate the slot write uses, rather than the one
+                // hand-written comparison this arm alone used to carry.
+                if (!try self.fits(value.span, val.ty, pointee, "a write through a borrow")) return;
                 // The slot holds the lender's address, so LOAD it and store
                 // through that. Storing into the slot would overwrite the
                 // pointer, which is what `reset(exclusive b) { b = Buffer {
@@ -560,9 +664,11 @@ const Emitter = struct {
         // with no diagnostic.
         if (slot < self.slot_ptr_to.items.len and self.slot_ptr_to.items[slot] != null) {
             const addr = (try self.borrowAddress(&v)) orelse return;
-            try self.line(
-                "llvm.store {s}, {s} : !llvm.ptr, !llvm.ptr",
-                .{ addr, self.slots.items[slot] },
+            try self.storeSlot(
+                v.span,
+                slot,
+                .{ .text = addr, .ty = "!llvm.ptr" },
+                "a borrow binding",
             );
             return;
         }
@@ -575,7 +681,7 @@ const Emitter = struct {
         // which is what this backend did before borrows in locals started
         // holding addresses, and what llvmemit.zig still emits.
         if (val.ptr_to) |pointee| val = try self.derefValue(val, pointee);
-        try self.storeSlot(slot, val.ty, val.text);
+        try self.storeSlot(v.span, slot, val, "a binding's initializer");
     }
 
     /// Read the object a borrow points AT, as a value.
@@ -698,11 +804,30 @@ const Emitter = struct {
                 };
                 // llvm.mlir.undef then one insertvalue per field, which is the
                 // same shape the LLVM backend emits.
+                const decl = self.module.findStruct(sl.name) orelse {
+                    try self.unsupported(e.span, "struct literal for an undeclared type");
+                    return Value.none;
+                };
                 var acc = try self.nextSsa();
                 try self.line("{s} = llvm.mlir.undef : {s}", .{ acc, t });
                 for (sl.fields, 0..) |fe, i| {
                     const v = try self.emitExpr(&fe);
                     if (v.isNone()) return Value.none;
+                    // A FIELD IS A DESTINATION TOO. The insertvalue names only
+                    // the STRUCT's type, so the operand's own type was never
+                    // stated and never checked: `B { name: "ab" }` for
+                    // `owned name: String` inserted a 16-byte borrowed view
+                    // where `structType` above renders 24 owning bytes.
+                    if (i >= decl.fields.len) {
+                        try self.unsupported(fe.span, "more initializers than the struct declares fields");
+                        return Value.none;
+                    }
+                    const field = decl.fields[i];
+                    const want = self.mlirTypeOwned(field.ty, field.ownership) orelse {
+                        try self.unsupported(fe.span, "struct field type");
+                        return Value.none;
+                    };
+                    if (!try self.fits(fe.span, v.ty, want, "a struct literal field")) return Value.none;
                     const next = try self.nextSsa();
                     try self.line("{s} = llvm.insertvalue {s}, {s}[{d}] : {s}", .{ next, v.text, acc, i, t });
                     acc = next;
@@ -832,6 +957,7 @@ const Emitter = struct {
 
         const left = try self.emitExpr(left_e);
         if (left.isNone()) return left;
+        if (!try self.fits(left_e.span, left.ty, "i1", "a short-circuit operand")) return Value.none;
         try self.line("memref.store {s}, {s}[] : memref<i1>", .{ left.text, slot });
 
         const rhs_b = self.nextBlock();
@@ -846,7 +972,9 @@ const Emitter = struct {
         try self.block_label(rhs_b);
         const right = try self.emitExpr(right_e);
         if (!right.isNone()) {
-            try self.line("memref.store {s}, {s}[] : memref<i1>", .{ right.text, slot });
+            if (try self.fits(right_e.span, right.ty, "i1", "a short-circuit operand")) {
+                try self.line("memref.store {s}, {s}[] : memref<i1>", .{ right.text, slot });
+            }
         }
         if (!self.returned) try self.line("cf.br {s}", .{end_b});
 
@@ -966,15 +1094,14 @@ const Emitter = struct {
             if (std.mem.eql(u8, pointee, w)) return self.derefValue(v, w);
         }
 
-        // Any other mismatch. No construct produces one today, so rather than
-        // emit a reinterpreting spill nobody has ever measured, say so at the
-        // span: refusing is this backend's contract, and a silent mismatch is
-        // exactly what produced the defect this function was written to fix.
-        try self.unsupported(arg.span, try std.fmt.allocPrint(
-            self.arena,
-            "an argument of type {s} cannot lower to a parameter declared {s}",
-            .{ v.ty, w },
-        ));
+        // Any other mismatch, through the same predicate every other position
+        // uses. This arm is why MLIR already refused `g(owned "ab")` at
+        // `2298fa9` while the LLVM backend accepted it: `paramType` renders an
+        // `owned String` as the 24-byte owning struct and the argument is a
+        // 16-byte view, so the comparison had something to catch. The other
+        // five positions in this file had no comparison at all, which is what
+        // the rest of this change fixes.
+        _ = try self.fits(arg.span, v.ty, w, "a call argument");
         return Value.none;
     }
 
@@ -1001,10 +1128,17 @@ const Emitter = struct {
             // longer disagree; when this did not exist, a `shared Buffer`
             // parameter was declared `!llvm.ptr` and then called with an
             // `!llvm.struct<(i64)>`, and mlir-opt refused the module.
-            const want: ?[]const u8 = if (i < modes.len)
-                self.paramType(a.ty, modes[i].param)
-            else
-                null;
+            var want: ?[]const u8 = null;
+            if (i < modes.len) {
+                // A null `want` means "the callee has no signature" inside
+                // `emitArg`, so letting `paramType`'s null fall through would
+                // silently reuse the no-signature path for a parameter type
+                // this backend has REFUSED. Two different facts, one spelling.
+                want = self.paramType(a.ty, modes[i].param) orelse {
+                    try self.unsupported(a.span, "an argument whose parameter type this backend cannot render");
+                    return Value.none;
+                };
+            }
             vals[i] = try self.emitArg(&a, want);
             if (vals[i].isNone()) return Value.none;
         }
@@ -1093,7 +1227,9 @@ const Emitter = struct {
         try self.block_label(then_b);
         const then_val = try self.emitExpr(then_e);
         if (produces and !then_val.isNone()) {
-            try self.line("memref.store {s}, {s}[] : memref<{s}>", .{ then_val.text, slot, slot_ty });
+            if (try self.fits(then_e.span, then_val.ty, slot_ty, "an if branch's value")) {
+                try self.line("memref.store {s}, {s}[] : memref<{s}>", .{ then_val.text, slot, slot_ty });
+            }
         }
         if (!self.returned) try self.line("cf.br {s}", .{end_b});
 
@@ -1101,7 +1237,9 @@ const Emitter = struct {
             try self.block_label(else_b);
             const else_val = try self.emitExpr(eb);
             if (produces and !else_val.isNone()) {
-                try self.line("memref.store {s}, {s}[] : memref<{s}>", .{ else_val.text, slot, slot_ty });
+                if (try self.fits(eb.span, else_val.ty, slot_ty, "an else branch's value")) {
+                    try self.line("memref.store {s}, {s}[] : memref<{s}>", .{ else_val.text, slot, slot_ty });
+                }
             }
             if (!self.returned) try self.line("cf.br {s}", .{end_b});
         }
@@ -1262,11 +1400,13 @@ const Emitter = struct {
             try self.block_label(body_b);
             if (arm.pattern.kind == .binding) {
                 const bslot = arm.pattern.kind.binding;
-                try self.storeSlot(bslot, scrutinee.ty, scrutinee.text);
+                try self.storeSlot(arm.span, bslot, scrutinee, "a match binding pattern");
             }
             const body_val = try self.emitExpr(arm.body);
             if (produces and !body_val.isNone()) {
-                try self.line("memref.store {s}, {s}[] : memref<{s}>", .{ body_val.text, slot, slot_ty });
+                if (try self.fits(arm.body.span, body_val.ty, slot_ty, "a match arm's value")) {
+                    try self.line("memref.store {s}, {s}[] : memref<{s}>", .{ body_val.text, slot, slot_ty });
+                }
             }
             if (!self.returned) try self.line("cf.br {s}", .{end_b});
 
@@ -2114,4 +2254,96 @@ test "an sret round trip computes the right answer through the whole pipeline" {
     defer gpa.free(out);
     // 7 * 3. By value this came back as 21248159473.
     try std.testing.expectEqualStrings("21\n", out);
+}
+
+test "the borrowed-view to owning-String conversion is refused at EVERY position" {
+    // The twin of `llvmemit.zig`'s table, with the same seven programs, in the
+    // same commit. That is the point rather than a courtesy: `tools/check.sh`
+    // compares the two backends' emit VERDICTS, so a conversion refused here
+    // and accepted there is a gate failure, and a conversion accepted in both
+    // is silent wrong code in both.
+    //
+    // Measured at 2298fa9: this backend already refused case 4, because
+    // `emitArg` compared the argument against `paramType`'s 24-byte owning
+    // struct and had something to catch. The other six positions had no
+    // comparison at all, so `let owned s: String = "ab"` emitted a 16-byte
+    // `llvm.store` into a 24-byte `llvm.alloca` and nothing in the module
+    // contradicted anything. `storeSlot` wrote with the VALUE's type, so it
+    // could not.
+    const cases = [_][]const u8{
+        \\pub fn f() -> String { return "ab" }
+        ,
+        \\pub fn f() { let owned s: String = "ab" }
+        ,
+        \\pub fn f() { var owned s: String = "ab" }
+        ,
+        \\pub fn g(owned s: String);
+        \\pub fn f() { g(owned "ab") }
+        ,
+        \\pub struct B { owned name: String }
+        \\pub fn f() { let owned b = B { name: "ab" } }
+        ,
+        \\pub fn make() -> String;
+        \\pub fn f() { var owned s: String = make() s = "cd" }
+        ,
+        \\pub fn f() -> arc String { return "ab" }
+        ,
+    };
+    for (cases, 0..) |src, i| {
+        var e = try emitSource(src);
+        defer e.deinit();
+        if (!e.bag.hasErrors()) {
+            std.debug.print("case {d} was ACCEPTED:\n{s}\nemitted:\n{s}\n", .{ i + 1, src, e.text });
+            return error.ConversionAccepted;
+        }
+        var named = false;
+        for (e.bag.list.items) |d| {
+            if (std.mem.indexOf(
+                u8,
+                d.message,
+                "!llvm.struct<(ptr, i64)> where !llvm.struct<(ptr, i64, i64)>",
+            ) != null) named = true;
+        }
+        if (!named) {
+            std.debug.print("case {d} refused without naming the conversion:\n", .{i + 1});
+            for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
+            return error.RefusalDoesNotNameTheConversion;
+        }
+    }
+}
+
+test "the guard does not refuse a matching String or a borrowed aggregate" {
+    // The other half. This backend performs no AAPCS64 coercion, so there is
+    // no `coerceArg` to place the guard around, but there IS the borrow path:
+    // `paramType` renders a borrowed struct `!llvm.ptr` and `emitArg` hands
+    // over the slot. That is a deliberate ABI spelling, not a conversion, and
+    // it must stay invisible to the guard.
+    const cases = [_][]const u8{
+        \\pub fn slen(shared s: String) -> Int;
+        \\pub fn f() -> Int { return slen(shared "hi") }
+        ,
+        \\pub fn f() { let shared s: String = "ab" }
+        ,
+        \\pub fn make() -> String;
+        \\pub fn f() { let owned s: String = make() }
+        ,
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn look(shared b: Buffer) { }
+        \\pub fn f() { var owned buf = Buffer { len: 0 } look(shared buf) look(&buf) }
+        ,
+        \\pub struct Big { copy a: Int, copy b: Int, copy c: Int }
+        \\pub fn make(copy n: Int) -> Big { return Big { a: n, b: n, c: n } }
+        \\pub fn sum(copy v: Big) -> Int { return v.a + v.b + v.c }
+        \\pub fn f() -> Int { return sum(copy make(copy 7)) }
+        ,
+    };
+    for (cases, 0..) |src, i| {
+        var e = try emitSource(src);
+        defer e.deinit();
+        if (e.bag.hasErrors()) {
+            std.debug.print("case {d} was REFUSED:\n{s}\n", .{ i + 1, src });
+            for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
+            return error.LegitimateProgramRefused;
+        }
+    }
 }
