@@ -1,0 +1,144 @@
+// A borrow BOUND TO A NAME is still the lender's object, not a copy of it.
+//
+// WHY THIS FILE EXISTS SEPARATELY FROM write_through_whole.cell. That file
+// measures what happens when a borrow is passed DIRECTLY as a call argument,
+// `bump(&mut buf)`. This one measures the other half of the same rule: a
+// borrow parked in a local first,
+//
+//     let exclusive e = &mut buf
+//     bump(exclusive e)
+//
+// which every call through `e` must forward to `buf` and not to a copy of it.
+// The two are different code paths in both new backends, and the argument path
+// being right says nothing about the binding path.
+//
+// examples/nll_dead_borrow.cell has carried this exact shape since 41abc3b and
+// could never have caught the defect, because its `grow` has an empty body and
+// writes nothing. A test can carry a defect's exact shape and still be blind to
+// it: what makes a shape testable is that something OBSERVABLE depends on it.
+//
+// WHAT WENT WRONG, measured at 9e591ab. `llvmemit.zig`'s slot-shape predicate
+// read `i < f.param_count and ...`. It made a claim about PARAMETERS and
+// applied it to every binding, so a let-bound borrow got a struct-shaped slot,
+// was initialized with a LOADED COPY of the lender, and handed that copy's
+// address to every later call. The write landed in the copy:
+//
+//     C backend     38 for the single-bump form, since 8b82b62
+//     MLIR backend  38, since e7605ac, which fixed the same predicate there
+//     LLVM backend  37, silently, with no diagnostic from anything
+//
+// A SECOND DEFECT LIVES IN THE SAME PROGRAM, and it is why `doubled` and `snap`
+// are here rather than a bare `print_int(buf.len)`. Once a borrow's slot holds
+// an ADDRESS, every position that wants the VALUE has to load through it.
+// `llvmemit.zig` loaded through in two positions and not the rest, so
+// `let copy c = b` stored an address into a struct-shaped slot and
+// `sum(copy b)` passed pointer bits as the argument. This program printed
+// 25320060605 through that backend while the other two printed 125. That is a
+// worse failure than a lost write and it is invisible to any check that only
+// asks whether the write landed, which is why both shapes are pinned here.
+//
+// WHAT IT PRINTS, and how to read a wrong answer. One integer, `122`:
+//
+//   `buf.len` starts at 37, `buf.step` is 1, and the three let-bound spellings
+//   below each add `step`, so `buf.len` is 40. `doubled` returns
+//   `(len + step) * 2` = 82 by two different by-value routes, and `snap.len` is
+//   40, for 122.
+//
+//   A spelling whose write is LOST costs 3 (2 from `doubled`, 1 from
+//   `snap.len`), so 119, 116 and 113 each name a count of broken spellings,
+//   and 113 means all three. A number in the billions means an address was
+//   read where an aggregate belonged, which is the second defect rather than
+//   the first.
+//
+// WHY THREE SPELLINGS AND NOT FIVE, and both reasons are defects in the
+// REFERENCE backend rather than choices. examples/borrows.cell declares five
+// unique-borrow spellings identical AS CALL ARGUMENTS, and
+// write_through_whole.cell exercises all five there. In a `let` INITIALIZER
+// `codegen.zig` breaks the group in two different ways, so two spellings are
+// left out rather than pinned to an answer this file would then have to bless:
+//
+//   `let exclusive e = exclusive buf`   emits `cell_Buffer e = buf;`, a COPY,
+//                                       where the sigil forms emit a pointer.
+//                                       Borrowck disagrees and creates a real
+//                                       exclusive loan for it: `let copy n =
+//                                       buf.len` after one is refused with
+//                                       "cannot use 'buf.len' while it is
+//                                       exclusively borrowed". So C prints 37
+//                                       for the single-bump form where LLVM
+//                                       and MLIR print 38, and C is the one
+//                                       that is wrong.
+//   `let exclusive e = exclusive &buf`  emits `const cell_Buffer *e = &buf;`.
+//                                       The keyword is supposed to win over
+//                                       the sigil, which is what
+//                                       examples/borrows.cell says of the
+//                                       argument form, and here it does not.
+//                                       Loud rather than silent: the gate's
+//                                       AddressSanitizer stage compiles at
+//                                       -Werror and reports
+//                                       -Wincompatible-pointer-types-discards-qualifiers
+//                                       at the call, which is how this was
+//                                       found.
+//
+// Both are lowered correctly by the LLVM backend, and a unit test in
+// src/cell/llvmemit.zig pins all FIVE spellings emitting byte-identical IR
+// there, so the coverage this file gives up is kept where it can be kept.
+//
+// EXPECT-OUTPUT: 122
+
+pub struct Buffer {
+    copy len: Int,
+    copy step: Int,
+}
+
+pub fn print_int(copy value: Int);
+
+// The mutator writes the WHOLE value rather than a field, because the MLIR
+// backend refuses a field-path assignment and this file is in the corpus those
+// two backends must agree on. Reading `b.step` on the way in forces the callee
+// to index the borrowed object at an offset past the first, where a wrong base
+// and a right base cannot coincide.
+pub fn bump(exclusive b: Buffer) {
+    b = Buffer { len: b.len + b.step, step: b.step }
+}
+
+pub fn sum(copy b: Buffer) -> Int {
+    return b.len + b.step
+}
+
+// A borrow consumed BY VALUE, twice, by the two routes that differ in the
+// emitted IR: once through a `copy` binding of the borrow, and once by passing
+// the borrow straight into a `copy` parameter. The C backend spells these
+// `cell_Buffer c = *b;` and `cell_sum(*b)`, so both are a load THROUGH the
+// borrow and neither is the borrow itself.
+pub fn doubled(exclusive b: Buffer) -> Int {
+    let copy c = b
+    return sum(copy c) + sum(copy b)
+}
+
+pub fn main() {
+    var owned buf = Buffer { len: 37, step: 1 }
+
+    // Three sigil spellings of a unique borrow, each parked in a name before
+    // the call. `&mut` is the Rust spelling, `&var` is the CELL v2.0 one, and
+    // `&exclusive` is this language's keyword sigil. All three reach a backend
+    // wrapped in a unary borrow node, and a backend that handles one and not
+    // another splits the group without saying so. The two spellings this file
+    // cannot carry are named in the header, with the reason.
+    let exclusive e1 = &mut buf
+    bump(exclusive e1)
+    let exclusive e2 = &var buf
+    bump(exclusive e2)
+    let exclusive e3 = &exclusive buf
+    bump(exclusive e3)
+
+    // buf.len is 40 here. Both by-value routes inside `doubled` read it
+    // through the borrow.
+    let copy twice = doubled(exclusive buf)
+
+    // And the same by-value question asked of a LET-BOUND borrow rather than a
+    // parameter, which is a different slot and was a different bug.
+    let exclusive v = &mut buf
+    let copy snap = v
+
+    print_int(twice + snap.len)
+}

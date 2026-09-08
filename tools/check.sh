@@ -68,6 +68,17 @@
 #                       example may declare `// EXPECT-OUTPUT:` to pin the
 #                       answer itself, since three backends agreeing is not the
 #                       same as three backends being right.
+#                       AND IT STILL ONLY SEES THE SHAPES THE CORPUS CONTAINS.
+#                       This stage was green over three further LLVM defects at
+#                       once, because no example BOUND a borrow to a name
+#                       before calling through it: a let-bound borrow took a
+#                       copy, a borrow consumed by value handed over pointer
+#                       bits, and `exclusive String` was classified by value
+#                       while codegen passed a pointer. So the compiler fix for
+#                       a silent class of defect is never the whole fix: the
+#                       corpus has to carry the shape, or the next regression
+#                       is silent again. examples/write_through_named.cell is
+#                       that half for these three.
 #   9. sanitizers       the same programs, rebuilt with -fsanitize=address and
 #                       run, with an ASan REPORT failing the gate. Eight
 #                       use-after-frees were found in this repository in one

@@ -48,15 +48,31 @@ const abi = @import("abi.zig");
 pub const EmitError = Io.Writer.Error || std.mem.Allocator.Error;
 
 /// An emitted LLVM value: its textual operand and its LLVM type.
+/// An emitted value is ALWAYS a value, never an address.
+///
+/// It used to carry a `ptr_to` field: when set, `text` was the address of an
+/// aggregate rather than the aggregate, and `emitExpr`'s `.ref` arm set it for
+/// every borrowed binding. Two consumers knew about it and the rest did not,
+/// so a borrow reaching any other value position handed over POINTER BITS
+/// where an aggregate belonged. Measured at 9e591ab, both silent:
+///
+///     let copy c = b          stored an 8-byte address into a struct slot
+///     sum(copy b)             loaded 16 bytes out of an 8-byte alloca and
+///                             passed the pointer as the argument
+///
+/// and a program that prints 84 through the C and MLIR backends printed
+/// 18400323745 through this one.
+///
+/// The invariant replaces the enumeration. An address is now produced only by
+/// the three functions that are ASKED for one, each of them total:
+/// `placeAddress` for an assignment target, `argPlaceAddress` for a call
+/// argument, and `borrowAddress` for a borrow binding's initializer. Every
+/// other position gets a value by construction, so a position nobody thought
+/// about cannot receive an address. The cost is a second load at a borrowed
+/// field read, which `mem2reg` and `instcombine` remove.
 const Value = struct {
     text: []const u8,
     ty: []const u8,
-    /// When set, `text` is the ADDRESS of an aggregate of this LLVM type
-    /// rather than the aggregate itself. A borrowed struct parameter arrives
-    /// as a pointer under AAPCS64 (the C backend spells it
-    /// `const cell_Buffer *`), so a field read has to `getelementptr` through
-    /// it instead of `extractvalue` out of it.
-    ptr_to: ?[]const u8 = null,
 
     const void_value: Value = .{ .text = "", .ty = "void" };
 
@@ -92,10 +108,23 @@ const Emitter = struct {
     /// Slot -> alloca operand, for the function being emitted.
     slots: std.ArrayList([]const u8) = .empty,
     /// Slot -> pointee LLVM type, when the slot holds an ADDRESS rather than a
-    /// value. Only borrowed aggregate parameters are stored this way, because
-    /// an `exclusive` borrow must write through to the caller's object; a copy
-    /// would silently drop every mutation.
+    /// value. EVERY borrow the ABI passes by pointer is stored this way, a
+    /// parameter and a local alike, because an `exclusive` borrow must write
+    /// through to the lender's object and a copy would silently drop every
+    /// mutation.
+    ///
+    /// "a parameter and a local alike" is the correction. This was filled in
+    /// only for parameters, gated on `i < f.param_count`, which made a claim
+    /// about PARAMETERS and applied it to every binding: `let exclusive e =
+    /// &mut buf` got a struct-shaped slot, was initialized with a loaded COPY
+    /// of the lender, and handed that copy's address to every later call. The
+    /// C backend spells the same binding `cell_Buffer *e = &buf;` and printed
+    /// 38 where this backend printed 37, with no diagnostic from either.
     slot_ptr_to: std.ArrayList(?[]const u8) = .empty,
+    /// Slot -> whether a whole-value write to it is refused. See
+    /// `assignDest`: this is a deliberate verdict alignment with
+    /// `mlirmit.zig`, not a limitation of the lowering here.
+    slot_write_refused: std.ArrayList(bool) = .empty,
     current_fn: []const u8 = "",
     /// The return type as the body computes it, and as the ABI writes it.
     /// They differ whenever the ABI coerces, e.g. a 16-byte non-HFA struct is
@@ -282,6 +311,9 @@ const Emitter = struct {
         self.slot_ptr_to.clearRetainingCapacity();
         try self.slot_ptr_to.resize(self.arena, f.bindings.len);
         for (self.slot_ptr_to.items) |*p| p.* = null;
+        self.slot_write_refused.clearRetainingCapacity();
+        try self.slot_write_refused.resize(self.arena, f.bindings.len);
+        for (self.slot_write_refused.items) |*p| p.* = false;
         self.ret_natural = ret_natural;
         self.ret_abi = ret;
         self.sret = if (uses_sret) "%sret" else null;
@@ -319,22 +351,45 @@ const Emitter = struct {
                 try self.out.print("  {s} = alloca i8\n", .{name});
                 continue;
             };
-            // A borrowed aggregate parameter's slot holds a pointer, so it is
-            // one word rather than the whole struct.
-            const is_ref = i < f.param_count and
-                self.borrowsByPointer(f.bindings[i].ty, f.bindings[i].ownership);
+            // A BORROW THE ABI PASSES BY POINTER, whatever binds it. Its slot
+            // holds the lender's address, so it is one word rather than the
+            // whole aggregate.
+            //
+            // The `i < f.param_count` this once carried is the defect: it
+            // enumerated parameters and asserted a property of every borrow,
+            // so a `let exclusive e = &mut buf` local was bound to a COPY and
+            // every write through it was lost. The question is asked of the
+            // BINDING now, which is the only thing that decides what the slot
+            // holds, and `emitLet` below fills a ref slot with an address
+            // exactly where a value slot gets a value.
+            //
+            // The pointee is `t`, the OWNERSHIP-AWARE type, and not
+            // `llType(b.ty)`: the two disagree for `String`, where the bare
+            // spelling is the 16-byte borrowed view `%cell_str` and an
+            // `exclusive String` points at the 24-byte owning `%cell_string`.
+            // Taking the bare one would size the write through the borrow at
+            // 16 bytes, which is the second half of the ABI divergence this
+            // change closes.
+            const is_ref = self.borrowsByPointer(b.ty, b.ownership);
+            if (is_ref) self.slot_ptr_to.items[i] = t;
+            self.slot_write_refused.items[i] = is_ref and b.ty.tag() != .struct_type;
             try self.out.print("  {s} = alloca {s}\n", .{ name, if (is_ref) "ptr" else t });
         }
         for (f.params(), 0..) |p, i| {
             const natural = self.llTypeOwned(p.ty, p.ownership) orelse continue;
             switch (abi.classifyParam(self.module, p.ty, p.ownership)) {
                 .direct => {
-                    if (self.borrowsByPointer(p.ty, p.ownership)) {
+                    if (self.slot_ptr_to.items[i] != null) {
                         // A borrowed aggregate. Keep the ADDRESS: an
                         // `exclusive` borrow must write through to the
                         // caller's object, and copying it in would silently
                         // drop every mutation.
-                        self.slot_ptr_to.items[i] = natural;
+                        //
+                        // The slot's shape was already decided in the binding
+                        // loop above, so this READS that decision rather than
+                        // re-deriving it. Two independent derivations of "is
+                        // this slot a pointer" is how the alloca and the store
+                        // get to disagree.
                         try self.out.print("  store ptr %arg{d}, ptr {s}\n", .{ i, self.slots.items[i] });
                     } else {
                         try self.out.print("  store {s} %arg{d}, ptr {s}\n", .{ natural, i, self.slots.items[i] });
@@ -378,6 +433,28 @@ const Emitter = struct {
         if (self.terminated) return;
         switch (stmt.kind) {
             .let => |l| {
+                // A REF SLOT WANTS AN ADDRESS, and a value slot wants a value.
+                // Which one this is was decided in `emitFn`; asking again here
+                // is how the two used to disagree.
+                if (l.slot < self.slot_ptr_to.items.len and
+                    self.slot_ptr_to.items[l.slot] != null)
+                {
+                    // `let exclusive e = &mut buf` binds the LENDER's address,
+                    // the way the C backend emits `cell_Buffer *e = &buf;`.
+                    // A borrow with no initializer has no lender to point at,
+                    // so it is refused rather than left holding whatever the
+                    // alloca happened to contain.
+                    const v = l.value orelse {
+                        try self.unsupported(stmt.span, "a borrow binding with no initializer");
+                        return;
+                    };
+                    const addr = (try self.borrowAddress(&v)) orelse return;
+                    try self.out.print(
+                        "  store ptr {s}, ptr {s}\n",
+                        .{ addr, self.slots.items[l.slot] },
+                    );
+                    return;
+                }
                 if (l.value) |v| {
                     const val = try self.emitExpr(&v);
                     if (!val.isVoid()) {
@@ -389,11 +466,33 @@ const Emitter = struct {
                 }
             },
             .assign => |a| {
+                // Classify BEFORE emitting the value, so a refusal does not
+                // leave dead instructions in a module nobody will lower.
+                const dest_kind = self.assignDest(&a.place);
+                if (dest_kind == .refuse) {
+                    try self.unsupported(stmt.span, dest_kind.refuse);
+                    return;
+                }
                 const val = try self.emitExpr(&a.value);
                 const dest = try self.placeAddress(&a.place);
-                if (!val.isVoid()) {
-                    try self.out.print("  store {s} {s}, ptr {s}\n", .{ val.ty, val.text, dest });
+                if (val.isVoid()) return;
+                if (dest_kind == .through_slot) {
+                    const pointee = dest_kind.through_slot;
+                    if (!std.mem.eql(u8, val.ty, pointee)) {
+                        // Borrowck refuses moving out of a borrow, so nothing
+                        // reaches here with a mismatched value today. Saying so
+                        // is still cheaper than the store: a pointer written
+                        // where an aggregate belongs is precisely the class of
+                        // defect this file was opened to remove.
+                        try self.unsupported(stmt.span, try std.fmt.allocPrint(
+                            self.arena,
+                            "a value of type {s} written through a borrow of {s}",
+                            .{ val.ty, pointee },
+                        ));
+                        return;
+                    }
                 }
+                try self.out.print("  store {s} {s}, ptr {s}\n", .{ val.ty, val.text, dest });
             },
             .expr => |e| _ = try self.emitExpr(&e),
             .while_loop => |w| {
@@ -470,14 +569,87 @@ const Emitter = struct {
         }
     }
 
+    /// Where a write to a place LANDS, as a TOTAL verdict.
+    ///
+    /// The shape matters more than the three cases. Every predicate this file
+    /// has got wrong was an enumeration whose unlisted forms fell through to
+    /// "store it in the slot", and silence is what an unenumerated form
+    /// produces. So the undecidable case is `refuse`, and a shape nobody
+    /// anticipated fails closed with a `cannot lower` diagnostic rather than
+    /// writing somewhere plausible. `mlirmit.assignDest` is the same shape for
+    /// the same reason.
+    const AssignDest = union(enum) {
+        /// `placeAddress` names the right address and the value's own type is
+        /// what gets stored. An owned or `copy` binding, a borrowed primitive,
+        /// or a FIELD write through a borrow, which `placeAddress` already
+        /// walks through the slot's pointer.
+        into_place,
+        /// A whole-value write through a borrow. Carries the pointee type,
+        /// which the value must match exactly.
+        through_slot: []const u8,
+        /// This backend will not say where the write lands. Carries the
+        /// diagnostic text.
+        refuse: []const u8,
+    };
+
+    fn assignDest(self: *Emitter, place: *const hir.Place) AssignDest {
+        if (place.slot >= self.slots.items.len) {
+            return .{ .refuse = "assignment to a binding with no slot" };
+        }
+        if (place.slot < self.slot_write_refused.items.len and
+            self.slot_write_refused.items[place.slot])
+        {
+            // REFUSED TO KEEP TWO BACKENDS ON ONE VERDICT, and the lowering
+            // this declines is believed correct.
+            //
+            // `abi.classifyParam` now places `exclusive String`, `exclusive
+            // [T]` and `exclusive T?` as a pointer, matching
+            // `codegen.applyOwnership`, so the machinery above WOULD write
+            // through to the lender exactly as it does for a struct.
+            // `mlirmit.zig` refuses these ("assignment to a borrowed aggregate
+            // this backend passes by value") because it still passes them by
+            // value, and that file is outside this change. Two backends
+            // splitting accept-versus-refuse on one program is what
+            // `tools/check.sh`'s backend-agreement stage exists to catch, and
+            // a split is worse than a shared limitation.
+            //
+            // LIFT BOTH TOGETHER: teach `mlirmit.paramType` the pointer form
+            // and delete this refusal in the same change, with a corpus entry
+            // that writes through an `exclusive String`.
+            return .{ .refuse = "a whole-value write through a borrowed String, list or optional" };
+        }
+        if (place.path.len != 0) return .into_place;
+        if (self.slot_ptr_to.items[place.slot]) |pointee| return .{ .through_slot = pointee };
+        return .into_place;
+    }
+
+    /// The address a borrow binding's initializer names, or null having
+    /// already reported why not.
+    ///
+    /// Total by construction: `argPlaceAddress` answers for the forms that
+    /// HAVE an address (a binding, a field of one, and the four sigil borrow
+    /// spellings that wrap either) and null for everything else, so a
+    /// temporary is refused rather than bound.
+    ///
+    /// It deliberately does NOT reuse `emitCall`'s spill path. That one
+    /// stores a temporary into a fresh alloca and hands over its address,
+    /// which is right for an argument, where nothing outlives the call and can
+    /// observe a write back, and exactly wrong for a BINDING: `let exclusive e
+    /// = mk()` would bind a copy that the initializer cannot see written.
+    fn borrowAddress(self: *Emitter, e: *const hir.Expr) EmitError!?[]const u8 {
+        if (try self.argPlaceAddress(e)) |addr| return addr;
+        try self.unsupported(e.span, "a borrow of a value that has no address");
+        return null;
+    }
+
     /// The address of an assignable place: its slot, walked through any field
     /// selections with `getelementptr`.
     fn placeAddress(self: *Emitter, place: *const hir.Place) EmitError![]const u8 {
         var addr = self.slots.items[place.slot];
-        // A borrowed parameter's slot holds the caller's ADDRESS, not the
-        // object, so the object is one load away. Reading a field already knew
-        // this (`emitExpr`'s `.field` arm follows `ptr_to`); WRITING one did
-        // not, and indexed the slot itself. `b.len = b.len + 5` inside
+        // A borrow's slot holds the lender's ADDRESS, not the object, so the
+        // object is one load away. Reading a field already knew this;
+        // WRITING one did not, and indexed the slot itself. `b.len = b.len + 5`
+        // inside
         // `bump(exclusive b: Buffer)` therefore read the caller's `len`
         // correctly, added to it correctly, and stored the result over the
         // POINTER VARIABLE, leaving the caller's object untouched. Silent, and
@@ -553,13 +725,27 @@ const Emitter = struct {
                     try self.unsupported(e.span, "type of a binding");
                     return Value.void_value;
                 };
-                // A borrowed aggregate's slot holds the caller's ADDRESS, so
-                // loading it gives a pointer, not the struct.
+                // A borrowed aggregate's slot holds the lender's ADDRESS, so
+                // reading it as a VALUE is two loads: the slot yields the
+                // address, the address yields the object.
+                //
+                // This used to return the address with a `ptr_to` tag and let
+                // consumers deal with it. Two did and the rest did not, so
+                // `let copy c = b` stored an address into a struct slot and
+                // `sum(copy b)` passed pointer bits: a program printing 84
+                // through the C backend printed 18400323745 through this one.
+                // Loading here is what makes every value position correct
+                // without any of them knowing that borrows exist. The
+                // positions that genuinely want the address ask
+                // `placeAddress`, `argPlaceAddress` or `borrowAddress`
+                // instead, and none of them route through here.
                 if (slot < self.slot_ptr_to.items.len) {
                     if (self.slot_ptr_to.items[slot]) |pointee| {
                         const addr = try self.nextTemp();
                         try self.out.print("  {s} = load ptr, ptr {s}\n", .{ addr, self.slots.items[slot] });
-                        return .{ .text = addr, .ty = "ptr", .ptr_to = pointee };
+                        const loaded = try self.nextTemp();
+                        try self.out.print("  {s} = load {s}, ptr {s}\n", .{ loaded, pointee, addr });
+                        return .{ .text = loaded, .ty = pointee };
                     }
                 }
                 const tmp = try self.nextTemp();
@@ -576,20 +762,11 @@ const Emitter = struct {
                     try self.unsupported(e.span, "field type");
                     return Value.void_value;
                 };
-                // Reading a field of a BORROWED aggregate goes through its
-                // address, the way the C backend writes `b->len`. Using
-                // extractvalue here would be an extract out of a pointer,
-                // which is not valid IR.
-                if (base.ptr_to) |pointee| {
-                    const gep = try self.nextTemp();
-                    try self.out.print(
-                        "  {s} = getelementptr inbounds {s}, ptr {s}, i32 0, i32 {d}\n",
-                        .{ gep, pointee, base.text, f.sel.index },
-                    );
-                    const loaded = try self.nextTemp();
-                    try self.out.print("  {s} = load {s}, ptr {s}\n", .{ loaded, t, gep });
-                    return .{ .text = loaded, .ty = t };
-                }
+                // `base` is always the aggregate now, never its address: the
+                // `.ref` arm above loads through a borrow rather than handing
+                // one out. So one rule covers a borrowed base and an owned
+                // one, and there is no second path to keep in step. The extra
+                // load that costs is removed by mem2reg plus instcombine.
                 const tmp = try self.nextTemp();
                 try self.out.print(
                     "  {s} = extractvalue {s} {s}, {d}\n",
@@ -735,21 +912,30 @@ const Emitter = struct {
         _ = e;
     }
 
-    /// Whether `(ty, own)` is a BORROWED STRUCT: the one parameter class whose
-    /// `ptr` spelling means "the caller's own object" rather than "a copy the
-    /// callee may do as it likes with".
+    /// Whether `(ty, own)` is a BORROW PASSED BY POINTER: the one parameter
+    /// class whose `ptr` spelling means "the lender's own object" rather than
+    /// "a copy the callee may do as it likes with".
     ///
     /// `abi.renderParam` cannot answer this and must not be asked. It renders
-    /// `.direct = "ptr"` (a borrowed struct) and `.indirect` (any aggregate
-    /// over 16 bytes, in EVERY ownership mode) as the same four characters,
-    /// and the two have opposite call-site rules: an indirect argument is a
-    /// copy the CALLER allocates and the callee is entitled to scribble on,
-    /// so handing it the caller's own storage would trade the lost-write
-    /// defect below for an unwanted-write one. Only the classification tells
-    /// them apart, so this asks `abi.classifyParam` and both the declaration
-    /// site in `emitFn` and the call site in `emitCall` go through here.
+    /// a borrow's `.direct = "ptr"` and `.indirect` (any aggregate over 16
+    /// bytes, in EVERY ownership mode) as the same four characters, and the
+    /// two have opposite call-site rules: an indirect argument is a copy the
+    /// CALLER allocates and the callee is entitled to scribble on, so handing
+    /// it the caller's own storage would trade the lost-write defect below for
+    /// an unwanted-write one. Only the classification tells them apart, so
+    /// this asks `abi.classifyParam` and both the declaration site in `emitFn`
+    /// and the call site in `emitCall` go through here.
+    ///
+    /// THE `struct_type` GATE THAT USED TO OPEN THIS IS GONE, and it was the
+    /// second half of the same divergence. `codegen.applyOwnership` makes
+    /// EVERY non-primitive `exclusive` parameter a pointer, `String`, `[T]`
+    /// and `T?` included, so restricting the question to structs left those
+    /// three passing a spilled copy at the call site and taking a lost write.
+    /// `[T]` hid it best: at 24 bytes it was already `.indirect`, so it was
+    /// already rendered `ptr` and the SPELLING agreed while the MEANING did
+    /// not. The question belongs entirely to `abi.classifyParam` now, which is
+    /// the module that mirrors `applyOwnership`.
     fn borrowsByPointer(self: *Emitter, ty: hir.Ty, own: hir.Ownership) bool {
-        if (ty.tag() != .struct_type) return false;
         return switch (abi.classifyParam(self.module, ty, own)) {
             .direct => |spelling| std.mem.eql(u8, spelling, "ptr"),
             else => false,
@@ -875,14 +1061,19 @@ const Emitter = struct {
             if (v.isVoid()) return Value.void_value;
             // Place the argument the way the CALLEE's parameter is declared,
             // not the way the value happens to be computed.
+            //
+            // `v` is a VALUE, always. The branch that used to sit here asked
+            // whether it was secretly an address and, if the callee also
+            // wanted `ptr`, forwarded it. That branch could fire for an
+            // `.indirect` parameter too, which renders as the same four
+            // characters and means the opposite thing: the caller allocates a
+            // copy and the callee may scribble on it. Handing over the
+            // lender's storage there is an unwanted write rather than a lost
+            // one. It is gone with `Value.ptr_to`, and a borrow that really is
+            // wanted by pointer took the `argPlaceAddress` path above.
             if (i < modes.len) {
                 if (abi.renderParam(self.arena, self.module, a.ty, modes[i].param)) |want| {
-                    // A borrowed struct is already an address here.
-                    if (!(v.ptr_to != null and std.mem.eql(u8, want, "ptr"))) {
-                        v = try self.coerceArg(v, want);
-                    } else {
-                        v = .{ .text = v.text, .ty = "ptr" };
-                    }
+                    v = try self.coerceArg(v, want);
                 }
             }
             vals[i] = v;
@@ -1578,16 +1769,26 @@ test "an HFA struct parameter uses the AAPCS64 coerced form" {
 }
 
 test "a borrowed struct parameter is a pointer and its fields are read through it" {
-    // Matches what the C backend emits: `const cell_Buffer *b` and `b->len`.
-    // An extractvalue here would be an extract out of a pointer, which is not
-    // valid IR, so the field path has to change with the signature.
+    // Matches what the C backend emits for the SIGNATURE: `const cell_Buffer
+    // *b`. The parameter is the lender's address and the slot is one word.
+    //
+    // The FIELD READ changed shape, and deliberately. It used to be a
+    // `getelementptr` through the borrow, keyed on a `ptr_to` tag riding on
+    // the emitted value. That tag was the second defect in this file: two
+    // consumers honoured it and the rest silently received pointer bits. The
+    // `.ref` arm loads through the borrow now, so a field read is the same
+    // `extractvalue` an owned struct gets and there is no second path to keep
+    // in step. `mem2reg` plus `instcombine` fold the extra load back to the
+    // same load of the field, so this is not a code-quality regression at -O1.
     var e = try emitSource(
         \\pub struct Buffer { copy len: Int }
         \\pub fn read(shared b: Buffer) -> Int { return b.len }
     );
     defer e.deinit();
     try expectContains(e.text, "define i64 @cell_read(ptr");
-    try expectContains(e.text, "getelementptr inbounds %cell_Buffer");
+    try expectContains(e.text, "%slot0 = alloca ptr");
+    try expectContains(e.text, "load %cell_Buffer, ptr");
+    try expectContains(e.text, "extractvalue %cell_Buffer");
 }
 
 test "a non-HFA struct of 16 bytes coerces to integer words" {
@@ -1965,4 +2166,218 @@ test "an indirect aggregate parameter still gets a caller-owned copy" {
         if (std.mem.indexOf(u8, line, "alloca %cell_Big") != null) allocas += 1;
     }
     try std.testing.expectEqual(@as(usize, 3), allocas);
+}
+
+test "a borrow bound to a NAME writes through to the lender, not to a copy" {
+    // THE DEFECT: the slot-shape predicate read `i < f.param_count and ...`,
+    // a claim about PARAMETERS applied to every binding. A let-bound borrow
+    // got a struct-shaped slot, was initialized with a loaded COPY of the
+    // lender, and handed that copy's address to every later call, so the
+    // write landed in the copy. This printed 37 where the C backend, which
+    // spells the same binding `cell_Buffer *e = &buf;`, printed 41.
+    //
+    // Four spellings rather than five: the keyword form
+    // `let exclusive e = exclusive buf` is a copy in the C backend today (see
+    // the test below and examples/write_through_named.cell), so pinning five
+    // here would pin a disagreement with the reference backend.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int, copy step: Int }
+        \\pub fn print_int(copy value: Int);
+        \\pub fn bump(exclusive b: Buffer) {
+        \\  b = Buffer { len: b.len + b.step, step: b.step }
+        \\}
+        \\pub fn main() {
+        \\  var owned buf = Buffer { len: 37, step: 1 }
+        \\  let exclusive e1 = &mut buf
+        \\  bump(exclusive e1)
+        \\  let exclusive e2 = &var buf
+        \\  bump(exclusive e2)
+        \\  let exclusive e3 = &exclusive buf
+        \\  bump(exclusive e3)
+        \\  let exclusive e4 = exclusive &buf
+        \\  bump(exclusive e4)
+        \\  print_int(buf.len)
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+
+    // The slot is one word holding an address, not a copy of the struct.
+    try expectContains(e.text, "%slot1 = alloca ptr");
+    try expectContains(e.text, "store ptr %slot0, ptr %slot1");
+
+    const out = try runEmitted(e.text);
+    defer std.testing.allocator.free(out);
+    // 41, not 37: a lost write costs one per spelling, so 40, 39, 38 and 37
+    // each name a count of broken spellings.
+    try std.testing.expectEqualStrings("41\n", out);
+}
+
+test "the five unique-borrow spellings emit byte-identical IR in a let" {
+    // examples/borrows.cell declares the five identical, and they do NOT
+    // reach a backend as one shape: `exclusive buf` arrives as a bare
+    // reference because hir.lower consumes the written prefix, while `&mut`,
+    // `&var`, `&exclusive` and `exclusive &buf` arrive wrapped in a unary
+    // borrow node. A backend that handles one and not the others splits the
+    // group with nothing said, which is invisible to any check that reads a
+    // single spelling.
+    //
+    // Note what this test does NOT say. All five agree HERE, and the C
+    // backend disagrees with all of them on the keyword form: `codegen.zig`
+    // emits `cell_Buffer e = buf;` for `let exclusive e = exclusive buf` and
+    // `cell_Buffer *e = &buf;` for the other four, while `borrowck.zig`
+    // creates a real exclusive loan for all five. That is a defect in
+    // codegen.zig, outside this file, and it is recorded rather than matched.
+    const spellings = [_][]const u8{
+        "exclusive buf",
+        "&mut buf",
+        "&var buf",
+        "&exclusive buf",
+        "exclusive &buf",
+    };
+    var first: ?[]const u8 = null;
+    var first_emitted: ?Emitted = null;
+    defer if (first_emitted) |*fe| fe.deinit();
+
+    for (spellings) |sp| {
+        const src = try std.fmt.allocPrint(std.testing.allocator,
+            \\pub struct Buffer {{ copy len: Int, copy step: Int }}
+            \\pub fn print_int(copy value: Int);
+            \\pub fn bump(exclusive b: Buffer) {{
+            \\  b = Buffer {{ len: b.len + b.step, step: b.step }}
+            \\}}
+            \\pub fn main() {{
+            \\  var owned buf = Buffer {{ len: 37, step: 1 }}
+            \\  let exclusive e = {s}
+            \\  bump(exclusive e)
+            \\  print_int(buf.len)
+            \\}}
+        , .{sp});
+        defer std.testing.allocator.free(src);
+
+        var e = try emitSource(src);
+        try std.testing.expect(!e.bag.hasErrors());
+        if (first) |want| {
+            defer e.deinit();
+            if (!std.mem.eql(u8, want, e.text)) {
+                std.debug.print("spelling '{s}' emits different IR\n", .{sp});
+                return error.SpellingsDisagree;
+            }
+        } else {
+            first = e.text;
+            first_emitted = e;
+        }
+    }
+}
+
+test "a borrow consumed BY VALUE is loaded through, not handed over" {
+    // THE SECOND DEFECT, and the one the first fix would have INTRODUCED had
+    // it stopped at making the slot hold an address. `Value` carried a
+    // `ptr_to` tag saying "this operand is really an address"; two consumers
+    // knew about it and the rest did not, so a borrow reaching any other
+    // value position handed over pointer bits. Both shapes below were silent:
+    // `let copy c = b` stored the address into a struct-shaped slot, and
+    // `sum(copy b)` loaded sixteen bytes out of an eight-byte alloca and
+    // passed the pointer. This program printed 18400323745 where the C and
+    // MLIR backends printed 84.
+    //
+    // The fix is the invariant, not the two positions: an emitted value is
+    // always a value, and the three functions that are ASKED for an address
+    // are the only producers of one.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int, copy step: Int }
+        \\pub fn print_int(copy value: Int);
+        \\pub fn sum(copy b: Buffer) -> Int { return b.len + b.step }
+        \\pub fn doubled(exclusive b: Buffer) -> Int {
+        \\  let copy c = b
+        \\  return sum(copy c) + sum(copy b)
+        \\}
+        \\pub fn main() {
+        \\  var owned buf = Buffer { len: 40, step: 2 }
+        \\  print_int(doubled(exclusive buf))
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+
+    const out = try runEmitted(e.text);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("84\n", out);
+}
+
+test "a let-bound borrow consumed by value reads the lender, not its address" {
+    // The same question asked of a LOCAL rather than a parameter, which is a
+    // different slot and was reachable only once a let-bound borrow started
+    // holding an address. At HEAD this program was correct BECAUSE the
+    // let-bound borrow was a copy; fixing that alone would have broken it.
+    // Measured: with the binding fix applied and this one reverted, it prints
+    // a number in the billions.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int, copy step: Int }
+        \\pub fn print_int(copy value: Int);
+        \\pub fn sum(copy b: Buffer) -> Int { return b.len + b.step }
+        \\pub fn main() {
+        \\  var owned buf = Buffer { len: 40, step: 2 }
+        \\  let exclusive e = &mut buf
+        \\  let copy c = e
+        \\  print_int(sum(copy c) + sum(copy e) - 42)
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+
+    const out = try runEmitted(e.text);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("42\n", out);
+}
+
+test "a borrow of a value with no address is refused, not bound to a copy" {
+    // `borrowAddress` deliberately does not reuse the call site's spill path.
+    // That one stores a temporary into a fresh alloca and hands over its
+    // address, which is right for an argument, where nothing outlives the
+    // call and can observe a write back, and exactly wrong for a binding.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn mk() -> Buffer { return Buffer { len: 1 } }
+        \\pub fn grow(exclusive b: Buffer) { b = Buffer { len: b.len + 1 } }
+        \\pub fn main() {
+        \\  let exclusive e = &mut mk()
+        \\  grow(exclusive e)
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(e.bag.hasErrors());
+}
+
+test "an exclusive String is a pointer, and a write through one is refused" {
+    // THE THIRD DEFECT, and it lived in the module whose header says every
+    // fact in it was measured. `abi.classifyParam` placed `exclusive String`
+    // BY VALUE as `[2 x i64]` while `codegen.applyOwnership` emitted
+    // `cell_string_t *` and wrote through it. This backend followed abi.zig,
+    // accepted the program, gave the binding a 16-byte `%cell_str` slot and
+    // stored a 24-byte `%cell_string` into it: eight bytes past the end of
+    // the alloca, plus a write the caller could never see.
+    //
+    // The declaration is a pointer now, matching the C. The WRITE is refused
+    // only to keep this backend's verdict equal to mlirmit.zig's, which still
+    // passes these by value; see `assignDest` for the note on lifting both
+    // together.
+    var e = try emitSource(
+        \\pub fn make() -> String { return "abcdefg" }
+        \\pub fn reset(exclusive s: String) { s = make() }
+    );
+    defer e.deinit();
+    try std.testing.expect(e.bag.hasErrors());
+    try expectContains(e.text, "define void @cell_reset(ptr %arg0)");
+
+    // Reading through one is still lowered, which is where mlirmit.zig also
+    // stands, so the two backends agree on the parameter and on the write.
+    var ok = try emitSource(
+        \\pub fn peek(exclusive s: String) -> Int { return 7 }
+    );
+    defer ok.deinit();
+    try std.testing.expect(!ok.bag.hasErrors());
+    try expectContains(ok.text, "define i64 @cell_peek(ptr %arg0)");
+    // One word for the address, not a 16-byte view of a 24-byte object.
+    try expectContains(ok.text, "%slot0 = alloca ptr");
 }

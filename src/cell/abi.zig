@@ -40,9 +40,19 @@ pub fn layoutOf(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) ?Layout {
         // this function takes it. codegen maps `shared String` to a 16-byte
         // cell_str_t (a borrowed {ptr, len} view) and `owned`/`copy String` to
         // a 24-byte cell_string_t (an owning {ptr, len, cap} buffer).
+        //
+        // `exclusive` used to be grouped with `shared` here and that was
+        // WRONG, measured against the C the reference backend emits.
+        // `codegen.applyOwnership` maps `exclusive String` to
+        // `cell_string_t *`, a pointer to the OWNING buffer, and writes
+        // through it. So the object an `exclusive String` names is 24 bytes,
+        // not 16, and `stringStruct` below names it accordingly. The old
+        // answer made `llvmemit.zig` give the binding a 16-byte slot and then
+        // store a 24-byte value into it: eight bytes past the end of the
+        // alloca, plus a lost write, with no diagnostic from anything.
         .string => switch (own) {
-            .shared, .exclusive => .{ .size = 16, .alignment = 8 },
-            .owned, .copy => .{ .size = 24, .alignment = 8 },
+            .shared => .{ .size = 16, .alignment = 8 },
+            .exclusive, .owned, .copy => .{ .size = 24, .alignment = 8 },
             // arc String is a cell_arc_t over a heap cell_string_t. arc has no
             // retain/release insertion yet (OWNERSHIP R11), so placing one
             // correctly would be lowering half a feature.
@@ -87,10 +97,15 @@ pub fn optionalBase(elem: hir.Ty) ?[]const u8 {
 
 /// The LLVM struct type a `String` occupies, by ownership. Null when this
 /// module does not place it.
+///
+/// For `exclusive` this is the POINTEE, not the parameter: `classifyParam`
+/// places an `exclusive String` as a `ptr`, and this names what it points at.
+/// The two answers have to be read together, which is why they are both
+/// derived from `codegen.applyOwnership` rather than from each other.
 pub fn stringStruct(own: hir.Ownership) ?[]const u8 {
     return switch (own) {
-        .shared, .exclusive => "%cell_str",
-        .owned, .copy => "%cell_string",
+        .shared => "%cell_str",
+        .exclusive, .owned, .copy => "%cell_string",
         .arc => null,
     };
 }
@@ -208,6 +223,50 @@ fn scalarSpelling(ty: hir.Ty) ?[]const u8 {
     };
 }
 
+/// Whether `codegen.applyOwnership` makes `(ty, own)` a POINTER TO THE
+/// LENDER'S OBJECT rather than the object itself.
+///
+/// THIS MIRRORS ONE FUNCTION AND THAT IS THE WHOLE CONTRACT. The C backend is
+/// the reference: it writes C and the C compiler places the argument, so
+/// whatever `applyOwnership` spells is what the ABI is. This says the same
+/// thing so the two newer backends can agree with it, and it is written as a
+/// switch over ownership rather than a list of types for the reason the rest
+/// of this repository keeps relearning: a list of types is an enumeration,
+/// and the form nobody enumerated is the one that ships wrong.
+///
+/// `applyOwnership` reads, in full:
+///
+///     if (base.shape.isPrimitive()) return base;      // never a pointer
+///     .arc       => cell_arc_t                        // not placed here
+///     .exclusive => `T *`                             // EVERY non-primitive
+///     .shared    => .string        => cell_str_t      // a view, by value
+///                   .record        => `const T *`
+///                   .unknown       => `const T *`
+///                   else           => T               // by value
+///     .owned, .copy => T                              // by value
+///
+/// The `.exclusive` row is the one this module got wrong. It had a rule about
+/// borrowed STRUCTS and applied it to every borrow, so `exclusive String`,
+/// `exclusive [T]` and `exclusive T?` were classified BY VALUE while codegen
+/// passed a pointer and wrote through it. That is not a placement detail: a
+/// write through such a parameter cannot reach the caller, which is exactly
+/// what `docs/OWNERSHIP.md` R1 and `runtime/cell_rt.h` section 7 define
+/// `exclusive` to do.
+///
+/// `.unknown` is deliberately absent: `layoutOf` refuses it anyway, and
+/// claiming a placement for a type this module cannot size would be the
+/// guess this file exists to avoid.
+pub fn borrowedByPointer(ty: hir.Ty, own: hir.Ownership) bool {
+    // A primitive is passed by value in every mode, including `exclusive`,
+    // which is `applyOwnership`'s first line and cell_rt.h section 1.
+    if (scalarSpelling(ty) != null) return false;
+    return switch (own) {
+        .exclusive => true,
+        .shared => ty.tag() == .struct_type,
+        .owned, .copy, .arc => false,
+    };
+}
+
 /// How a parameter of `(ty, own)` is placed.
 ///
 /// Ownership is a parameter because it changes the answer:
@@ -219,17 +278,22 @@ pub fn classifyParam(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) Class
     // fixes this and the language depends on it, so the check comes first.
     if (scalarSpelling(ty)) |s| return .{ .direct = s };
 
-    const layout = layoutOf(m, ty, own) orelse return .unclassified;
-
-    // A borrowed STRUCT is a pointer, matching codegen's `const cell_T *`. A
-    // borrowed String is NOT: cell_str_t is already a borrowed view and is
-    // passed by value, which cell_rt.h section 2 fixes.
-    if (ty.tag() == .struct_type) {
-        switch (own) {
-            .shared, .exclusive => return .{ .direct = "ptr" },
-            .owned, .copy, .arc => {},
-        }
+    // A borrow the C backend passes by pointer. Measured, not read: a probe
+    // declaring `void f(cell_string_t *)`, `void f(cell_slice_t *)` and
+    // `void f(cell_opt_i64_t *)` compiled with `cc -S -emit-llvm -O0` on this
+    // host emits `define void @f(ptr noundef %0)` for all three, and the test
+    // at the bottom of this file re-runs that comparison rather than trusting
+    // this sentence.
+    //
+    // The layout is still demanded first. A `ptr` for a type this module
+    // cannot size would let a backend name a pointee it has no spelling for,
+    // and `.unclassified` is the honest answer there.
+    if (borrowedByPointer(ty, own)) {
+        _ = layoutOf(m, ty, own) orelse return .unclassified;
+        return .{ .direct = "ptr" };
     }
+
+    const layout = layoutOf(m, ty, own) orelse return .unclassified;
 
     // The HFA rule is checked BEFORE the size cutoff, because it ignores it.
     if (hfaOf(m, ty)) |h| return .{ .coerce_float = .{ .count = h.count, .elem = h.elem } };
@@ -531,6 +595,12 @@ test "String's size depends on ownership, and only String's does" {
     try std.testing.expectEqual(@as(u32, 16), layoutOf(&m, types.t_string, .shared).?.size);
     try std.testing.expectEqual(@as(u32, 24), layoutOf(&m, types.t_string, .owned).?.size);
     try std.testing.expectEqual(@as(u32, 24), layoutOf(&m, types.t_string, .copy).?.size);
+    // `exclusive String` is `cell_string_t *`, so the OBJECT it names is the
+    // 24-byte owning buffer. Grouping it with `shared` at 16 was the
+    // misclassification `borrowedByPointer` was written to close.
+    try std.testing.expectEqual(@as(u32, 24), layoutOf(&m, types.t_string, .exclusive).?.size);
+    try std.testing.expectEqualStrings("%cell_str", stringStruct(.shared).?);
+    try std.testing.expectEqualStrings("%cell_string", stringStruct(.exclusive).?);
 }
 
 test "a shared String coerces to two words; an owned one is indirect" {
@@ -541,12 +611,51 @@ test "a shared String coerces to two words; an owned one is indirect" {
     }
     // 24 bytes, so it goes indirect rather than in registers.
     try std.testing.expect(classifyParam(&m, types.t_string, .owned) == .indirect);
-    // A borrowed String is NOT a pointer, unlike a borrowed struct: a
+    // A SHARED String is NOT a pointer, unlike a borrowed struct: a
     // cell_str_t is already a borrowed view and passes by value.
     switch (classifyParam(&m, types.t_string, .shared)) {
         .direct => return error.ShouldNotBePointer,
         else => {},
     }
+}
+
+test "every exclusive aggregate is a pointer, because codegen writes through it" {
+    // The divergence this closes, measured at 9e591ab: `classifyParam` said
+    // `exclusive String` was `[2 x i64]` while `codegen.applyOwnership`
+    // emitted `cell_string_t *`. `llvmemit.zig` followed this module,
+    // ACCEPTED the program, gave the binding a 16-byte slot and stored a
+    // 24-byte value into it. `mlirmit.zig` refused the same shape, so the two
+    // backends also disagreed on the VERDICT.
+    //
+    // `[T]` is the case that hid it: a cell_slice_t is 24 bytes, so it was
+    // already `.indirect` and already rendered as the four characters `ptr`.
+    // The spelling was right by coincidence and the MEANING was wrong, since
+    // an indirect argument is a caller-allocated copy the callee may scribble
+    // on while a borrow is the lender's own object.
+    const m = emptyModule();
+    const elem = types.t_byte;
+    const list_ty: hir.Ty = .{ .list = &elem };
+    const inner = types.t_int;
+    const opt_ty: hir.Ty = .{ .optional = &inner };
+
+    try expectDirect(classifyParam(&m, types.t_string, .exclusive), "ptr");
+    try expectDirect(classifyParam(&m, list_ty, .exclusive), "ptr");
+    try expectDirect(classifyParam(&m, opt_ty, .exclusive), "ptr");
+
+    // The predicate itself, so an unenumerated aggregate is covered by the
+    // ownership row rather than by having been listed above.
+    try std.testing.expect(borrowedByPointer(types.t_string, .exclusive));
+    try std.testing.expect(borrowedByPointer(list_ty, .exclusive));
+    try std.testing.expect(borrowedByPointer(opt_ty, .exclusive));
+    // `shared` does NOT follow: only a struct is a pointer there, matching
+    // `applyOwnership`'s `.record => const T *` row.
+    try std.testing.expect(!borrowedByPointer(types.t_string, .shared));
+    try std.testing.expect(!borrowedByPointer(list_ty, .shared));
+    try std.testing.expect(!borrowedByPointer(opt_ty, .shared));
+    // And a primitive is by value in every mode, `exclusive` included.
+    try std.testing.expect(!borrowedByPointer(types.t_int, .exclusive));
+    try std.testing.expect(!borrowedByPointer(types.t_bool, .exclusive));
+    try expectDirect(classifyParam(&m, types.t_int, .exclusive), "i64");
 }
 
 // ---------------------------------------------------------------------------
@@ -683,6 +792,119 @@ test "the classifier predicts what clang actually does" {
                 .{ case.name, want_return, return_line },
             );
             return error.ReturnClassDisagrees;
+        }
+    }
+}
+
+/// One runtime type in one ownership mode, expressed twice: the C parameter
+/// the reference backend emits for it, and the Cell `(ty, own)` pair this
+/// module classifies.
+const OwnedProbeCase = struct {
+    name: []const u8,
+    /// The C parameter declaration `codegen.applyOwnership` produces, spelled
+    /// against the REAL `runtime/cell_rt.h` rather than a transcription of
+    /// it, so a change to the header breaks this test instead of drifting
+    /// past it.
+    c_param: []const u8,
+    own: hir.Ownership,
+};
+
+test "the ownership rows predict what clang does with the runtime's own types" {
+    // THE TEST THE PREVIOUS PROBE DID NOT HAVE. Its six cases are all
+    // `.owned` structs, so the ownership axis was never compared against
+    // clang at all, and `exclusive String` sat misclassified underneath a
+    // module whose header says every fact in it was measured.
+    //
+    // The Cell side is built here; the C side is compiled against the actual
+    // cell_rt.h, which is why this needs the repository's `runtime/` on the
+    // include path and follows llvmemit.zig's tests in finding it from the
+    // process's own working directory.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const have_cc = std.process.run(gpa, io, .{ .argv = &.{ "cc", "--version" } }) catch
+        return error.SkipZigTest;
+    gpa.free(have_cc.stdout);
+    gpa.free(have_cc.stderr);
+    if (!have_cc.term.success()) return error.SkipZigTest;
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = std.process.currentPath(io, &cwd_buf) catch return error.SkipZigTest;
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{cwd_buf[0..cwd_len]});
+    defer gpa.free(include);
+
+    const elem = types.t_byte;
+    const list_ty: hir.Ty = .{ .list = &elem };
+    const inner = types.t_int;
+    const opt_ty: hir.Ty = .{ .optional = &inner };
+
+    // `ty` cannot live in the struct literal beside a pointer to a stack
+    // local in a comptime-known array, so the two halves are parallel arrays.
+    const cases = [_]OwnedProbeCase{
+        .{ .name = "excl_string", .c_param = "cell_string_t *v", .own = .exclusive },
+        .{ .name = "shared_string", .c_param = "cell_str_t v", .own = .shared },
+        .{ .name = "owned_string", .c_param = "cell_string_t v", .own = .owned },
+        .{ .name = "excl_slice", .c_param = "cell_slice_t *v", .own = .exclusive },
+        .{ .name = "shared_slice", .c_param = "cell_slice_t v", .own = .shared },
+        .{ .name = "excl_opt", .c_param = "cell_opt_i64_t *v", .own = .exclusive },
+        .{ .name = "copy_opt", .c_param = "cell_opt_i64_t v", .own = .copy },
+        .{ .name = "excl_int", .c_param = "int64_t v", .own = .exclusive },
+    };
+    const tys = [_]hir.Ty{
+        types.t_string,
+        types.t_string,
+        types.t_string,
+        list_ty,
+        list_ty,
+        opt_ty,
+        opt_ty,
+        types.t_int,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "#include \"cell_rt.h\"\n");
+    for (cases) |case| {
+        try src.appendSlice(gpa, try std.fmt.allocPrint(
+            arena,
+            "void {s}({s});\nvoid {s}({s}) {{ (void)v; }}\n",
+            .{ case.name, case.c_param, case.name, case.c_param },
+        ));
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "own_probe.c", .data = src.items });
+
+    const m = emptyModule();
+    const run = try std.process.run(gpa, io, .{
+        .argv = &.{ "cc", "-S", "-emit-llvm", "-O0", "-I", include, "own_probe.c", "-o", "-" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(run.stdout);
+    defer gpa.free(run.stderr);
+    if (!run.term.success()) {
+        std.debug.print("cc failed on the ownership probe:\n{s}\n", .{run.stderr});
+        return error.ProbeFailed;
+    }
+
+    for (cases, tys) |case, ty| {
+        const want = renderParam(arena, &m, ty, case.own) orelse {
+            std.debug.print("{s}: this module refuses to place it\n", .{case.name});
+            return error.Unclassified;
+        };
+        const needle = try std.fmt.allocPrint(arena, "@{s}(", .{case.name});
+        const line = lineContaining(run.stdout, needle) orelse return error.NoParamDefine;
+        if (std.mem.indexOf(u8, line, want) == null) {
+            std.debug.print(
+                "{s}: we predict parameter '{s}', clang emitted:\n  {s}\n",
+                .{ case.name, want, line },
+            );
+            return error.ParamClassDisagrees;
         }
     }
 }
