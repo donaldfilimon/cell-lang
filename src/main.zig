@@ -2,13 +2,13 @@ const std = @import("std");
 const cell = @import("cell");
 const Io = std.Io;
 
-// C runtime ABI (Zig 0.17: no @cImport — declare externs)
+// C runtime ABI (Zig master: no @cImport, so declare externs)
 extern fn cell_rt_version() [*:0]const u8;
 extern fn cell_cxx_probe() c_int;
 extern fn cell_swift_probe() c_int;
 
 const Usage =
-    \\cell — Cell language toolchain (Zig host)
+    \\cell - Cell language toolchain (Zig host)
     \\
     \\USAGE:
     \\  cell <command> [args]
@@ -40,8 +40,14 @@ const Usage =
 /// of spawning the binary, is that its help text and its dispatcher agree:
 /// a command documented but not handled, or handled but not documented, is
 /// a real defect that ships silently. Naming the commands once, dispatching
-/// through a switch on this enum, and checking the usage text against
-/// `std.meta.fields` makes that drift a build failure instead.
+/// through a switch on this enum, and checking the usage text against the
+/// enum's own reflected field names makes that drift a build failure instead.
+///
+/// Read those names with `@typeInfo(Command).@"enum".field_names`, NOT with
+/// `std.meta.fields`, which this comment named until 2026-09-07 and which is
+/// now a `@compileError` on Zig master. `Type.Enum` there carries parallel
+/// `field_names` and `field_values` slices rather than a `fields` array of
+/// structs.
 const Command = enum { check, dump, emit, version, help };
 
 /// Aliases are handled here rather than in the dispatcher so there is one

@@ -58,6 +58,19 @@ zig test src/root.zig --test-filter "escaping borrow"
 zig test src/cell/borrowck.zig --test-filter "R5"
 ```
 
+**`--test-filter` fails toward a false green, and here it is worse than the
+usual warning.** A filter matching nothing exits 0. It does not print
+"All 0 tests passed" either: `src/root.zig:143` is an ANONYMOUS
+`test { refAllDecls(@This()); }`, so it has no name for a filter to exclude and
+always runs. A typo'd filter therefore prints a plausible
+
+    1/1 root.test_0...OK
+    All 1 tests passed.
+
+Measured 2026-09-07. Always check the named test you asked for actually appears
+in the output; the count alone cannot tell a real pass from a typo, and it is
+always one higher than the number of named tests that matched.
+
 `zig build test` does **not** accept `--test-filter`; filter by invoking
 `zig test` on the file directly. That works for `src/root.zig` and the
 `src/cell/*` modules, but **not** for `src/main.zig`, which fails outright with
