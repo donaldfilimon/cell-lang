@@ -18,8 +18,21 @@ Verified with a binary built by `~/.zvm/bin/zig build -Dswift=false`.
 
 ## Running the checks
 
-There is no gate script, because `tools/` is not part of this change. Run these
-from the repository root after `~/.zvm/bin/zig build -Dswift=false`.
+`tools/check.sh` is the gate: build, tests (with the count printed), the four
+corpus contracts below, backend agreement (LLVM vs MLIR must reach the same
+verdict), and execution (emit, `cc`, link, run, and compare the output) for
+the key cases. Run it from the repository root:
+
+```sh
+tools/check.sh
+```
+
+Its own header comment records why it exists: these four loops used to be the
+only way to check the corpus, and they were retyped by hand more than a dozen
+times in a single session, each retype a chance to run a subtly different
+check and believe a different answer. They are kept below because they
+document WHAT the four contracts are, not as instructions to paste and run by
+hand instead of the gate.
 
 Top-level examples, all must pass:
 
@@ -173,19 +186,23 @@ R14 files are rejected, and so is call-site mismatch (R15) since `67529a9`:
 the parser now keeps the argument ownership prefix and borrowck compares it
 against the parameter.
 
-Three of them are not ownership bugs at all. Two are currently-rejected for
-the wrong reason (unknown identifier); only `unknown_type.cell` is still
+Two of them are not ownership bugs at all. One is currently-rejected for the
+wrong reason (unknown identifier); the other, `unknown_type.cell`, is still
 accepted:
 
-- `while_is_not_a_loop.cell`: currently-rejected. `while` is not a keyword, so
-  a loop-shaped program would parse as a call plus a discarded block. Today
-  `cell check` reports `unknown identifier 'while'`. If a function named
-  `while` existed, this would compile and silently not loop.
 - `silent_literals.cell`: currently-rejected. `0x1F`, `1_000`, and `1e9` each
   lex as two tokens. Today the checker reports `unknown identifier 'x1F'`;
   the lexer still splits the literal.
 - `unknown_type.cell`: currently-accepted. Any type name outside the eleven
   primitives silently becomes `void*`.
+
+A third file used to live here for the same reason: `while_is_not_a_loop.cell`,
+rejected as `unknown identifier 'while'` because `while` was not yet a
+keyword. Once `while` became a reserved word and then grew loops, the file was
+moved and renamed rather than deleted, since its SOURCE never changed while
+its MEANING changed four times. It now lives at
+`examples/while_is_now_a_loop.cell` (see the top-level table above), and its
+own header comment records the full history.
 
 ## The pairing demo
 
