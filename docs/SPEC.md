@@ -148,7 +148,8 @@ then: unknown type names were still accepted silently as `void*`, `if` and
 enforced. The whole of `examples/rejected/` was re-run: seven of the thirteen
 files still passed, including every use-after-move, aliasing, escaping-borrow,
 and call-site-mismatch case. Section 0.6 records what later work changed:
-`if` / `match` now lower to C, and R2/R3/R5/R8/R14 are enforced. Unknown type
+`if` / `match` now lower to C, and R1/R2/R2.a/R2.b/R3/R3a/R4/R5/R6/R8/R9/R14/R15/R18
+are enforced. Unknown type
 names remain accepted as `void*`.
 
 ### 0.6 Delta: ownership enforcement and body-bearing emit
@@ -156,7 +157,8 @@ names remain accepted as `void*`.
 Later work wired `src/cell/borrowck.zig` into `cell check` and replaced
 placeholder codegen. Measured against a binary built with `-Dswift=false`:
 
-- R2, R3, R5, R8, and R14 are enforced. `examples/rejected/use_after_move.cell`,
+- R1, R2, R2.a, R2.b, R3, R3a, R4, R5, R6, R8, R9, R14, R15 and R18 are
+  enforced. `examples/rejected/use_after_move.cell`,
   `move_out_of_borrow.cell`, `aliasing.cell`, `escaping_borrow.cell`,
   `immutable_assign.cell`, and `field_assign_immutable.cell` are
   `currently-rejected`. Call-site prefixes (R15) were still discarded at this
