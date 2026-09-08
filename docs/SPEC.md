@@ -54,13 +54,18 @@ parser-only cases include `T?`, `[T]` as a type, and `use`.
 
 | Status | Constructs |
 |---|---|
-| implemented | 96 |
+| implemented | 97 |
 | partially implemented | 2 |
 | parsed, not enforced | 5 |
 | designed, not implemented | 49 |
-| **total** | **152** |
+| **total** | **153** |
 
-Counted from the section 12 index on 2026-09-08, not estimated. **Recount rather
+Counted from the section 12 index on 2026-09-08, not estimated. Recounted the
+same day when R2.b added an `implemented` row, 96 to 97 and 152 to 153; the
+awk command below reports the long qualified statuses as their own buckets, so
+fold every string that STARTS with a status word into that status before
+totalling, and note that BSD `sed` does not take `\|` as alternation, which
+silently leaves those rows uncollapsed and the total short. **Recount rather
 than trusting these numbers**, because they have been wrong before and will be
 again: they said 86 / 8 / 55 / 149 while the table held 96 / 2 / 5 / 49 / 152,
 had no row at all for `partially implemented` when two constructs carried it,
@@ -74,8 +79,8 @@ awk '/^## 12\. Status index/,/^## 13\./' docs/SPEC.md \
   | awk -F'|' '{gsub(/^ +| +$/,"",$3); print $3}' | sort | uniq -c
 ```
 
-The headline consequence: **the front end, a typechecker, a borrow checker for R1/R2/R3/R3a/R4/R5/R6/R8/R9/R14/R15 plus one clause of
-R10, and C lowering for the flagship examples are real.** As of
+The headline consequence: **the front end, a typechecker, a borrow checker for R1/R2/R2.a/R2.b/R3/R3a/R4/R5/R6/R8/R9/R14/R15 plus one
+clause of R10, and C lowering for the flagship examples are real.** As of
 the working tree the lexer, parser, AST, diagnostics, typechecker, and
 borrowck are wired into `cell check`. `if` / `else`, `match`, blocks, struct
 literals, list literals, and mangled calls lower to C. What is still designed
@@ -1934,6 +1939,7 @@ records the missing lowering.
 | Default ownership is `owned` | implemented |
 | Call-site ownership prefix | implemented (see 0.7; this row postdates the 0.2 count) |
 | Move checking | implemented |
+| R2.b: an `owned` position is asked of the EXPRESSION, not of a place | implemented in `borrowck.zig` at all SIX `owned` consumption sites (a `let`, an assignment into an `owned` place, a call argument, a `return`, an `owned` struct field, a list-literal element). Every site used to ask `placeOf` first and fall through to an ordinary READ for anything else, so `let owned s2: String = match c { 0 => s1, _ => s1 }` read `s1` instead of moving it, `pendingDrops` kept both bindings, and the emitted C freed one buffer twice: ASan double free at exit 134, measured at `0e82266` in ordinary `owned String` code with **no `arc` in it**. FOUR of the six were live (`let`, assignment, call argument, `return`); the struct field and the list element are latent only because a `record` is never dropped and slice elements are never released, and are refused with the rest. `ownedMoveSource` is a TOTAL verdict whose `unknown` case is REFUSED rather than read, and a place reached through a branch is promoted to `unknown` rather than moved, because deciding which arm ran is the dataflow question OWNERSHIP.md 0.3 declines to answer. This is the general rule R10's first axis was a special case of. Named over-refusal: a `match` over `copy` places in an `owned` slot, which OWNERSHIP.md R2.b explains was not exempted on purpose |
 | Shared-XOR-exclusive aliasing | implemented |
 | R9: `arc` grants shared access only | implemented in `borrowck.zig`, both halves, and read the scoping in OWNERSHIP.md R9 before quoting this row. The borrow half refuses an `exclusive` borrow of an `arc` place at `createLoan`, the one point every exclusive loan passes through, so the keyword form, both sigil forms and both `let` forms are one check; `refuseArcValueBorrow` adds the VALUE position (`&mut fresh()` over an `arc`-returning callee) at the two sites that can reach it. The mutation half refuses a write through an `arc` place, asked of the STRICT prefixes of the target's path, so `b.n = 2` on an `arc` `b` is refused while rebinding a `var arc` handle stays legal (that is R11's leak, not R9). The classifier walks the binding plus every field segment and REFUSES a step whose annotation it cannot read, the same total verdict R10 had to adopt. **Five programs were accepted before this**, three of them silently, and 4.1.4 claimed the rule was already in force; OWNERSHIP.md R9 tables them with their emitted C. NOT covered, and refused by R14's immutability derivation with R14's generic message instead: `arc n: String` with `n = "other"`, an empty path and therefore a handle rebind; and any write through an IMMUTABLE `arc` holder (a `let arc` binding or an `arc` parameter), because R14's check runs first. Both are still refused; only the explanation differs. The total verdict's unresolved case has had to be closed twice, by propagating a struct type into `checkLet` across a borrow and into `checkMatch` from the scrutinee, and an unannotated `let` initialized by an `if` or a block is the disclosed residual |
 | R14 second clause: a borrow-holding binding may not be reassigned | implemented in `borrowck.zig`. `let` was already covered by immutability; `var` was not, and the gap was that the statement has two meanings: borrowck read `e = &mut b` as a retarget (creating a TEMPORARY loan that died with the statement, leaving a loan on the old referent and none on the new one) while the C backend emits `*e = *&b;`, a write through. Measured as an AddressSanitizer double free at exit 134 with heap values, plus a leak of the old referent's buffer in the same statement. Refused rather than modelled, because a retarget means killing a NAME-keyed loan (the unsafe direction) and a write-through means a place for `*e`, which "places, not names" does not have. Scoped to an empty target path and to a value `borrowSource` proves is a borrow, so a field write through an `exclusive` parameter and a whole-value write through a borrow both stay legal |

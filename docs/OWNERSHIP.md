@@ -24,7 +24,10 @@ C backend, with the gaps R11 itself names; **R10**'s move-into-`arc` is not
 implemented in the checker, which is why one of those gaps exists. R10's other
 direction, an `arc` value made UNIQUE, IS implemented, at six consumption
 sites and with a total verdict that refuses a source it cannot classify. **R2.a**
-(a move inside a loop) landed with `while`. Stem pairing has
+(a move inside a loop) landed with `while`. **R2.b** (an `owned` position is
+asked of the EXPRESSION, and a value that may yield a place on some paths is
+refused rather than read) landed after four live double frees; it is the
+general rule R10's first axis was a special case of. Stem pairing has
 since landed (SPEC section 1.2).
 
 ---
@@ -213,6 +216,12 @@ pub fn main() {
 Corpus: `examples/rejected/use_after_move.cell`, which passes `cell check`
 today and must not once this rule exists.
 
+**That list names the forms a PLACE takes, and reading it as a list of
+initializers is what R2.b below exists to correct.** Every one of the five
+positions asked `placeOf` first and READ anything else, so an `owned` slot
+filled by a `match` double freed. R2.b is where the question is asked of the
+expression instead.
+
 ### R3. Moving out of a borrow is an error
 
 A `shared` or `exclusive` parameter is not owned, so it cannot be moved from,
@@ -269,6 +278,113 @@ while i < 3 {
 
 A place declared **inside** the body is fresh each iteration and is never
 subject to this rule.
+
+### R2.b. An `owned` position is asked of the EXPRESSION, and an undecidable one is refused
+
+R2's list above names the forms that move a **place**. Every consumption site
+used to ask `placeOf` first: a place moved, and **anything else fell through to
+an ordinary read**. That is an enumeration of place initializers standing in
+for a claim about every initializer, and `placeOf` returns null for a `match`,
+so this was accepted:
+
+```cell
+pub fn mk() -> String;
+pub fn use_it(shared s: String) -> Int;
+
+pub fn main() {
+    var copy c = 0
+    let owned s1 = mk()
+    let owned s2: String = match c { 0 => s1, _ => s1 }
+    print_int(use_it(shared s2))
+}
+```
+
+`s1` was READ rather than moved, `wasMoved(s1)` stayed false, and codegen's
+`pendingDrops` kept **both** `s1` and `s2`, because both are droppable,
+`.owned`, have a drop call and are not moved. `emitValueInto`'s leaf emitted a
+bitwise `_cell_t0 = s1;`, so the two headers held one buffer:
+
+```
+cell check                  exit 0
+cc -fsanitize=address       exit 0
+running it                  exit 134   AddressSanitizer: attempting double-free
+```
+
+Measured at `0e82266`. **There is no `arc` in this program.** It is ordinary
+`owned String` code and it predates all of the `arc` ownership work; R10's axis
+1 closed exactly this shape for `arc` sources and left it open for every other
+source, which is what makes this the general rule and R10 a special case of it.
+
+> `err: cannot bind the place 's1' reached through a branch to 'owned' binding 's2': which owned place it gives up cannot be resolved here`
+> `note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path`
+
+**Why refusal and not a move.** A `match` yielding a place from two arms is two
+potential moves of ONE value, and deciding which arm ran is the dataflow
+question section 0.3 deliberately does not answer. Reading it, which is what
+happened before, is the one answer that is definitely wrong. Refusing is the
+same trade 0.3 already made and carries the same guarantee: a program accepted
+under this rule stays accepted under a real control-flow analysis.
+
+**The classifier is total.** `ownedMoveSource` returns `no_owned_place`,
+`place`, or `unknown`, and `unknown` is REFUSED. It is not an optional whose
+"none" means permit, because that is the permissive default all three of R10's
+widenings escaped through. A place reached through a branch is never `place`:
+`ownedMoveBranch` promotes it to `unknown`, so no recursive arm can hand a
+movable place back up.
+
+**Six consumption sites, and the count is the point.** The brief that opened
+this rule named four and two of the ones it did not name were live:
+
+| Position | At `0e82266` |
+|---|---|
+| `let owned s2: String = match ...` | ASan double free, exit 134 |
+| `s2 = match ...`, writing into an `owned` place | ASan double free, exit 134 |
+| a call argument to an `owned` parameter | ASan double free, exit 134 |
+| a `return` whose declared return type is not `arc` | ASan double free, exit 134 |
+| an `owned` struct field in a literal | latent: a `record` shape is never dropped, so the field's buffer is freed once by the source's own scope drop |
+| a list-literal ELEMENT | latent: slice elements are never released (R11) |
+
+The last two refuse `unknown` **only**. A plain place stored in a struct field
+or a list element stays a READ, exactly as R2's move list says, and widening
+that into a move would be the wrong repair: nothing drops a `record`, so moving
+`s1` out of `Box { s: s1 }` would LEAK the buffer rather than free it once.
+What decides those two positions is record drops and slice element release,
+both R11's gaps, not this rule.
+
+**What still compiles**, since "refused" has to be scoped to mean something:
+
+```cell
+let owned s2: String = s1                                  // moves, R2 unchanged
+let owned s2: String = match c { 0 => mk(), _ => mk() }     // fresh on every path
+let owned n: Int = match c { 0 => 1, _ => 2 }               // scalar arms
+let owned b: Box = Box { s: s1 }                            // still a read
+```
+
+**The named over-refusal.** A `match` over `copy` places in an `owned` slot was
+accepted before this rule and is not now:
+
+```cell
+pub fn pick(copy c: Int, copy a: Int, copy b: Int) -> Int {
+    return match c { 0 => a, _ => b }        // refused
+}
+```
+
+A `copy` place is exempt from R2 by R12 and `pendingDrops` never drops one, so
+an exemption looks free. It was considered and rejected: the exemption would be
+an enumeration of the ownership modes this backend drops today asserted over
+every `copy` place, which is the reasoning failure this rule is an instance of,
+and the neighbouring claim is already false, because `copy String` is spellable
+and `let owned s: String = a` over one emits a shallow header copy and frees
+`a`'s buffer through `s`. Bind the value to a `copy` name and hand the name
+over:
+
+```cell
+let copy r = match c { 0 => a, _ => b }
+return copy r
+```
+
+Corpus: `examples/rejected/owned_move_through_match.cell`, which carries the
+measurements.
 
 **Where it is conservative, stated plainly.** A body that always `break`s
 before reaching the move is rejected anyway, because this rule does not track

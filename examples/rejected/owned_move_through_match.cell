@@ -1,0 +1,69 @@
+// EXPECT: currently-rejected
+// Violates: docs/OWNERSHIP.md R2.b (an `owned` position consumes a place, and
+// a value that may yield a place on some paths and not others is refused).
+//
+// WHY THIS FILE EXISTS. This was a LIVE double free in ordinary `owned String`
+// code, with no `arc` anywhere in it, and it predates every line of the `arc`
+// ownership work. Measured end to end against `zig-out/bin/cell` built at
+// `0e82266`, with `mk`, `use_it` and `print_int` supplied by a C host:
+//
+//     cell check                                    exit 0
+//     cc -fsanitize=address                         exit 0
+//     running it                                    exit 134
+//
+//     AddressSanitizer: attempting double-free
+//       free <- cell_string_free <- cell_main
+//
+// The emitted C ended:
+//
+//     cell_string_t s2 = ({ ... _cell_t0 = s1; ... _cell_t0; });
+//     cell_print_int(cell_use_it(cell_string_as_str(&s2)));
+//     cell_string_free(&s2);
+//     cell_string_free(&s1);      /* the same buffer */
+//
+// WHY IT ESCAPED, which is the part worth keeping. R2 enumerates the forms
+// that move a PLACE, and every one of its consumption sites asked `placeOf`
+// first: a place moved, and anything else fell through to `checkExpr`, which
+// only READS. `placeOf` returns null for a `match`, so `s1` was read rather
+// than moved, `wasMoved(s1)` stayed false, and codegen's `pendingDrops` kept
+// both `s1` and `s2` because both are droppable, `.owned`, have a drop call
+// and are not moved. `emitValueInto`'s leaf then emitted a bitwise
+// `_cell_t0 = s1;`, so the two headers hold one buffer.
+//
+// That is an enumeration of PLACE initializers standing in for a claim about
+// every initializer. It is the SAME SHAPE as R10's axis 1, in the general rule
+// R10 is a special case of: R10 closed it for `arc` sources and the underlying
+// move analysis still had it for every source. The fix is not a longer
+// enumeration. `ownedMoveSource` is a TOTAL verdict whose undecidable case is
+// `.unknown` and is REFUSED, so a value shape nobody enumerated fails closed.
+//
+// WHY IT IS REFUSED AND NOT MOVED. A `match` yielding a place from two arms is
+// two potential moves of ONE value, and deciding which arm ran is the dataflow
+// question `docs/OWNERSHIP.md` 0.3 deliberately does not answer. Reading, which
+// is what happened before, is the one answer that is definitely wrong.
+//
+// SIX consumption sites ask this. Four were live double frees at `0e82266`:
+// this `let`, an assignment into an `owned` place, a call argument to an
+// `owned` parameter, and a `return`. Two are latent and refused with them: an
+// `owned` struct field (a `record` shape is never dropped) and a list-literal
+// element (slice elements are never released). Both gaps are R11's.
+//
+// WHAT STILL COMPILES, so "refused" is scoped to mean something:
+//
+//     let owned s2: String = s1                        moves, R2 unchanged
+//     let owned s2: String = match c { 0 => mk(), _ => mk() }   fresh arms
+//     let owned n: Int = match c { 0 => 1, _ => 2 }             scalar arms
+//
+// The named over-refusal is a `match` over `copy` places in an `owned` slot,
+// which was accepted before and is not now. Bind it to a `copy` name first.
+
+pub fn mk() -> String;
+pub fn use_it(shared s: String) -> Int;
+pub fn print_int(copy value: Int);
+
+pub fn main() {
+    var copy c = 0
+    let owned s1 = mk()
+    let owned s2: String = match c { 0 => s1, _ => s1 }
+    print_int(use_it(shared s2))
+}

@@ -565,6 +565,19 @@ pub const Checker = struct {
                             "function",
                             fn_name,
                         )) return;
+                        // R2.b, the return position, the other live site the
+                        // brief did not name. Measured at `0e82266`:
+                        // `return match c { 0 => s1, _ => s1 }` from a
+                        // `-> String` function was exit 134, the caller and
+                        // the callee's scope drop freeing one buffer.
+                        switch (try self.ownedMoveSource(e)) {
+                            .unknown => |s| {
+                                try self.refuseUnknownMove(s, "return", "from", "function", fn_name);
+                                return;
+                            },
+                            // A place is moved below, unchanged.
+                            .place, .no_owned_place => {},
+                        }
                     }
                     if (try self.placeOf(e)) |place| {
                         const note = try self.msg("'{s}' was moved here by returning it", .{place.display});
@@ -686,19 +699,31 @@ pub const Checker = struct {
                 "binding",
                 l.name,
             )) return;
-            if (try self.placeOf(v)) |place| {
-                // The `arc` case already returned above. `let owned ys:
-                // [Int] = xs` with an `arc [Int]` source emitted
-                // `cell_slice_t ys = *(...)xs.ptr;` followed by BOTH
-                // `cell_slice_free(&ys)` and the box's own glue: an
-                // AddressSanitizer double free, silent at `cell check` and
-                // clean at `-Werror`.
-                const note = try self.msg(
-                    "'{s}' was moved here by binding it to '{s}'",
-                    .{ place.display, l.name },
-                );
-                try self.movePlace(place, note);
-                return;
+            // R2.b, the `let` position, and the FIRST of the four live double
+            // frees this rule closes. It replaces a bare `placeOf` here: a
+            // `match` is not a place, so the old fall-through read `s1`
+            // instead of moving it and `pendingDrops` freed the buffer twice.
+            // See `ownedMoveSource`.
+            switch (try self.ownedMoveSource(v)) {
+                .place => |place| {
+                    // The `arc` case already returned above. `let owned ys:
+                    // [Int] = xs` with an `arc [Int]` source emitted
+                    // `cell_slice_t ys = *(...)xs.ptr;` followed by BOTH
+                    // `cell_slice_free(&ys)` and the box's own glue: an
+                    // AddressSanitizer double free, silent at `cell check` and
+                    // clean at `-Werror`.
+                    const note = try self.msg(
+                        "'{s}' was moved here by binding it to '{s}'",
+                        .{ place.display, l.name },
+                    );
+                    try self.movePlace(place, note);
+                    return;
+                },
+                .unknown => |s| {
+                    try self.refuseUnknownMove(s, "bind", "to", "binding", l.name);
+                    return;
+                },
+                .no_owned_place => {},
             }
         }
         // `copy` and `arc` bindings duplicate or retain rather than move
@@ -896,6 +921,19 @@ pub const Checker = struct {
                 self.revive(place);
                 return;
             }
+            // R2.b, the assignment position. Scoped to an `owned` TARGET,
+            // because the double free needs the target to be dropped and
+            // `pendingDrops` drops `.owned` bindings. Measured at `0e82266`:
+            // `s2 = match c { 0 => s1, _ => s1 }` was exit 134.
+            switch (try self.ownedMoveSource(&a.value)) {
+                .unknown => |s| {
+                    try self.refuseUnknownMove(s, "assign", "to", "place", place.display);
+                    self.revive(place);
+                    return;
+                },
+                // A place is moved by the shared path below, unchanged.
+                .place, .no_owned_place => {},
+            }
         }
 
         if (try self.placeOf(&a.value)) |src| {
@@ -978,6 +1016,27 @@ pub const Checker = struct {
                                     "field",
                                     f.name,
                                 )) continue;
+                                // R2.b, the struct-field position. `.unknown`
+                                // ONLY. A plain place stays a READ here, which
+                                // is what R2's move list already says and what
+                                // the comment above this switch records.
+                                // Measured at `0e82266`: `Box { s: s1 }` runs
+                                // clean today, and it does so by coincidence,
+                                // because this backend never drops a `record`,
+                                // so the field's buffer is freed once by `s1`'s
+                                // own scope drop. Widening the READ into a MOVE
+                                // would make that a LEAK the moment nothing
+                                // drops `s1` either, which is the wrong repair
+                                // for a gap that belongs to record drops. The
+                                // value shape is refused because it is the same
+                                // undecidable question as everywhere else.
+                                switch (try self.ownedMoveSource(&f.value)) {
+                                    .unknown => |s| {
+                                        try self.refuseUnknownMove(s, "store", "in", "field", f.name);
+                                        continue;
+                                    },
+                                    .place, .no_owned_place => {},
+                                }
                             }
                         }
                     }
@@ -1010,6 +1069,20 @@ pub const Checker = struct {
                         "list element",
                         null,
                     )) continue;
+                    // R2.b, the list-element position. `.unknown` ONLY, for
+                    // the same reason as the struct field above: a plain place
+                    // stays a READ, and it is not a use-after-free today only
+                    // because slice elements are never released. That gap is
+                    // disclosed in OWNERSHIP.md R11 and closing it is what
+                    // decides whether this position moves; turning it into a
+                    // move here, ahead of that, would leak instead.
+                    switch (try self.ownedMoveSource(item)) {
+                        .unknown => |s| {
+                            try self.refuseUnknownMove(s, "store", "in", "list element", null);
+                            continue;
+                        },
+                        .place, .no_owned_place => {},
+                    }
                     try self.checkExpr(item);
                 }
             },
@@ -1188,6 +1261,21 @@ pub const Checker = struct {
                     "parameter",
                     slot_name,
                 )) continue;
+                // R2.b, the call-argument position, and one of the two live
+                // sites the brief that opened this rule did not name. Asked
+                // on the peeled `operand` and BEFORE the place check below,
+                // for the same reason R10's is: `placeOf` returns null for a
+                // `match`, and the early exit under it is exactly how the
+                // value shapes escaped. Measured at `0e82266`:
+                // `take(owned match c { 0 => s1, _ => s1 })` was exit 134.
+                switch (try self.ownedMoveSource(operand)) {
+                    .unknown => |s| {
+                        try self.refuseUnknownMove(s, "pass", "to", "parameter", slot_name);
+                        continue;
+                    },
+                    // A place is moved by the `.owned` arm below, unchanged.
+                    .place, .no_owned_place => {},
+                }
             }
 
             const place = try self.placeOf(operand);
@@ -1689,6 +1777,207 @@ pub const Checker = struct {
             .display = try self.msg("{s}()", .{name}),
             .span = span,
         } };
+    }
+
+    /// R2.b: what an `owned` consumption position takes ownership OF.
+    ///
+    /// **The verdict is total, for the same reason `ArcSource`'s is and after
+    /// the same defect.** R2 enumerates the forms that MOVE a place, and every
+    /// one of its consumption sites asked `placeOf` first: a place moved, and
+    /// anything else fell through to `checkExpr`, which only READS. That is an
+    /// enumeration of PLACE initializers standing in for a claim about every
+    /// initializer, which is R10 axis 1 recurring in the rule R10 is a special
+    /// case of. `placeOf` returns null for a `match`, so
+    ///
+    ///     let owned s2: String = match c { 0 => s1, _ => s1 }
+    ///
+    /// read `s1` instead of moving it. `wasMoved(s1)` stayed false, codegen's
+    /// `pendingDrops` therefore dropped BOTH `s1` and `s2`, and the leaf
+    /// emitted a bitwise `_cell_t0 = s1;` so the two headers hold one buffer:
+    /// `cell check` exit 0, `cc -fsanitize=address` exit 0, running it exit
+    /// 134, `AddressSanitizer: attempting double-free`. Measured at
+    /// `0e82266` at four sites, all four live.
+    ///
+    /// **Silence must not mean "read it".** `.unknown` is REFUSED. A shape
+    /// nobody enumerated is exactly what produces silence here, and the cost
+    /// of the two directions is not symmetric: a refusal costs a program that
+    /// can be spelled with an explicit binding, an acceptance costs a double
+    /// free.
+    ///
+    /// **A place reached THROUGH a branch is never `.place`.** Promoting it to
+    /// a move is the wrong repair and is not available: a `match` yielding a
+    /// place from two arms is two potential moves of one value, and deciding
+    /// which one happened is the dataflow question `docs/OWNERSHIP.md` 0.3
+    /// deliberately does not answer. `ownedMoveBranch` performs that promotion
+    /// to `.unknown`, so no recursive arm can hand a movable place back up.
+    ///
+    /// The switch is exhaustive with no `else` arm, and exhaustive over the
+    /// FIELDS of each variant it descends into rather than only over the
+    /// variants: a `match` visits every arm, an `if` visits both branches, a
+    /// `unary` splits on its operator. Those are different claims and treating
+    /// them as one is what hid a match GUARD from `exprUsesName` in this file.
+    const OwnedMove = union(enum) {
+        /// Provably hands over no place an existing binding still holds: a
+        /// literal, a fresh scalar, a borrow, a fresh aggregate, or a call's
+        /// temporary. Every arm that returns this states why.
+        no_owned_place,
+        /// The expression IS a place. Moved, exactly as before this rule
+        /// existed. This is the ONLY verdict that moves, and it is reachable
+        /// only from the top of `ownedMoveSource`, never from a branch.
+        place: Place,
+        /// A value shape that may give up an owned place, on a path this
+        /// checker does not resolve. Refused, not read.
+        unknown: ArcSource.Site,
+
+        /// Combine two branch verdicts. `.unknown` from any branch wins,
+        /// because any branch may be the one taken.
+        ///
+        /// `.place` cannot appear on either side: every recursive call in a
+        /// branch position goes through `ownedMoveBranch`, which promotes it.
+        /// It is still handled rather than left to an `else`, and it is
+        /// handled by REFUSING to let it out, so that if a future arm forgets
+        /// the promotion the result is an over-refusal and not a move the
+        /// caller cannot justify.
+        fn join(a: OwnedMove, b: OwnedMove) OwnedMove {
+            return switch (a) {
+                .unknown, .place => a,
+                .no_owned_place => b,
+            };
+        }
+    };
+
+    /// `ownedMoveSource` in a BRANCH position, where a place is not movable.
+    /// See `OwnedMove`'s comment for why the promotion is the fix and a move
+    /// is not.
+    fn ownedMoveBranch(self: *Checker, e: *const ast.Expr) Error!OwnedMove {
+        return switch (try self.ownedMoveSource(e)) {
+            .no_owned_place => .no_owned_place,
+            .place => |p| .{ .unknown = .{
+                .display = try self.msg("the place '{s}' reached through a branch", .{p.display}),
+                .span = p.span,
+            } },
+            .unknown => |s| .{ .unknown = s },
+        };
+    }
+
+    fn ownedMoveSource(self: *Checker, e: *const ast.Expr) Error!OwnedMove {
+        if (try self.placeOf(e)) |place| return .{ .place = place };
+        return switch (e.kind) {
+            // A literal is a fresh value with no binding behind it.
+            .int, .float, .string, .bool => .no_owned_place,
+            // Every binary operator in this grammar is arithmetic, comparison
+            // or logic, and yields a fresh scalar.
+            .binary => .no_owned_place,
+            .unary => |u| switch (u.op) {
+                // A fresh scalar.
+                .neg, .not => .no_owned_place,
+                // A borrow does not own its referent, so consuming it hands
+                // over nothing that a drop would free twice. Consuming a
+                // borrow in an `owned` position is R3's move-out-of-a-borrow
+                // and R15's annotation disagreement, both of which run
+                // elsewhere and neither of which is this question.
+                .ref_shared, .ref_exclusive => .no_owned_place,
+            },
+            // A struct or list literal builds a FRESH record or buffer, so the
+            // aggregate itself gives up nothing. What its elements give up is
+            // the element sites' question, asked there.
+            .struct_lit, .list_lit => .no_owned_place,
+            // A call's result is a temporary the callee produced, not a place
+            // the caller still holds.
+            .call => .no_owned_place,
+            // `placeOf` already peels `.annotated`, so reaching here means the
+            // operand is not a place: `owned mk()` is the call arm above and
+            // `owned match ...` is the match arm below. Recursing therefore
+            // adds no move that `placeOf` was not already making, which
+            // matters because a NEW move would change what codegen's
+            // `pendingDrops` frees. Measured at `0e82266`:
+            // `let owned s2: String = owned s1` already reports use-after-move
+            // on `s1`, and `owned match c { 0 => s1, _ => s1 }` was exit 134.
+            .annotated => |a| try self.ownedMoveSource(a.value),
+            // An `ident` reaching here means `lookup` failed: the name is not
+            // in scope, so nothing decides what it owns.
+            .ident => |n| .{ .unknown = .{
+                .display = try self.msg("the unresolved name '{s}'", .{n}),
+                .span = e.span,
+            } },
+            // A `field` reaching here is rooted at something that is not a
+            // binding. Two different things wear that shape, as
+            // `arcUniqueSource` records:
+            //
+            //   * `Quadrant.First`, a qualified ENUM VARIANT. A variant in
+            //     this grammar carries no payload, so it is a unit constant
+            //     and owns nothing.
+            //   * `mk_box().s`, a field of a temporary. Which place that
+            //     temporary's field came from is not resolved here.
+            .field => |f| blk: {
+                if (f.base.kind == .ident and
+                    self.enums.contains(f.base.kind.ident)) break :blk .no_owned_place;
+                break :blk .{ .unknown = .{
+                    .display = try self.msg("the field '{s}' of a temporary value", .{f.name}),
+                    .span = e.span,
+                } };
+            },
+            .if_expr => |i| blk: {
+                const then_v = try self.ownedMoveBranch(i.then_body);
+                // A missing `else` yields unit on that path, which owns
+                // nothing and is not unknown.
+                const else_v: OwnedMove = if (i.else_body) |eb|
+                    try self.ownedMoveBranch(eb)
+                else
+                    .no_owned_place;
+                break :blk OwnedMove.join(then_v, else_v);
+            },
+            .match_expr => |m| blk: {
+                var acc: OwnedMove = .no_owned_place;
+                for (m.arms) |arm| {
+                    acc = OwnedMove.join(acc, try self.ownedMoveBranch(arm.body));
+                }
+                break :blk acc;
+            },
+            // A block's value is its trailing expression statement. A block
+            // that ends in anything else, or in nothing, yields unit.
+            .block => |stmts| blk: {
+                if (stmts.len == 0) break :blk .no_owned_place;
+                const last = &stmts[stmts.len - 1];
+                if (last.kind != .expr) break :blk .no_owned_place;
+                break :blk try self.ownedMoveBranch(&last.kind.expr);
+            },
+        };
+    }
+
+    /// R2.b's refusal. `verb`, `prep` and `slot` name the position, so all six
+    /// consumption sites read as the same rule, the way `refuseArcUnique`'s do.
+    ///
+    /// It is a refusal and not a move, and that is not a conservative default
+    /// chosen for taste. Moving would require deciding which path produced the
+    /// value, and `docs/OWNERSHIP.md` 0.3 chose a checker with no control-flow
+    /// graph. Reading, which is what happened before this rule, is the one
+    /// answer that is definitely wrong: the source is dropped at its scope end
+    /// and the consumer frees the same buffer.
+    fn refuseUnknownMove(
+        self: *Checker,
+        s: ArcSource.Site,
+        verb: []const u8,
+        prep: []const u8,
+        slot: []const u8,
+        slot_name: ?[]const u8,
+    ) Error!void {
+        const message = if (slot_name) |n|
+            try self.msg(
+                "cannot {s} {s} {s} 'owned' {s} '{s}': which owned place it gives up cannot be resolved here",
+                .{ verb, s.display, prep, slot, n },
+            )
+        else
+            try self.msg(
+                "cannot {s} {s} {s} an 'owned' {s}: which owned place it gives up cannot be resolved here",
+                .{ verb, s.display, prep, slot },
+            );
+        try self.diagnostics.err(self.allocator, s.span, message);
+        try self.diagnostics.note(
+            self.allocator,
+            s.span,
+            "R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path",
+        );
     }
 
     /// R10: an `arc` place may not be made unique. `verb` and `slot` name the
@@ -4381,6 +4670,266 @@ test "R10's total verdict needs a struct type inferred from a CALL, or it refuse
         \\t.cell:9:33: error: cannot pass 'arc' value 's.name' to 'owned' parameter 's': ownership is shared and cannot be made unique
         \\t.cell:9:33: note: an 'owned' holder frees the value, and the 'arc' box would free it again
         \\
+    );
+}
+
+test "R2.b: a value shape reaching an owned position was READ, not moved, and double freed" {
+    // THE DEFECT. R2 enumerates the forms that move a PLACE, and every one of
+    // its consumption sites asked `placeOf` first: a place moved, and anything
+    // else fell through to `checkExpr`, which only reads. A `match` is not a
+    // place, so
+    //
+    //     let owned s2: String = match c { 0 => s1, _ => s1 }
+    //
+    // read `s1`. `wasMoved(s1)` stayed false, codegen's `pendingDrops` kept
+    // BOTH `s1` and `s2`, and `emitValueInto`'s leaf emitted a bitwise
+    // `_cell_t0 = s1;`, so two headers held one buffer. Measured end to end
+    // against `zig-out/bin/cell` built at `0e82266`:
+    //
+    //     cell check                  exit 0
+    //     cc -fsanitize=address       exit 0
+    //     running it                  exit 134
+    //     AddressSanitizer: attempting double-free, under cell_string_free
+    //
+    // This has nothing to do with `arc`: it is ordinary `owned String` code,
+    // and it predates every line of the `arc` work. It is R10 axis 1 in the
+    // general rule R10 is a special case of.
+    try expectDiagnostics(
+        \\pub fn mk() -> String;
+        \\pub fn main() {
+        \\    var copy c = 0
+        \\    let owned s1 = mk()
+        \\    let owned s2: String = match c { 0 => s1, _ => s1 }
+        \\}
+    ,
+        \\t.cell:5:43: error: cannot bind the place 's1' reached through a branch to 'owned' binding 's2': which owned place it gives up cannot be resolved here
+        \\t.cell:5:43: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
+        \\
+    );
+}
+
+test "R2.b is asked at all six owned consumption sites, four of which were live" {
+    // FOUR of these were AddressSanitizer double frees at exit 134, measured
+    // at `0e82266` with the same `mk() -> String` and the same `match`: the
+    // `let` above, the assignment, the call argument and the return. The
+    // opening brief named the `let`, the assignment, the struct field and the
+    // list element; the call argument and the return are the two it did not
+    // name and both were live. That is this repository's recurring
+    // undercount, so the sites are enumerated in a test rather than in prose.
+    //
+    // The remaining two are latent for reasons that belong to other gaps and
+    // are refused with the rest rather than left as traps for closing them:
+    // a `record` shape is never dropped, and slice elements are never
+    // released (OWNERSHIP.md R11).
+    try expectDiagnostics(
+        \\pub fn mk() -> String;
+        \\pub fn main() {
+        \\    var copy c = 0
+        \\    let owned s1 = mk()
+        \\    var owned s2: String = mk()
+        \\    s2 = match c { 0 => s1, _ => s1 }
+        \\}
+    ,
+        \\t.cell:6:25: error: cannot assign the place 's1' reached through a branch to 'owned' place 's2': which owned place it gives up cannot be resolved here
+        \\t.cell:6:25: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
+        \\
+    );
+    try expectDiagnostics(
+        \\pub fn mk() -> String;
+        \\pub fn take(owned s: String);
+        \\pub fn main() {
+        \\    var copy c = 0
+        \\    let owned s1 = mk()
+        \\    take(owned match c { 0 => s1, _ => s1 })
+        \\}
+    ,
+        \\t.cell:6:31: error: cannot pass the place 's1' reached through a branch to 'owned' parameter 's': which owned place it gives up cannot be resolved here
+        \\t.cell:6:31: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
+        \\
+    );
+    try expectDiagnostics(
+        \\pub fn mk() -> String;
+        \\pub fn pick(copy c: Int) -> String {
+        \\    let owned s1 = mk()
+        \\    return match c { 0 => s1, _ => s1 }
+        \\}
+    ,
+        \\t.cell:4:27: error: cannot return the place 's1' reached through a branch from 'owned' function 'pick': which owned place it gives up cannot be resolved here
+        \\t.cell:4:27: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
+        \\
+    );
+    try expectDiagnostics(
+        \\pub struct Box { owned items: [Int] }
+        \\pub fn fresh() -> [Int];
+        \\pub fn main() {
+        \\    var copy c = 0
+        \\    let owned xs: [Int] = fresh()
+        \\    let owned b = Box { items: match c { 0 => xs, _ => xs } }
+        \\}
+    ,
+        \\t.cell:6:47: error: cannot store the place 'xs' reached through a branch in 'owned' field 'items': which owned place it gives up cannot be resolved here
+        \\t.cell:6:47: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
+        \\
+    );
+    try expectDiagnostics(
+        \\pub fn fresh() -> [Int];
+        \\pub fn main() {
+        \\    var copy c = 0
+        \\    let owned xs: [Int] = fresh()
+        \\    let owned zss: [[Int]] = [match c { 0 => xs, _ => xs }]
+        \\}
+    ,
+        \\t.cell:5:46: error: cannot store the place 'xs' reached through a branch in an 'owned' list element: which owned place it gives up cannot be resolved here
+        \\t.cell:5:46: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
+        \\
+    );
+}
+
+test "R2.b covers an if branch and a block tail, which typecheck alone would hide" {
+    // Neither reaches a typed `owned` position through `cell check` today:
+    // typecheck gives an `if`-expression and a block the type `()` and
+    // refuses the initializer first. Measured, both of them. That is an
+    // ACCIDENT of the type checker rather than enforcement of this rule, and
+    // R10's own text objects to a rule enforced by a coincidence of two
+    // types. Borrowck runs independently of typecheck, so its own tests reach
+    // both forms and pin them on their own merits.
+    try expectDiagnostics(
+        \\pub fn mk() -> String;
+        \\pub fn main() {
+        \\    var copy c = 0
+        \\    let owned s1 = mk()
+        \\    let owned s2 = if c == 0 { s1 } else { s1 }
+        \\}
+    ,
+        \\t.cell:5:32: error: cannot bind the place 's1' reached through a branch to 'owned' binding 's2': which owned place it gives up cannot be resolved here
+        \\t.cell:5:32: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
+        \\
+    );
+    try expectDiagnostics(
+        \\pub fn mk() -> String;
+        \\pub fn main() {
+        \\    let owned s1 = mk()
+        \\    let owned s2 = { s1 }
+        \\}
+    ,
+        \\t.cell:4:22: error: cannot bind the place 's1' reached through a branch to 'owned' binding 's2': which owned place it gives up cannot be resolved here
+        \\t.cell:4:22: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
+        \\
+    );
+    // An `owned` keyword in front of the value does not get around it.
+    // `placeOf` already peels `.annotated`, so this arm adds no move that
+    // `placeOf` was not already making: `let owned s2: String = owned s1`
+    // already reported use-after-move at `0e82266`, and it still does (the
+    // control below). Only the value shape underneath is new.
+    try expectDiagnostics(
+        \\pub fn mk() -> String;
+        \\pub fn main() {
+        \\    var copy c = 0
+        \\    let owned s1 = mk()
+        \\    let owned s2: String = owned match c { 0 => s1, _ => s1 }
+        \\}
+    ,
+        \\t.cell:5:49: error: cannot bind the place 's1' reached through a branch to 'owned' binding 's2': which owned place it gives up cannot be resolved here
+        \\t.cell:5:49: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
+        \\
+    );
+}
+
+test "R2.b leaves a plain place moving, and a fresh value on every path accepted" {
+    // THE OVER-REFUSAL CONTROLS. The fix refuses; the risk of a refusal is
+    // that it refuses everything, and the risk of routing a move decision
+    // through a new classifier is that the move stops happening. This is what
+    // proves the move still happens: `s1` is moved, so reading it afterwards
+    // is R2's use-after-move. If `ownedMoveSource` ever returned
+    // `.no_owned_place` for a plain place, this test would report nothing and
+    // codegen's `pendingDrops` would free the buffer twice, which is the
+    // defect this whole rule exists to close, reintroduced by its own fix.
+    try expectDiagnostics(
+        \\pub fn mk() -> String;
+        \\pub fn use_it(shared s: String) -> Int;
+        \\pub fn main() {
+        \\    let owned s1 = mk()
+        \\    let owned s2: String = s1
+        \\    let copy n = use_it(shared s1)
+        \\}
+    ,
+        \\t.cell:6:32: error: use of 's1' after it was moved
+        \\t.cell:5:28: note: 's1' was moved here by binding it to 's2'
+        \\
+    );
+    // A `match` whose arms are all fresh values owns nothing an existing
+    // binding still holds, so it is accepted. This is the common shape and
+    // refusing it would have made `match` unusable as an initializer.
+    try expectAccepted(
+        \\pub fn mk() -> String;
+        \\pub fn main() {
+        \\    var copy c = 0
+        \\    let owned s2: String = match c { 0 => mk(), _ => mk() }
+        \\}
+    );
+    // Scalar arms, the same claim one type down.
+    try expectAccepted(
+        \\pub fn main() {
+        \\    var copy c = 0
+        \\    let owned n: Int = match c { 0 => 1, _ => 2 }
+        \\}
+    );
+    // A plain place stored in a struct field or a list element stays a READ,
+    // unchanged. R2's move list does not include either, and widening them
+    // would be the wrong repair: a `record` is never dropped, so moving `s1`
+    // out of `Box { s: s1 }` would LEAK the buffer instead of freeing it once.
+    // The gap that decides these two positions is record drops and slice
+    // element release, not this rule.
+    try expectAccepted(
+        \\pub struct Box { owned s: String }
+        \\pub fn mk() -> String;
+        \\pub fn main() {
+        \\    let owned s1 = mk()
+        \\    let owned b: Box = Box { s: s1 }
+        \\}
+    );
+    try expectAccepted(
+        \\pub fn fresh() -> [Int];
+        \\pub fn main() {
+        \\    let owned xs: [Int] = fresh()
+        \\    let owned zss: [[Int]] = [xs]
+        \\}
+    );
+}
+
+test "R2.b over-refuses a match over copy places, and the workaround is a name" {
+    // NAMED RATHER THAN LEFT TO BE DISCOVERED. This program was accepted at
+    // `0e82266`, runs clean, and is now REFUSED:
+    //
+    //     pub fn pick(copy c: Int, copy a: Int, copy b: Int) -> Int {
+    //         return match c { 0 => a, _ => b }
+    //     }
+    //
+    // A `copy` place is exempt from R2 by R12 and `pendingDrops` never drops
+    // one, so an exemption for it looks free. It was considered and REJECTED.
+    // The exemption would be an enumeration of the ownership modes this
+    // backend drops today, asserted over every `copy` place, which is exactly
+    // the reasoning failure this rule is the sixteenth instance of; and the
+    // neighbouring claim is already false, because `copy String` is spellable
+    // and `let owned s: String = a` over one emits a shallow header copy and
+    // frees `a`'s buffer through `s`. Refusing costs a program that can be
+    // spelled with a name. Accepting costs a free of something still live.
+    try expectDiagnostics(
+        \\pub fn pick(copy c: Int, copy a: Int, copy b: Int) -> Int {
+        \\    return match c { 0 => a, _ => b }
+        \\}
+    ,
+        \\t.cell:2:27: error: cannot return the place 'a' reached through a branch from 'owned' function 'pick': which owned place it gives up cannot be resolved here
+        \\t.cell:2:27: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
+        \\
+    );
+    // The workaround, verified rather than asserted: bind the value to a name
+    // whose annotation says what it is, then hand the name over.
+    try expectAccepted(
+        \\pub fn pick(copy c: Int, copy a: Int, copy b: Int) -> Int {
+        \\    let copy r = match c { 0 => a, _ => b }
+        \\    return copy r
+        \\}
     );
 }
 
