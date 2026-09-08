@@ -1332,9 +1332,135 @@ pub const Generator = struct {
         }
     }
 
+    /// A call, with R11's missing release for an UNBOUND `arc` temporary.
+    ///
+    /// `inspect(shared fresh())` used to emit
+    /// `cell_inspect(cell_string_as_str((const cell_string_t *)cell_fresh().ptr))`.
+    /// `fresh` returns a reference the caller owns (`cell_rt.h` section 7,
+    /// R11 release rule 3), the handle is never bound, and so nothing ever
+    /// released it: measured at 2998 leaks / 63968 bytes over 1000
+    /// iterations, the largest of R11's disclosed gaps.
+    ///
+    /// The release cannot go where the conversion goes. `cell_string_as_str`
+    /// hands out a view INTO the box's payload, so dropping the handle
+    /// inside the argument expression frees the characters the callee is
+    /// about to read. The drop has to happen after the enclosing call
+    /// returns, which is why the handle is hoisted into a statement
+    /// expression wrapped around the WHOLE call rather than fixed inside
+    /// `emitArgLike`:
+    ///
+    ///     ({ cell_arc_t _t0 = cell_fresh();
+    ///        int64_t _t1 = cell_inspect(cell_string_as_str(... _t0.ptr));
+    ///        cell_arc_drop(_t0);
+    ///        _t1; })
+    ///
+    /// WHY THIS CANNOT OVER-DROP, which is the only direction that matters
+    /// here (dropping too little leaks, dropping too much is a double free):
+    ///
+    ///   1. The temporary holds exactly ONE reference and it is one this
+    ///      frame owns. A Cell function that returns `arc` returns it
+    ///      already retained, and a C one must too, so the count this drop
+    ///      decrements is the one the call handed over.
+    ///   2. Nothing can alias it. The expression was never bound to a name,
+    ///      never passed to an `arc` parameter (that path is `want.shape ==
+    ///      .arc`, which `needsArcTemp` excludes, and it transfers the
+    ///      reference instead), and never stored, because a hoist happens
+    ///      only for an ARGUMENT of this one call.
+    ///   3. The pointee outlives the callee's use of it. The callee received
+    ///      a borrow, and R8 forbids a borrow from escaping the call, which
+    ///      is the same rule that makes R11's `shared`-parameter non-retain
+    ///      safe. The drop is emitted after the call statement, not before.
+    ///
+    /// WHAT IS DELIBERATELY NOT HOISTED, because each would be a
+    /// use-after-free rather than a fix, and the leak is the safe side:
+    ///
+    ///   - Any position that is not a call argument. `let shared s: String =
+    ///     fresh()`, a struct literal field, and a list element all keep the
+    ///     unboxed VIEW alive past the statement that produced it, so a drop
+    ///     at the end of that statement dangles. `emitArgLike` is shared by
+    ///     all of them, which is precisely why the hoist lives here and not
+    ///     there. An absence test pins the `let` form.
+    ///   - Any argument that is not syntactically a call. An `if`, `match`,
+    ///     or block argument reaches `emitValueExpr`, whose temporary starts
+    ///     as `{0}` and stays that way when no branch assigns to it, so a
+    ///     drop there could run on a null handle. Those forms still leak and
+    ///     are recorded as leaking rather than handled untested.
     fn emitCall(self: *Generator, c: anytype, indent: usize) EmitError!void {
         const out = self.writer;
         const callee = try self.resolveCallee(c.callee, c.args.len);
+
+        // Pre-scan. `temps[i]` is the hoisted handle's C name, or null for
+        // an argument that is emitted in place. Only a callee with a
+        // declaration has parameter types, so only it can need one.
+        var temps: []const ?[]const u8 = &.{};
+        var hoisted = false;
+        if (callee.def) |def| {
+            const scan = try self.arena.alloc(?[]const u8, c.args.len);
+            @memset(scan, null);
+            for (c.args, 0..) |_, i| {
+                if (i >= def.params.len) continue;
+                const p = def.params[i];
+                const want = try self.lowerType(&p.ty, p.ownership);
+                if (!try self.needsArcTemp(&c.args[i], want)) continue;
+                scan[i] = try self.nextTemp();
+                hoisted = true;
+            }
+            temps = scan;
+        }
+
+        if (!hoisted) return try self.writeCallExpr(c, callee, &.{}, indent);
+
+        const def = callee.def.?;
+        const ret = if (def.return_type) |rt| try self.lowerType(&rt, .owned) else CType.void_type;
+
+        try out.writeAll("({\n");
+        for (c.args, 0..) |_, i| {
+            const name = temps[i] orelse continue;
+            try self.writeIndent(indent + 1);
+            try out.print("cell_arc_t {s} = ", .{name});
+            try self.emitExpr(&c.args[i], indent + 1);
+            try out.writeAll(";\n");
+        }
+
+        // A void call leaves the statement expression's value as the last
+        // drop's, which is also void. Only a value-returning call needs a
+        // result slot, and it must be filled BEFORE any drop runs.
+        const result: ?[]const u8 = if (ret.shape == .unit) null else try self.nextTemp();
+        try self.writeIndent(indent + 1);
+        if (result) |name| {
+            try self.writeDecl(ret, name);
+            try out.writeAll(" = ");
+        }
+        try self.writeCallExpr(c, callee, temps, indent + 1);
+        try out.writeAll(";\n");
+
+        // Reverse hoist order, matching `pendingDrops`.
+        var i = c.args.len;
+        while (i > 0) {
+            i -= 1;
+            const name = temps[i] orelse continue;
+            try self.writeIndent(indent + 1);
+            try out.print("cell_arc_drop({s});\n", .{name});
+        }
+        if (result) |name| {
+            try self.writeIndent(indent + 1);
+            try out.print("{s};\n", .{name});
+        }
+        try self.writeIndent(indent);
+        try out.writeAll("})");
+    }
+
+    /// The call itself. `temps` may be empty, in which case this emits what
+    /// `emitCall` always emitted, byte for byte; otherwise a non-null entry
+    /// replaces that argument's handle with the hoisted temporary's name.
+    fn writeCallExpr(
+        self: *Generator,
+        c: anytype,
+        callee: Callee,
+        temps: []const ?[]const u8,
+        indent: usize,
+    ) EmitError!void {
+        const out = self.writer;
         if (callee.symbol) |sym| {
             try out.writeAll(sym);
         } else {
@@ -1347,13 +1473,43 @@ pub const Generator = struct {
             if (callee.def) |def| {
                 if (i < def.params.len) {
                     const p = def.params[i];
-                    try self.emitArgLike(arg, try self.lowerType(&p.ty, p.ownership), indent);
+                    const want = try self.lowerType(&p.ty, p.ownership);
+                    if (i < temps.len) {
+                        if (temps[i]) |name| {
+                            const emitted = try self.emitUnbox(arg, name, want, indent);
+                            // `needsArcTemp` already required `unboxable`.
+                            std.debug.assert(emitted);
+                            continue;
+                        }
+                    }
+                    try self.emitArgLike(arg, want, indent);
                     continue;
                 }
             }
             try self.emitExpr(arg, indent);
         }
         try out.writeAll(")");
+    }
+
+    /// True when this argument is an unbound `arc` whose handle would
+    /// otherwise be dropped on the floor. Every clause is a restriction, and
+    /// `emitCall`'s doc comment gives the reason for each.
+    ///
+    /// The `.call` test is the load-bearing one: it is the only argument
+    /// form whose `arc` value is guaranteed to be a live +1 reference this
+    /// frame owns, and it is the form that was measured. A place is excluded
+    /// because it belongs to a binding that is released elsewhere; an `if`,
+    /// `match`, or block is excluded because its value comes out of a
+    /// zero-initialised temporary.
+    fn needsArcTemp(self: *Generator, arg: *const ast.Expr, want: CType) Alloc!bool {
+        switch (unwrapAnnotated(arg).kind) {
+            .call => {},
+            else => return false,
+        }
+        if (want.shape == .arc) return false;
+        if (!unboxable(want)) return false;
+        const have = try self.inferExpr(arg);
+        return have.shape == .arc;
     }
 
     // ── arc retain and boxing (task 4b) ─────────────────────────────────
@@ -1409,29 +1565,7 @@ pub const Generator = struct {
         const out = self.writer;
 
         if (have.shape == .arc and want.shape != .arc) {
-            // `.ptr` is `void *`, so every cast below is a widening to the
-            // pointee's own type and needs no intermediate.
-            if (want.shape == .str) {
-                try out.writeAll("cell_string_as_str((const cell_string_t *)");
-                try self.emitExpr(arg, indent);
-                try out.writeAll(".ptr)");
-                return true;
-            }
-            if (want.shape == .slice and !want.pointer) {
-                try out.writeAll("(*(const cell_slice_t *)");
-                try self.emitExpr(arg, indent);
-                try out.writeAll(".ptr)");
-                return true;
-            }
-            if (want.pointer) {
-                try out.print("(({s})", .{want.text});
-                try self.emitExpr(arg, indent);
-                try out.writeAll(".ptr)");
-                return true;
-            }
-            // Anything else (an owned aggregate, say) would be a move out of
-            // a shared box, which R10 forbids anyway. Fall through loud.
-            return false;
+            return try self.emitUnbox(arg, null, want, indent);
         }
 
         if (want.shape != .arc) return false;
@@ -1467,6 +1601,59 @@ pub const Generator = struct {
             },
             else => return false,
         }
+    }
+
+    /// R11's deliberate non-retain, written once so the hoisted and the
+    /// un-hoisted spelling can never drift apart.
+    ///
+    /// `handle` chooses where the `cell_arc_t` comes from: null emits `arg`
+    /// itself (the ordinary path, byte for byte what this function emitted
+    /// inline before it was extracted), or the C identifier of a temporary
+    /// `emitCall` hoisted out of the argument list. Everything else about
+    /// the three spellings is identical either way, which is the point: the
+    /// pre-scan in `emitCall` asks `unboxable` and this function answers with
+    /// the same three conditions in the same order, so a `want` the pre-scan
+    /// hoists is always a `want` this function has a spelling for.
+    fn emitUnbox(
+        self: *Generator,
+        arg: *const ast.Expr,
+        handle: ?[]const u8,
+        want: CType,
+        indent: usize,
+    ) EmitError!bool {
+        const out = self.writer;
+        // Anything else (an owned aggregate, say) would be a move out of a
+        // shared box, which R10 forbids anyway. Fall through loud.
+        if (!unboxable(want)) return false;
+
+        // `.ptr` is `void *`, so every cast below is a widening to the
+        // pointee's own type and needs no intermediate.
+        if (want.shape == .str) {
+            try out.writeAll("cell_string_as_str((const cell_string_t *)");
+            try self.writeArcHandle(arg, handle, indent);
+            try out.writeAll(".ptr)");
+            return true;
+        }
+        if (want.shape == .slice and !want.pointer) {
+            try out.writeAll("(*(const cell_slice_t *)");
+            try self.writeArcHandle(arg, handle, indent);
+            try out.writeAll(".ptr)");
+            return true;
+        }
+        try out.print("(({s})", .{want.text});
+        try self.writeArcHandle(arg, handle, indent);
+        try out.writeAll(".ptr)");
+        return true;
+    }
+
+    fn writeArcHandle(
+        self: *Generator,
+        arg: *const ast.Expr,
+        handle: ?[]const u8,
+        indent: usize,
+    ) EmitError!void {
+        if (handle) |name| return try self.writer.writeAll(name);
+        try self.emitExpr(arg, indent);
     }
 
     /// Emit `arg` where a value of type `want` is required, inserting the
@@ -2008,6 +2195,17 @@ fn isPlace(e: *const ast.Expr) bool {
         .annotated => |a| isPlace(a.value),
         else => false,
     };
+}
+
+/// True when `emitUnbox` has a spelling for `want`, which is exactly the
+/// three conditions it tests, in the order it tests them. Kept as one
+/// predicate because two callers need the answer: `emitUnbox` itself, and
+/// `emitCall`'s pre-scan, which must not hoist an argument the emitter would
+/// then decline to unbox (the hoisted temporary would be declared, dropped,
+/// and never read, and the argument would fall through to a C type error
+/// with a `cell_arc_drop` of a live handle beside it).
+fn unboxable(want: CType) bool {
+    return want.shape == .str or (want.shape == .slice and !want.pointer) or want.pointer;
 }
 
 /// True when a function body's LAST top-level statement is a `return`, so
@@ -3081,6 +3279,123 @@ test "an arc place flowing out of a match arm in return position is cloned" {
     );
 }
 
+test "an unbound arc call result is hoisted out of the call and released after it" {
+    var e = try emitSource(
+        \\pub fn inspect(shared name: String) -> Int;
+        \\pub fn fresh() -> arc String {
+        \\  let arc s = "x"
+        \\  return s
+        \\}
+        \\pub fn f() -> Int {
+        \\  return inspect(shared fresh())
+        \\}
+    );
+    defer e.deinit();
+    // R11's largest disclosed gap, measured at 2998 leaks / 63968 bytes over
+    // 1000 iterations. `fresh` hands back a reference this frame owns, the
+    // handle was never bound, and the emitted C read `.ptr` off the call's
+    // return value and let the handle go.
+    //
+    // The whole statement expression is asserted, not just the drop, because
+    // ORDER is what makes this safe rather than a use-after-free: the
+    // unboxed `cell_str_t` points into the box's payload, so the drop must
+    // come after `cell_inspect` returns. A drop emitted inside the argument
+    // instead would free the characters the callee is reading.
+    try expectContains(e.text,
+        \\  return ({
+        \\    cell_arc_t _cell_t1 = cell_fresh();
+        \\    int64_t _cell_t2 = cell_inspect(cell_string_as_str((const cell_string_t *)_cell_t1.ptr));
+        \\    cell_arc_drop(_cell_t1);
+        \\    _cell_t2;
+        \\  });
+    );
+}
+
+test "two unbound arc call results in one call are both released, in reverse order" {
+    var e = try emitSource(
+        \\pub fn note(shared a: String, shared b: String);
+        \\pub fn fresh() -> arc String {
+        \\  let arc s = "x"
+        \\  return s
+        \\}
+        \\pub fn f() {
+        \\  note(shared fresh(), shared fresh())
+        \\}
+    );
+    defer e.deinit();
+    // Two things one argument cannot show. Both handles are hoisted rather
+    // than only the first, and a VOID callee gets no result slot, so the
+    // statement expression's value is the last drop's, which is also void.
+    // `cc -Wall -Wextra -Werror` accepts that; a stray result temporary of
+    // type `void` would not compile at all.
+    try expectContains(e.text,
+        \\    cell_arc_t _cell_t1 = cell_fresh();
+        \\    cell_arc_t _cell_t2 = cell_fresh();
+        \\    cell_note(cell_string_as_str((const cell_string_t *)_cell_t1.ptr), cell_string_as_str((const cell_string_t *)_cell_t2.ptr));
+        \\    cell_arc_drop(_cell_t2);
+        \\    cell_arc_drop(_cell_t1);
+    );
+}
+
+test "an arc call result unboxed OUTSIDE a call argument is NOT hoisted or released" {
+    var e = try emitSource(
+        \\pub fn fresh() -> arc String {
+        \\  let arc s = "x"
+        \\  return s
+        \\}
+        \\pub fn f() {
+        \\  let shared v: String = fresh()
+        \\}
+    );
+    defer e.deinit();
+    // The boundary of the fix above, and the test that catches the next
+    // person moving the hoist down into `emitArgLike` where every unbox
+    // would reach it. `v` is a view INTO the box's payload and it outlives
+    // the statement that produced it, so a `cell_arc_drop` here would leave
+    // `v` dangling for the rest of the scope. This form still leaks the box,
+    // deliberately: a leak is the safe side of this backend's asymmetry and
+    // a use-after-free is not.
+    //
+    // The WHOLE function is spelled out rather than just the unbox, because
+    // the absence is the claim and a `cell_arc_drop` could otherwise sit on
+    // any line this assertion does not name. A bare
+    // `expectAbsent("cell_arc_drop")` cannot say it: `fresh`'s own body is
+    // in the same emitted module and legitimately contains one.
+    try expectContains(e.text,
+        \\void cell_f(void) {
+        \\  cell_str_t v = cell_string_as_str((const cell_string_t *)cell_fresh().ptr);
+        \\  (void)v;
+        \\}
+    );
+    try expectAbsent(e.text, "cell_arc_drop(_cell_t");
+}
+
+test "an arc call result passed to an arc parameter is transferred, not hoisted" {
+    var e = try emitSource(
+        \\pub fn observe(arc name: String) -> Int;
+        \\pub fn fresh() -> arc String {
+        \\  let arc s = "x"
+        \\  return s
+        \\}
+        \\pub fn f() -> Int {
+        \\  return observe(arc fresh())
+        \\}
+    );
+    defer e.deinit();
+    // The adjacent path the hoist must not touch. Here the reference is
+    // HANDED to the callee, which releases it per cell_rt.h section 7, so
+    // hoisting and dropping it in this frame would be a double free. The
+    // absence is what pins that, and the whole function is spelled out to
+    // say it: a bare `expectAbsent("cell_arc_drop")` would fail on `fresh`'s
+    // own legitimate drop in the same emitted module.
+    try expectContains(e.text,
+        \\int64_t cell_f(void) {
+        \\  return cell_observe(cell_fresh());
+        \\}
+    );
+    try expectAbsent(e.text, "cell_arc_drop(_cell_t");
+}
+
 test "no drop is emitted after a body-terminating return" {
     var e = try emitSource(
         \\pub fn f() -> arc String {
@@ -3621,4 +3936,97 @@ test "a returned arc match-arm binding survives its scrutinee's release, run" {
         return error.ProgramCrashed;
     }
     try std.testing.expectEqualStrings("2\n", run_result.stdout);
+}
+
+test "an unbound arc temporary's release balances, compiled and run under ASan" {
+    // The execution counterpart to the hoist tests above, and the one that
+    // covers BOTH directions of the asymmetry in one program, because
+    // neither emitted text nor a single tool covers both.
+    //
+    //   OVER-DROP is caught by AddressSanitizer. `inspect(shared fresh())`
+    //   holds the only reference to its box, so a drop emitted before the
+    //   call rather than after it takes the count to zero and
+    //   `cell_string_as_str`'s result points at freed characters. That is a
+    //   heap-use-after-free, and it is the failure this whole change had to
+    //   avoid.
+    //
+    //   UNDER-DROP is caught by the printed number. `dup(arc a)` clones at
+    //   the call site and returns its own parameter, so the hoisted handle
+    //   is the second reference to `a`'s box. If the hoist's release is
+    //   missing, the count never comes back down and the `observe` that
+    //   follows reports 3 instead of 2, printing 13 instead of 12.
+    //
+    // The 12 decomposes as 5 + 5 + 2: "boxed" and "count" are both five
+    // characters, and `cell_observe` returns the strong count it was handed,
+    // which is the caller's one reference plus its own call-site retain.
+    // AddressSanitizer on macOS does not detect leaks, so the leak numbers
+    // for this shape stay a `leaks` measurement outside the test suite.
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn observe(arc name: String) -> Int;
+        \\pub fn inspect(shared name: String) -> Int;
+        \\pub fn dup(arc n: String) -> arc String {
+        \\  return n
+        \\}
+        \\pub fn fresh() -> arc String {
+        \\  let arc s = "boxed"
+        \\  return s
+        \\}
+        \\pub fn main() {
+        \\  let arc a = "count"
+        \\  let copy w = inspect(shared fresh())
+        \\  let copy x = inspect(shared dup(arc a))
+        \\  let copy y = observe(arc a)
+        \\  print_int(w + x + y)
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_arc_t _cell_t1 = cell_fresh();");
+    try expectContains(e.text, "cell_arc_t _cell_t3 = cell_dup(cell_arc_clone(a));");
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.c", .data = e.text });
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const root = cwd_buf[0..cwd_len];
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{root});
+    defer gpa.free(include);
+    const rt_c = try std.fmt.allocPrint(gpa, "{s}/runtime/cell_rt.c", .{root});
+    defer gpa.free(rt_c);
+    const host_c = try std.fmt.allocPrint(gpa, "{s}/examples/arc_host.c", .{root});
+    defer gpa.free(host_c);
+
+    const cc_result = try std.process.run(gpa, io, .{
+        .argv = &.{
+            "cc", "-std=c11",                     "-Wall",  "-Wextra", "-Werror",
+            "-g", "-fsanitize=address,undefined", "body.c", host_c,    rt_c,
+            "-I", include,                        "-o",     "body",
+        },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(cc_result.stdout);
+    defer gpa.free(cc_result.stderr);
+    if (!cc_result.term.success()) {
+        std.debug.print("cc rejected emitted C:\n{s}\n--- source ---\n{s}\n", .{ cc_result.stderr, e.text });
+        return error.CcRejectedEmittedC;
+    }
+
+    const run_result = try std.process.run(gpa, io, .{
+        .argv = &.{"./body"},
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(run_result.stdout);
+    defer gpa.free(run_result.stderr);
+    if (!run_result.term.success()) {
+        std.debug.print(
+            "the hoisted arc temporary's release is unsafe (ASan reports a use-after-free when the drop runs before the call):\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ run_result.stdout, run_result.stderr },
+        );
+        return error.ProgramCrashed;
+    }
+    try std.testing.expectEqualStrings("12\n", run_result.stdout);
 }
