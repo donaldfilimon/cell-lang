@@ -818,11 +818,55 @@ pub const Generator = struct {
     /// `arc` ones. It does not, and must not, hold for a returned `arc`: a
     /// function with nothing to drop can still return a reference it does
     /// not own, and an `arc` FIELD is exactly that case.
+    /// ## A `return` is a declared-type position, and it owes R11 rule 1
+    ///
+    /// `emitArcConversion`'s doc comment used to say `emitArgLike` was "the
+    /// single place this backend lowers a value into a position with a
+    /// declared type" and that "there is no second place to keep in step".
+    /// That was false, and this function is the second place: a `return`
+    /// lowers a value into the function's declared return type and never
+    /// asked the conversion question. `pub fn h() -> arc String { return "x" }`
+    /// passed `cell check` and emitted `return cell_str_from_parts("x", 1);`,
+    /// which only `cc` caught.
+    ///
+    /// The BOX direction is routed through the shared conversion, so
+    /// `emitArcConversion` stays the one place R11 rule 1 is spelled.
+    ///
+    /// THE UNBOX DIRECTION IS DELIBERATELY NOT ROUTED, and this is the whole
+    /// safety argument. `pub fn f(arc xs: [Int]) -> [Int] { return xs }` is
+    /// refused by `cc` today, and routing it would make it COMPILE:
+    /// `unboxable(cell_slice_t)` is true, so the conversion would emit
+    /// `(*(const cell_slice_t *)xs.ptr)`. `docs/OWNERSHIP.md` R10 documents
+    /// exactly that emission and exactly why it is a double free: `owned [T]`
+    /// and `shared [T]` are the same C type, the callee frees the buffer, and
+    /// `cell_slice_drop_glue` frees the same buffer again when the box dies.
+    /// A refcount does not govern the buffer, so no retain fixes it. Returning
+    /// an `arc` place from an `owned`-returning function is a make-unique
+    /// position, and R10 refuses four of those; this one it does not reach
+    /// yet, so the C type error is the only thing refusing it and it must
+    /// stay. The same holds for `-> String`, where `unboxable` is false and
+    /// the conversion declines on its own.
+    ///
+    /// The retain stays hand-written above rather than joining the routing,
+    /// because it is not the same rule. `emitArcConversion`'s arc-to-arc
+    /// branch clones every `arc` place, and R11 rule 3's exception (a
+    /// parameter returned directly is handed back on the caller's own
+    /// retain) exists only at a `return`. Routing that direction would clone
+    /// a parameter and leak one reference per call. `retain` and the box are
+    /// mutually exclusive on `have.shape`, so they can never both fire.
     fn emitReturnValue(self: *Generator, v: *const ast.Expr, retain: bool, indent: usize) EmitError!void {
-        if (!retain) return try self.emitExpr(v, indent);
-        try self.writer.writeAll("cell_arc_clone(");
+        if (retain) {
+            try self.writer.writeAll("cell_arc_clone(");
+            try self.emitExpr(v, indent);
+            try self.writer.writeAll(")");
+            return;
+        }
+        const want = self.current_ret_ty;
+        const have = try self.inferExpr(v);
+        if (want.shape == .arc and have.shape != .arc) {
+            if (try self.emitArcConversion(v, want, have, indent)) return;
+        }
         try self.emitExpr(v, indent);
-        try self.writer.writeAll(")");
     }
 
     /// True when returning `v` owes an `arc` retain (R11 release rule 3: a
@@ -1547,12 +1591,25 @@ pub const Generator = struct {
     /// the deliberate NON-retain expressible. Returns true when it emitted
     /// `arg` itself, false to let `emitArgLike` carry on.
     ///
-    /// Every one of R11's four retain sites reaches this one function,
-    /// because `emitArgLike` is already the single place this backend lowers
-    /// a value into a position with a declared type: a `let` initializer
+    /// Every one of R11's four retain sites reaches this one function.
+    /// `emitArgLike` carries five positions into it: a `let` initializer
     /// (rule 3), a call argument (rules 1 and 2), a struct literal field
-    /// (rule 4), a list element, and an assignment's right side. There is no
-    /// second place to keep in step.
+    /// (rule 4), a list element, and an assignment's right side.
+    ///
+    /// AN EARLIER VERSION OF THIS PARAGRAPH ADDED "there is no second place
+    /// to keep in step", AND THAT WAS FALSE. A `return` lowers a value into
+    /// the function's declared return type, which is a declared-type
+    /// position by exactly the same argument, and it did not ask this
+    /// question: `pub fn h() -> arc String { return "x" }` emitted
+    /// `return cell_str_from_parts("x", 1);`. `emitReturnValue` now routes
+    /// the BOX direction here, and its doc comment gives the reason the
+    /// unbox direction must NOT be routed (it would turn R10's documented
+    /// double free from a C type error into compiling code).
+    ///
+    /// The claim to keep making is the enumeration, not the "no second
+    /// place": six positions reach this function, and the way the seventh
+    /// gets found is by someone listing them again rather than by trusting
+    /// a sentence that says the list is closed.
     ///
     /// Three cases, in the order they are tested:
     ///
@@ -3105,6 +3162,94 @@ test "a returned arc local is retained before the drop that would free it" {
         \\  cell_arc_drop(s);
         \\  return _cell_t0;
     );
+}
+
+test "a value returned where the declared return type is arc IS boxed" {
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn lit() -> arc String {
+        \\  return "x"
+        \\}
+        \\pub fn from_call() -> arc String {
+        \\  return make()
+        \\}
+        \\pub fn from_list() -> arc [Int] {
+        \\  return [1, 2, 3]
+        \\}
+    );
+    defer e.deinit();
+    // A `return` lowers a value into the function's DECLARED return type, so
+    // it owes R11 rule 1 exactly as a `let`, a call argument, a struct field
+    // and a list element do. It was the one such position that never asked,
+    // and `emitArcConversion`'s doc comment asserted there was no second
+    // position to keep in step. All three of these passed `cell check` and
+    // were caught only by `cc`.
+    //
+    // Three forms, all run: a literal, a call result, and a list literal.
+    // Each is boxed rather than cloned because the box does not exist yet.
+    try expectContains(e.text, "return cell_arc_from_string(cell_string_from_str(cell_str_from_parts(\"x\", 1)));");
+    try expectContains(e.text, "return cell_arc_from_string(cell_make());");
+    try expectContains(e.text, "return cell_arc_from_slice(({");
+}
+
+test "an arc place returned where a non-arc type is declared stays a loud C type error" {
+    var e = try emitSource(
+        \\pub fn f(arc xs: [Int]) -> [Int] {
+        \\  return xs
+        \\}
+        \\pub fn g(arc s: String) -> String {
+        \\  return s
+        \\}
+    );
+    defer e.deinit();
+    // The direction that must NOT be routed through the conversion, and the
+    // test that stops someone completing the symmetry. `unboxable` is TRUE
+    // for `cell_slice_t`, so routing the unbox here would make `f` COMPILE,
+    // emitting `(*(const cell_slice_t *)xs.ptr)`. docs/OWNERSHIP.md R10
+    // documents that exact emission and why it is a double free: `owned [T]`
+    // and `shared [T]` are the same C type, the callee frees the buffer, and
+    // the box's drop glue frees the same buffer again. A refcount does not
+    // govern the buffer, so no retain fixes it.
+    //
+    // Returning an `arc` place from an `owned`-returning function is a
+    // make-unique position that R10 does not yet reach, so this C type error
+    // is the only thing refusing it. Keeping it loud is the whole point.
+    try expectContains(e.text,
+        \\cell_slice_t cell_f(cell_arc_t xs) {
+        \\  return xs;
+        \\}
+    );
+    try expectContains(e.text,
+        \\cell_string_t cell_g(cell_arc_t s) {
+        \\  return s;
+        \\}
+    );
+}
+
+test "an owned String PLACE returned as arc stays loud, like every other position" {
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f() -> arc String {
+        \\  let owned p = make()
+        \\  return p
+        \\}
+    );
+    defer e.deinit();
+    // The box direction's own decline, and it is `emitArcConversion`'s
+    // existing `isPlace` guard doing it, not a return-specific rule.
+    // `cell_arc_from_string` MOVES its argument, and R10's move-into-`arc`
+    // is unimplemented in `borrowck.zig`, so boxing a place is a silent
+    // double free everywhere else. A `return` is arguably the one position
+    // where it would be safe, because borrowck DOES kill a returned place,
+    // but earning that would mean a second hand-written conversion site
+    // keyed on a difference between positions, which is the exact shape that
+    // produced every use-after-free this file has had. The loud C error is
+    // the safe side.
+    try expectContains(e.text,
+        \\  cell_string_t p = cell_make();
+        \\  return p;
+    );
+    try expectAbsent(e.text, "cell_arc_from_string(p)");
 }
 
 test "a returned arc parameter is neither retained nor released" {
