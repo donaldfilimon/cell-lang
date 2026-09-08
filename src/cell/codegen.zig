@@ -233,6 +233,15 @@ pub const CType = struct {
     /// that loud. `applyOwnership` and `pointerTo` must preserve this field
     /// or it vanishes for `shared [T]` and `exclusive [T]`.
     elem: ?*const CType = null,
+    /// What this points AT, set by `pointerTo`, which is the only thing in
+    /// this file that ever sets `pointer`. Null for a non-pointer.
+    ///
+    /// Needed because a whole-value assignment through an `exclusive` borrow
+    /// has to write the POINTEE, so it needs that type to lower the right
+    /// side against. Recovering it by string surgery on `text` (stripping a
+    /// leading `const ` and a trailing ` *`) would work today and break the
+    /// first time a spelling changes; carrying it is exact.
+    pointee: ?*const CType = null,
 
     pub const unknown: CType = .{ .text = "void*", .shape = .unknown };
     pub const void_type: CType = .{ .text = "void", .shape = .unit };
@@ -669,15 +678,55 @@ pub const Generator = struct {
                 .annotated => |a| try self.emitEffect(a.value, indent),
                 else => try self.emitDiscarded(&e, indent),
             },
-            .assign => |a| {
-                try self.writeIndent(indent);
-                try self.emitExpr(&a.target, indent);
-                try out.writeAll(" = ");
-                const want = try self.inferExpr(&a.target);
-                try self.emitArgLike(&a.value, want, indent);
-                try out.writeAll(";\n");
-            },
+            .assign => |a| try self.emitAssign(a, indent),
         }
+    }
+
+    /// An assignment, which has to dereference when the target is a borrow.
+    ///
+    /// A whole-value write through an `exclusive` borrow emitted the struct
+    /// into the POINTER:
+    ///
+    ///     pub fn reset(exclusive b: Buffer) { b = Buffer { len: 42 } }
+    ///     -> b = (cell_Buffer){ .len = 42 };
+    ///
+    /// `cell check` accepted it and `cc` refused it, `assigning to
+    /// 'cell_Buffer *' from incompatible type 'cell_Buffer'`. An `exclusive`
+    /// parameter lowers to a pointer (`applyOwnership`), and writing the
+    /// whole value through it means writing what it points at. The same
+    /// defect hit `exclusive String`, whose `s = make()` emitted
+    /// `s = cell_make();` against a `cell_string_t *`.
+    ///
+    /// The dereference is keyed on the target's lowered type being a
+    /// pointer, and `pointerTo` is the only thing that makes one, so this
+    /// covers exactly the borrow modes and nothing else. A `.field` target is
+    /// unaffected: `inferExpr` gives it the FIELD's type, `emitExpr` already
+    /// spells the base with `->`, and R8 forbids a field from storing a
+    /// borrow, so a field's type is never a borrow pointer.
+    ///
+    /// WHY THIS CANNOT CHANGE A PROGRAM THAT WORKS TODAY. Only two things
+    /// lower to a pointer here, and `borrowck.zig` refuses an assignment to
+    /// both of the ways one could already be reached: a `shared` borrow is
+    /// immutable (`cannot assign to immutable binding 'b'`), and assigning
+    /// one `exclusive` borrow to another is `cannot move out of 'c': it is an
+    /// exclusive borrow, not an owner`. So every assignment this changes was
+    /// a C type error, which is also why the whole class stayed invisible.
+    ///
+    /// The right side is lowered against the POINTEE type, so it keeps every
+    /// conversion `emitArgLike` already applies rather than getting a second
+    /// hand-written path.
+    fn emitAssign(self: *Generator, a: anytype, indent: usize) EmitError!void {
+        const out = self.writer;
+        try self.writeIndent(indent);
+        var want = try self.inferExpr(&a.target);
+        if (want.pointee) |pointee| {
+            try out.writeAll("*");
+            want = pointee.*;
+        }
+        try self.emitExpr(&a.target, indent);
+        try out.writeAll(" = ");
+        try self.emitArgLike(&a.value, want, indent);
+        try out.writeAll(";\n");
     }
 
     // ── drop insertion (task 3) ────────────────────────────────────────
@@ -2025,7 +2074,16 @@ pub const Generator = struct {
             try std.fmt.allocPrint(self.arena, "const {s} *", .{base.text})
         else
             try std.fmt.allocPrint(self.arena, "{s} *", .{base.text});
-        return .{ .text = text, .shape = base.shape, .pointer = true, .name = base.name, .elem = base.elem };
+        const pointee = try self.arena.create(CType);
+        pointee.* = base;
+        return .{
+            .text = text,
+            .shape = base.shape,
+            .pointer = true,
+            .name = base.name,
+            .elem = base.elem,
+            .pointee = pointee,
+        };
     }
 
     fn namedType(self: *Generator, n: []const u8) Alloc!CType {
@@ -3041,6 +3099,138 @@ test "an unguarded catch-all still removes the panic" {
 // `main()` that assigns one owned local's value onto another, then lets
 // both reach scope exit) aborts, then restoring the check and confirming
 // the same program exits clean.
+
+test "a whole-value assignment through an exclusive borrow writes the POINTEE" {
+    var e = try emitSource(
+        \\pub struct Buffer {
+        \\  copy len: Int
+        \\}
+        \\pub fn make() -> String;
+        \\pub fn reset(exclusive b: Buffer) {
+        \\  b = Buffer { len: 42 }
+        \\}
+        \\pub fn set_str(exclusive s: String) {
+        \\  s = make()
+        \\}
+    );
+    defer e.deinit();
+    // An `exclusive` parameter lowers to a pointer, and writing the whole
+    // value through it means writing what it points at. Both of these passed
+    // `cell check` and emitted the value into the POINTER: `cc` refused with
+    // `assigning to 'cell_Buffer *' from incompatible type 'cell_Buffer';
+    // take the address with &`. Two forms, a record and a string, because
+    // the record is the reported one and the string is the same defect
+    // reached through a different `applyOwnership` branch.
+    try expectContains(e.text, "  *b = (cell_Buffer){ .len = 42 };");
+    try expectContains(e.text, "  *s = cell_make();");
+}
+
+test "a FIELD assignment through an exclusive borrow is unchanged" {
+    var e = try emitSource(
+        \\pub struct Buffer {
+        \\  copy len: Int
+        \\}
+        \\pub fn bump(exclusive b: Buffer) {
+        \\  b.len = b.len + 5
+        \\}
+        \\pub fn local() {
+        \\  var owned b = Buffer { len: 1 }
+        \\  b = Buffer { len: 2 }
+        \\}
+    );
+    defer e.deinit();
+    // The two neighbours the dereference must not touch. A `.field` target
+    // gets the FIELD's type from `inferExpr` and `emitExpr` already spells
+    // the base with `->`, and an owned local is not a pointer at all. Adding
+    // a `*` to either would be a fresh miscompile rather than a fix, so both
+    // are pinned by exact text.
+    try expectContains(e.text, "  b->len = (b->len + 5);");
+    try expectContains(e.text, "  b = (cell_Buffer){ .len = 2 };");
+    try expectAbsent(e.text, "*b->len");
+}
+
+test "a write through an exclusive borrow reaches the caller, compiled and run" {
+    // The assertion emitted text cannot make. The reporting agent measured
+    // that the MLIR backend prints 37 for this shape, i.e. it silently drops
+    // the write, so "it compiles" is not evidence that the caller sees it.
+    // Only running it and reading the caller's own value back distinguishes
+    // a write through the borrow from a write to a copy.
+    //
+    // The printed 47 decomposes as 42 + 5, and both halves are measurements:
+    // `reset` replaces the whole value through the borrow, and `bump` then
+    // adds 5 through the field path. If the whole-value write went to a copy
+    // this prints 6, and if either write were dropped it prints 6 or 43.
+    // No host is needed: `cell_print_int` is in the runtime.
+    var e = try emitSource(
+        \\pub struct Buffer {
+        \\  copy len: Int
+        \\}
+        \\pub fn print_int(copy value: Int);
+        \\pub fn reset(exclusive b: Buffer) {
+        \\  b = Buffer { len: 42 }
+        \\}
+        \\pub fn bump(exclusive b: Buffer) {
+        \\  b.len = b.len + 5
+        \\}
+        \\pub fn main() {
+        \\  let owned buf = Buffer { len: 1 }
+        \\  reset(exclusive buf)
+        \\  bump(exclusive buf)
+        \\  print_int(buf.len)
+        \\}
+    );
+    defer e.deinit();
+    // Both sides of the call, because the adjacent LLVM fix a few hours ago
+    // turned out to be TWO bugs, one per side, and either alone still
+    // printed the wrong number.
+    try expectContains(e.text, "  *b = (cell_Buffer){ .len = 42 };");
+    try expectContains(e.text, "  cell_reset(&buf);");
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.c", .data = e.text });
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const root = cwd_buf[0..cwd_len];
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{root});
+    defer gpa.free(include);
+    const rt_c = try std.fmt.allocPrint(gpa, "{s}/runtime/cell_rt.c", .{root});
+    defer gpa.free(rt_c);
+
+    const cc_result = try std.process.run(gpa, io, .{
+        .argv = &.{
+            "cc",    "-std=c11",                     "-Wall",  "-Wextra", "-Werror",
+            "-g",    "-fsanitize=address,undefined", "body.c", rt_c,      "-I",
+            include, "-o",                           "body",
+        },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(cc_result.stdout);
+    defer gpa.free(cc_result.stderr);
+    if (!cc_result.term.success()) {
+        std.debug.print("cc rejected emitted C:\n{s}\n--- source ---\n{s}\n", .{ cc_result.stderr, e.text });
+        return error.CcRejectedEmittedC;
+    }
+
+    const run_result = try std.process.run(gpa, io, .{
+        .argv = &.{"./body"},
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(run_result.stdout);
+    defer gpa.free(run_result.stderr);
+    if (!run_result.term.success()) {
+        std.debug.print(
+            "the emitted program did not exit cleanly:\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ run_result.stdout, run_result.stderr },
+        );
+        return error.ProgramCrashed;
+    }
+    // 6 means the whole-value write went to a copy the caller never sees.
+    try std.testing.expectEqualStrings("47\n", run_result.stdout);
+}
 
 test "a moved value is not dropped" {
     // The double-free guard: `s` is moved into `take` (borrowck's call-site
