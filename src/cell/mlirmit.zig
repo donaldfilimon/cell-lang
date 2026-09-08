@@ -567,9 +567,30 @@ const Emitter = struct {
             return;
         }
 
-        const val = try self.emitExpr(&v);
+        var val = try self.emitExpr(&v);
         if (val.isNone()) return;
+        // A borrow bound where a VALUE belongs: `let copy c = s`. Storing
+        // `val.text` would put the address in a struct-shaped slot and every
+        // later read of `c` would see pointer bits. Load through it instead,
+        // which is what this backend did before borrows in locals started
+        // holding addresses, and what llvmemit.zig still emits.
+        if (val.ptr_to) |pointee| val = try self.derefValue(val, pointee);
         try self.storeSlot(slot, val.ty, val.text);
+    }
+
+    /// Read the object a borrow points AT, as a value.
+    ///
+    /// The inverse of `borrowAddress`, and it exists because a borrow is a
+    /// legal source for a value: `read(copy s)` where `s` is a borrow is what
+    /// the C backend spells `cell_read(*s)`. Handing over `v.text` unloaded
+    /// would put an ADDRESS where an aggregate belongs, in a slot or an
+    /// operand typed for the aggregate, and mlir-opt accepts that happily
+    /// because both are pointer sized. That is the same defect this file was
+    /// opened to fix, one level over.
+    fn derefValue(self: *Emitter, v: Value, pointee: []const u8) EmitError!Value {
+        const loaded = try self.nextSsa();
+        try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ loaded, v.text, pointee });
+        return .{ .text = loaded, .ty = pointee };
     }
 
     /// The address a borrow initializer names, or null having already refused.
@@ -935,6 +956,14 @@ const Emitter = struct {
             try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ tmp, one, v.ty });
             try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ v.text, tmp, v.ty });
             return .{ .text = tmp, .ty = "!llvm.ptr" };
+        }
+
+        // A borrow consumed BY VALUE, `read(copy s)`. The C backend spells this
+        // `cell_read(*s)`, so load through the borrow rather than passing the
+        // address, which the mismatch refusal below would otherwise reject
+        // outright for a shape all three backends agree on.
+        if (v.ptr_to) |pointee| {
+            if (std.mem.eql(u8, pointee, w)) return self.derefValue(v, w);
         }
 
         // Any other mismatch. No construct produces one today, so rather than
@@ -1901,6 +1930,39 @@ test "a borrow held in a LOCAL binds the lender's address, not a copy" {
     const out = try runThroughMlir(gpa, e.text);
     defer gpa.free(out);
     try std.testing.expectEqualStrings("38\n", out);
+}
+
+test "a borrow consumed BY VALUE is loaded through, not passed as an address" {
+    // The other direction of the same slot change, and it went WRONG first.
+    // Once a borrow in a local held an address, `read(copy s)` reached
+    // emitArg with an `!llvm.ptr` where a struct was wanted and hit the
+    // mismatch refusal, an accept-to-refuse flip on a shape all three
+    // backends agree on: the C backend spells it `cell_read(*s)`. And
+    // `let copy c = s` was worse than a refusal, storing the ADDRESS into a
+    // struct-shaped slot, which mlir-opt accepts because both are pointer
+    // sized and which makes every later read of `c` see pointer bits.
+    const gpa = std.testing.allocator;
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn print_int(copy value: Int);
+        \\pub fn read(copy b: Buffer) -> Int { return b.len }
+        \\pub fn main() {
+        \\  var owned buf = Buffer { len: 20 }
+        \\  let shared s = &buf
+        \\  let copy c = s
+        \\  print_int(read(copy s) + c.len + 2)
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    // Two loads, not one: the slot yields the address, the address the value.
+    try expectContains(e.text, "%9 = llvm.load %2 : !llvm.ptr -> !llvm.ptr");
+    try expectContains(e.text, "%10 = llvm.load %9 : !llvm.ptr -> !llvm.struct<(i64)>");
+
+    const out = try runThroughMlir(gpa, e.text);
+    defer gpa.free(out);
+    // 20 read through the borrow, 20 through the copy of it, plus 2.
+    try std.testing.expectEqualStrings("42\n", out);
 }
 
 test "a write to a borrowed aggregate passed BY VALUE is refused, not lost" {
