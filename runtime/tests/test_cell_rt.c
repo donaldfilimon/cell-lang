@@ -289,6 +289,22 @@ static void test_arc_from_slice_roundtrip(void) {
  * memory instead of the address that was just supposedly freed, and the
  * comparison below fails. Verified empirically, and by deliberately
  * breaking each half in turn: see task-4a-report.md.
+ *
+ * WHICH DIRECTION THIS FAILS IN, now MEASURED rather than reasoned. The
+ * heuristic above is not guaranteed by the C standard, so the question that
+ * decides whether it is worth having is what happens when it stops holding.
+ * Built with Apple clang and `-fsanitize=address`, this harness exits 1 with
+ * exactly two failures, `buf_freed` here and its slice twin, and NO
+ * AddressSanitizer error: the code is clean and ASan's quarantine simply
+ * refuses to hand a freed block straight back. So a broken allocator
+ * assumption costs a FALSE FAILURE on correct code, loudly, and can never
+ * produce a silent pass on broken code, because a leaked block is still live
+ * and malloc cannot return a live block.
+ *
+ * That asymmetry is the whole argument for keeping this test. Earlier notes
+ * called the ASan half "reasoned, not reproduced", because `zig cc
+ * -fsanitize=address` would not link in the environments that tried it. Plain
+ * `cc` does link it, and the measurement above is that run.
  */
 static void test_arc_string_glue_frees_both_halves(void) {
     cell_string_t s = cell_string_from_cstr("dropme!");
