@@ -277,8 +277,13 @@ other diagnostic.
 **Three backends.** `cell emit` now takes `--target=c|llvm|mlir`. C remains the
 only backend that lowers the whole language. The LLVM IR and MLIR backends go
 through a typed IR (`src/cell/hir.zig`) and are scalar-first: `String`, `[T]`,
-`T?`, `Result`, `arc`, and (for MLIR) structs produce a `cannot lower`
-diagnostic at the offending span rather than wrong output. Both are verified by
+`T?`, `Result`, `arc`, and (for MLIR) structs mostly produce a `cannot lower`
+diagnostic at the offending span rather than wrong output. **Mostly, because
+this sentence was a blanket claim and is no longer one:** an `exclusive`
+`String`/`[T]`/`T?` parameter, and a whole-value write through it, lower in
+both backends as of `a6c41e8`, which made them pointers agreeing with
+`abi.classifyParam` and with the C ABI. Read the backends' refusals as a list
+that shrinks, and check the emitter rather than this paragraph. Both are verified by
 executing what they emit. `examples/backends.cell` prints `24` through all
 three. Section 10's C ABI contract is unchanged and remains normative for the
 C backend.

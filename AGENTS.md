@@ -138,7 +138,7 @@ Syntax is not implementation. Verify by running the compiler.
 Three emitters selected by `cell emit --target=`:
 
 - `c` (default): only one that lowers the whole language today (if/else, match, blocks, struct/list literals, mangled calls). Walks AST directly.
-- `llvm`, `mlir`: go through `hir`; deliberately **scalar-first**. Refuse `String`, `[T]`, `T?`, `Result`, `arc` (and most aggregates crossing C boundary) with a `cannot lower` diagnostic at the span. Never emit plausible wrong code.
+- `llvm`, `mlir`: go through `hir`; deliberately **scalar-first**. Refuse most of `String`, `[T]`, `T?`, `Result`, `arc` (and most aggregates crossing the C boundary) with a `cannot lower` diagnostic at the span. Never emit plausible wrong code. **Two exceptions, both narrower than the blanket claim this line used to make:** an `exclusive` `String`/`[T]`/`T?` PARAMETER and a whole-value write through it now lower in both backends, since `a6c41e8` made them pointers matching `abi.classifyParam` and the C ABI; and the `str` -> owning-`String` conversion is refused for the specific reason that neither backend can call a `static inline` runtime helper, not because aggregates are out of scope.
 
 `examples/backends.cell` (scalar) and now `hello.cell` (with struct) and `loops.cell` execute through all three. `arc.cell` executes through C alone, and needs `examples/arc_host.c` for its two bodyless declarations; `tools/check.sh` runs it with `run_c_host`.
 
