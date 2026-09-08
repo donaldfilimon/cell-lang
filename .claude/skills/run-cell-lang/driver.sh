@@ -47,10 +47,10 @@ ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 LLVM_BIN=${LLVM_BIN:-/opt/homebrew/opt/llvm/bin}
 CELL="$ROOT/zig-out/bin/cell"
 
-expect=""; hosts=""; backends="c,llvm,mlir"; build=1; src=""; explicit=0
+expect=""; has_expect=0; hosts=""; backends="c,llvm,mlir"; build=1; src=""; explicit=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        --expect)   expect=$2; shift 2 ;;
+        --expect)   expect=$2; has_expect=1; shift 2 ;;
         --host)     hosts="$hosts $2"; shift 2 ;;
         --backends) backends=$2; explicit=1; shift 2 ;;
         --no-build) build=0; shift ;;
@@ -122,8 +122,26 @@ done
 # MLIR emits no main, so it alone needs an entry point.
 printf 'extern void cell_main(void);\nint main(void){cell_main();return 0;}\n' > "$TMP/drv.c"
 
-report() { # backend, output
-    if [ -n "$expect" ]; then
+# backend, output, EXIT STATUS of the program.
+#
+# The status is not optional decoration. This repository's entire defect history
+# is use-after-frees that print the right answer and THEN die in a drop, which
+# surface as exit 134. An earlier version of this function ignored the status
+# and reported `ok C -> 42` for a program that printed 42 and aborted, at exit
+# 0. That is precisely the false green this script exists to prevent, so the
+# status is checked BEFORE the output is compared: a crash is a failure even
+# when the text matches.
+report() {
+    if [ "$3" -ne 0 ]; then
+        case "$3" in
+            134) why="SIGABRT, 134" ;;
+            139) why="SIGSEGV, 139" ;;
+            *)   why="exit $3" ;;
+        esac
+        fail "$1 -> $2, but the program DIED ($why)"
+        return
+    fi
+    if [ "$has_expect" -eq 1 ]; then
         if [ "$2" = "$expect" ]; then pass "$1 -> $2"; else fail "$1 -> $2, want $expect"; fi
     else
         pass "$1 -> $2"
@@ -135,7 +153,7 @@ if want c; then
     if [ $? -ne 0 ]; then fail "C emit"; sed -n '1,6p' "$TMP/c.err"; else
         cc -I "$ROOT/runtime" "$TMP/o.c" $host_objs "$TMP/rt.o" -o "$TMP/b_c" 2>"$TMP/c2.err"
         if [ $? -ne 0 ]; then fail "C compile"; sed -n '1,6p' "$TMP/c2.err"; else
-            out=$("$TMP/b_c"); report "C   " "$out"
+            out=$("$TMP/b_c"); st=$?; report "C   " "$out" "$st"
         fi
     fi
 fi
@@ -151,7 +169,7 @@ if want llvm; then
         if [ $? -ne 0 ]; then fail "LLVM compile"; sed -n '1,6p' "$TMP/l2.err"; else
             cc "$TMP/o_l.o" $host_objs "$TMP/rt.o" -o "$TMP/b_l" 2>"$TMP/l3.err"
             if [ $? -ne 0 ]; then fail "LLVM link"; sed -n '1,6p' "$TMP/l3.err"; else
-                out=$("$TMP/b_l"); report "LLVM" "$out"
+                out=$("$TMP/b_l"); st=$?; report "LLVM" "$out" "$st"
             fi
         fi
     fi
@@ -179,7 +197,7 @@ if want mlir; then
                     if [ $? -ne 0 ]; then fail "llc"; sed -n '1,6p' "$TMP/m4.err"; else
                         cc "$TMP/o_m.o" "$TMP/drv.c" $host_objs "$TMP/rt.o" -o "$TMP/b_m" 2>"$TMP/m5.err"
                         if [ $? -ne 0 ]; then fail "MLIR link"; sed -n '1,6p' "$TMP/m5.err"; else
-                            out=$("$TMP/b_m"); report "MLIR" "$out"
+                            out=$("$TMP/b_m"); st=$?; report "MLIR" "$out" "$st"
                         fi
                     fi
                 fi

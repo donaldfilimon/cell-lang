@@ -63,13 +63,24 @@ Options, all exercised:
 
 | Option | Effect |
 |---|---|
-| `--expect TEXT` | require that exact stdout; without it the output is only reported |
+| `--expect TEXT` | require that exact stdout. `--expect ""` pins a deliberately silent program |
 | `--host FILE.c` | link an extra C source, for a program with bodyless declarations. Repeatable |
 | `--backends LIST` | subset of `c,llvm,mlir`. **Naming a backend makes its refusal a failure**; the default does not |
 | `--no-build` | use `zig-out/bin/cell` as-is |
 
-It exits 0 only if every selected backend built, ran, and matched. Verified
-commands:
+It exits 0 only if every selected backend built, ran, **exited 0**, and
+matched. The exit status is checked BEFORE the output is compared, and that
+ordering is the point: this repository's defect history is use-after-frees that
+print the right answer and then die in a drop, surfacing as exit 134. An earlier
+version of this driver ignored the status and reported `ok C -> 42` at exit 0
+for a program that printed 42 and aborted. Review caught it. A crash is now a
+failure even when the text matches:
+
+```
+  FAIL  C    -> 42, but the program DIED (SIGABRT, 134)
+```
+
+Verified commands:
 
 ```sh
 .claude/skills/run-cell-lang/driver.sh --expect 24 examples/backends.cell
@@ -171,6 +182,11 @@ zig test src/root.zig 2>&1 | tail -1  # the count
   in the output.
 - **A green `zig build test` says nothing about the language.** It does not run a
   single `.cell` program. Use the driver or `tools/check.sh`.
+- **`tools/check.sh` executes only four programs.** It checks that LLVM and MLIR
+  agree on the emit VERDICT for every example, which is not the same as checking
+  that the emitted MLIR actually lowers. A sweep of the whole corpus with this
+  driver found `examples/borrows.cell` emitting MLIR that `mlir-opt` then
+  refuses, which no gate stage covers.
 
 ## Troubleshooting
 
