@@ -128,10 +128,20 @@ const Emitter = struct {
     /// rejects it outright with "invalid memref element type", so aggregates
     /// use the llvm dialect's own allocation and access ops.
     slot_is_llvm: std.ArrayList(bool) = .empty,
-    /// Slot -> pointee type, when the slot holds an ADDRESS. Borrowed
-    /// aggregate parameters only: an `exclusive` borrow has to write through
-    /// to the caller's object.
+    /// Slot -> pointee type, when the slot holds an ADDRESS. Borrowed STRUCT
+    /// bindings, parameters and locals alike: an `exclusive` borrow has to
+    /// write through to the caller's object, and a `let exclusive e = &mut
+    /// buf` that stored the struct instead of its address handed every
+    /// subsequent call a copy.
     slot_ptr_to: std.ArrayList(?[]const u8) = .empty,
+    /// Slot -> true when the slot holds a BORROWED aggregate that this backend
+    /// passes BY VALUE, so the slot is a copy and no write to it can reach the
+    /// lender. `String`, `[T]` and `T?` are the cases: `paramType` makes only a
+    /// borrowed struct an `!llvm.ptr`, while `codegen.applyOwnership` makes
+    /// `exclusive String` a `cell_string_t *` and writes through it. A write
+    /// here is therefore refused rather than emitted, per this backend's
+    /// scalar-first contract.
+    slot_borrowed_copy: std.ArrayList(bool) = .empty,
     /// String literals become llvm.mlir.global constants, emitted at module
     /// scope once the bodies that reference them are known.
     strings: std.ArrayList(StringGlobal) = .empty,
@@ -268,6 +278,9 @@ const Emitter = struct {
         self.slot_ptr_to.clearRetainingCapacity();
         try self.slot_ptr_to.resize(self.arena, f.bindings.len);
         for (self.slot_ptr_to.items) |*v| v.* = null;
+        self.slot_borrowed_copy.clearRetainingCapacity();
+        try self.slot_borrowed_copy.resize(self.arena, f.bindings.len);
+        for (self.slot_borrowed_copy.items) |*v| v.* = false;
 
         const uses_sret = abi.classifyReturn(self.module, f.ret) == .indirect;
         self.sret = if (uses_sret) "%sret" else null;
@@ -293,8 +306,22 @@ const Emitter = struct {
         self.indent = 4;
 
         for (f.bindings, 0..) |b, i| {
-            const is_ref = i < f.param_count and b.ty.tag() == .struct_type and
-                (b.ownership == .shared or b.ownership == .exclusive);
+            // A BORROW, whatever binds it. The `i < f.param_count` this once
+            // carried made the claim about parameters and applied it to every
+            // binding, and a `let exclusive e = &mut buf` local therefore got
+            // a struct-shaped slot, was initialized with a LOADED COPY of
+            // `buf`, and handed that copy's address to every call. The write
+            // then landed in the copy: 37 where the C backend, which spells
+            // the same binding `cell_Buffer *e = &buf`, printed 38. Nothing
+            // refused and nothing crashed. `examples/nll_dead_borrow.cell` has
+            // used this shape since 41abc3b and could not catch it, because
+            // its `grow` has an empty body and writes nothing.
+            const borrowed = b.ownership == .shared or b.ownership == .exclusive;
+            const is_ref = borrowed and b.ty.tag() == .struct_type;
+            // A borrowed aggregate this backend passes by VALUE. The write
+            // through it cannot reach the lender, and `emitAssign` refuses
+            // rather than storing into the copy.
+            self.slot_borrowed_copy.items[i] = borrowed and !is_ref and isAggregate(b.ty);
             const t = (if (is_ref) "!llvm.ptr" else self.mlirTypeOwned(b.ty, b.ownership)) orelse {
                 // A binding this backend cannot type is reported once, here,
                 // rather than at each use.
@@ -305,9 +332,11 @@ const Emitter = struct {
             const name = try self.nextSsa();
             self.slots.items[i] = name;
             if (is_ref) {
-                // Keep the caller's ADDRESS: an `exclusive` borrow must write
-                // through to the caller's object, and copying would drop every
-                // mutation.
+                // Keep the LENDER's ADDRESS: an `exclusive` borrow must write
+                // through to the borrowed object, and copying would drop every
+                // mutation. For a parameter the address arrives in `%argN`;
+                // for a local `emitLet` stores the address of the place the
+                // initializer names.
                 self.slot_is_llvm.items[i] = true;
                 self.slot_ptr_to.items[i] = self.mlirType(b.ty) orelse "!llvm.ptr";
                 const one = try self.nextSsa();
@@ -370,22 +399,8 @@ const Emitter = struct {
 
     fn emitStmt(self: *Emitter, stmt: *const hir.Stmt) EmitError!void {
         switch (stmt.kind) {
-            .let => |l| {
-                if (l.value) |v| {
-                    const val = try self.emitExpr(&v);
-                    if (val.isNone()) return;
-                    try self.storeSlot(l.slot, val.ty, val.text);
-                }
-            },
-            .assign => |a| {
-                const val = try self.emitExpr(&a.value);
-                if (val.isNone()) return;
-                if (a.place.path.len != 0) {
-                    try self.unsupported(stmt.span, "assignment through a field path");
-                    return;
-                }
-                try self.storeSlot(a.place.slot, val.ty, val.text);
-            },
+            .let => |l| try self.emitLet(l.slot, l.value),
+            .assign => |a| try self.emitAssign(stmt, a.place, &a.value),
             .expr => |e| _ = try self.emitExpr(&e),
             .while_loop => |w| {
                 const cond_b = self.nextBlock();
@@ -437,6 +452,149 @@ const Emitter = struct {
                 self.returned = true;
             },
         }
+    }
+
+    /// Where a write to a slot LANDS.
+    ///
+    /// A TOTAL verdict, deliberately, and the shape matters more than the
+    /// three cases. The predicate this replaces was "does the place have a
+    /// field path", an enumeration of the one form that was known to be
+    /// unlowerable, and everything it did not enumerate fell through to a
+    /// plain store into the slot. A borrowed slot holds the lender's ADDRESS,
+    /// so that store overwrote the pointer instead of the object and the
+    /// caller never saw the write. `AGENTS.md` records seven instances of
+    /// exactly that reasoning failure in this repository: a derivation that
+    /// enumerated some forms of a construct and asserted a property of all of
+    /// them. So the undecidable case here is `refuse`, not `into_slot`, and a
+    /// shape nobody anticipated fails closed with a `cannot lower` diagnostic
+    /// rather than silently writing somewhere plausible.
+    const AssignDest = union(enum) {
+        /// Write the value into the slot itself. An owned or `copy` binding,
+        /// or a borrowed PRIMITIVE, which `cell_rt.h` section 1 passes by
+        /// value in every ownership mode and which the C backend also writes
+        /// locally, so the two backends agree.
+        into_slot,
+        /// Write through the ADDRESS the slot holds, to the lender's object.
+        /// Carries the pointee type; the value must match it exactly.
+        through_slot: []const u8,
+        /// This backend cannot say where the write would land. Refuse at the
+        /// span. Carries the text for the diagnostic.
+        refuse: []const u8,
+    };
+
+    fn assignDest(self: *Emitter, place: hir.Place) AssignDest {
+        if (place.path.len != 0) return .{ .refuse = "assignment through a field path" };
+        if (place.slot >= self.slots.items.len) {
+            return .{ .refuse = "assignment to a binding with no slot" };
+        }
+        if (self.slot_ptr_to.items[place.slot]) |pointee| return .{ .through_slot = pointee };
+        if (self.slot_borrowed_copy.items[place.slot]) {
+            // `exclusive String`, `exclusive [T]` and `exclusive T?`.
+            // `paramType` passes these BY VALUE while
+            // `codegen.applyOwnership` makes them `cell_string_t *` and
+            // friends and writes through the pointer, so the slot here is a
+            // copy the lender cannot see. Emitting the store would be a
+            // silent lost write AND, for `exclusive String`, a 24-byte
+            // owning string stored into a 16-byte borrowed-view slot.
+            //
+            // DISCLOSED: `llvmemit.zig` has the identical hole and ACCEPTS
+            // this shape today, so the first `examples/` entry that writes it
+            // will split the gate's llvm-versus-mlir verdict stage. That is a
+            // reason to fix that backend, not to emit a wrong store here.
+            return .{ .refuse = "assignment to a borrowed aggregate this backend passes by value" };
+        }
+        return .into_slot;
+    }
+
+    fn emitAssign(
+        self: *Emitter,
+        stmt: *const hir.Stmt,
+        place: hir.Place,
+        value: *const hir.Expr,
+    ) EmitError!void {
+        // Classify BEFORE emitting the value: a refusal that first emits the
+        // right-hand side leaves dead ops in a module nobody will lower.
+        const dest = self.assignDest(place);
+        if (dest == .refuse) {
+            try self.unsupported(stmt.span, dest.refuse);
+            return;
+        }
+
+        const val = try self.emitExpr(value);
+        if (val.isNone()) return;
+
+        switch (dest) {
+            .into_slot => try self.storeSlot(place.slot, val.ty, val.text),
+            .through_slot => |pointee| {
+                if (!std.mem.eql(u8, val.ty, pointee)) {
+                    // Borrowck refuses moving out of a borrow, so no construct
+                    // reaches here with a mismatched value today. Saying so is
+                    // still cheaper than the store: a pointer written where a
+                    // struct belongs is exactly the defect above, one level in.
+                    try self.unsupported(stmt.span, try std.fmt.allocPrint(
+                        self.arena,
+                        "a value of type {s} written through a borrow of {s}",
+                        .{ val.ty, pointee },
+                    ));
+                    return;
+                }
+                // The slot holds the lender's address, so LOAD it and store
+                // through that. Storing into the slot would overwrite the
+                // pointer, which is what `reset(exclusive b) { b = Buffer {
+                // len: 42 } }` did: the C backend printed 42 and this one
+                // printed 37, with no diagnostic from either.
+                const addr = try self.loadSlot(place.slot, "!llvm.ptr");
+                try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ val.text, addr, val.ty });
+            },
+            .refuse => unreachable, // handled above
+        }
+    }
+
+    fn emitLet(self: *Emitter, slot: u32, value: ?hir.Expr) EmitError!void {
+        const v = value orelse return;
+
+        // A `let shared`/`let exclusive` of a struct binds an ADDRESS, the way
+        // the C backend emits `cell_Buffer *e = &buf;`. Storing the loaded
+        // struct here made the binding a COPY, and every call that then passed
+        // `e` handed the callee that copy: a write through the borrow was lost
+        // with no diagnostic.
+        if (slot < self.slot_ptr_to.items.len and self.slot_ptr_to.items[slot] != null) {
+            const addr = (try self.borrowAddress(&v)) orelse return;
+            try self.line(
+                "llvm.store {s}, {s} : !llvm.ptr, !llvm.ptr",
+                .{ addr, self.slots.items[slot] },
+            );
+            return;
+        }
+
+        const val = try self.emitExpr(&v);
+        if (val.isNone()) return;
+        try self.storeSlot(slot, val.ty, val.text);
+    }
+
+    /// The address a borrow initializer names, or null having already refused.
+    ///
+    /// Total by construction, and it does NOT reuse `emitArg`'s pointer path
+    /// on purpose. That one spills a temporary to a fresh `llvm.alloca` and
+    /// hands over its address, which is correct for a call argument, where
+    /// nothing outlives the call and can observe a write back. It is exactly
+    /// wrong for a binding: `let exclusive e = make()` would bind a copy that
+    /// the initializer's own value cannot see written, which is the defect
+    /// this function exists to remove. So a temporary is REFUSED here.
+    fn borrowAddress(self: *Emitter, e: *const hir.Expr) EmitError!?[]const u8 {
+        // A place with a slot of its own: its slot IS the object's address.
+        // `placeSlot` unwraps the `.unary` borrow spellings, so `&mut buf`,
+        // `&var buf`, `&exclusive buf` and `&buf` reach the same answer as the
+        // bare `buf` that `hir.lower` produces for the keyword form.
+        if (self.placeSlot(e)) |s| return self.slots.items[s];
+
+        const v = try self.emitExpr(e);
+        if (v.isNone()) return null;
+        // Already an address: re-borrowing a borrow, `let exclusive f = e`.
+        if (v.ptr_to != null) return v.text;
+
+        try self.unsupported(e.span, "a borrow of a value that has no address");
+        return null;
     }
 
     fn emitExpr(self: *Emitter, e: *const hir.Expr) EmitError!Value {
@@ -1335,6 +1493,102 @@ fn expectContains(text: []const u8, needle: []const u8) !void {
     }
 }
 
+/// Lower, translate, assemble, link and RUN emitted MLIR; returns what the
+/// program printed, which the caller frees.
+///
+/// One copy of the pipeline rather than one per test. There were two before
+/// this, and a third and a fourth were about to land: a run test is the ONLY
+/// assertion that catches a backend which emits a module that verifies,
+/// lowers, links, runs and computes the wrong number, which is precisely the
+/// defect class this file keeps producing. Duplicating a hundred lines per
+/// such test is how they stop being written.
+///
+/// Skips rather than passes when `mlir-opt`, `mlir-translate` or `llc` is
+/// absent: they live in the Homebrew LLVM keg and are not on PATH here, and a
+/// test that quietly succeeds when its subject is missing is worse than none.
+fn runThroughMlir(gpa: std.mem.Allocator, mlir_text: []const u8) ![]u8 {
+    const io = std.testing.io;
+
+    const mlir_opt = (try findTool(gpa, "mlir-opt")) orelse return error.SkipZigTest;
+    defer gpa.free(mlir_opt);
+    const mlir_translate = (try findTool(gpa, "mlir-translate")) orelse return error.SkipZigTest;
+    defer gpa.free(mlir_translate);
+    const llc = (try findTool(gpa, "llc")) orelse return error.SkipZigTest;
+    defer gpa.free(llc);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.mlir", .data = mlir_text });
+    // The MLIR path emits no C entry point of its own, so the driver supplies
+    // one. That asymmetry with the LLVM backend is deliberate: `main` is a C
+    // ABI concept and the func dialect has no reason to know about it.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "drv.c",
+        .data = "extern void cell_main(void);\nint main(void){cell_main();return 0;}\n",
+    });
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, mlir_opt);
+    try argv.append(gpa, "m.mlir");
+    for (lowering_passes) |p| try argv.append(gpa, p);
+    try argv.append(gpa, "-o");
+    try argv.append(gpa, "low.mlir");
+
+    const lowered = try std.process.run(gpa, io, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } });
+    defer gpa.free(lowered.stdout);
+    defer gpa.free(lowered.stderr);
+    if (!lowered.term.success()) {
+        std.debug.print("mlir-opt rejected emitted MLIR:\n{s}\n--- mlir ---\n{s}\n", .{ lowered.stderr, mlir_text });
+        return error.MlirOptRejectedOutput;
+    }
+
+    const translated = try std.process.run(gpa, io, .{
+        .argv = &.{ mlir_translate, "--mlir-to-llvmir", "low.mlir", "-o", "m.ll" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(translated.stdout);
+    defer gpa.free(translated.stderr);
+    if (!translated.term.success()) {
+        std.debug.print("mlir-translate failed:\n{s}\n", .{translated.stderr});
+        return error.MlirTranslateFailed;
+    }
+
+    const compiled = try std.process.run(gpa, io, .{
+        .argv = &.{ llc, "-filetype=obj", "m.ll", "-o", "m.o" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(compiled.stdout);
+    defer gpa.free(compiled.stderr);
+    if (!compiled.term.success()) return error.LlcFailed;
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const rt_c = try std.fmt.allocPrint(gpa, "{s}/runtime/cell_rt.c", .{cwd_buf[0..cwd_len]});
+    defer gpa.free(rt_c);
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{cwd_buf[0..cwd_len]});
+    defer gpa.free(include);
+
+    const linked = try std.process.run(gpa, io, .{
+        .argv = &.{ "cc", "m.o", "drv.c", rt_c, "-I", include, "-o", "prog" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(linked.stdout);
+    defer gpa.free(linked.stderr);
+    if (!linked.term.success()) {
+        std.debug.print("link failed:\n{s}\n", .{linked.stderr});
+        return error.LinkFailed;
+    }
+
+    const run = try std.process.run(gpa, io, .{ .argv = &.{"./prog"}, .cwd = .{ .dir = tmp.dir } });
+    defer gpa.free(run.stderr);
+    errdefer gpa.free(run.stdout);
+    // BOTH signals. A program that prints the right answer and then dies is
+    // not a passing program.
+    if (!run.term.success()) return error.ProgramFailed;
+    return run.stdout;
+}
+
 test "a function becomes a func.func with memref slots" {
     var e = try emitSource(
         \\pub fn add(shared a: Int, shared b: Int) -> Int {
@@ -1426,14 +1680,6 @@ test "arc is still refused, because R11 is not implemented" {
 
 test "emitted MLIR verifies, lowers, translates, links and prints the right answer" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    const mlir_opt = (try findTool(gpa, "mlir-opt")) orelse return error.SkipZigTest;
-    defer gpa.free(mlir_opt);
-    const mlir_translate = (try findTool(gpa, "mlir-translate")) orelse return error.SkipZigTest;
-    defer gpa.free(mlir_translate);
-    const llc = (try findTool(gpa, "llc")) orelse return error.SkipZigTest;
-    defer gpa.free(llc);
 
     var e = try emitSource(
         \\pub fn print_int(copy value: Int);
@@ -1453,76 +1699,10 @@ test "emitted MLIR verifies, lowers, translates, links and prints the right answ
     defer e.deinit();
     try std.testing.expect(!e.bag.hasErrors());
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "m.mlir", .data = e.text });
-    // The MLIR path emits no C entry point of its own, so the driver supplies
-    // one. That asymmetry with the LLVM backend is deliberate: `main` is a C
-    // ABI concept and the func dialect has no reason to know about it.
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "drv.c",
-        .data = "extern void cell_main(void);\nint main(void){cell_main();return 0;}\n",
-    });
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-    try argv.append(gpa, mlir_opt);
-    try argv.append(gpa, "m.mlir");
-    for (lowering_passes) |p| try argv.append(gpa, p);
-    try argv.append(gpa, "-o");
-    try argv.append(gpa, "low.mlir");
-
-    const lowered = try std.process.run(gpa, io, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } });
-    defer gpa.free(lowered.stdout);
-    defer gpa.free(lowered.stderr);
-    if (!lowered.term.success()) {
-        std.debug.print("mlir-opt rejected emitted MLIR:\n{s}\n--- mlir ---\n{s}\n", .{ lowered.stderr, e.text });
-        return error.MlirOptRejectedOutput;
-    }
-
-    const translated = try std.process.run(gpa, io, .{
-        .argv = &.{ mlir_translate, "--mlir-to-llvmir", "low.mlir", "-o", "m.ll" },
-        .cwd = .{ .dir = tmp.dir },
-    });
-    defer gpa.free(translated.stdout);
-    defer gpa.free(translated.stderr);
-    if (!translated.term.success()) {
-        std.debug.print("mlir-translate failed:\n{s}\n", .{translated.stderr});
-        return error.MlirTranslateFailed;
-    }
-
-    const compiled = try std.process.run(gpa, io, .{
-        .argv = &.{ llc, "-filetype=obj", "m.ll", "-o", "m.o" },
-        .cwd = .{ .dir = tmp.dir },
-    });
-    defer gpa.free(compiled.stdout);
-    defer gpa.free(compiled.stderr);
-    if (!compiled.term.success()) return error.LlcFailed;
-
-    var cwd_buf: [4096]u8 = undefined;
-    const cwd_len = try std.process.currentPath(io, &cwd_buf);
-    const rt_c = try std.fmt.allocPrint(gpa, "{s}/runtime/cell_rt.c", .{cwd_buf[0..cwd_len]});
-    defer gpa.free(rt_c);
-    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{cwd_buf[0..cwd_len]});
-    defer gpa.free(include);
-
-    const linked = try std.process.run(gpa, io, .{
-        .argv = &.{ "cc", "m.o", "drv.c", rt_c, "-I", include, "-o", "prog" },
-        .cwd = .{ .dir = tmp.dir },
-    });
-    defer gpa.free(linked.stdout);
-    defer gpa.free(linked.stderr);
-    if (!linked.term.success()) {
-        std.debug.print("link failed:\n{s}\n", .{linked.stderr});
-        return error.LinkFailed;
-    }
-
-    const run = try std.process.run(gpa, io, .{ .argv = &.{"./prog"}, .cwd = .{ .dir = tmp.dir } });
-    defer gpa.free(run.stderr);
-    defer gpa.free(run.stdout);
-    if (!run.term.success()) return error.ProgramFailed;
+    const out = try runThroughMlir(gpa, e.text);
+    defer gpa.free(out);
     // The C backend prints 24 for this same source. Three backends, one answer.
-    try std.testing.expectEqualStrings("24\n", run.stdout);
+    try std.testing.expectEqualStrings("24\n", out);
 }
 
 test "a String lowers, and a literal builds its borrowed view" {
@@ -1610,6 +1790,194 @@ test "a borrowed struct is a pointer at the CALL SITE too, in all five spellings
     try std.testing.expectEqual(@as(usize, 5), calls);
 }
 
+test "a whole-value write through an exclusive borrow stores through the slot" {
+    // THE SHAPE of the fix, pinned so a later "simplification" back to a plain
+    // storeSlot is loud. A borrowed parameter's slot holds the CALLER's
+    // address, so `b = Buffer { ... }` has to load that address and store
+    // through it. Storing into the slot overwrote the pointer instead, and the
+    // caller's object never changed: silent, verified by mlir-opt, linked, ran.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn reset(exclusive b: Buffer) { b = Buffer { len: 42 } }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    // The slot is loaded as a pointer, and the struct goes through THAT.
+    try expectContains(e.text, "%5 = llvm.load %0 : !llvm.ptr -> !llvm.ptr");
+    try expectContains(e.text, "llvm.store %4, %5 : !llvm.struct<(i64)>, !llvm.ptr");
+    // The exact text the defect produced: the struct written into the slot.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        e.text,
+        "llvm.store %4, %0 : !llvm.struct<(i64)>, !llvm.ptr",
+    ) == null);
+}
+
+test "an owned local's assignment still writes the slot itself" {
+    // The neighbour, pinned by exact text so the dereference above cannot
+    // spread to a binding that owns its value. codegen.zig's af4134f made the
+    // same pairing for the C backend and for the same reason.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn f() {
+        \\  var owned b = Buffer { len: 1 }
+        \\  b = Buffer { len: 2 }
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    // No dereference: the slot IS the object, so nothing loads an address.
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "llvm.load %0 : !llvm.ptr -> !llvm.ptr") == null);
+    try expectContains(e.text, "llvm.store %7, %0 : !llvm.struct<(i64)>, !llvm.ptr");
+}
+
+test "a whole-value write through an exclusive borrow reaches the CALLER" {
+    // THE ANSWER, which is the assertion that matters: the shape test above
+    // would pass against a backend that emitted the right ops for the wrong
+    // object. Pre-fix this program printed 1, not 37, because the whole-value
+    // store of a 16-byte struct into an 8-byte pointer slot also overflowed
+    // it; the one-field version printed 37. Both are wrong and neither said
+    // so. `examples/write_through_whole.cell` is the corpus form and runs the
+    // same arithmetic through all three backends.
+    const gpa = std.testing.allocator;
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int, copy step: Int }
+        \\pub fn print_int(copy value: Int);
+        \\pub fn bump(exclusive b: Buffer) {
+        \\  b = Buffer { len: b.len + b.step, step: b.step }
+        \\}
+        \\pub fn main() {
+        \\  var owned buf = Buffer { len: 37, step: 1 }
+        \\  bump(exclusive buf)
+        \\  bump(&mut buf)
+        \\  bump(&var buf)
+        \\  bump(&exclusive buf)
+        \\  bump(exclusive &buf)
+        \\  print_int(buf.len)
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+
+    const out = try runThroughMlir(gpa, e.text);
+    defer gpa.free(out);
+    // 37 plus one per spelling. All five, because the five are one group:
+    // 41 would mean exactly one of them lost its write.
+    try std.testing.expectEqualStrings("42\n", out);
+}
+
+test "a borrow held in a LOCAL binds the lender's address, not a copy" {
+    // THE OTHER SIDE OF THE CALL, and a second bug rather than a consequence
+    // of the first. `let exclusive e = &mut buf` stored a LOADED COPY of `buf`
+    // into a struct-shaped slot, so `bump(exclusive e)` handed the callee that
+    // copy's address and the write landed in it. Measured: the C backend, which
+    // spells this binding `cell_Buffer *e = &buf;`, printed 38 while this one
+    // printed 37, and the write-through fix above alone still printed 37.
+    //
+    // examples/nll_dead_borrow.cell has used this shape since 41abc3b and could
+    // never have caught it: its `grow` has an empty body and writes nothing.
+    // The shape does NOT go into examples/, because llvmemit.zig has the
+    // identical caller-side hole and still prints 37, and a corpus entry would
+    // fail the gate's answer stage on a backend outside this file.
+    const gpa = std.testing.allocator;
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn print_int(copy value: Int);
+        \\pub fn bump(exclusive b: Buffer) { b = Buffer { len: b.len + 1 } }
+        \\pub fn main() {
+        \\  var owned buf = Buffer { len: 37 }
+        \\  let exclusive e = &mut buf
+        \\  bump(exclusive e)
+        \\  print_int(buf.len)
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+
+    // The binding's slot holds a pointer and is initialized with an ADDRESS.
+    try expectContains(e.text, "llvm.alloca %3 x !llvm.ptr : (i64) -> !llvm.ptr");
+    try expectContains(e.text, "llvm.store %0, %2 : !llvm.ptr, !llvm.ptr");
+
+    const out = try runThroughMlir(gpa, e.text);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("38\n", out);
+}
+
+test "a write to a borrowed aggregate passed BY VALUE is refused, not lost" {
+    // The third axis of the same defect, and the one the reported program
+    // cannot show. `paramType` makes only a borrowed STRUCT an `!llvm.ptr`,
+    // while `codegen.applyOwnership` makes `exclusive String` a
+    // `cell_string_t *` and writes through it. So the slot here is a copy the
+    // caller cannot see, and emitting the store would be a silent lost write
+    // AND a 24-byte owning string stored into a 16-byte borrowed-view slot.
+    //
+    // Refusing is this backend's documented contract. DISCLOSED: llvmemit.zig
+    // has the identical hole and accepts this shape today.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn setit(exclusive s: String) { s = make() }
+    );
+    defer e.deinit();
+    try std.testing.expect(e.bag.hasErrors());
+    var found = false;
+    for (e.bag.list.items) |d| {
+        if (std.mem.indexOf(u8, d.message, "passes by value") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "a borrowed PRIMITIVE parameter still writes its own slot, matching C" {
+    // The neighbour of the refusal above. cell_rt.h section 1 passes every
+    // primitive by value in every ownership mode, and codegen.applyOwnership
+    // returns the base type unchanged for one, so `n = 5` writes the callee's
+    // own copy in BOTH backends. Refusing it here would break agreement with a
+    // backend that is right.
+    var e = try emitSource(
+        \\pub fn bump(exclusive n: Int) { n = 5 }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "memref.store");
+}
+
+test "assignment through a field path is still refused, and refused FIRST" {
+    // Unchanged behaviour, pinned because emitAssign now classifies before it
+    // emits the right-hand side. The refusal must still fire, and it must no
+    // longer leave the value's ops behind in a module nobody will lower.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn bump(exclusive b: Buffer) { b.len = b.len + 5 }
+    );
+    defer e.deinit();
+    try std.testing.expect(e.bag.hasErrors());
+    var found = false;
+    for (e.bag.list.items) |d| {
+        if (std.mem.indexOf(u8, d.message, "field path") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "a let-bound borrow of a temporary is refused rather than bound to a copy" {
+    // borrowck accepts `let exclusive e = mk()` today, and emitArg's pointer
+    // path would happily spill the call result to a fresh alloca and hand back
+    // its address. That is correct for an ARGUMENT, where nothing outlives the
+    // call to observe a write back, and wrong for a BINDING. borrowAddress
+    // therefore refuses instead of reusing emitArg: the undecidable case fails
+    // closed.
+    var e = try emitSource(
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn mk() -> Buffer;
+        \\pub fn f() { let exclusive e = mk() }
+    );
+    defer e.deinit();
+    try std.testing.expect(e.bag.hasErrors());
+    var found = false;
+    for (e.bag.list.items) |d| {
+        if (std.mem.indexOf(u8, d.message, "no address") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "an unused struct with an unrepresentable field is still refused" {
     // MLIR renders !llvm.struct structurally at each USE, so an unused struct
     // was never examined and this module was accepted here while the LLVM
@@ -1669,13 +2037,6 @@ test "a struct return over 16 bytes uses sret, because by value is WRONG" {
 
 test "an sret round trip computes the right answer through the whole pipeline" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    const mlir_opt = (try findTool(gpa, "mlir-opt")) orelse return error.SkipZigTest;
-    defer gpa.free(mlir_opt);
-    const mlir_translate = (try findTool(gpa, "mlir-translate")) orelse return error.SkipZigTest;
-    defer gpa.free(mlir_translate);
-    const llc = (try findTool(gpa, "llc")) orelse return error.SkipZigTest;
-    defer gpa.free(llc);
 
     var e = try emitSource(
         \\pub fn print_int(copy value: Int);
@@ -1687,67 +2048,8 @@ test "an sret round trip computes the right answer through the whole pipeline" {
     defer e.deinit();
     try std.testing.expect(!e.bag.hasErrors());
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "m.mlir", .data = e.text });
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "drv.c",
-        .data = "extern void cell_main(void);\nint main(void){cell_main();return 0;}\n",
-    });
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-    try argv.append(gpa, mlir_opt);
-    try argv.append(gpa, "m.mlir");
-    for (lowering_passes) |p| try argv.append(gpa, p);
-    try argv.append(gpa, "-o");
-    try argv.append(gpa, "low.mlir");
-    const lowered = try std.process.run(gpa, io, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } });
-    defer gpa.free(lowered.stdout);
-    defer gpa.free(lowered.stderr);
-    if (!lowered.term.success()) {
-        std.debug.print("mlir-opt rejected:\n{s}\n--- mlir ---\n{s}\n", .{ lowered.stderr, e.text });
-        return error.MlirOptRejectedOutput;
-    }
-
-    const tr = try std.process.run(gpa, io, .{
-        .argv = &.{ mlir_translate, "--mlir-to-llvmir", "low.mlir", "-o", "m.ll" },
-        .cwd = .{ .dir = tmp.dir },
-    });
-    defer gpa.free(tr.stdout);
-    defer gpa.free(tr.stderr);
-    if (!tr.term.success()) return error.MlirTranslateFailed;
-
-    const co = try std.process.run(gpa, io, .{
-        .argv = &.{ llc, "-filetype=obj", "m.ll", "-o", "m.o" },
-        .cwd = .{ .dir = tmp.dir },
-    });
-    defer gpa.free(co.stdout);
-    defer gpa.free(co.stderr);
-    if (!co.term.success()) return error.LlcFailed;
-
-    var cwd_buf: [4096]u8 = undefined;
-    const cwd_len = try std.process.currentPath(io, &cwd_buf);
-    const rt_c = try std.fmt.allocPrint(gpa, "{s}/runtime/cell_rt.c", .{cwd_buf[0..cwd_len]});
-    defer gpa.free(rt_c);
-    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{cwd_buf[0..cwd_len]});
-    defer gpa.free(include);
-
-    const link = try std.process.run(gpa, io, .{
-        .argv = &.{ "cc", "m.o", "drv.c", rt_c, "-I", include, "-o", "prog" },
-        .cwd = .{ .dir = tmp.dir },
-    });
-    defer gpa.free(link.stdout);
-    defer gpa.free(link.stderr);
-    if (!link.term.success()) {
-        std.debug.print("link failed:\n{s}\n", .{link.stderr});
-        return error.LinkFailed;
-    }
-
-    const run = try std.process.run(gpa, io, .{ .argv = &.{"./prog"}, .cwd = .{ .dir = tmp.dir } });
-    defer gpa.free(run.stdout);
-    defer gpa.free(run.stderr);
-    if (!run.term.success()) return error.ProgramFailed;
+    const out = try runThroughMlir(gpa, e.text);
+    defer gpa.free(out);
     // 7 * 3. By value this came back as 21248159473.
-    try std.testing.expectEqualStrings("21\n", run.stdout);
+    try std.testing.expectEqualStrings("21\n", out);
 }

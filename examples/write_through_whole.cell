@@ -1,0 +1,90 @@
+// A WHOLE-VALUE write through an `exclusive` borrow must land in the CALLER's
+// object, the same way a field write must.
+//
+// WHY THIS FILE EXISTS SEPARATELY FROM write_through.cell. That file measures
+// which ADDRESS a call site hands over, and its mutator is deliberately
+// bodyless in C, for the reason its own header gives. So it exercises exactly
+// one of the two shapes an `exclusive` borrow can be written through:
+//
+//     b.len = b.len + 1        the FIELD form, which write_through.cell's C
+//                              host performs, and which the MLIR backend
+//                              refuses in a Cell body to this day
+//                              ("assignment through a field path")
+//     b = Buffer { ... }       the WHOLE-VALUE form, which no example used at
+//                              all, and which the MLIR backend silently
+//                              MISCOMPILED
+//
+// The gate ran nine stages green over that gap. Stage 8 compares the backends
+// on their ANSWERS rather than their verdicts, which is exactly the stage that
+// would have caught this, and it could not, because the shape was absent from
+// the corpus. A comparison is only as good as the programs it compares, so the
+// fix for a silent class of defect is never only the compiler change: the
+// corpus has to carry the shape, or the next regression is silent again.
+//
+// WHAT WENT WRONG, measured. A borrowed struct parameter's slot holds the
+// CALLER's address rather than the object. The whole-value assignment stored
+// the new struct INTO that slot, overwriting the pointer, so the callee wrote
+// over its own local copy of the address and the caller's object never
+// changed. `cell check` accepted it, all three backends emitted it, mlir-opt
+// verified it, it linked and it ran:
+//
+//     C backend     42        correct
+//     LLVM backend  42        correct, since 8b82b62
+//     MLIR backend  WRONG, and silent, in two different ways depending on the
+//                   struct's width. A one-field Buffer stores 8 bytes into an
+//                   8-byte pointer slot, fits, and prints 37: the write is
+//                   merely lost. THIS file's two-field Buffer stores 16 bytes
+//                   into that same 8-byte slot, so it also overflows it, and
+//                   this exact program printed 1 (reproducibly, three runs).
+//
+// WHAT IT PRINTS, and how to read a wrong answer. One integer, `42`:
+//
+//   `buf.len` starts at 37 and each of the five unique-borrow spellings adds
+//   `buf.step`, which is 1. So 42 means all five wrote through and 41 means
+//   exactly one lost its write, which is the reading that matters for a
+//   REGRESSION: a call site that passes a copy for some spellings and the
+//   caller's object for others lands between 37 and 42. Anything else, 1
+//   included, means the callee wrote somewhere it should not have.
+//
+// WHY `step` IS A SECOND FIELD RATHER THAN THE LITERAL 1. The whole-value
+// write has to copy every field, and reading `b.step` forces the callee to
+// index the borrowed object at an offset PAST THE FIRST on the way in as well
+// as on the way out. A one-field struct would let a backend that indexes the
+// slot instead of loading through it still produce 42 by accident, because at
+// offset 0 a wrong base and a right base can coincide.
+//
+// EXPECT-OUTPUT: 42
+
+pub struct Buffer {
+    copy len: Int,
+    copy step: Int,
+}
+
+pub fn print_int(copy value: Int);
+
+// The mutator has a Cell BODY here, unlike write_through.cell's `grow`, and
+// that is the whole point: what is under test is what the CALLEE emits for
+// `b = Buffer { ... }`, which no C host can stand in for. All three backends
+// lower this body, because the assignment target is the binding itself and
+// not a field path.
+pub fn bump(exclusive b: Buffer) {
+    b = Buffer { len: b.len + b.step, step: b.step }
+}
+
+pub fn main() {
+    var owned buf = Buffer { len: 37, step: 1 }
+
+    // All five unique-borrow spellings, which examples/borrows.cell declares
+    // identical and which do NOT reach a backend as one shape: `exclusive
+    // buf` arrives as a bare reference because `hir.lower` consumes the
+    // written prefix, while the four sigil forms arrive wrapped in a unary
+    // borrow node. A backend that handles one and not the others splits the
+    // group silently, and this arithmetic is what makes that visible.
+    bump(exclusive buf)
+    bump(&mut buf)
+    bump(&var buf)
+    bump(&exclusive buf)
+    bump(exclusive &buf)
+
+    print_int(buf.len)
+}

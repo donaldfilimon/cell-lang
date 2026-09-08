@@ -454,7 +454,26 @@ fi
 # backend is checked against that too. The declaration lives in the example,
 # beside the program that produces it, for the same reason stage 5 reads the
 # mlir pipeline out of the emitted file rather than keeping a copy here: a
-# second copy drifts, and then the gate pins something nobody ships.
+# second copy drifts, and then the gate pins something nobody ships. The count
+# of PINNED programs is reported below and zero is a FAILURE, for the same
+# reason zero printing programs is: a stage that compared only unpinned
+# programs has proved agreement and not correctness.
+#
+# THIS STAGE STILL ONLY SEES THE SHAPES THE CORPUS CONTAINS, and that is not a
+# limitation to be engineered away, it is a standing obligation on whoever
+# lands a compiler change. Measured a second time, on the other backend and
+# the other side of the same rule: the MLIR backend silently miscompiled a
+# WHOLE-VALUE write through an `exclusive` borrow,
+#
+#     pub fn reset(exclusive b: Buffer) { b = Buffer { len: 42 } }
+#
+# printing 37 where C and LLVM printed 42, and every stage here was green.
+# write_through.cell was already in this stage and could not catch it, because
+# its mutator writes a FIELD and lives in C. So the shape, not the rule, is
+# what a corpus entry covers: `examples/write_through_whole.cell` is the
+# whole-value half and prints 42. When a fix closes a silent class, the corpus
+# has to gain a PRINTING program of that exact shape, or the next regression
+# is silent again.
 #
 # An example whose bodyless declarations need C definitions gets them from
 # `examples/<stem>_host.c`, the convention arc_host.c and write_through_host.c
@@ -469,6 +488,7 @@ printf '\n== backend answers ==\n'
 answers_before=$fails
 answers_compared=0
 answers_printing=0
+answers_pinned=0
 
 if [ ! -x "$LLVM_BIN/mlir-opt" ] || [ ! -x "$LLVM_BIN/mlir-translate" ] || [ ! -x "$LLVM_BIN/llc" ]; then
     skip "the MLIR leg of the answer comparison (mlir-opt/mlir-translate/llc not found in $LLVM_BIN)"
@@ -588,6 +608,7 @@ for f in examples/*.cell; do
     # wrong in the same way still agree with each other, and this is the only
     # check in the stage that can tell that case apart.
     if [ -n "$want" ]; then
+        answers_pinned=$((answers_pinned + 1))
         for b in $ran; do
             case $b in
                 C) this_out=$out_c ;;
@@ -606,11 +627,16 @@ done
 # A stage that compared nothing must SAY so rather than reporting a green it
 # did not earn, and one that compared only silent programs has proved exactly
 # as much. That is the same silence this stage exists to end, one level up.
-printf '  ....  %d program(s) compared, %d of them printing\n' "$answers_compared" "$answers_printing"
+printf '  ....  %d program(s) compared, %d of them printing, %d pinned by EXPECT-OUTPUT\n' \
+    "$answers_compared" "$answers_printing" "$answers_pinned"
 if [ "$answers_compared" -eq 0 ]; then
     fail "the answer comparison ran against nothing at all"
 elif [ "$answers_printing" -eq 0 ]; then
     fail "every program compared was silent, so nothing was actually compared"
+elif [ "$answers_pinned" -eq 0 ]; then
+    # Three backends wrong the same way agree with each other. Without at
+    # least one declared answer this stage has compared them to nothing.
+    fail "no program compared declares an EXPECT-OUTPUT, so agreement is all that was checked"
 elif [ $fails -eq $answers_before ]; then
     pass "every backend that runs an example computes the same answer"
 fi
