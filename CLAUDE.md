@@ -43,7 +43,9 @@ MLIR stages **SKIP loudly** when `mlir-opt`/`mlir-translate`/`llc` are missing,
 and the verdict says the run was weaker. They are in the Homebrew keg, not on
 PATH; override with `LLVM_BIN=`.
 
-Verified green 2026-09-07: exit 0, all 254 library tests, nine execution checks.
+**Do not trust a test count written here.** It moved 254 -> 289 in a single
+evening, and an execution-check count with it. Run the gate and read its own
+output; the count is the one thing this file cannot keep current.
 
 ## Tests
 
@@ -101,11 +103,24 @@ From the checked AST the two emit paths diverge, and knowing which one you are
 in explains most surprises:
 
 - **`--target=c` (default) walks the AST directly** in `codegen.zig`. It is
-  the only backend that lowers the whole language today, and it is where drop
-  insertion lives. Its drop pass depends on an id-numbering agreement with the
-  binding walk and is written to **fail toward a leak**: skipping a live
-  place's drop only leaks, while dropping a place that is still live is a
-  double free, so a numbering drift trips a loud test rather than mis-dropping.
+  the only backend that lowers the whole language today, and it owns both
+  halves of ownership lowering: drop insertion (release) and `arc`
+  retain insertion (OWNERSHIP.md R11). Its drop pass depends on an
+  id-numbering agreement with the binding walk and is written to **fail toward
+  a leak**: skipping a live place's drop only leaks, while dropping a place
+  that is still live is a double free, so a numbering drift trips a loud test
+  rather than mis-dropping. The retain side runs the same asymmetry in reverse,
+  retaining when unsure, because retaining too much leaks and retaining too
+  little dangles.
+
+  Retains reach two kinds of position by two deliberately different routes,
+  and the split is not accidental: `emitArcConversion` is **type-directed** and
+  serves argument and value slots, while `returnedArcNeedsRetain` is a
+  **position policy** for `return`, which alone carries R11's exception that a
+  returned parameter must not be retained. Do not "simplify" these into one
+  function; that exception is a fact about the position, not the type, and
+  merging them means passing a mode flag into a clean type-directed
+  conversion.
 - **`--target=llvm` and `--target=mlir` go through `hir.lower`** and are
   deliberately **scalar-first**. They refuse `String`, `[T]`, `T?`, `Result`,
   `arc`, and most aggregates crossing the C boundary with a `cannot lower`
@@ -113,9 +128,15 @@ in explains most surprises:
   share `hir`, a disagreement between them means one is wrong, which is what
   the gate's agreement stage exists to catch.
 
-`cfg.zig` (CFG over one `hir.Fn`) and `abi.zig` (AAPCS64 classification) are
-leaf modules importing only `hir`/`types`, kept that way so neither backend can
-smuggle target knowledge past them.
+`cfg.zig` (CFG over one `hir.Fn`), `liveness.zig` (backward liveness and
+last-use over that graph) and `abi.zig` (AAPCS64 classification) are leaf
+modules importing only `hir`/`cfg`/`types`, kept that way so neither backend
+can smuggle target knowledge past them. `liveness.zig` is `cfg.zig`'s only
+consumer and has none of its own yet: it is scaffolding for a precise drop pass
+and for NLL, and "nothing uses this" is expected rather than a defect. It
+correlates its op lists to `cfg.Block`s by mirroring `cfg.Builder`'s traversal
+function for function, so **the two walks must change together**; a drift
+misaligns every list against the wrong block.
 
 `runtime/cell_rt.h` is the ABI contract that keeps emitted code linking: change
 it and the emitters together. `src/main.zig` holds the three `extern fn`
