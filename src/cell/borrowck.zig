@@ -568,6 +568,31 @@ pub const Checker = struct {
             if (struct_name == null) {
                 if (v.kind == .struct_lit) struct_name = v.kind.struct_lit.name;
             }
+            // And from a CALL's declared return type. Without this,
+            // `let owned s = make()` over `make() -> Session` leaves
+            // `struct_name` null, `placeOwnership` cannot read `s.data`'s
+            // annotation, and R10's total verdict calls that `unknown` and
+            // REFUSES a valid program. Measured: it did exactly that, and
+            // typecheck reported nothing alongside it, so the refusal was the
+            // only diagnostic. A total verdict makes every unresolved
+            // annotation load-bearing, which is the cost of the guarantee and
+            // the reason this inference has to exist rather than being an
+            // optimisation.
+            //
+            // Residual, stated rather than left to be rediscovered: a `match`
+            // or a block yielding a struct in an UNANNOTATED `let` still
+            // leaves `struct_name` null and is still refused in an `owned`
+            // field consumption. Write the type (`let owned s: Session = ...`)
+            // and it resolves.
+            if (struct_name == null) {
+                if (v.kind == .call) {
+                    if (v.kind.call.callee.kind == .ident) {
+                        if (self.fns.get(v.kind.call.callee.kind.ident)) |sig| {
+                            if (sig.return_type) |rt| struct_name = typeStructName(&rt);
+                        }
+                    }
+                }
+            }
             try self.checkLetInit(l, v);
         }
 
@@ -1301,15 +1326,21 @@ pub const Checker = struct {
     fn arcUniqueSource(self: *Checker, e: *const ast.Expr) Error!ArcSource {
         if (try self.placeOf(e)) |place| {
             const site: ArcSource.Site = .{ .display = place.display, .span = place.span };
+            const unresolved: ArcSource = .{ .unknown = .{
+                .display = try self.msg("the place '{s}'", .{place.display}),
+                .span = place.span,
+            } };
             const b = self.bindingById(place.binding) orelse
                 // A place whose binding id does not resolve. It should not
                 // happen, and if it does the annotation is unreadable.
-                return .{ .unknown = site };
+                return unresolved;
             const own = self.placeOwnership(b, place.path) orelse
-                // A field path through a struct definition this checker does
-                // not have. The annotation that decides this lives in that
-                // definition, so it may well be `arc`.
-                return .{ .unknown = site };
+                // A field path whose struct type could not be resolved, so the
+                // annotation that decides this was never read. `checkLet`
+                // infers that type from a declared type, a struct literal and
+                // a call's return type; a `match` or block initializer in an
+                // unannotated `let` still lands here.
+                return unresolved;
             if (own == .arc) return .{ .arc_place = site };
             // A place with a declared, resolved, non-`arc` annotation. It is
             // still a place, so there is no value position underneath it.
@@ -3656,6 +3687,68 @@ test "R10's widening does not over-refuse a call result, an arc return, or an en
         \\    let owned xs: [Int] = [1, 2, 3]
         \\    let copy n = take(owned xs)
         \\}
+    );
+}
+
+test "R10's total verdict needs a struct type inferred from a CALL, or it refuses valid code" {
+    // The cost of a verdict with no permissive default: every annotation it
+    // cannot resolve becomes load-bearing. `Binding.struct_name` was inferred
+    // from a declared type and from a struct literal, but not from a call, so
+    //
+    //     let owned s = make()          // make() -> Session
+    //     take(owned s.data)            // Session { owned data: [Int] }
+    //
+    // left `struct_name` null, `placeOwnership` returned null on the first
+    // segment, and the field's plainly `owned` annotation was never read.
+    // Measured: accepted at `b6aadb5`, refused after the widening, with NO
+    // typecheck error alongside it, i.e. a valid program lost. `checkLet` now
+    // reads the callee's return type, the same lookup `arcCallResult` does.
+    try expectAccepted(
+        \\pub struct Session {
+        \\    owned data: [Int]
+        \\    copy id: Int
+        \\}
+        \\pub fn make() -> Session;
+        \\pub fn take(owned xs: [Int]) -> Int;
+        \\pub fn main() {
+        \\    let owned s = make()
+        \\    let copy n = take(owned s.data)
+        \\}
+    );
+    // The annotated form was never affected, and is here so a future change
+    // that breaks only one of the two is caught rather than half-caught.
+    try expectAccepted(
+        \\pub struct Session {
+        \\    owned data: [Int]
+        \\    copy id: Int
+        \\}
+        \\pub fn make() -> Session;
+        \\pub fn take(owned xs: [Int]) -> Int;
+        \\pub fn main() {
+        \\    let owned s: Session = make()
+        \\    let copy n = take(owned s.data)
+        \\}
+    );
+    // Resolving the type is not the same as permitting the field, and this is
+    // the direction that matters: an `arc` field reached through an
+    // unannotated `let` is now REFUSED where the old permissive default let it
+    // through, so the inference strengthens the rule rather than widening a
+    // hole in it.
+    try expectDiagnostics(
+        \\pub struct Session {
+        \\    arc name: String
+        \\    copy id: Int
+        \\}
+        \\pub fn make() -> Session;
+        \\pub fn take_str(owned s: String) -> Int;
+        \\pub fn main() {
+        \\    let owned s = make()
+        \\    let copy n = take_str(owned s.name)
+        \\}
+    ,
+        \\t.cell:9:33: error: cannot pass 'arc' value 's.name' to 'owned' parameter 's': ownership is shared and cannot be made unique
+        \\t.cell:9:33: note: an 'owned' holder frees the value, and the 'arc' box would free it again
+        \\
     );
 }
 
