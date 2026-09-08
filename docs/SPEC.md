@@ -1266,8 +1266,11 @@ The value is optional; the parser stops looking for one at `;` or `}`.
 Typecheck reports a missing return and a return-type mismatch. Borrowck reports
 R8 at the returned expression when the declared return is a `shared` or
 `exclusive` borrow. Codegen maps a declared `arc` return to `cell_arc_t`, and
-a returned `arc` local is retained into the return temporary so the scope drop
-cannot free it before the caller sees it (OWNERSHIP.md R11 release rule 2).
+retains every returned `arc` place except a parameter returned directly:
+a LOCAL, so the scope drop cannot free it before the caller sees it
+(OWNERSHIP.md R11 release rule 2), and a FIELD, so the caller's eventual
+release does not free a box the record still points at. A parameter is the one
+reference the frame received pre-retained and hands straight back (R11 rule 3).
 
 ### 7.5 Expression statements
 
@@ -1708,8 +1711,9 @@ is R11's one deliberate non-retain.
 The return type maps by section 3.1, and no `->` clause means `void`. The
 rule for `arc` is implemented in the C backend: a returned `arc` value is
 returned **already retained**, so the caller must release it, and a returned
-`arc` local is cloned into the return temporary to make that true in the face
-of the scope drop. Still designed, not implemented: a returned `owned` value
+`arc` local or FIELD is cloned into the return temporary to make that true, in
+the face of the scope drop for a local and of the caller's own release for a
+field. Only a parameter returned directly is handed back uncloned. Still designed, not implemented: a returned `owned` value
 transfers ownership to the caller, and returning a `shared` or `exclusive`
 borrow requires
 a lifetime story this revision does not have and therefore forbids
@@ -1857,7 +1861,7 @@ records the missing lowering.
 | Call-site ownership prefix | implemented (see 0.7; this row postdates the 0.2 count) |
 | Move checking | implemented |
 | Shared-XOR-exclusive aliasing | implemented |
-| Retain / release insertion for `arc` | partially implemented, C backend only: all four R11 retain sites and the `shared`-parameter non-retain; release is the drop pass, function-scoped. Three leaks remain, all named in `docs/OWNERSHIP.md` R11: an `arc` parameter is never released by a Cell body, a struct with an `arc` field is never dropped, and an `owned` place bound as `arc` is not boxed because R10's move-into-`arc` is unimplemented |
+| Retain / release insertion for `arc` | partially implemented, C backend only: all four R11 retain sites, the `shared`-parameter non-retain, and a retain for every returned `arc` place except a parameter; release is the drop pass, function-scoped. **Six** leaks remain, and `docs/OWNERSHIP.md` R11 tables them with a `leaks` measurement each: an `arc` parameter is never released by a Cell body, a struct with an `arc` field is never dropped, an unbound `arc` temporary unboxed for a `shared` parameter drops its handle, a block-scoped `arc` local is never released (unbounded in a `while` body), reassigning an `arc` `var` leaks the previous box, and an `owned` place bound as `arc` is not boxed because R10's move-into-`arc` is unimplemented. Two use-after-frees were found by review under an earlier "leaks, never dangling" claim and fixed with tests: a returned `arc` FIELD handed out unretained, and a SHADOWED `arc` local released twice because drops are spelled by name. Do not restate the categorical |
 | Atomic refcounts in the runtime | implemented |
 | Drop insertion for `owned` | partially implemented: unmoved `owned`/`arc` `let`/`var` locals only, function-scoped, conservative on moves; not structs, not parameters, not a value revived after a move (see `docs/OWNERSHIP.md` R16) |
 | Copyability derivation | designed, not implemented |

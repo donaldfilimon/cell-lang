@@ -692,10 +692,12 @@ pub const Generator = struct {
     ///
     /// The check is deliberately about ALL later bindings rather than only
     /// droppable ones: what decides the question is which declaration the C
-    /// identifier resolves to, and a match-arm binding or a parameter shadows
-    /// a name just as effectively as a `let` does. Note the reverse walk
-    /// reaches the innermost binding first, so the innermost one is the only
-    /// one that is ever nameable, and it is the one kept.
+    /// identifier resolves to, and a match-arm binding shadows a name just as
+    /// effectively as a `let` does. A parameter never appears here, because
+    /// parameters are pushed before any statement and so are never the LATER
+    /// binding. Note the reverse walk reaches the innermost binding first, so
+    /// the innermost one is the only one that is ever nameable, and it is the
+    /// one kept.
     ///
     /// Suppressing the outer drop leaks the outer box. That is the correct
     /// side of this backend's asymmetry, and the same choice `pushLocal`
@@ -3148,16 +3150,23 @@ test "a returned arc field survives the caller releasing it, compiled and run" {
     // literal clones it into the `arc` field (2); `peek` returns
     // `cell_arc_clone(s->name)` (3); the call site clones again for the
     // `arc` parameter (4), which is the count the host reports before
-    // releasing its own reference (3). Delete the field retain and every
-    // number after the first drops by one, so this prints 3.
+    // releasing its own reference (3). Delete the field retain and this
+    // program prints 3, measured on a deliberately broken binary rather
+    // than predicted.
     //
-    // What this does NOT show, and the reason `examples/arc.cell` rather
-    // than this file is the leak evidence: the record's own reference is
-    // never released, because this backend does not drop a `record` shape.
-    // So this program ends with the box alive at count 1. That is the
-    // disclosed struct-field leak, and it is the correct side of the
-    // asymmetry: before the retain, the same program left the record
-    // pointing at a box the caller had already freed.
+    // Two things this program does NOT show, stated because the number
+    // alone invites the wrong conclusion from both. It does not show a
+    // crash: broken, it still exits 0 and AddressSanitizer stays silent,
+    // because nothing dereferences the record's now-dangling field
+    // afterwards. Reaching the actual use-after-free takes a second `peek`
+    // (see the task report's F4). And it does not show a clean heap: the
+    // record's own reference is never released, since this backend does not
+    // drop a `record` shape, so this program ends with the box alive at
+    // count 1. That is the disclosed struct-field leak, and it is why
+    // `examples/arc.cell` rather than this test carries the zero-leak
+    // evidence. It is also the correct side of the asymmetry: before the
+    // retain, the same program left the record pointing at a box the
+    // caller had already freed.
     var e = try emitSource(
         \\pub struct Session {
         \\  arc name: String
