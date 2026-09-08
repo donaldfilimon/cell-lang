@@ -480,6 +480,46 @@ Enumerated and each one measured:
 | `ys = xs`, writing into an `owned` place | ASan double free, exit 134 |
 | an `owned` struct field in a literal | not a double free **yet**: this backend never drops a `record`, so the field's buffer is freed once by the box's glue and the record merely outlives it. It becomes a double free when struct drops land, so it is refused with the others |
 
+**THE REFUSAL IS ASKED OF THE EXPRESSION, NOT OF A PLACE, AND IT WAS NOT
+ALWAYS.** Each of the four positions above used to ask `placeOf` first and only
+then whether that place was `arc`. A `match` is valued and is not a place, so
+`placeOf` returned null and **all four positions let it straight through.**
+Measured, on the same `arc` binding and the same semantic operation:
+
+```
+take(owned xs)                            refused, exit 1
+take(owned match c { 0 => xs, _ => xs })  ACCEPTED, exit 0
+```
+
+and identically for `let owned ys: [Int] = match ...`, `ys = match ...`, and an
+`owned` struct field. The emitted C unboxed the arc and handed the box's slice
+by value to an `owned` parameter, which is precisely the shape this rule's own
+text names as the double free it exists to prevent. It was masked, not absent:
+the `cell_arc_clone` in the value temporary held the refcount off zero, so a
+later change that releases that temporary would have turned the mask into a live
+double free. Refused now by one shared `arcUniqueSource` that looks THROUGH the
+value positions, used by all four sites rather than copied to a fifth.
+
+**This is the same axis, place versus value, that produced `arc`
+use-after-frees three and four**, where an earlier search covered
+return-position PLACES and not VALUE positions. Enumerating four *positions* and
+asserting a property of every *consumption* is that mistake one layer up.
+
+`if` and a block tail are covered too, although neither can reach a typed
+`owned` position through `cell check` today: typecheck gives both the type `()`
+and refuses the argument first. That is an accident of the type checker, not
+enforcement of this rule, and this document objects elsewhere to a rule whose
+enforcement depends on a coincidence of two types. Borrowck runs independently
+of typecheck, so its own tests pin both forms on their own merits.
+
+**STILL ESCAPING, measured rather than assumed: a CALL RESULT whose return type
+is `arc`.** `take(owned fresh())` with `fresh() -> arc [Int]` is accepted today,
+exit 0. It is a different axis from the one above: the `arc`-ness comes from a
+signature's return type rather than from a binding's annotation, so the
+place-ownership machinery cannot see it at all, and the shared reporter takes a
+place a call result does not have. Not fixed here, and named so the next search
+starts from a stated boundary rather than from an assumed one.
+
 The `owned String` analogue of each was already a loud C type error, because
 `owned String` and `shared String` do not share a C type, and `return xs` from
 a `-> [Int]` function is loud for the same reason. They are refused here too on
