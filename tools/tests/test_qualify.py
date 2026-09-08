@@ -105,7 +105,10 @@ class QualifyIntegrationTests(unittest.TestCase):
     def test_clean_release(self):
         result, report = self.run_qualify("complete", "--release")
         self.assertEqual(result.returncode, 0)
-        self.assertTrue(report["release_ready"])
+        self.assertTrue(report["local_gate_ready"])
+        self.assertEqual(report["qualification_scope"], "local_gate")
+        self.assertFalse(report["release_ready"])
+        self.assertIn("three target platforms", report["release_readiness_reason"])
 
     def test_nonzero_and_early_build_failure(self):
         result, report = self.run_qualify("nonzero")
@@ -236,6 +239,33 @@ class QualifyIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertEqual(report.read_text(), "artifact\n")
+
+    def test_rejects_outside_artifact_hardlinks(self):
+        qualify = str(self.root / "tools/qualify.py")
+        tracked = self.root / "tracked.txt"
+        original = tracked.read_bytes()
+        with tempfile.TemporaryDirectory(prefix="cell outside artifacts ") as directory:
+            outside = Path(directory)
+            for role in ("log", "temporary", "pairwise"):
+                with self.subTest(role=role):
+                    report = outside / (role + ".json")
+                    log = outside / (role + ".log")
+                    if role == "log":
+                        os.link(tracked, log)
+                    elif role == "temporary":
+                        os.link(tracked, report.with_name(report.name + ".tmp"))
+                    else:
+                        report.write_text("preserved artifact")
+                        os.link(report, log)
+                    result = subprocess.run(
+                        [qualify, "--report", str(report), "--log", str(log)],
+                        cwd=self.root, text=True, capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("hardlink", result.stderr)
+                    self.assertEqual(tracked.read_bytes(), original)
+                    if role == "pairwise":
+                        self.assertEqual(report.read_text(), "preserved artifact")
 
     def test_missing_tool_versions_are_null(self):
         absent = str(self.root / "does not exist")

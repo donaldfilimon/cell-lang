@@ -78,15 +78,16 @@ def validate_artifact_paths(root: Path, report: Path, log: Path) -> None:
         try:
             relative = path.relative_to(root)
         except ValueError:
-            continue
-        tracked = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", "--", os.fsdecode(relative)],
-            cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-        )
-        if tracked.returncode == 0:
-            raise ValueError(f"{name} path resolves to tracked source: {path}")
-        if tracked.returncode not in (0, 1):
-            raise RuntimeError(f"could not validate {name} path against tracked source")
+            relative = None
+        if relative is not None:
+            tracked = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", "--", os.fsdecode(relative)],
+                cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+            if tracked.returncode == 0:
+                raise ValueError(f"{name} path resolves to tracked source: {path}")
+            if tracked.returncode not in (0, 1):
+                raise RuntimeError(f"could not validate {name} path against tracked source")
         try:
             info = path.stat()
         except FileNotFoundError:
@@ -357,7 +358,13 @@ def main(argv: list[str] | None = None) -> int:
         "errors": errors,
         "artifacts": {"report": str(report_path), "log": str(log_path)},
         "verdict": verdict,
-        "release_ready": bool(args.release and verdict == "qualified"),
+        "qualification_scope": "local_gate",
+        "local_gate_ready": verdict == "qualified" and not before["dirty"],
+        "release_ready": False,
+        "release_readiness_reason": (
+            "Local gate evidence does not qualify the complete feature matrix, "
+            "three target platforms, or extracted release artifacts."
+        ),
     }
     write_report(report_path, report)
     return 0 if not errors else 1

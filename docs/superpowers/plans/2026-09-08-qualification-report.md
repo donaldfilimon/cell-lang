@@ -37,3 +37,16 @@ signal, missing required stage, paths with spaces, and missing tool versions.
 Test exit codes and serialized reports, not only parser helper return values.
 Run the real gate once through the wrapper and inspect its JSON and preserved
 log. Record exact count and stage evidence. No loosening of existing pins.
+
+## Reviewed scope and artifact boundary
+
+Validate artifact inode identity regardless of whether a path is inside the
+checkout. Outside paths skip only Git pathname lookup, never tracked-source
+or pairwise artifact hard-link checks. Regressions must preserve tracked bytes
+for outside log and report-temporary aliases, and preserve aliased artifacts.
+
+`qualification_scope` is `local_gate`. `local_gate_ready` requires a clean,
+qualified local run. `release_ready` remains false until a separate evaluator
+proves complete feature, same-SHA platform, ABI and extracted-artifact evidence.
+`--release` applies stricter local checks; it cannot certify global readiness.
+A synthetically clean local gate must still report global readiness false.
