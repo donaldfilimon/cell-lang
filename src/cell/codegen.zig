@@ -213,6 +213,26 @@ pub const CType = struct {
     pointer: bool = false,
     /// The Cell name, for `record` and `enumeration`.
     name: []const u8 = "",
+    /// The DECLARED element type, for a `slice`. Null when the type was not
+    /// written down (an inferred `let`, or `CType.slice` used as a bare
+    /// spelling), in which case the element type has to be inferred from the
+    /// literal's first item and can disagree with what the consumer reads.
+    ///
+    /// `cell_slice_t` is type-erased: it carries a byte length and a stride,
+    /// and nothing about it tells C what the elements are. So a list literal
+    /// is the one expression whose element C type cannot be recovered from
+    /// the expression itself, and getting it wrong is SILENT. `let owned zs:
+    /// [String] = [a, a]` with an `arc` `a` built a buffer of `cell_arc_t`
+    /// while the declared type said `cell_string_t`, passed `cell check`,
+    /// compiled at `-Wall -Wextra -Werror`, and stayed clean under
+    /// AddressSanitizer, because reinterpreting a refcount box pointer as a
+    /// string length is type confusion rather than a memory error: a
+    /// `shared [String]` callee read `len = 105690555222384`.
+    ///
+    /// Carrying the declared element down to `emitListLit` is what makes
+    /// that loud. `applyOwnership` and `pointerTo` must preserve this field
+    /// or it vanishes for `shared [T]` and `exclusive [T]`.
+    elem: ?*const CType = null,
 
     pub const unknown: CType = .{ .text = "void*", .shape = .unknown };
     pub const void_type: CType = .{ .text = "void", .shape = .unit };
@@ -1213,9 +1233,16 @@ pub const Generator = struct {
 
     /// `if`, `match`, and `block` in expression position, as a GNU statement
     /// expression. See the module comment for why.
-    fn emitValueExpr(self: *Generator, e: *const ast.Expr, indent: usize) EmitError!void {
+    /// `want` is non-null only when the position being lowered into has a
+    /// DECLARED type that inference cannot reproduce, which today is exactly
+    /// a `[T]` whose element type is written down. It is deliberately not
+    /// passed for every position: routing it everywhere would change the
+    /// destination type of every value-position `if`, `match` and block at
+    /// once, and the only defect that needs it is the type-erased slice
+    /// element. See `CType.elem`.
+    fn emitValueExpr(self: *Generator, e: *const ast.Expr, want: ?CType, indent: usize) EmitError!void {
         const out = self.writer;
-        var ty = try self.inferExpr(e);
+        var ty = want orelse try self.inferExpr(e);
         if (ty.shape == .unit or ty.shape == .unknown) ty = CType.int64;
         const name = try self.nextTemp();
         const dest: Dest = .{ .name = name, .ty = ty };
@@ -1290,6 +1317,19 @@ pub const Generator = struct {
                 try self.writeIndent(indent);
                 try out.print("{s} = ", .{dest.name});
                 const have = try self.inferExpr(e);
+                if (dest.ty.shape == .slice and !dest.ty.pointer and dest.ty.elem != null) {
+                    // The other end of `emitArgLike`'s slice routing: the
+                    // destination carries the declared element down, and this
+                    // is where an arm body's own list literal is emitted.
+                    switch (unwrapAnnotated(e).kind) {
+                        .list_lit => |items| {
+                            try self.emitListLit(items, dest.ty.elem.?.*, indent);
+                            try out.writeAll(";\n");
+                            return;
+                        },
+                        else => {},
+                    }
+                }
                 if (!try self.emitArcConversion(e, dest.ty, have, indent)) {
                     try self.emitExpr(e, indent);
                 }
@@ -1344,8 +1384,8 @@ pub const Generator = struct {
                 }
             },
             .struct_lit => |sl| try self.emitStructLit(sl, indent),
-            .list_lit => |items| try self.emitListLit(items, indent),
-            .block, .if_expr, .match_expr => try self.emitValueExpr(e, indent),
+            .list_lit => |items| try self.emitListLit(items, null, indent),
+            .block, .if_expr, .match_expr => try self.emitValueExpr(e, null, indent),
             .annotated => |a| try self.emitExpr(a.value, indent),
         }
     }
@@ -1759,6 +1799,27 @@ pub const Generator = struct {
         // handle) where the pointee is wanted.
         if (try self.emitArcConversion(arg, want, have, indent)) return;
 
+        // A list literal is the one expression whose element C type is not
+        // recoverable from the expression alone, because `cell_slice_t` is
+        // type-erased. This is the only position that knows the declared
+        // one, so it hands it down rather than letting `emitExpr` infer.
+        if (want.shape == .slice and !want.pointer and want.elem != null) {
+            const inner = unwrapAnnotated(arg);
+            switch (inner.kind) {
+                .list_lit => |items| return try self.emitListLit(items, want.elem.?.*, indent),
+                // A list literal can also arrive through a value-position
+                // `match` or block, and `let owned zs: [String] = match c {
+                // 0 => [a], _ => [a] }` passes `cell check` today, so this is
+                // reachable rather than hypothetical: without it the arm's
+                // literal is emitted through `emitExpr` and infers its own
+                // element type again. (A value-position `if` is typed `()`
+                // by the checker and cannot reach an annotated binding, but
+                // it costs nothing to carry it here too.)
+                .block, .if_expr, .match_expr => return try self.emitValueExpr(inner, want, indent),
+                else => {},
+            }
+        }
+
         if (want.pointer and !have.pointer and isPlace(arg)) {
             try out.writeAll("&");
             try self.emitExpr(arg, indent);
@@ -1818,14 +1879,42 @@ pub const Generator = struct {
     /// `[]` is an empty header. A populated literal needs a heap buffer and a
     /// push per element, which is a statement sequence, so it lowers to the
     /// same statement expression the module comment describes.
-    fn emitListLit(self: *Generator, items: []const ast.Expr, indent: usize) EmitError!void {
+    /// A list literal, with the DECLARED element type when the position it
+    /// is being lowered into has one.
+    ///
+    /// `want_elem` null means the element type is inferred from the first
+    /// item, which is what this always did and what an un-annotated
+    /// `let zs = [1, 2]` still gets. When a declaration IS available it wins,
+    /// and the difference is not cosmetic: `cell_slice_t` is type-erased, so
+    /// an element type that disagrees with what the consumer reads is
+    /// silent. `let owned zs: [String] = [a, a]` with an `arc` `a` built a
+    /// buffer of `cell_arc_t` against a declared `cell_string_t`, and a
+    /// `shared [String]` callee read a refcount box pointer as a length.
+    ///
+    /// This does not "fix" that program, it makes it LOUD: with the declared
+    /// element in hand, each item is lowered through `emitArgLike` against
+    /// `cell_string_t`, `emitArcConversion` declines the arc-to-owned-String
+    /// direction (`unboxable` is false for a non-pointer `.string`), and
+    /// `cc` rejects the assignment. That is the right answer, because an
+    /// element of an `owned [String]` is a make-unique position: R10 refuses
+    /// four such positions and this is a fifth one it does not reach.
+    fn emitListLit(
+        self: *Generator,
+        items: []const ast.Expr,
+        want_elem: ?CType,
+        indent: usize,
+    ) EmitError!void {
         const out = self.writer;
         if (items.len == 0) {
             try out.writeAll("cell_slice_empty()");
             return;
         }
-        var elem = try self.inferExpr(&items[0]);
-        if (elem.shape == .unknown or elem.shape == .unit) elem = CType.int64;
+        var elem = want_elem orelse try self.inferExpr(&items[0]);
+        // The normalization is for the INFERRED path only. A declared type
+        // that lowers to `void*` is this backend's deliberate "visible rather
+        // than silently wrong", and quietly turning it into an int64 buffer
+        // would be the opposite.
+        if (want_elem == null and (elem.shape == .unknown or elem.shape == .unit)) elem = CType.int64;
         const list = try self.nextTemp();
         const slot = try self.nextTemp();
 
@@ -1899,7 +1988,12 @@ pub const Generator = struct {
         return switch (ty.*) {
             .unit => CType.void_type,
             .name => |n| try self.namedType(n),
-            .list => CType.slice,
+            .list => |inner| blk: {
+                // R1: an element carries no annotation, so it is `owned`.
+                const elem = try self.arena.create(CType);
+                elem.* = try self.lowerType(inner, .owned);
+                break :blk .{ .text = CType.slice.text, .shape = .slice, .elem = elem };
+            },
             .optional => |inner| blk: {
                 const inst = try self.optionalInstance(inner);
                 break :blk .{
@@ -1931,7 +2025,7 @@ pub const Generator = struct {
             try std.fmt.allocPrint(self.arena, "const {s} *", .{base.text})
         else
             try std.fmt.allocPrint(self.arena, "{s} *", .{base.text});
-        return .{ .text = text, .shape = base.shape, .pointer = true, .name = base.name };
+        return .{ .text = text, .shape = base.shape, .pointer = true, .name = base.name, .elem = base.elem };
     }
 
     fn namedType(self: *Generator, n: []const u8) Alloc!CType {
@@ -3665,6 +3759,98 @@ test "no drop is emitted after a body-terminating return" {
         \\  return _cell_t0;
         \\  cell_arc_drop(s);
     );
+}
+
+test "a list literal uses the DECLARED element type, making a mismatch loud" {
+    var e = try emitSource(
+        \\pub fn takes(shared zs: [String]) -> Int;
+        \\pub fn build() -> Int {
+        \\  let arc a = "hello"
+        \\  let owned zs: [String] = [a, a]
+        \\  return takes(shared zs)
+        \\}
+    );
+    defer e.deinit();
+    // `cell_slice_t` is type-erased, so a list literal is the one expression
+    // whose element C type cannot be recovered from the expression itself,
+    // and getting it wrong is SILENT. This program built a buffer of
+    // `cell_arc_t` against a declared `[String]`, passed `cell check`,
+    // compiled at `-Wall -Wextra -Werror`, and stayed clean under
+    // AddressSanitizer, because reinterpreting a refcount box pointer as a
+    // string is type confusion rather than a memory error. Both types happen
+    // to be 24 bytes here, so even the stride matched and only the fields
+    // lied: a `shared [String]` callee read `len = 105690555222384`.
+    //
+    // The fix does not make this program work, it makes it FAIL LOUDLY. An
+    // element of an `owned [String]` is a make-unique position, R10 refuses
+    // four such positions, and this is a fifth one R10 does not reach; the C
+    // type error is what refuses it. Both halves are asserted, because the
+    // stride alone would pass with the elements still assigned unconverted.
+    try expectContains(e.text, "cell_slice_alloc(sizeof(cell_string_t), 2)");
+    try expectContains(e.text, "cell_string_t _cell_t1 = (cell_string_t){0};");
+    try expectAbsent(e.text, "sizeof(cell_arc_t)");
+    // The retain is gone with the conversion: `emitArgLike` now declines
+    // arc-to-owned-String instead of cloning into a mistyped slot, which is
+    // also the two-references-per-list leak that rode on top of the
+    // confusion.
+    try expectAbsent(e.text, "cell_arc_clone");
+}
+
+test "a list literal reached through a match arm also uses the declared element type" {
+    var e = try emitSource(
+        \\pub fn takes(shared zs: [String]) -> Int;
+        \\pub fn f(copy c: Int) -> Int {
+        \\  let arc a = "hello"
+        \\  let owned zs: [String] = match c {
+        \\    0 => [a],
+        \\    _ => [a]
+        \\  }
+        \\  return takes(shared zs)
+        \\}
+    );
+    defer e.deinit();
+    // The form that made the first fix incomplete, and it is reachable
+    // rather than hypothetical: this passes `cell check` today. The literal
+    // arrives through a value-position `match`, so it reaches
+    // `emitValueInto`'s leaf rather than `emitArgLike`'s, and with only the
+    // argument-position fix it inferred `cell_arc_t` all over again and
+    // compiled clean. Same axis as every other finding in this file: one
+    // form of a construct was handled and a second was not.
+    try expectContains(e.text, "cell_slice_alloc(sizeof(cell_string_t), 1)");
+    try expectAbsent(e.text, "sizeof(cell_arc_t)");
+}
+
+test "a list literal with no declared type still infers its element type" {
+    var e = try emitSource(
+        \\pub fn takes(shared zs: [Int]) -> Int;
+        \\pub fn f() -> Int {
+        \\  let owned ys = [4, 5]
+        \\  return takes(shared ys)
+        \\}
+    );
+    defer e.deinit();
+    // The other side of the same change, and the one that would catch a fix
+    // that simply required an annotation. Nothing declares an element type
+    // here, so inference from the first item is still the answer and the
+    // emitted C is unchanged.
+    try expectContains(e.text, "cell_slice_alloc(sizeof(int64_t), 2)");
+}
+
+test "a declared element type survives shared and exclusive ownership" {
+    var e = try emitSource(
+        \\pub fn takes(shared zs: [String]) -> Int;
+        \\pub fn f() -> Int {
+        \\  let shared zs: [String] = ["a"]
+        \\  return takes(shared zs)
+        \\}
+    );
+    defer e.deinit();
+    // `applyOwnership` and `pointerTo` build NEW CTypes, and both had to be
+    // taught to carry `elem` across. If either drops it, the declared
+    // element vanishes for every borrowed list and this silently reverts to
+    // inference, which is how the defect looked in the first place.
+    try expectContains(e.text, "cell_slice_alloc(sizeof(cell_string_t), 1)");
+    try expectAbsent(e.text, "sizeof(cell_str_t)");
 }
 
 test "an owned String call result bound as arc IS boxed" {
