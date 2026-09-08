@@ -6,15 +6,40 @@
 // STRUCT binding itself carries (`owned Session` here; `codegen.zig` never
 // emits a free for it, arc field included).
 //
-// This fixture ISOLATES that gap alone: `name` is boxed directly from a
-// string literal in the struct literal (BOX, R11 retain rule 1), so no
-// separate `arc` local is bound first. That matters: an `arc` local bound
-// inside this same `while` body before being stored would ALSO trip the
-// block-scoped-local gap (examples/leaks/block_scoped_local.cell), and this
-// fixture exists to measure the struct-field gap on its own. `sess` is
-// re-declared every iteration inside the loop body, but as an `owned`
-// RECORD, not an `arc` local, so the block-scoped gap (which is specific to
-// `arc`-annotated bindings) does not apply to it.
+// This fixture avoids binding a separate `arc` local: `name` is boxed
+// directly from a string literal in the struct literal (BOX, R11 retain
+// rule 1). An `arc` local bound inside this same `while` body before being
+// stored would ALSO trip the block-scoped-local gap
+// (examples/leaks/block_scoped_local.cell).
+//
+// **IT DOES NOT ISOLATE THE STRUCT-FIELD GAP, AND AN EARLIER VERSION OF THIS
+// COMMENT CLAIMED IT DID.** That claim said `sess` is "an `owned` RECORD, not
+// an `arc` local, so the block-scoped gap (which is specific to
+// `arc`-annotated bindings) does not apply to it". Measured: the block-scoped
+// gap is NOT specific to `arc`. `emitStmts` opens with
+//
+//     const mark = self.locals.items.len;
+//     defer self.locals.shrinkRetainingCapacity(mark);
+//
+// and that pop reads no annotation at all. It removes a record exactly as it
+// removes an `arc` local, so `sess` is off `self.locals` before the `while`
+// statement finishes and the function-scoped `emitScopeDrops` never sees it.
+// The emitted C declares `sess` inside the loop braces, where it is not
+// nameable at function end either. A record local in a `while` body gets no
+// drop emitted at all today; that was checked by emitting one.
+//
+// **The consequence for anyone about to build per-struct drop glue: it will
+// move this fixture's number by exactly ZERO**, because the local is gone
+// before any function-scoped drop point runs. Moving it additionally requires
+// a block-scoped drop point, which is R11 row 4's work. Write a
+// FUNCTION-scoped fixture and pin that instead; do not "fix" this one by
+// hoisting the local out of the loop, which would be loosening a measurement
+// to make a number move.
+//
+// The comment being corrected here enumerated the ANNOTATIONS the block gap
+// had been observed on and asserted a property of every binding, which is the
+// same reasoning failure `AGENTS.md` tracks -- in a file whose entire purpose
+// is to measure rather than assert.
 //
 // Status: parses, passes `cell check`. LLVM and MLIR refuse it (arc is
 // scalar-first-refused there, same as examples/arc.cell); lives under
