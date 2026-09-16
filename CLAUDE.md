@@ -83,7 +83,7 @@ zig test src/cell/borrowck.zig --test-filter "R5"
 
 **`--test-filter` fails toward a false green, and here it is worse than the
 usual warning.** A filter matching nothing exits 0. It does not print
-"All 0 tests passed" either: `src/root.zig:143` is an ANONYMOUS
+"All 0 tests passed" either: `src/root.zig:145` is an ANONYMOUS
 `test { refAllDecls(@This()); }`, so it has no name for a filter to exclude and
 always runs. A typo'd filter therefore prints a plausible
 
@@ -163,8 +163,20 @@ misaligns every list against the wrong block.
 it and the emitters together. `src/main.zig` holds the three `extern fn`
 declarations (`cell_rt_version`, `cell_cxx_probe`, `cell_swift_probe`) that pin
 runtime signatures, so changing the C side without updating them breaks the
-build in a way the C compiler cannot see. `stdlib/prelude.cell` is bodyless
-declarations only; nothing is auto-imported and no module resolution exists.
+build in a way the C compiler cannot see.
+
+`cell build` and `cell run` do not read the checkout's runtime. `src/main.zig`
+`@embedFile`s `cell_rt_h` and `cell_rt_c`, two anonymous imports `build.zig`
+supplies, and its comment there records that both modules compiling `main.zig`
+need the same two names or the test build fails. Gate stage 6 links
+`runtime/cell_rt.c` from disk while stage 12 links the copy baked into the
+binary, so editing the runtime without rebuilding `cell` makes those two stages
+disagree for a reason that is not a defect. AGENTS.md Toolchain and gates
+carries the operational half: `$CC`, the `.c` host positionals, and exit-status
+forwarding.
+
+`stdlib/prelude.cell` is bodyless declarations only; nothing is auto-imported
+and no module resolution exists.
 
 ## Traps that have already produced false claims here
 

@@ -74,7 +74,7 @@ zig test src/root.zig --test-filter "this-name-does-not-exist-anywhere"
 # All 1 tests passed.
 ```
 
-It does **not** print `All 0 tests passed`. `src/root.zig:143` is an anonymous `test { std.testing.refAllDecls(@This()); }`, so it has no name for a filter to exclude, always runs, and always passes. A typo'd filter therefore produces a plausible pass with a real count at exit 0. Two consequences, both of which bite:
+It does **not** print `All 0 tests passed`. `src/root.zig:145` is an anonymous `test { std.testing.refAllDecls(@This()); }`, so it has no name for a filter to exclude, always runs, and always passes. A typo'd filter therefore produces a plausible pass with a real count at exit 0. Two consequences, both of which bite:
 
 - **Confirm the NAMED test you asked for appears in the output.** The count is not evidence that your filter matched anything.
 - **The count is always one higher** than the number of named tests that matched, in `src/root.zig`.
