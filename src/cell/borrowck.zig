@@ -8,10 +8,12 @@
 //! binding, an assignment into an `owned` place, an `owned` struct field, a
 //! list-literal element, and a `return` whose declared return type is not
 //! `arc`). The rest of R10 is still designed only, except that
-//! move-into-`arc` is implemented at ONE position since 2026-09-16: `let arc`
-//! moves a whole `owned` `String` or list binding into the fresh box
-//! (`boxableOwnedBinding`); every other owned-into-`arc` source and position
-//! is refused as not implemented. That single clause is here rather than in codegen
+//! move-into-`arc` is implemented at TWO positions since 2026-09-16, both for
+//! one source shape, a whole `owned` `String` or list binding
+//! (`boxableOwnedBinding`): `let arc` moves it into the fresh box, and a
+//! direct `return` from a `-> arc T` function does (the ordinary R2 return
+//! move). Every other owned-into-`arc` source and position (assignment, call
+//! argument, struct field, a block tail) is refused as not implemented. That single clause is here rather than in codegen
 //! because codegen cannot refuse it: `owned [T]` and `shared [T]` lower to
 //! the SAME C type, so the emitted conversion compiles clean and double frees
 //! the buffer. Its classifier, `arcUniqueSource`, returns a TOTAL verdict:
@@ -396,7 +398,8 @@ pub const Checker = struct {
     /// String { return p }` was accepted by the checker and rejected by `cc`,
     /// the fifth position of this rule and the last one found; the first four
     /// were a binding, an assignment, a call argument and a struct-literal
-    /// field. Exactly one of these two flags is non-null once a return type is
+    /// field. That exact program is accepted and boxed since 2026-09-16 (a
+    /// direct return of a whole `owned` `String` or list binding). Exactly one of these two flags is non-null once a return type is
     /// declared, and both stay null when none is.
     fn_return_arc: ?[]const u8 = null,
     /// The function whose body is being walked. Read only by the differential
@@ -756,7 +759,22 @@ pub const Checker = struct {
                                 depth = t.depth;
                             },
                         }
-                        if (try self.refuseUnimplementedArcMove(v, "return", "from", "function", fn_name)) return;
+                        // IMPLEMENTED for one source shape (2026-09-16), the
+                        // same one `let arc` takes: a bare `owned` `String` or
+                        // list binding returned DIRECTLY (not through a block
+                        // tail) is moved into a fresh box. Nothing is refused
+                        // or recorded here for it: the R2 move below already
+                        // kills every returned place, and the C backend boxes
+                        // exactly a place borrowck recorded as wholly moved
+                        // (`isMovedOwnedBinding`), so the callee's drop pass
+                        // skips it and the caller owns the only reference.
+                        // A block tail keeps the refusal: its binding is
+                        // scoped to the block, and the box path was not
+                        // built or measured for that.
+                        const boxable = depth == 0 and try self.boxableOwnedBinding(v) != null;
+                        if (!boxable) {
+                            if (try self.refuseUnimplementedArcMove(v, "return", "from", "function", fn_name)) return;
+                        }
                     }
                     if (self.fn_return_owned) |fn_name| {
                         switch (try self.openBlockTail(ret)) {
@@ -2846,7 +2864,8 @@ pub const Checker = struct {
     /// legal retain, and a `shared` source is a view that
     /// `cell_arc_from_string(cell_string_from_str(p))` copies rather than
     /// aliases, all three verified.
-    /// The one source `let arc` may move into a box: a whole `owned` binding
+    /// The one source `let arc` and a direct `-> arc T` return may move into
+    /// a box: a whole `owned` binding
     /// whose resolved type is `String` or a list, the two shapes the runtime
     /// boxes by taking the header (`cell_arc_from_string`,
     /// `cell_arc_from_slice`). Null for anything else, including an
@@ -5920,6 +5939,60 @@ test "R10's move into arc: a whole owned String or list binding is moved at let"
         \\    return 0
         \\}
     , "moving an owned place into an 'arc' box is not implemented");
+}
+
+test "R10's move into arc: a whole owned String or list binding is moved at return" {
+    // Implemented 2026-09-16, the second position after `let`. A local and
+    // a parameter, of both boxable types, returned directly.
+    try expectAccepted(
+        \\pub fn from_param(owned p: String) -> arc String {
+        \\    return p
+        \\}
+        \\pub fn from_list(owned xs: [Int]) -> arc [Int] {
+        \\    return xs
+        \\}
+        \\pub fn from_local() -> arc String {
+        \\    let owned t: String = "t"
+        \\    return t
+        \\}
+    );
+    // The return still MOVES: a use after a conditional return is refused
+    // exactly as it is for a `-> String` function.
+    try expectRejectedWith(
+        \\pub fn view(shared s: String) -> Int;
+        \\pub fn f(copy c: Int, owned p: String) -> arc String {
+        \\    if c > 0 {
+        \\        return p
+        \\    }
+        \\    let n = view(p)
+        \\    return "x"
+        \\}
+    , "use of 'p' after it was moved");
+    // Every other source keeps the refusal: a field, an `Int?`, a block tail
+    // (its binding is block-scoped and that box path was not built), and a
+    // branch value.
+    const refused = "moving an owned place into an 'arc' box is not implemented";
+    try expectRejectedWith(
+        \\pub struct R { owned s: String }
+        \\pub fn f(owned r: R) -> arc String {
+        \\    return r.s
+        \\}
+    , refused);
+    try expectRejectedWith(
+        \\pub fn f(owned p: Int?) -> arc Int? {
+        \\    return p
+        \\}
+    , refused);
+    try expectRejectedWith(
+        \\pub fn f(owned p: String) -> arc String {
+        \\    return { p }
+        \\}
+    , refused);
+    try expectRejectedWith(
+        \\pub fn f(owned p: String) -> arc String {
+        \\    return match 1 { _ => p }
+        \\}
+    , refused);
 }
 
 test "R10's other direction leaves every legal arc source alone" {

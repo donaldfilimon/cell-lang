@@ -24,8 +24,9 @@ derived-loan propagation remains conservative. See [FEATURES.md](FEATURES.md)
 for the current cross-backend matrix, rather than treating this historical
 summary as an exhaustive rule inventory. **R11** retain-release insertion is implemented in the
 C backend, with the gaps R11 itself names; **R10**'s move-into-`arc` is
-implemented in the checker at `let` for a whole `owned` `String` or list
-binding (2026-09-16) and refused everywhere else. R10's other
+implemented in the checker at `let` and at a direct `-> arc T` return for a
+whole `owned` `String` or list binding (2026-09-16) and refused everywhere
+else. R10's other
 direction, an `arc` value made UNIQUE, IS implemented, at six consumption
 sites and with a total verdict that refuses a source it cannot classify. **R2.a**
 (a move inside a loop) landed with `while`. **R18** (an `owned` binding may not
@@ -934,10 +935,12 @@ releases the box was the other half, and R11 row 1 answered it on 2026-09-16
 (the holder releases it, a callee included, exactly as `runtime/cell_rt.h`
 section 7 already said). The same day the checker began consuming the source
 at ONE position: a `let arc` binding whose source is a whole `owned` `String`
-or list binding is moved into the box (see R11's emptied table below).
-Everywhere else it refuses and says "not implemented", at five positions
-rather than the sweep's four rows: a binding (for any other source), an
-assignment, a call argument, a struct-literal field, and a return.
+or list binding is moved into the box (see R11's emptied table below). A
+direct `return` of the same source from a `-> arc T` function followed later
+that day, the second position. Everywhere else it refuses and says "not
+implemented", at five positions rather than the sweep's four rows: a binding
+and a return (for any other source), an assignment, a call argument, and a
+struct-literal field.
 The last two are not in the sweep at all and were found by probing positions
 instead of rows, which is the discipline this rule's own text asks for.
 
@@ -1267,8 +1270,33 @@ Moving on only one branch (`if c > 0 { let arc a = s }`) leaks `s` when the
 branch is not taken, one allocation over 100 calls, because a branch move is
 recorded conservatively as a move: the leak direction, stated. Still refused
 as not implemented: a field source (`let arc a = r.s`), a source reached
-through a branch, an `Int?` or unresolved-type source, and the other four
-positions (assignment, call argument, struct field, return).
+through a branch, an `Int?` or unresolved-type source, and the other
+positions (assignment, call argument, struct field).
+
+**The return position, implemented the same day.** `fn f(owned p: String)
+-> arc String { return p }`, the fifth position this rule's refusal found,
+is accepted when the returned value is a whole `owned` `String` or list
+binding, returned directly. The checker needed no new move: every `return`
+already kills its returned place (R2), so it only stops refusing, and the C
+backend's `isMovedOwnedBinding` then emits `return cell_arc_from_string(p);`
+with no release of `p` and no retain (the place is a `String`, not an
+`arc`). Pinned in the gate by `examples/leaks/arc_box_move.cell` (both
+positions, 0 on both witnesses; `leaks` 0, `ALLOC=12000 FREE=12000`) and
+AddressSanitizer clean outside it. Six more spellings were run end to end,
+not reasoned about, because each became newly accepted: a parenthesized
+source, `return owned p`, `return arc p`, `return shared p`, an unannotated
+`let t = make()`, and a reassigned `var owned v`: all box and are ASan clean,
+and all but the last measure 0. The `var` one leaks the value it was
+reassigned away from, 100 over 100 calls, and the same program returning a
+plain `-> String` on the tree before this change leaks the same 100: an
+`owned` `var`'s reassignment has no pre-drop (the `emitAssign` pre-drop is
+`arc`-only), which is not this position's defect. A move on only one branch
+(`if c > 0 { return p }`) leaks `p` on the path that did not return, 50 over
+50 such calls, and again a plain `-> String` function leaks the same 50: the
+conservative branch move R2 already makes. Still refused at this position: a
+field (`return r.s`), an `Int?`, a block tail (`return { p }`, whose binding
+is block-scoped and whose box path was not built), and a branch value
+(`return match ...`, `return if ...`).
 
 **CLOSED (row 1), and gone from the table above.** A Cell body never
 released its own `arc` parameter, because no parameter was dropped, so every

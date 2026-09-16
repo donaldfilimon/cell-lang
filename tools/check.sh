@@ -375,6 +375,15 @@ LEAK_VALUE_BLOCK_LOCAL=0
 # re-opens it. A CONDITIONAL partial move still leaks the moved field on the
 # path that did not move it, by design; that is not measured here.
 LEAK_PARTIAL_MOVE_FIELD=0
+# R10 move-into-`arc` at its two IMPLEMENTED positions (`let arc` since
+# f9441cb, a direct `return` from `-> arc T` since 2026-09-16). Not an R11
+# row and never a measured leak: both positions were refused until they were
+# built. Pinned because the move is correct only while borrowck records the
+# source as moved AND codegen boxes it and skips its drop; a drift on either
+# side is a double free or a leak here. Measured 0 on both witnesses (`leaks`
+# 0, ALLOC=12000 FREE=12000 LIVE=0) and ASan clean outside the gate before it
+# was added. Stays pinned at 0.
+LEAK_ARC_BOX_MOVE=0
 
 # ---- stage 10 disclosed signature disagreements, pinned by defect ---------
 # Each line is `<example key>:<function>:<leg>` naming a place where the C
@@ -856,6 +865,7 @@ else
     run_c_leaks reassigned_var "" "$LEAK_REASSIGNED_VAR" "R11 row 5, CLOSED 2026-09-15"
     run_c_leaks value_block_local "" "$LEAK_VALUE_BLOCK_LOCAL" "R11 value-position block residual, CLOSED 2026-09-15"
     run_c_leaks partial_move_field "" "$LEAK_PARTIAL_MOVE_FIELD" "partial-move residual, CLOSED 2026-09-16"
+    run_c_leaks arc_box_move "" "$LEAK_ARC_BOX_MOVE" "R10 move-into-arc at let and return, implemented 2026-09-16"
 fi
 
 # ------------------------------------------- 8. cross-backend answer agreement --

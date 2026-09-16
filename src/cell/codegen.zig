@@ -176,8 +176,9 @@
 //! leaked the previous box (CLOSED 2026-09-15); and an `owned` String or
 //! list PLACE bound as `arc` was not boxed at all, because
 //! `cell_arc_from_string` moves its argument while `borrowck.zig` left the
-//! source unmoved (boxed since 2026-09-16 at `let` for a whole binding,
-//! which borrowck now moves; see `isMovedOwnedBinding`). That list is what running programs
+//! source unmoved (boxed since 2026-09-16 at `let` and at a direct `-> arc`
+//! return for a whole binding, which borrowck now moves; see
+//! `isMovedOwnedBinding`). That list is what running programs
 //! has found, not a proof that nothing else dangles; `docs/OWNERSHIP.md` R11
 //! records exactly which positions the search covered, values as well as
 //! places.
@@ -2411,9 +2412,10 @@ pub const Generator = struct {
 
     /// A place `emitArcConversion` may box by moving its header: a bare
     /// identifier naming an `owned` binding that borrowck recorded as wholly
-    /// moved. borrowck moves a place into a box only at `let arc` (R10,
-    /// `boxableOwnedBinding`) and refuses the other positions, so this is the
-    /// only way such a place reaches a boxing conversion; the moved source is
+    /// moved. borrowck moves a place into a box only at `let arc` and at a
+    /// direct `-> arc T` return (R10, `boxableOwnedBinding`) and refuses the
+    /// other positions, so this is the only way such a place reaches a boxing
+    /// conversion; the moved source is
     /// then skipped by the drop pass and the box owns the buffer. Anything
     /// else keeps the loud `cc` type error.
     fn isMovedOwnedBinding(self: *Generator, arg: *const ast.Expr) bool {
@@ -4968,43 +4970,35 @@ test "an arc place returned where a non-arc type is declared stays a loud C type
     try expectAbsent(e.text, "unbox");
 }
 
-test "an owned String PLACE returned as arc stays loud, like every other position" {
+test "an owned String or list binding returned as arc is moved into the box" {
+    // R10's move-into-arc at `return`, implemented 2026-09-16 after `let`.
+    // Until then this test pinned `cell_arc_t _cell_t0 = p;`, a loud C type
+    // error, because borrowck refused the program and the drop pass still
+    // spelled a release for `p`. borrowck now accepts a whole `owned`
+    // `String` or list binding returned directly and moves it (the ordinary
+    // R2 return move), so `emitArcConversion`'s `isMovedOwnedBinding` boxes
+    // exactly that place, nothing frees it, and the caller owns the box. No
+    // retain: `returnedArcNeedsRetain` asks about an `arc`-typed place, and
+    // `p` is a `String`.
     var e = try emitSource(
         \\pub fn make() -> String;
         \\pub fn f() -> arc String {
         \\  let owned p = make()
         \\  return p
         \\}
+        \\pub fn g(owned xs: [Int]) -> arc [Int] {
+        \\  return xs
+        \\}
     );
     defer e.deinit();
-    // The box direction's own decline, and it is `emitArcConversion`'s
-    // existing `isPlace` guard doing it, not a return-specific rule.
-    // `cell_arc_from_string` MOVES its argument, and R10's move-into-`arc`
-    // is unimplemented in `borrowck.zig`, so boxing a place is a silent
-    // double free everywhere else. A `return` is arguably the one position
-    // where it would be safe, because borrowck DOES kill a returned place,
-    // but earning that would mean a second hand-written conversion site
-    // keyed on a difference between positions, which is the exact shape that
-    // produced every use-after-free this file has had. The loud C error is
-    // the safe side.
-    //
-    // **`borrowck.zig` now refuses this program outright** (R10's other
-    // direction, the return position, 2026-09-16), so what this test reads is
-    // BEST-EFFORT C for a module the front end rejects, which this backend
-    // has always emitted and the module doc comment states. The refusal
-    // reports and stops, so the returned place is no longer recorded as
-    // moved, and the drop pass therefore spells a release for `p` that the
-    // old text did not have. That difference is only observable through this
-    // harness, which bypasses `check`; through the CLI the program never
-    // reaches codegen. The property under test is unchanged and still holds:
-    // no box is emitted for a place, and the C does not compile
-    // (`cell_arc_t _cell_t0 = p;` is the type error now, `return p;` was
-    // before), so the position stays loud rather than silently unsound.
-    try expectContains(e.text,
-        \\  cell_string_t p = cell_make();
-        \\  cell_arc_t _cell_t0 = p;
-    );
-    try expectAbsent(e.text, "cell_arc_from_string(p)");
+    const f = try fnDef(e.text, "f");
+    try expectContains(f, "return cell_arc_from_string(p);");
+    try expectAbsent(f, "cell_string_free(&p);");
+    try expectAbsent(f, "cell_arc_clone");
+    const g = try fnDef(e.text, "g");
+    try expectContains(g, "return cell_arc_from_slice(xs);");
+    try expectAbsent(g, "cell_slice_free(&xs);");
+    try expectCompiles(e.text);
 }
 
 test "a returned arc parameter is retained once and released once" {
