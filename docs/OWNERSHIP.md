@@ -1072,8 +1072,10 @@ refuse `arc` outright and emit no drops at all):
   call, at the binding, and at the struct field store.
 - The `shared`-parameter non-retain holds, and is asserted by an explicit
   absence test.
-- Release rule 1 is function-scoped rather than block-scoped, and reverse
-  creation order holds within that scope.
+- Release rule 1 was function-scoped rather than block-scoped until
+  2026-09-15; it is now block-scoped for every statement-position scope
+  (value-position blocks excepted, see the CLOSED paragraph under "Still
+  broken"), and reverse creation order holds within each scope.
 - Release rule 2's "except the one being returned" is paid for on the retain
   side instead: a returned `arc` local is cloned into the return temporary, so
   the drop that follows takes the count back to exactly the reference the
@@ -1539,11 +1541,15 @@ marks moved, at the end of its function's body and before every `return`, in
 reverse declaration order. This is **not** the rule as stated above, in three
 ways, and each is a real, documented gap rather than an oversight:
 
-- **Function-scoped, not block-scoped.** A local declared inside a nested
-  `if`/`match`/`while` block is dropped only if it is still live at the
-  function's own end or at a `return`; if its enclosing block ends normally
-  without either, it leaks. The rule above says "its innermost block";
-  this implementation drops at the innermost *function*.
+- **Function-scoped, not block-scoped: CORRECTED 2026-09-15.** A local
+  declared inside a nested `if`/`match`/`while` block used to be dropped only
+  at a `return`; if its enclosing block ended normally, it leaked (it was
+  popped before the function-end drop could see it). `emitStmts` now drops
+  a statement-position block's own locals at its closing brace, and
+  `break`/`continue` drop everything declared since the enclosing loop
+  opened, so this row of the list is closed for statement position. What
+  remains of it: a local declared inside a VALUE-position block (a block
+  used as an expression) is still not released at that block's exit.
 - **Conservative on moves, in the leak-safe direction.** Borrowck's move
   tracking merges branches conservatively (a move in one arm of an `if`
   marks the place moved for everything after it, whether or not that arm
@@ -1608,8 +1614,9 @@ Ordered so each step is testable and none depends on a later one. Steps marked
 9. **R8, R17**: escape checking and the runtime side of the double-free
    guarantee. **R16 (drop insertion) is partially done** without a
    control-flow graph, by consuming borrowck's existing conservative move
-   tracking directly (function-scoped, `let`/`var` locals only, structs
-   excluded); see R16 above for exactly what landed and what did not.
+   tracking directly (block-scoped for statement-position scopes since
+   2026-09-15, `let`/`var` locals only, structs excluded); see R16 above for
+   exactly what landed and what did not.
    **Revisiting 0.3 in favor of NLL is DONE for named loans, and it needed no
    control-flow graph.** An earlier version of this step claimed it was gated
    on one. R8 is what makes the claim decidable syntactically: a loan value

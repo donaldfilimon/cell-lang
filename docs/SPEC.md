@@ -815,7 +815,10 @@ assignment to an `owned` place, an `owned` struct field, a list-literal element,
 and a `return` whose declared return type is not `arc`). There is no NLL,
 and R10's move-into-`arc` is still not checked. The C
 backend (`codegen.zig`) inserts drops for an unmoved `owned`/`arc` `let`/`var`
-local, function-scoped and conservative on moves; that is R16 partially done,
+local, block-scoped for statement-position scopes since 2026-09-15 (function
+body, `while` body, bare block, `if` branch, `match` arm body, plus
+`break`/`continue`; value-position blocks still release nothing) and
+conservative on moves; that is R16 partially done,
 not R16 complete -- see `docs/OWNERSHIP.md` R16 for exactly which cases still
 leak (a value moved on only one path, a struct with owning fields, a `var`
 revived after a move). It also inserts R11's `arc` retains, with R11's own
@@ -918,13 +921,16 @@ a struct field is cloned; and an `arc` place passed to a `shared` parameter is
 deliberately not cloned (OWNERSHIP.md R11, safe by R8).
 `examples/arc.cell` compiles, links and runs, and prints a strong count.
 
-Six gaps remain and OWNERSHIP.md R11 lists them all with the `leaks` and
-AddressSanitizer measurements: an `arc` parameter is never released by a Cell
-body, because no parameter is dropped; a struct holding an `arc` field is
-never dropped at all; an `arc` value unboxed for a `shared` parameter without
-ever being bound drops its handle on the floor; an `arc` local declared inside
-a block is never released, because release is function-scoped, which inside a
-`while` body is unbounded; reassigning an `arc` `var` leaks the previous box;
+Six gaps were listed, and OWNERSHIP.md R11 carries every one with the `leaks`
+and AddressSanitizer measurements; **two of the six are CLOSED** (dated
+2026-09-15; the gate's leaks stage pins both at 0 and is the authority): an
+`arc` parameter is never released by a Cell body, because no parameter is
+dropped; a struct holding an `arc` field is never dropped at all; an `arc`
+value unboxed for a `shared` parameter without ever being bound used to drop
+its handle on the floor (closed 2026-09-07); an `arc` local declared inside a
+block used to be never released while release was function-scoped, which
+inside a `while` body was unbounded (closed 2026-09-15 by block-scoped
+release in `codegen.zig`); reassigning an `arc` `var` leaks the previous box;
 and an `owned` String or list **place** bound as `arc` is not boxed, because
 R10's move-into-`arc` is unimplemented in the checker and boxing an un-moved
 place would double free it.
@@ -1961,7 +1967,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | R14 second clause: a borrow-holding binding may not be reassigned | implemented in `borrowck.zig`. `let` was already covered by immutability; `var` was not, and the gap was that the statement has two meanings: borrowck read `e = &mut b` as a retarget (creating a TEMPORARY loan that died with the statement, leaving a loan on the old referent and none on the new one) while the C backend emits `*e = *&b;`, a write through. Measured as an AddressSanitizer double free at exit 134 with heap values, plus a leak of the old referent's buffer in the same statement. Refused rather than modelled, because a retarget means killing a NAME-keyed loan (the unsafe direction) and a write-through means a place for `*e`, which "places, not names" does not have. Scoped to an empty target path and to a value `borrowSource` proves is a borrow, so a field write through an `exclusive` parameter and a whole-value write through a borrow both stay legal |
 | Retain / release insertion for `arc` | partially implemented, C backend only: all four R11 retain sites, the `shared`-parameter non-retain, a retain for every returned `arc` place except a PARAMETER returned directly (a match-arm binding returned from a block arm body is retained, and spelling that exception as "not droppable" instead of "not a parameter" reopened a use-after-free once), and a retain for an `arc` place flowing out of an `if` branch, a `match` arm, or a block's trailing expression; release is the drop pass, function-scoped. **Six** leaks remain, and `docs/OWNERSHIP.md` R11 tables them with a `leaks` measurement each: an `arc` parameter is never released by a Cell body, a struct with an `arc` field is never dropped, an unbound `arc` temporary unboxed for a `shared` parameter drops its handle, a block-scoped `arc` local is never released (unbounded in a `while` body), reassigning an `arc` `var` leaks the previous box, and an `owned` place bound as `arc` is not boxed because R10's move-into-`arc` is unimplemented. NINE use-after-frees were found under earlier "leaks, never dangling" claims and are fixed with tests: a returned `arc` FIELD handed out unretained, a SHADOWED `arc` local released twice because drops are spelled by name, an `arc` place flowing out of an `if` branch, one flowing out of a `match` arm in return position, an `arc` place passed to an `owned` parameter, an `arc` match-arm binding returned from a BLOCK arm body (which the round that removed `Local.is_param` had derived to be unreachable), `let owned ys: [Int] = xs`, a double free of the buffer that the parameter-position guard did not reach, R10's refusal being place-only so every VALUE position escaped it, and `take(owned fresh())` over an `arc`-returning callee, the one that was a LIVE ASan double free rather than masked. The last four are refused by R10 rather than retained, since no retain can fix a double free of the buffer. Do not restate the categorical, and note that each of the three rounds was falsified by a FORM of a construct the previous round had not written out |
 | Atomic refcounts in the runtime | implemented |
-| Drop insertion for `owned` | partially implemented: unmoved `owned`/`arc` `let`/`var` locals only, function-scoped, conservative on moves; not structs, not parameters, not a value revived after a move (see `docs/OWNERSHIP.md` R16) |
+| Drop insertion for `owned` | partially implemented: unmoved `owned`/`arc` `let`/`var` locals only, block-scoped for statement-position scopes since 2026-09-15 (value-position blocks release nothing), conservative on moves; not structs, not parameters, not a value revived after a move (see `docs/OWNERSHIP.md` R16) |
 | Copyability derivation | designed, not implemented |
 
 ### Expressions

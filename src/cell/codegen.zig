@@ -160,9 +160,11 @@
 //! dropped, so every call-site retain into one leaks a reference; a struct
 //! holding an `arc` field is never dropped, so the field's retain leaks; an
 //! `arc` value unboxed for a `shared` parameter without ever being bound
-//! (`inspect(shared fresh())`) drops its handle on the floor; a block-scoped
-//! `arc` local is never released at all, since release is function-scoped,
-//! which inside a `while` body is unbounded; reassigning an `arc` `var`
+//! (`inspect(shared fresh())`) drops its handle on the floor (CLOSED
+//! 2026-09-07, pinned at 0 in the gate); a block-scoped `arc` local was
+//! never released at all while release was function-scoped, which inside a
+//! `while` body was unbounded (CLOSED 2026-09-15 by the block-scope drop
+//! point in `emitStmts`, pinned at 0 in the gate); reassigning an `arc` `var`
 //! leaks the previous box; and an `owned` String or list PLACE bound as
 //! `arc` is not boxed at all, because `cell_arc_from_string` moves its
 //! argument while `borrowck.zig` leaves the source unmoved, and a loud C
@@ -4697,6 +4699,10 @@ test "a local declared in a VALUE-position block is still not released: pinned r
     );
     defer e.deinit();
     try expectAbsent(e.text, "cell_arc_drop(a);");
+    // The uncompilable emission is pinned too, so the day a block's tail is
+    // typed as its value this line fails and the residual above is re-read
+    // rather than silently outliving the defect that justified it.
+    try expectContains(e.text, "int64_t r = ({");
 }
 
 test "a shared or copy local is never dropped" {
