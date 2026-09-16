@@ -1,0 +1,35 @@
+// Reassigning an `owned` `var` that was never moved freed nothing: the old
+// value leaked on every `v = ...`. Not an R11 "Still broken" row (R11 is
+// about `arc`); OWNERSHIP.md's R16 paragraph carried it together with the
+// revival leak, and `emitAssign`'s pre-drop was `arc`-only because a list
+// literal `[s]` once copied the header without marking `s` moved, so freeing
+// the old value would have freed under that element. borrowck refuses that
+// list element since c314a0e, and no other untracked alias of an `owned`
+// String or list is accepted.
+//
+// Each iteration reassigns a String var and a list var once each, so the
+// pre-fix count is 2000 on both witnesses.
+//
+// NOT covered, by design: a var that is moved ANYWHERE in the function,
+// before the reassignment (R3a revival, where the old value may belong to
+// someone else) or after it (a later `return v` or `take(v)`, because
+// borrowck's `wasMoved` is not flow-sensitive). No pre-drop is emitted for
+// either and the reassigned-away values still leak.
+//
+// Status: parses, passes `cell check`. LLVM and MLIR refuse it; lives under
+// examples/leaks/ so it is invisible to the top-level corpus, agreement and
+// mlir-lowering loops (see examples/leaks/README.md).
+
+pub fn print_int(copy value: Int);
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        var owned s: String = "first-string"
+        s = "second-string"
+        var owned xs: [Int] = [1, 2, 3]
+        xs = [4, 5]
+        i = i + 1
+    }
+    print_int(i)
+}

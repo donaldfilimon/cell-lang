@@ -1289,8 +1289,12 @@ source, `return owned p`, `return arc p`, `return shared p`, an unannotated
 and all but the last measure 0. The `var` one leaks the value it was
 reassigned away from, 100 over 100 calls, and the same program returning a
 plain `-> String` on the tree before this change leaks the same 100: an
-`owned` `var`'s reassignment has no pre-drop (the `emitAssign` pre-drop is
-`arc`-only), which is not this position's defect. A move on only one branch
+`owned` `var`'s reassignment had no pre-drop then (the `emitAssign`
+pre-drop was `arc`-only), which is not this position's defect. The
+never-moved case closed later the same day (R16 below), but this program
+still measures 100 after that: `v` is RETURNED, a return is a move, and the
+pre-drop's `wasMoved` gate answers "moved anywhere in the function",
+including after the reassignment. A move on only one branch
 (`if c > 0 { return p }`) leaks `p` on the path that did not return, 50 over
 50 such calls, and again a plain `-> String` function leaks the same 50: the
 conservative branch move R2 already makes. Still refused at this position: a
@@ -1466,10 +1470,11 @@ heap-use-after-free, exit 134, flat and inside a `while` body, found by the
 advisor pass the same night and closed in borrowck beside R4 ("cannot assign
 to 'v' while the match binding 'x' aliases it"), for every ownership, since
 the `owned` form leaks today and would dangle the moment `owned`
-reassignment gets its own pre-drop. `owned` is
-deliberately NOT covered: `[s]` copies the header without marking `s` moved,
-so a pre-drop at `s = make()` would free under a list element; that stays
-R16's revival leak, stated there. A droppable var declared without an
+reassignment gets its own pre-drop, which it now has (2026-09-16, below).
+`owned` was deliberately NOT covered at first: `[s]` copied the header
+without marking `s` moved, so a pre-drop at `s = make()` would have freed
+under a list element. That reason is gone: borrowck refuses an `owned`
+resource-bearing list element since `c314a0e`. A droppable var declared without an
 initializer is now zero-initialized, which also fixes a latent defect: `var
 arc v: String` never assigned ran its scope-end drop on garbage. Falsified
 before re-pinning: the gate went red on the old constant with both witnesses
@@ -2078,13 +2083,34 @@ ways, and each is a real, documented gap rather than an oversight:
 - **"Moved" means moved anywhere in the function, once, permanently.** A
   `var` that is moved and later revived by a fresh assignment (R3a) is
   never dropped either, even though it holds a fresh, unmoved value at the
-  function's end. The revived value leaks. The plain `owned` reassignment
-  (`var owned s = make() \n s = make()`, no move anywhere) leaks the old
-  value too, and it is left that way on purpose while `arc` vars get a
-  pre-drop (R11 row 5, closed 2026-09-15): a list literal `[s]` copies the
-  header without marking `s` moved, so freeing the old value on `s = ...`
-  would free under that element. Closing it needs the list-element read to
-  become a tracked alias or a move, not a drop insertion.
+  function's end. The revived value leaks, and so does every value such a
+  var is reassigned away from: `emitAssign` gives a MOVED `owned` var no
+  pre-drop, because its old value may belong to whoever took it.
+- **CLOSED 2026-09-16: the plain `owned` reassignment.** `var owned s =
+  make() \n s = make()`, with no move of `s` anywhere in the function, leaked
+  the old value on every store. It was left that way while `arc` vars got a
+  pre-drop (R11 row 5, closed 2026-09-15), because a list literal `[s]`
+  copied the header without marking `s` moved. borrowck refuses that
+  element since `c314a0e`, and a match-arm alias, a live `shared` borrow, an
+  `owned` struct field and a `shared` field were all probed and are refused
+  before a reassignment, so `emitAssign` now releases the old value of a
+  droppable `owned` `String` or list var (a parameter included: the callee
+  owns it) exactly as it does an `arc` one, gated on borrowck's `wasMoved`
+  answering no. `examples/leaks/reassigned_owned_var.cell` measured 2000 on
+  both witnesses before and 0 after (`ALLOC=4000 FREE=4000`), pinned in the
+  gate; ASan clean. An edge program (revival, a one-branch move, a
+  parameter, a var with no initializer, `s = grow(s)`) measured 650 before
+  and 350 after, the 350 being exactly the revival and one-branch leaks
+  derived by hand, and ASan clean. Removing the `wasMoved` gate made the
+  revival shape an AddressSanitizer double free (exit 134), so that gate is
+  load-bearing, not tidiness. **Its cost, measured:** `wasMoved` is not
+  flow-sensitive, so a var moved LATER than the reassignment (returned, or
+  passed to an `owned` parameter afterwards) also gets no pre-drop and still
+  leaks every value it was reassigned away from (100 over 100 calls for
+  `var owned v = "a" \n v = "b" \n return v` from a `-> arc String`
+  function). Closing that needs a per-assignment "definitely not moved yet"
+  answer from borrowck, not a wider codegen predicate. Records are not
+  covered (a record var keeps the plain store).
 
 Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released. What remains out of scope is a field moved on only one branch (it leaks on the other path, pending drop flags) and a partly moved field (the whole field is left unreleased).
 

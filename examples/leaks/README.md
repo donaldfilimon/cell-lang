@@ -1,8 +1,9 @@
 # `examples/leaks/`
 
-Eight fixtures: seven, one per measurable gap in `docs/OWNERSHIP.md` R11's
+Nine fixtures: seven, one per measurable gap in `docs/OWNERSHIP.md` R11's
 "Still broken" table and its CLOSED paragraphs (five until 2026-09-15, six
-until 2026-09-16; six of the seven are closed and pinned at 0), and one
+until 2026-09-16; six of the seven are closed and pinned at 0); the `owned`
+twin of row 5 (`reassigned_owned_var.cell`, closed 2026-09-16); and one
 regression pin for an implemented feature (`arc_box_move.cell`, below). Each isolates exactly one disclosed `arc` retain/release gap
 and loops it 1000 times so a leak is a stable count, not noise.
 
@@ -30,6 +31,7 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `unbound_shared_temp.cell` | 3: an unbound `arc` temporary unboxed for a `shared` parameter |
 | `block_scoped_local.cell` | 4: a block-scoped `arc` local is never released; **CLOSED 2026-09-15**, kept and pinned at 0 |
 | `reassigned_var.cell` | 5: reassigning an `arc` `var` leaked the previous box; **CLOSED 2026-09-15** by the reassignment pre-drop in `emitAssign`, kept and pinned at 0 |
+| `reassigned_owned_var.cell` | not an R11 row: row 5's `owned` twin. Reassigning a never-moved `owned` String or list var leaked the old value (2000 before on both witnesses); **CLOSED 2026-09-16** by extending `emitAssign`'s pre-drop, gated on borrowck's `wasMoved`, pinned at 0. A moved var (R3a revival) keeps its leak by design and is not measured here |
 | `value_block_local.cell` | the residual of row 4's closure: an `arc` local declared in a VALUE-position block was not released at that block's exit (measurable since 2026-09-15, when a block began to type as its tail); **CLOSED 2026-09-15** the same evening by `emitValueBlockDrops`, kept and pinned at 0 |
 | `arc_box_move.cell` | not a gap: R10 move-into-`arc` at `let` and at a direct `-> arc` return, both IMPLEMENTED 2026-09-16; pinned at 0 as a regression guard (a drift between borrowck's move and codegen's box is a double free or a leak). A move on one branch only leaks by design and is not measured |
 | `partial_move_field.cell` | not a numbered row: a record with one owning field moved out was skipped whole, leaking its other owning field; **CLOSED 2026-09-16** by field-path move records in borrowck and `emitPartialRecordDrop` in codegen, kept and pinned at 0. A field moved on only one branch still leaks by design and is not measured here |

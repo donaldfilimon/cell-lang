@@ -65,7 +65,9 @@
 //! owning fields is never destroyed at all; `wasMoved` answers "moved
 //! ANYWHERE in the function", so a `var` that is moved and later reassigned
 //! (R3a revival) is never dropped either, even though it holds a fresh,
-//! unmoved value at the function's end -- the revived value leaks too; and
+//! unmoved value at the function's end -- the revived value leaks too, and
+//! for the same reason `emitAssign` gives a moved `owned` var no pre-drop
+//! (a never-moved one is released before each store since 2026-09-16); and
 //! a local declared inside a VALUE-position block (`emitValueInto`) is not
 //! released at that block's exit, because it may be the value flowing out.
 //! Why block-scoped release is safe for a local whose initializer moves an
@@ -875,12 +877,22 @@ pub const Generator = struct {
         // write clause refuses it while a match-arm binding aliases `v`
         // (an arm binding is an UNRETAINED copy of the handle: without that
         // refusal `match v { x => { v = "two" \n print(x) } }` was a
-        // measured heap-use-after-free at 4c93571). `owned` is
-        // deliberately NOT covered: `[s]` copies the header without marking
-        // `s` moved, so a pre-drop there would free under a list element
-        // (R16's revival leak, left as a leak). The RHS goes into a temporary
-        // FIRST, because `v = v` and `v = mk(v)` read the old box.
-        if (self.reassignedArcLocal(&a.target)) |local| {
+        // measured heap-use-after-free at 4c93571).
+        //
+        // An `owned` `String` or list var is covered too, since 2026-09-16,
+        // but ONLY when borrowck never moved that binding anywhere in the
+        // function (`wasMoved`, permanent and branch-conservative). That is
+        // the question the `arc` case never had to ask: a moved `owned`
+        // var's old value belongs to whoever took it, so a pre-drop after
+        // `take(v)` (R3a revival) or after a move on one branch is a double
+        // free. Those keep the leak (R16's revival leak). The old reason for
+        // excluding `owned` entirely, `[s]` copying the header without a
+        // move, is gone: borrowck refuses that list element since c314a0e,
+        // and a match-arm binding, a live `shared` borrow, an `owned` struct
+        // field and a `shared` field are all refused before this point too.
+        // The RHS goes into a temporary FIRST, because `v = v` and
+        // `v = mk(v)` read the old value.
+        if (self.reassignedDroppableLocal(&a.target)) |local| {
             const temp = try self.nextTemp();
             try self.writeIndent(indent);
             try self.writeDecl(want, temp);
@@ -903,11 +915,15 @@ pub const Generator = struct {
         try out.writeAll(";\n");
     }
 
-    /// The innermost visible local an assignment target names, when it is a
-    /// droppable `arc` binding (see `emitAssign`). A field path, a deref
-    /// through a borrow, a parameter, and every other ownership answer null
-    /// and keep the plain emission.
-    fn reassignedArcLocal(self: *Generator, target: *const ast.Expr) ?Local {
+    /// The innermost visible local an assignment target names, when its old
+    /// value is safe to release before the store (see `emitAssign`): a
+    /// droppable `arc` binding, or a droppable `owned` `String` or list
+    /// binding that borrowck never moved. A field path, a deref through a
+    /// borrow, a record, a moved `owned` binding, and every other ownership
+    /// answer null and keep the plain emission. A parameter is a droppable
+    /// local since R11 row 1 and is covered like any other: the callee owns
+    /// an `owned` or `arc` parameter's value.
+    fn reassignedDroppableLocal(self: *Generator, target: *const ast.Expr) ?Local {
         var t = target;
         while (t.kind == .annotated) t = t.kind.annotated.value;
         if (t.kind != .ident) return null;
@@ -917,8 +933,19 @@ pub const Generator = struct {
             i -= 1;
             const local = self.locals.items[i];
             if (!eq(local.name, name)) continue;
-            if (!local.droppable or local.ownership != .arc or !hasDropCall(local.ty.shape)) return null;
-            return local;
+            if (!local.droppable or !hasDropCall(local.ty.shape)) return null;
+            switch (local.ownership) {
+                .arc => return local,
+                .owned => {
+                    if (local.ty.shape != .string and local.ty.shape != .slice) return null;
+                    // No checker means no move facts, and without them the
+                    // pre-drop cannot be proven safe: keep the leak.
+                    const checker = self.checker orelse return null;
+                    if (checker.wasMoved(local.id)) return null;
+                    return local;
+                },
+                else => return null,
+            }
         }
         return null;
     }
@@ -5879,19 +5906,64 @@ test "reassigning an arc var evaluates the value into a temporary, drops the old
     try expectLineBefore(e.text, "v = _cell_t0;", "cell_arc_drop(v);");
 }
 
-test "reassigning an owned var is untouched: the list-element read is an untracked alias" {
-    // `[s]` copies the header without marking `s` moved, so a pre-drop at
-    // `s = make()` would free under the element. Left as R16's revival leak.
+test "reassigning a never-moved owned var releases the old value first" {
+    // Until 2026-09-16 this test pinned the opposite (no temporary, no free
+    // before the store), because `[s]` copied the header without marking `s`
+    // moved and a pre-drop would have freed under that element. borrowck
+    // refuses that element since c314a0e, so the `arc` reassignment pre-drop
+    // now covers a never-moved `owned` `String` or list var too.
     var e = try emitSource(
         \\pub fn make() -> String { return "abc" }
+        \\pub fn list() -> [Int] { return [1] }
         \\pub fn f() {
         \\  var owned s = make()
         \\  s = make()
         \\}
+        \\pub fn g() {
+        \\  var owned xs = list()
+        \\  xs = list()
+        \\}
     );
     defer e.deinit();
-    try expectAbsent(e.text, "_cell_t0");
-    try expectLineBefore(e.text, "cell_string_free(&s);", "s = cell_make();");
+    const f = try fnDef(e.text, "f");
+    // The value goes into a temporary first (`s = mk(s)` reads the old
+    // value), then the old value is released, then the store.
+    try expectLineBefore(f, "cell_string_free(&s);", "cell_string_t _cell_t2 = cell_make();");
+    try expectLineBefore(f, "s = _cell_t2;", "cell_string_free(&s);");
+    try expectOccurrences(f, "cell_string_free(&s);", 2);
+    const g = try fnDef(e.text, "g");
+    try expectOccurrences(g, "cell_slice_free(&xs);", 2);
+    try expectCompiles(e.text);
+}
+
+test "reassigning a moved owned var keeps no pre-drop: its old value is gone" {
+    // R3a revival and a move on one branch. borrowck's `wasMoved` is
+    // permanent and branch-conservative, so both answer "moved" and no
+    // release is emitted before the store: the old value belongs to `take`.
+    // Removing that guard was measured as an AddressSanitizer double free
+    // (exit 134). The reassigned value still leaks (R16's revival leak).
+    var e = try emitSource(
+        \\pub fn take(owned s: String);
+        \\pub fn revive() {
+        \\  var owned v: String = "a"
+        \\  take(v)
+        \\  v = "b"
+        \\}
+        \\pub fn branch(copy c: Int) {
+        \\  var owned v: String = "a"
+        \\  if c > 0 {
+        \\    take(v)
+        \\  }
+        \\  v = "b"
+        \\}
+    );
+    defer e.deinit();
+    for ([_][]const u8{ "revive", "branch" }) |name| {
+        const body = try fnDef(e.text, name);
+        try expectAbsent(body, "cell_string_free(&v);");
+        try expectAbsent(body, "_cell_t0");
+    }
+    try expectCompiles(e.text);
 }
 
 test "a droppable var declared without an initializer is zero-initialized" {
@@ -7152,8 +7224,13 @@ test "row 6: an assignment's right side converts, with the only literal on the a
         \\}
     );
     defer e.deinit();
-    try expectContains(e.text, "s = cell_string_from_str(cell_str_from_parts(\"cd\", 2));");
-    try expectOccurrences(e.text, "cell_string_free(&s);", 1);
+    // Since 2026-09-16 the never-moved `owned` reassignment is pre-dropped,
+    // so the converted value lands in the temporary rather than straight in
+    // `s`, and `s` is released twice: the old value before the store, and
+    // the new one at scope end.
+    try expectContains(e.text, "cell_string_t _cell_t0 = cell_string_from_str(cell_str_from_parts(\"cd\", 2));");
+    try expectContains(e.text, "s = _cell_t0;");
+    try expectOccurrences(e.text, "cell_string_free(&s);", 2);
 }
 
 test "row 7: a match arm writing into an owning String value slot converts" {

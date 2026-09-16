@@ -1278,8 +1278,8 @@ pub const Checker = struct {
         // reads freed memory: `match v { x => { v = "two" \n print(x) } }`
         // was an AddressSanitizer heap-use-after-free at 4c93571, flat and
         // inside a `while`. Refused for every ownership, not only `arc`: the
-        // `owned` form merely leaks today and would dangle the moment
-        // `owned` reassignment gets its own pre-drop. Asked of the ROOT
+        // `owned` form leaked until 2026-09-16 and would dangle now, because
+        // a never-moved `owned` var's reassignment has its own pre-drop. Asked of the ROOT
         // binding, so a write anywhere under the scrutinee's root is refused
         // while any arm alias of that root is visible; a sibling-field write
         // is over-refused, in the leak-safe direction.
