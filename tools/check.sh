@@ -1707,6 +1707,10 @@ esac
 # a.cell and said nothing). A program's exit code must come back through
 # `run` unchanged: that is what makes `cell run` usable from a script.
 printf '\n== cli build/run (stage 6 through the CLI, embedded runtime) ==\n'
+# Counted before and after rather than asserted zero: another session's
+# concurrent `cell run`, or a directory a crashed one left behind, is not
+# this commit's leak. Only a count that GREW across this stage is.
+staging_before=$(/bin/ls -d "${TMPDIR:-/tmp}"/cell-build-* 2>/dev/null | wc -l | tr -d ' ')
 for pair in hello:42 backends:24 loops:55; do
     ex=${pair%%:*}; want=${pair##*:}
     got=$("$CELL" run "examples/$ex.cell" 2> "$TMP/run_$ex.err"); rc=$?
@@ -1757,10 +1761,10 @@ fi
     && pass "a second source file is refused, not silently dropped" \
     || fail "cell build with two sources: exit $rc, stderr: $(head -1 "$TMP/build_two.err")"
 # Nothing staged is left behind: every run above removes its own directory.
-leftover=$(/bin/ls -d "${TMPDIR:-/tmp}"/cell-build-* 2>/dev/null | wc -l | tr -d ' ')
-[ "$leftover" = "0" ] \
-    && pass "no cell-build-* staging directory left under \${TMPDIR:-/tmp}" \
-    || fail "$leftover cell-build-* staging directories left under ${TMPDIR:-/tmp}"
+staging_after=$(/bin/ls -d "${TMPDIR:-/tmp}"/cell-build-* 2>/dev/null | wc -l | tr -d ' ')
+[ "$staging_after" -le "$staging_before" ] \
+    && pass "no cell-build-* staging directory added under \${TMPDIR:-/tmp} ($staging_before before, $staging_after after)" \
+    || fail "cell-build-* staging directories under ${TMPDIR:-/tmp} grew from $staging_before to $staging_after during this stage"
 
 # ---------------------------------------------------------------- verdict --
 printf '\n== verdict ==\n'
