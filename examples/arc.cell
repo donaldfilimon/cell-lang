@@ -4,7 +4,8 @@
 // runs. It prints 13, and that number is a refcount measurement rather than
 // arithmetic: `observe` reports the strong count it was handed, so the two
 // 3s below are the retains this file's own call sites inserted. See
-// examples/arc_host.c for the two bodyless declarations' C side, and
+// examples/arc_host.c for the two bodyless declarations' C side (run it with
+// `cell run examples/arc.cell examples/arc_host.c`), and
 // tools/check.sh's execution section for the command that runs it.
 //
 // The C backend implements the retain half of docs/OWNERSHIP.md R11:

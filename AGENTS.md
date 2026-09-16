@@ -26,7 +26,8 @@ zig build test-runtime -Dswift=false       # C ABI harness alone (exercises weak
 ./zig-out/bin/cell check examples/hello.cell
 ./zig-out/bin/cell emit --target=c|llvm|mlir examples/hello.cell
 ./zig-out/bin/cell run examples/hello.cell          # build to $TMPDIR with $CC, run, forward the exit status
-./zig-out/bin/cell build examples/hello.cell -o hello  # C target only; no *_host.c linking
+./zig-out/bin/cell build examples/hello.cell -o hello  # C target only
+./zig-out/bin/cell run examples/arc.cell examples/arc_host.c  # .c positionals are hand-written hosts
 ```
 
 **Full gate** (build + tests + corpus contracts + backend agreement + execution):

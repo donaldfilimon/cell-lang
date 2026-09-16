@@ -24,8 +24,8 @@ const Usage =
     \\  check <file.cell>     Parse + typecheck + borrow-check
     \\  dump  <file.cell>     Parse and print AST
     \\  emit  <file.cell>     Emit code (see --target)
-    \\  build <file.cell>     Compile to an executable with cc (C target only)
-    \\  run   <file.cell>     Build into a temp dir, execute, forward the exit code
+    \\  build <file.cell> [host.c ...]  Compile to an executable with cc (C target only)
+    \\  run   <file.cell> [host.c ...]  Build into a temp dir, execute, forward the exit code
     \\  version               Print version
     \\  help                  Show this help
     \\
@@ -41,9 +41,11 @@ const Usage =
     \\
     \\build and run stage the emitted C beside an embedded copy of the runtime
     \\(runtime/cell_rt.h and cell_rt.c) under $TMPDIR, then invoke $CC
-    \\(default: cc) on them, the same recipe tools/check.sh executes. Programs
-    \\that need a hand-written C host (examples/*_host.c) are out of scope:
-    \\use emit and cc directly for those.
+    \\(default: cc) on them, the same recipe tools/check.sh executes. Extra
+    \\positionals ending in .c are hand-written C hosts for the program's
+    \\bodyless declarations (examples/*_host.c); they are handed to cc as given,
+    \\between the emitted C and the runtime, and are refused by every other
+    \\command, so a .c file is never loaded as Cell source.
     \\
 ;
 
@@ -91,6 +93,16 @@ const Invocation = struct {
     path: []const u8,
     target: cell.Target = .c,
     out: ?[]const u8 = null,
+    /// Host C sources, bounded so the struct can be returned by value: a
+    /// slice into its own array would dangle. Read through `hosts()`.
+    host_buf: [max_hosts][]const u8 = undefined,
+    host_count: usize = 0,
+
+    pub const max_hosts = 8;
+
+    pub fn hosts(self: *const Invocation) []const []const u8 {
+        return self.host_buf[0..self.host_count];
+    }
 };
 
 /// The outcome of `parseArgs`. Each refusal carries the offending token so
@@ -103,13 +115,16 @@ const ParsedArgs = union(enum) {
     extra_positional: []const u8,
     unknown_target: []const u8,
     unknown_option: []const u8,
+    too_many_hosts,
 };
 
-/// Parse the arguments after the command. The path, `--target=` and `-o`
-/// may appear in any order. A second positional is refused rather than
-/// dropped: until 2026-09-16 the loop kept the first path and said nothing
-/// about the rest, which for `build` would have compiled a.cell in silence
-/// when handed `a.cell b.cell`.
+/// Parse the arguments after the command. The path, `--target=`, `-o` and
+/// any `.c` host sources may appear in any order. A second non-host
+/// positional is refused rather than dropped: until 2026-09-16 the loop kept
+/// the first path and said nothing about the rest, which for `build` would
+/// have compiled a.cell in silence when handed `a.cell b.cell`. A `.c`
+/// positional is a host for build/run and never a Cell source, even though
+/// `load`'s unknown-extension fallback would once have read it as one.
 fn parseArgs(args: []const []const u8) ParsedArgs {
     var inv: Invocation = .{ .path = "" };
     var i: usize = 0;
@@ -124,6 +139,10 @@ fn parseArgs(args: []const []const u8) ParsedArgs {
             inv.out = args[i];
         } else if (a.len > 1 and a[0] == '-') {
             return .{ .unknown_option = a };
+        } else if (std.mem.eql(u8, std.fs.path.extension(a), ".c")) {
+            if (inv.host_count == Invocation.max_hosts) return .too_many_hosts;
+            inv.host_buf[inv.host_count] = a;
+            inv.host_count += 1;
         } else if (inv.path.len == 0) {
             inv.path = a;
         } else {
@@ -148,21 +167,37 @@ fn defaultOutput(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 /// The cc command line, in the shape tools/check.sh stage 6 uses
-/// (`cc -I runtime main.c runtime/cell_rt.c -o out`), with `runtime/`
-/// replaced by the staging directory the embedded runtime was written to.
-/// No `-Werror`: the gate's corpus stage is where warnings are a failure,
-/// and a user program that trips one should still run.
+/// (`cc -I runtime main.c [host.c ...] runtime/cell_rt.c -o out`), with
+/// `runtime/` replaced by the staging directory the embedded runtime was
+/// written to. Hosts pass through as given, between the emitted C and the
+/// runtime, which is run_c_host's order; cc inherits the cwd, so a path
+/// relative to the checkout resolves and nothing is staged for them. No
+/// `-Werror`: the gate's corpus stage is where warnings are a failure, and
+/// a user program that trips one should still run.
 fn ccArgv(
     allocator: std.mem.Allocator,
     cc: []const u8,
     stage_dir: []const u8,
     main_c: []const u8,
+    hosts: []const []const u8,
     out: []const u8,
 ) ![]const []const u8 {
     const rt_c = try std.fs.path.join(allocator, &.{ stage_dir, "cell_rt.c" });
-    const argv = try allocator.alloc([]const u8, 7);
-    argv[0..7].* = .{ cc, "-I", stage_dir, main_c, rt_c, "-o", out };
+    const argv = try allocator.alloc([]const u8, 7 + hosts.len);
+    argv[0..4].* = .{ cc, "-I", stage_dir, main_c };
+    @memcpy(argv[4 .. 4 + hosts.len], hosts);
+    argv[4 + hosts.len ..][0..3].* = .{ rt_c, "-o", out };
     return argv;
+}
+
+/// Only build and run invoke cc, so only they can do anything with a host
+/// source. Null means go ahead.
+fn hostRefusal(command: Command, host_count: usize) ?[]const u8 {
+    if (host_count == 0) return null;
+    return switch (command) {
+        .build, .run => null,
+        else => "host .c sources apply to build and run only",
+    };
 }
 
 /// Only the C backend produces something cc can compile. Null means go
@@ -228,10 +263,20 @@ pub fn main(init: std.process.Init) !void {
             try printUsage(io);
             std.process.exit(1);
         },
+        .too_many_hosts => {
+            std.debug.print("error: at most {d} host .c sources per invocation\n", .{Invocation.max_hosts});
+            std.process.exit(1);
+        },
     };
     if (inv.out != null and command != .build) {
         std.debug.print("error: -o applies to build only\n", .{});
         std.process.exit(1);
+    }
+    if (command) |c| {
+        if (hostRefusal(c, inv.host_count)) |why| {
+            std.debug.print("error: {s}\n", .{why});
+            std.process.exit(1);
+        }
     }
     const path = inv.path;
     const target = inv.target;
@@ -382,7 +427,7 @@ fn buildOrRun(init: std.process.Init, cwd: Io.Dir, command: Command, inv: Invoca
         else => unreachable,
     };
     const cc = init.environ_map.get("CC") orelse "cc";
-    const argv = try ccArgv(arena, cc, stage, main_c, out);
+    const argv = try ccArgv(arena, cc, stage, main_c, inv.hosts(), out);
     const result = std.process.run(init.gpa, io, .{ .argv = argv }) catch |err| {
         try err_w.print("error: cannot run '{s}': {s} (set CC to a working C compiler)\n", .{ cc, @errorName(err) });
         try err_w.flush();
@@ -535,6 +580,17 @@ test "parseArgs: the path, --target=, and -o are order-independent, and a second
 
     const c = parseArgs(&.{"x.cell"});
     try std.testing.expect(c.ok.out == null);
+    try std.testing.expectEqual(@as(usize, 0), c.ok.hosts().len);
+
+    // A positional with a `.c` extension is a host source, not a second
+    // Cell file, wherever it appears; the cap is refused by name, never
+    // truncated.
+    const h = parseArgs(&.{ "examples/arc_host.c", "examples/arc.cell", "-o", "arc", "extra.c" });
+    try std.testing.expectEqualStrings("examples/arc.cell", h.ok.path);
+    try std.testing.expectEqual(@as(usize, 2), h.ok.hosts().len);
+    try std.testing.expectEqualStrings("examples/arc_host.c", h.ok.hosts()[0]);
+    try std.testing.expectEqualStrings("extra.c", h.ok.hosts()[1]);
+    try std.testing.expect(parseArgs(&.{ "a.cell", "1.c", "2.c", "3.c", "4.c", "5.c", "6.c", "7.c", "8.c", "9.c" }) == .too_many_hosts);
 
     try std.testing.expectEqualStrings("b.cell", parseArgs(&.{ "a.cell", "b.cell" }).extra_positional);
     try std.testing.expectEqualStrings("wasm", parseArgs(&.{ "a.cell", "--target=wasm" }).unknown_target);
@@ -573,10 +629,29 @@ test "ccArgv mirrors the gate's run_c recipe, with the runtime taken from the st
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const argv = try ccArgv(arena, "clang", "/tmp/cell-build-1", "/tmp/cell-build-1/main.c", "hello");
+    const argv = try ccArgv(arena, "clang", "/tmp/cell-build-1", "/tmp/cell-build-1/main.c", &.{}, "hello");
     const want = [_][]const u8{ "clang", "-I", "/tmp/cell-build-1", "/tmp/cell-build-1/main.c", "/tmp/cell-build-1/cell_rt.c", "-o", "hello" };
     try std.testing.expectEqual(want.len, argv.len);
     for (want, argv) |w, g| try std.testing.expectEqualStrings(w, g);
+
+    // Hosts sit between the emitted C and the runtime, run_c_host's order,
+    // and pass through as given: cc inherits the cwd, so nothing is staged.
+    const with_hosts = try ccArgv(arena, "cc", "/s", "/s/main.c", &.{ "examples/arc_host.c", "x.c" }, "arc");
+    const want2 = [_][]const u8{ "cc", "-I", "/s", "/s/main.c", "examples/arc_host.c", "x.c", "/s/cell_rt.c", "-o", "arc" };
+    try std.testing.expectEqual(want2.len, with_hosts.len);
+    for (want2, with_hosts) |w, g| try std.testing.expectEqualStrings(w, g);
+}
+
+test "host sources are refused outside build and run" {
+    // `cell check foo.c` used to load foo.c as Cell source through load's
+    // unknown-extension fallback. A `.c` positional is a host now, and only
+    // the two commands that invoke cc can do anything with one.
+    try std.testing.expect(hostRefusal(.build, 2) == null);
+    try std.testing.expect(hostRefusal(.run, 1) == null);
+    try std.testing.expect(hostRefusal(.check, 0) == null);
+    try std.testing.expect(hostRefusal(.check, 1) != null);
+    try std.testing.expect(hostRefusal(.emit, 1) != null);
+    try std.testing.expect(hostRefusal(.dump, 3) != null);
 }
 
 test "build refuses the textual targets and points at emit" {

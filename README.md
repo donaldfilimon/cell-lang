@@ -132,11 +132,15 @@ it, and returns the program's own exit status (a signal death comes back as
 128 plus the signal number, the shell convention). `cell build -o hello
 examples/hello.cell` leaves the executable behind instead; without `-o` the
 output is the source stem. Both are the C path only (`--target=llvm`/`mlir`
-are refused with a pointer to `emit`), and neither links a hand-written C
-host, so `examples/arc.cell` still goes through `emit` and `cc` by hand. There
-is no `cell test`, and the prelude's group 3 declarations still resolve to no
+are refused with a pointer to `emit`). A positional ending in `.c` is a
+hand-written host for the program's bodyless declarations, handed to cc as
+given between the emitted C and the runtime, so
+`cell run examples/arc.cell examples/arc_host.c` prints the live refcount 13
+and `examples/owned_string.cell` with its host prints 44. Every other command
+refuses a `.c` positional rather than loading it as Cell source. There is no
+`cell test`, and the prelude's group 3 declarations still resolve to no
 symbol: `cell build` reports that as cc's undefined-symbol link error. Gate
-stage 12 pins the three execution answers through this path.
+stage 12 pins five execution answers through this path.
 
 `cell emit --target=llvm` and `cell emit --target=mlir` produce textual LLVM IR
 and MLIR by way of a typed IR in `src/cell/hir.zig`. Their retained execution

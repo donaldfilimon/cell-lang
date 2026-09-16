@@ -154,7 +154,9 @@
 #                       embeds, forwards the program's exit status, refuses
 #                       the textual targets and a second source file, writes
 #                       nothing for a rejected program, and leaves no staging
-#                       directory behind.
+#                       directory behind. Since the same night, .c positionals
+#                       are hand-written hosts handed to cc in run_c_host's
+#                       order, so arc (13) and owned_string (44) run here too.
 #
 # TRAPS THIS SCRIPT IS WRITTEN AGAINST, each one having actually bitten:
 #
@@ -1720,6 +1722,21 @@ for pair in hello:42 backends:24 loops:55; do
         fail "cell run $ex -> '$got' (exit $rc), want $want; stderr: $(head -3 "$TMP/run_$ex.err" | tr '\n' ' ')"
     fi
 done
+# The two host-linked answers stage 6 pins through run_c_host: 13 is a
+# refcount measurement only a C host can take, 44 exercises owned String at
+# the boundary. A .c positional is handed to cc as given.
+got=$("$CELL" run examples/arc.cell examples/arc_host.c 2> "$TMP/run_arc.err"); rc=$?
+[ $rc -eq 0 ] && [ "$got" = "13" ] \
+    && pass "cell run arc + arc_host.c -> 13" \
+    || fail "cell run arc with its host -> '$got' (exit $rc), want 13; stderr: $(head -2 "$TMP/run_arc.err" | tr '\n' ' ')"
+got=$("$CELL" run examples/owned_string_host.c examples/owned_string.cell 2> "$TMP/run_os.err"); rc=$?
+[ $rc -eq 0 ] && [ "$got" = "44" ] \
+    && pass "cell run owned_string + its host (host first) -> 44" \
+    || fail "cell run owned_string with its host -> '$got' (exit $rc), want 44; stderr: $(head -2 "$TMP/run_os.err" | tr '\n' ' ')"
+"$CELL" check examples/arc.cell examples/arc_host.c > /dev/null 2> "$TMP/check_host.err"; rc=$?
+[ $rc -eq 1 ] && grep -q 'apply to build and run only' "$TMP/check_host.err" \
+    && pass "a host .c is refused by check, never loaded as Cell source" \
+    || fail "cell check with a .c positional: exit $rc, stderr: $(head -1 "$TMP/check_host.err")"
 "$CELL" build examples/hello.cell -o "$TMP/hello_built" 2> "$TMP/build_hello.err"
 if [ $? -eq 0 ] && [ -x "$TMP/hello_built" ] && [ "$("$TMP/hello_built")" = "42" ]; then
     pass "cell build -o writes a runnable executable (hello -> 42)"

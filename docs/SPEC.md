@@ -396,10 +396,12 @@ module. `examples/pairing/` is the worked pair.
 resolution, no include path, no package manager, and no linking of a module to
 its body file. A `use` declaration (section 8.4) is recorded and emitted as a C
 comment. Since 2026-09-16 `cell build` and `cell run` take that one file's C
-through `$CC` together with an embedded copy of the runtime; they add no second
-unit, no host source, and no target other than C, so the compilation unit is
-unchanged and a bodyless declaration with no runtime symbol surfaces as a link
-error rather than a compiler diagnostic.
+through `$CC` together with an embedded copy of the runtime; they add no second Cell
+unit and no target other than C, so the compilation unit is unchanged and a
+bodyless declaration with no runtime symbol surfaces as a link error rather
+than a compiler diagnostic. A `.c` positional is a hand-written host for such
+declarations: it is a C translation unit handed to the C compiler, never a
+second Cell unit, and no other command accepts one.
 
 ---
 
