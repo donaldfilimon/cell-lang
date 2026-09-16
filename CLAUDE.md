@@ -40,7 +40,7 @@ cross-file picture that no single source file states.
 tools/check.sh          # exit code is the verdict
 ```
 
-One command, **fourteen stages** plus a verdict, and its header comment explains
+One command, **fifteen stages** plus a verdict, and its header comment explains
 why each stage earns its place. `zig build test` alone is not the gate: it
 does not run a single `.cell` program, and `zig build examples` checks only
 `hello.cell`. The stages, in the order the script prints them: build, tests
@@ -49,8 +49,10 @@ does not run a single `.cell` program, and `zig build examples` checks only
 (`docs/OWNERSHIP.md` R11's disclosed gaps, pinned as constants), backend
 answers, sanitized execution under AddressSanitizer, declared signatures,
 rule lists (every document's enforced-rule list against `borrowck.zig`'s
-header), and cli build/run (stage 6's recipe driven through `cell build` /
-`cell run` with the embedded runtime).
+header), cli build/run (stage 6's recipe driven through `cell build` /
+`cell run` with the embedded runtime), prelude signatures, cli test, and
+grok bots (stage 15: every project Grok overlay under `.grok/` still names
+this gate, `-Dswift=false` and the `--test-filter` trap).
 
 **Read the stage list off the script's own output, not off this paragraph.**
 It said "five stages" for days after the gate reached nine, and every stage

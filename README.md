@@ -201,13 +201,15 @@ enforces.
 ## Checking any of this yourself
 
 `tools/check.sh` is the local compiler gate and its exit code is the verdict.
-Its fourteen stages cover build, unit tests, corpus contracts, backend acceptance
+Its fifteen stages cover build, unit tests, corpus contracts, backend acceptance
 agreement, MLIR lowering, execution, disclosed leak fixtures, backend answers,
 AddressSanitizer execution, declared ABI signatures, rule-list agreement
 with `src/cell/borrowck.zig`'s header, `cell build`/`cell run` through
 the embedded runtime, prelude signatures (stage 13: emitted prototypes match
-`runtime/cell_rt.h`), and `cell test` (stage 14: a directory of programs
-through the run recipe). Signature-only
+`runtime/cell_rt.h`), `cell test` (stage 14: a directory of programs
+through the run recipe), and grok bots (stage 15: the project Grok overlays
+under `.grok/` still name this gate, `-Dswift=false` and the `--test-filter`
+trap). Signature-only
 fixtures participate in lowering validation. A clean gate can retain explicitly
 pinned defects; those disclosures are separate from release qualification.
 
