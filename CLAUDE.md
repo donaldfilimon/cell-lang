@@ -34,16 +34,17 @@ cross-file picture that no single source file states.
 tools/check.sh          # exit code is the verdict
 ```
 
-One command, **eleven stages** plus a verdict, and its header comment explains
+One command, **twelve stages** plus a verdict, and its header comment explains
 why each stage earns its place. `zig build test` alone is not the gate: it
 does not run a single `.cell` program, and `zig build examples` checks only
 `hello.cell`. The stages, in the order the script prints them: build, tests
 (with the count printed), the four corpus contracts from
 `examples/README.md`, backend agreement, MLIR lowering, execution, leaks
 (`docs/OWNERSHIP.md` R11's disclosed gaps, pinned as constants), backend
-answers, sanitized execution under AddressSanitizer, declared signatures, and
+answers, sanitized execution under AddressSanitizer, declared signatures,
 rule lists (every document's enforced-rule list against `borrowck.zig`'s
-header).
+header), and cli build/run (stage 6's recipe driven through `cell build` /
+`cell run` with the embedded runtime).
 
 **Read the stage list off the script's own output, not off this paragraph.**
 It said "five stages" for days after the gate reached nine, and every stage

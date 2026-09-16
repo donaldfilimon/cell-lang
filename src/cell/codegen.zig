@@ -477,10 +477,18 @@ pub const Generator = struct {
     /// C that does not compile.
     ///
     /// Depth-first post-order, source order among independent structs so the
-    /// common case keeps emitting exactly as it did. A cycle is left in
-    /// source order rather than reordered: a struct that contains itself by
-    /// value has no size in C, so no permutation compiles, and `cc` reporting
-    /// it is better than this pass picking an arbitrary rotation.
+    /// common case keeps emitting exactly as it did.
+    ///
+    /// On a cycle the back edge is dropped and both structs still emit, in
+    /// post-order: `struct A { owned b: B }` with `struct B { owned a: A }`
+    /// emits B then A, so a cycle IS reordered. That is worth stating
+    /// precisely because the first version of this comment claimed the cycle
+    /// was "left in source order", which is not what the code does -- the
+    /// `visiting` arm returns rather than unwinding, so A's recursion into B
+    /// completes and B is emitted first. Nothing is lost by it: a struct
+    /// containing itself by value has no size in C, so no permutation
+    /// compiles and `cc` reports the cycle either way. The point of the
+    /// `visiting` arm is termination, not ordering.
     fn emitStructsInDependencyOrder(self: *Generator, module: *const ast.Module) EmitError!void {
         var state: std.StringHashMapUnmanaged(StructEmitState) = .empty;
         for (module.items) |item| {
@@ -3698,9 +3706,16 @@ test "independent structs keep source order" {
     try expectBefore(e.text, "} cell_First;", "typedef struct cell_Second {");
 }
 
-test "a struct cycle terminates and still emits both typedefs" {
+test "a struct cycle terminates, emits both typedefs, and drops the back edge" {
     // No emission order compiles a by-value cycle, so the pass must not hang
     // or drop a struct; it leaves the cycle for `cc` to report.
+    //
+    // The order assertion documents what the DFS actually does rather than
+    // stating a requirement: A is visited first, recurses into B, B's edge
+    // back to A meets `visiting` and returns, so B completes and emits first.
+    // It is pinned because the first version of this test asserted only that
+    // both were present, and that blindness let the doc comment claim for a
+    // while that a cycle was "left in source order" when it is not.
     var e = try emitSource(
         \\pub struct A { owned b: B }
         \\pub struct B { owned a: A }
@@ -3708,6 +3723,7 @@ test "a struct cycle terminates and still emits both typedefs" {
     defer e.deinit();
     try expectContains(e.text, "} cell_A;");
     try expectContains(e.text, "} cell_B;");
+    try expectBefore(e.text, "} cell_B;", "typedef struct cell_A {");
 }
 
 test "an enum a struct field names is emitted before the struct" {

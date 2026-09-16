@@ -1244,10 +1244,15 @@ the same edge as a value field; `[B]` lowers to the opaque `cell_slice_t` and
 needs no edge, but the conservative direction only constrains the order
 further, and over-ordering costs nothing while a missed edge emits C that does
 not compile. Enums are hoisted ahead of all structs, which is sound because a
-struct field may name an enum and an enum can never name a struct. A cycle is
-left in source order rather than rotated arbitrarily: a struct containing
-itself by value has no size in C, so no permutation compiles and `cc` is the
-better reporter. Five tests pin it (forward reference, `ref` field,
+struct field may name an enum and an enum can never name a struct. On a cycle
+the back edge is dropped and both structs still emit, in post-order, so a
+cycle IS reordered (`struct A { owned b: B }` with `struct B { owned a: A }`
+emits B then A). Nothing is lost by that: a struct containing itself by value
+has no size in C, so no permutation compiles and `cc` reports the cycle either
+way; the cycle arm exists for termination, not ordering. An earlier version of
+this paragraph said the cycle was "left in source order", which was a claim
+about intent rather than about the code, and the cycle test could not catch it
+because it asserted only that both typedefs were present. Five tests pin it (forward reference, `ref` field,
 independent structs keeping source order, cycle termination, enum before
 referring struct); the ordering assertions compare positions rather than
 asserting presence, because a presence-only test passes in exactly the
