@@ -20,8 +20,10 @@
 #
 # Usage: tools/sweep-backends.sh [tree]   (default: this checkout)
 #
-# RESULT ON 2026-09-08 at 8eb1a21, 78 programs probed and 5 reported: no new
-# defect. Everything it
+# RESULT ON 2026-09-15 (tree after 671d14d, with the value-position block rows
+# added the same day): 88 programs probed and 5 reported, the same five as
+# below. RESULT ON 2026-09-08 at 8eb1a21, 78 programs probed and 5 reported:
+# no new defect. Everything it
 # reported belonged to ONE disclosed gap, R10's unimplemented move-into-`arc`
 # in the front end, where `let arc x = <owned place>` and the assignment form
 # of the same are stopped only by a C type error. That negative result is the
@@ -75,6 +77,20 @@ for ty in String "[Int]" "Int?"; do
     probe "field of $ty" "pub struct B { f: $ty }
 pub fn f(owned b: B) -> Int { return 1 }"
 done
+# A VALUE-position block whose tail is a block-local. Added 2026-09-15 after
+# `let arc r = { let arc a = "x" \n a }` passed `cell check` and emitted an
+# `int64_t r` that cc refused: no row above contains a block used as a value.
+for mode in owned arc copy; do
+    for ty in String "[Int]" Int; do
+        probe "value block tail $mode $ty" "pub fn mk() -> $ty;
+pub fn f() -> Int { let $mode x: $ty = { let $mode t = mk()
+  t }
+  return 1 }"
+    done
+done
+probe "value block tail arc literal" "pub fn f() -> Int { let arc x = { let arc t = \"v\"
+  t }
+  return 1 }"
 
 echo "---"
 echo "$n programs probed, $issues issue(s)"

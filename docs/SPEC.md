@@ -1227,7 +1227,12 @@ both arms into a temporary. Measured on `examples/control_flow.cell`.
 
 ### 6.10 Block expressions
 
-**Status: implemented (parse and emit).**
+**Status: implemented (parse, typecheck, and emit; typecheck since 2026-09-15).**
+A block's type is its last statement's expression type when that statement is
+an expression, else unit; the typechecker typed every block as unit until
+2026-09-15, which let `let arc r = { let arc a = "x" \n a }` through to C that
+did not compile. Codegen's inference sees a block's own `let`s since the same
+day (`pushScratchLocal` in `codegen.zig`).
 
 A brace-delimited block is a primary expression, so `{ ... }` may appear
 wherever an expression may. `Expr.block` carries the statements. Codegen
@@ -1999,6 +2004,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | `if` as a value-producing expression | implemented |
 | Block expression parsing | implemented |
 | Block expression lowering | implemented |
+| Block expression typing (tail expression is the value; `if` branches must agree) | implemented 2026-09-15 |
 | Indexing `a[i]` | designed, not implemented |
 
 ### Statements

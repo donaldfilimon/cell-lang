@@ -1161,12 +1161,19 @@ the `leaks` count and the malloc counter's LIVE, with the other four fixtures
 unchanged. Safe against a loop body that moves an OUTER place because R2.a
 already refuses that program (the back edge would use it dead); an outer `arc`
 place is cloned into the body's local and the per-iteration drop releases that
-clone. **Residual, stated:** a local declared inside a VALUE-position block
-(`let r = { let arc a = ...; a }`) is still not released at that block's exit,
-and the same program is separately defective: `cell check` accepts it while
-typing the block as `()`, and the emitted C declares `int64_t r` and assigns
-the arc into it, which `cc` refuses. Both are pinned by tests in `codegen.zig`
-rather than left as prose.
+clone. **Residual, stated and MEASURED:** a local declared inside a
+VALUE-position block (`let arc r = { let arc a = ...; a }`) is still not
+released at that block's exit: `examples/leaks/value_block_local.cell` reads
+**3000 leaks over 1000 iterations** on both witnesses and the gate pins it.
+That program became expressible on 2026-09-15 itself: until then the
+typechecker typed every block as `()` (so the typed form was refused) and
+codegen's inference could not see the block's own `let`, so the untyped form
+emitted `int64_t r` and did not compile; both are fixed the same day and pinned
+by tests in `codegen.zig` and `typecheck.zig`. Only `arc` reaches this gap:
+the `owned` form, `let owned s = { let owned t = make() \n t }`, is refused by
+R10 ("cannot bind the unresolved name 't'"), because borrowck resolves a block
+tail after the block's scope has closed; that refusal is safe and is a
+separate scoping limitation.
 
 **A SIXTH gap existed and was never in this table. It is closed by REFUSAL, so
 it gets no fixture and changes no constant in the gate.** `let owned ys: [Int] =

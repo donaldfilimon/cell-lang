@@ -2543,6 +2543,22 @@ pub const Generator = struct {
             .list_lit => return CType.slice,
             .block => |stmts| {
                 if (stmts.len == 0) return CType.void_type;
+                // The tail may name a `let` the block itself declares, and
+                // inference runs BEFORE the block is emitted, so those names
+                // are not in `self.locals` yet: `let arc r = { let arc a =
+                // "x" \n a }` inferred `a` as unknown, fell to int64, and
+                // emitted an `int64_t r` that cc refused (found 2026-09-15).
+                // Scratch locals make them visible for the duration of this
+                // inference only; see `pushScratchLocal` for why they must
+                // not go through `pushLocal`.
+                const mark = self.locals.items.len;
+                defer self.locals.shrinkRetainingCapacity(mark);
+                for (stmts[0 .. stmts.len - 1]) |s| {
+                    switch (s.kind) {
+                        .let => |l| try self.pushScratchLocal(l.name, try self.letType(l.ty, l.value, l.ownership), l.ownership),
+                        else => {},
+                    }
+                }
                 const last = stmts[stmts.len - 1];
                 return switch (last.kind) {
                     .expr => |le| try self.inferExpr(&le),
@@ -2644,6 +2660,26 @@ pub const Generator = struct {
             if (eq(v, field)) return def.name;
         }
         return null;
+    }
+
+    /// An INFERENCE-ONLY local: visible to `lookupLocal` while an enclosing
+    /// `inferExpr` runs, and gone (shrunk back by that caller's `defer`)
+    /// before any emission. It deliberately bypasses `pushLocal`, because
+    /// `pushLocal` advances `next_binding_id`, which must move only at the
+    /// three points that mirror borrowck's `declare` (module doc comment);
+    /// advancing it during inference would drift every later binding's id,
+    /// and `pendingDrops` would then be asking `wasMoved` about the wrong
+    /// place. `droppable` is false so that even if one of these outlived its
+    /// inference, no drop could be spelled for it.
+    fn pushScratchLocal(self: *Generator, name: []const u8, ty: CType, ownership: ast.Ownership) Alloc!void {
+        try self.locals.append(self.arena, .{
+            .name = name,
+            .ty = ty,
+            .ownership = ownership,
+            .id = 0,
+            .droppable = false,
+            .is_param = false,
+        });
     }
 
     fn lookupLocal(self: *Generator, name: []const u8) ?CType {
@@ -4679,16 +4715,13 @@ test "a local declared in a VALUE-position block is still not released: pinned r
     // `emitValueInto` owns value-position blocks and does not release
     // their locals, because the block's value may be that very place. When
     // block-scoped release reaches value position, this test should flip to
-    // expecting the drop, not be deleted.
+    // expecting the drop, not be deleted. examples/leaks/value_block_local.cell
+    // measures this residual (3000 over 1000 iterations) and the gate pins it.
     //
-    // Found while writing it, and NOT fixed here: this program passes
-    // `cell check` (the typechecker gives a block expression the type `()`,
-    // so the untyped `let` accepts it) and the emitted C declares
-    // `int64_t r` and assigns `cell_arc_t a` into it, which `cc` refuses. A
-    // block's tail expression is not typed as the block's value anywhere. A
-    // `cell check`-accepted program whose C does not compile is the class
-    // tools/sweep-backends.sh hunts, and its probes contain no value-position
-    // block, which is why it never reported this one.
+    // History: until 2026-09-15 this program emitted `int64_t r = ({` and did
+    // not compile, because `inferExpr` could not see the block's own `let`
+    // when `letType` asked (the block had not been emitted yet). Now the
+    // destination is typed and the tail is cloned into it.
     var e = try emitSource(
         \\pub fn f() {
         \\  let arc r = {
@@ -4699,10 +4732,34 @@ test "a local declared in a VALUE-position block is still not released: pinned r
     );
     defer e.deinit();
     try expectAbsent(e.text, "cell_arc_drop(a);");
-    // The uncompilable emission is pinned too, so the day a block's tail is
-    // typed as its value this line fails and the residual above is re-read
-    // rather than silently outliving the defect that justified it.
-    try expectContains(e.text, "int64_t r = ({");
+    try expectContains(e.text, "cell_arc_t r = ({");
+    try expectContains(e.text, "_cell_t0 = cell_arc_clone(a);");
+    try expectContains(e.text, "cell_arc_drop(r);");
+}
+
+test "a value-position block's tail resolves through a nested block, and later bindings keep their ids" {
+    // Two things at once. The nested block: inference has to push the outer
+    // block's `let` as scratch and recurse for the inner one. The id
+    // agreement: scratch locals bypass `pushLocal`, so `next_binding_id`
+    // must not move during inference; if it drifted, `z` would no longer
+    // match borrowck's name for its id, `pushLocal` would clear `droppable`,
+    // and `z`'s drop would vanish.
+    var e = try emitSource(
+        \\pub fn f() {
+        \\  let arc r = {
+        \\    let arc a = "outer"
+        \\    {
+        \\      let arc b = a
+        \\      b
+        \\    }
+        \\  }
+        \\  let arc z = "after"
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_arc_t r = ({");
+    try expectContains(e.text, "cell_arc_drop(z);");
+    try expectContains(e.text, "cell_arc_drop(r);");
 }
 
 test "a shared or copy local is never dropped" {

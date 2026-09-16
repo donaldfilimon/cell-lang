@@ -1,7 +1,7 @@
 # `examples/leaks/`
 
-Five fixtures, one per measurable gap in `docs/OWNERSHIP.md` R11's "Still
-broken" table. Each isolates exactly one disclosed `arc` retain/release gap
+Six fixtures, one per measurable gap in `docs/OWNERSHIP.md` R11's "Still
+broken" table and its CLOSED paragraph (five until 2026-09-15). Each isolates exactly one disclosed `arc` retain/release gap
 and loops it 1000 times so a leak is a stable count, not noise.
 
 **These programs assert leaks that currently exist.** That is deliberate:
@@ -28,6 +28,7 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `unbound_shared_temp.cell` | 3: an unbound `arc` temporary unboxed for a `shared` parameter |
 | `block_scoped_local.cell` | 4: a block-scoped `arc` local is never released; **CLOSED 2026-09-15**, kept and pinned at 0 |
 | `reassigned_var.cell` | 5: reassigning an `arc` `var` leaks the previous box |
+| `value_block_local.cell` | the residual of row 4's closure: an `arc` local declared in a VALUE-position block is not released at that block's exit (measurable since 2026-09-15, when a block began to type as its tail) |
 
 R11's sixth disclosed gap (an `owned` String or list place bound as `arc`) is
 not a runtime leak at all: it is refused as a C type error at compile time, so

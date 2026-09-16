@@ -34,13 +34,15 @@
 #                       runtime, RUN, and its answer checked. Every backend
 #                       defect found in this repo that mattered was invisible
 #                       in the IR and visible only here.
-#   7. leaks            docs/OWNERSHIP.md R11's "Still broken" table discloses
-#                       six `arc` retain/release gaps and MEASURES five of
+#   7. leaks            docs/OWNERSHIP.md R11's "Still broken" table disclosed
+#                       six `arc` retain/release gaps and MEASURED five of
 #                       them with `leaks`, in prose that lived nowhere as a
 #                       file: nobody could re-run a single one of those
 #                       numbers, or tell whether a change moved them.
 #                       examples/leaks/*.cell isolates each measurable gap in
-#                       its own program. THESE FIXTURES ASSERT LEAKS THAT
+#                       its own program (six fixtures since 2026-09-15: the
+#                       value-position block residual joined the five, and
+#                       two of the six are closed and pinned at 0). THESE FIXTURES ASSERT LEAKS THAT
 #                       CURRENTLY EXIST, ON PURPOSE: that is the entire value.
 #                       A later change that closes one of R11's gaps makes a
 #                       pinned number here go DOWN, which is visible instead
@@ -295,6 +297,13 @@ LEAK_UNBOUND_SHARED_TEMP=0
 LEAK_BLOCK_SCOPED_LOCAL=0
 # R11 row 5: reassigning an `arc` `var` leaks the previous box.
 LEAK_REASSIGNED_VAR=3000
+# The residual the 2026-09-15 block-scoped release left behind, measurable
+# only since the same day (typing a block by its tail made the program
+# expressible): an `arc` local declared inside a VALUE-position block is not
+# released at that block's exit. Measured 3 runs, both witnesses, on the
+# tree that added it. Not an OWNERSHIP.md "Still broken" row number; the
+# CLOSED paragraph under that table carries it.
+LEAK_VALUE_BLOCK_LOCAL=3000
 
 # ---- stage 10 disclosed signature disagreements, pinned by defect ---------
 # Each line is `<example key>:<function>:<leg>` naming a place where the C
@@ -774,6 +783,7 @@ else
     run_c_leaks unbound_shared_temp examples/arc_host.c "$LEAK_UNBOUND_SHARED_TEMP" "R11 row 3, CLOSED @ 460b9a3"
     run_c_leaks block_scoped_local "" "$LEAK_BLOCK_SCOPED_LOCAL" "R11 row 4, CLOSED 2026-09-15"
     run_c_leaks reassigned_var "" "$LEAK_REASSIGNED_VAR" "R11 row 5 @ ${LEAKS_MEASURED_AT}"
+    run_c_leaks value_block_local "" "$LEAK_VALUE_BLOCK_LOCAL" "R11 value-position block residual, pinned 2026-09-15"
 fi
 
 # ------------------------------------------- 8. cross-backend answer agreement --

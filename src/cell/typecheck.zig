@@ -369,10 +369,25 @@ pub const Checker = struct {
             .block => |stmts| {
                 self.pushScope();
                 defer self.popScope();
-                for (stmts) |*s| try self.checkStmt(s);
-                // A block has no trailing expression in this grammar, so its
-                // value is always unit.
-                return types.t_unit;
+                // CORRECTED 2026-09-15. This used to return unit with the
+                // comment "a block has no trailing expression in this
+                // grammar", which was false when written: SPEC.md 6.10 makes
+                // a block a primary expression, and codegen's `emitValueInto`
+                // yields the last statement's expression as the block's
+                // value. Typing every block as unit let `let arc r = { let arc
+                // a = "x" \n a }` through `cell check` and into C that did not
+                // compile. A block's type is its last statement's expression
+                // type when that statement is an expression, else unit.
+                if (stmts.len == 0) return types.t_unit;
+                for (stmts[0 .. stmts.len - 1]) |*s| try self.checkStmt(s);
+                const last = &stmts[stmts.len - 1];
+                switch (last.kind) {
+                    .expr => |*e| return try self.checkExpr(e),
+                    else => {
+                        try self.checkStmt(last);
+                        return types.t_unit;
+                    },
+                }
             },
 
             .if_expr => |*i| {
@@ -382,9 +397,23 @@ pub const Checker = struct {
                         try self.typeName(cond),
                     });
                 }
-                _ = try self.checkExpr(i.then_body);
-                if (i.else_body) |e| _ = try self.checkExpr(e);
-                // Both branches are blocks, so both are unit.
+                // Both branches are blocks, and since 2026-09-15 a block
+                // types as its tail expression, so an `if` with an `else`
+                // types as its branches do, following `match`'s precedent
+                // for arms: disagreement is an error here rather than a C
+                // error downstream. Without an `else` the value is unit.
+                const then_ty = try self.checkExpr(i.then_body);
+                if (i.else_body) |e| {
+                    const else_ty = try self.checkExpr(e);
+                    if (!types.compatible(then_ty, else_ty)) {
+                        try self.errf(e.span, "if branches have types {s} and {s}", .{
+                            try self.typeName(then_ty),
+                            try self.typeName(else_ty),
+                        });
+                        return types.t_unknown;
+                    }
+                    return then_ty;
+                }
                 return types.t_unit;
             },
 
@@ -1224,6 +1253,57 @@ test "a binding declared in a block is not visible after it" {
     );
     try t.expectCount(1);
     try t.expectDiag(0, .err, 3, 22, "unknown identifier 'inner'");
+}
+
+test "a block types as its tail expression, so it can initialize a typed binding" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn mk() -> String;
+        \\pub fn f() {
+        \\    let owned x: String = { mk() }
+        \\    let owned y: String = { let owned inner = mk()
+        \\        inner }
+        \\}
+    );
+    try t.expectClean();
+}
+
+test "a block whose tail does not match the annotation is reported, not typed as unit" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn mk() -> String;
+        \\pub fn f() {
+        \\    let copy x: Int = { mk() }
+        \\}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 3, 23, "cannot initialize a binding of type Int with a value of type String");
+}
+
+test "a block whose last statement is not an expression is unit" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f() {
+        \\    let copy x: Int = { let copy y = 1 }
+        \\}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 2, 23, "cannot initialize a binding of type Int with a value of type ()");
+}
+
+test "an if whose branches disagree is reported at the else branch" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f(copy c: Bool) {
+        \\    let copy x: Int = if c { 1 } else { "s" }
+        \\}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 2, 39, "if branches have types Int and String");
 }
 
 test "a function may call one declared later in the file" {

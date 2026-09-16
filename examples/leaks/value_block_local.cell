@@ -1,0 +1,39 @@
+// R11 residual left by the 2026-09-15 block-scoped release: an `arc` local
+// declared inside a VALUE-position block (a block used as an expression) is
+// not released at that block's exit. `emitValueInto` owns those blocks and
+// keeps its own mark without emitting drops, because the block's value may be
+// the very local, and whether releasing it after the conversion into the
+// destination is balanced depends on whether borrowck marks it moved into
+// the destination, which it does not (an `arc` place is never made dead,
+// R10 by design). So `a` is boxed, `r` receives a clone of it, `r` is
+// released at the end of the `while` body (block-scoped release), and `a`'s
+// own reference is never released: one box leaks per iteration.
+//
+// This program could not be written before 2026-09-15: the typed form was
+// refused (the typechecker typed every block as unit) and the untyped form
+// emitted `int64_t r` and did not compile. Typing a block by its tail
+// expression made it expressible, and the leaks README's rule is one fixture
+// per measurable gap, so this pins it the day it became measurable.
+//
+// The `owned` form of the same program, `let owned s = { let owned t =
+// make() \n t }`, is refused by R10 ("cannot bind the unresolved name 't'"),
+// so `arc` is the only owning shape that reaches this gap today.
+//
+// Status: parses, passes `cell check`. LLVM and MLIR refuse it (arc is
+// scalar-first-refused there, same as examples/arc.cell). Lives under
+// examples/leaks/ so it is invisible to the top-level corpus loops (see
+// examples/leaks/README.md).
+
+pub fn print_int(copy value: Int);
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        let arc r = {
+            let arc a = "leaked-value-block"
+            a
+        }
+        i = i + 1
+    }
+    print_int(i)
+}
