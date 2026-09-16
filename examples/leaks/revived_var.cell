@@ -14,11 +14,11 @@
 // walked (`Checker.exit_liveness`), and codegen releases a moved var at
 // exactly the exits borrowck vouches for.
 //
-// NOT covered, by design: a var moved on one branch and revived on only one
-// (dead after the merge), a var declared outside a `while` and moved inside
-// it (a `break` or the back edge can skip the revival), the `break` and
-// `continue` drop points, a value block's tail, and a record var. Those keep
-// the leak rather than risk a double free.
+// NOT covered, by design: a var declared outside a `while` and moved
+// inside it, a field moved on only one branch, and a partly moved field.
+// Those keep the leak rather than risk a double free. The four residuals
+// this header used to name (one-branch, jump, value-block tail, record
+// revival) closed 2026-09-16; see OWNERSHIP.md R16.
 //
 // Status: parses, passes `cell check`. LLVM and MLIR refuse it; lives under
 // examples/leaks/ so it is invisible to the top-level corpus, agreement and

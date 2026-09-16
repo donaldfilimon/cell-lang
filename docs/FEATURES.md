@@ -4,7 +4,7 @@ This is the current-status entry point. SPEC.md defines intended semantics;
 OWNERSHIP.md defines ownership rules and retains historical defect evidence.
 Their dated snapshot tables are not current qualification results.
 
-Source inspected: compiler revision `584162a`, 2026-09-08. This matrix records
+Source inspected: compiler revision `90074bf`, 2026-09-16. This matrix records
 static source and fixture evidence, not freshly qualified execution. No row is
 release-qualified on macOS, Linux or Windows. Gate reports qualify particular
 revisions and cases, not every possible program using a feature.
@@ -52,11 +52,15 @@ operation on the named type. M1-M10 refer to the approved completion program.
 
 ## Future fixture ownership
 
-All current `examples/future/*.cell` files remain rejection contracts until
-their implementation lands: `generics.cell`, `result.cell`, `enum_payload.cell`
-and `optional_list.cell` belong to M6; `unit_type.cell` belongs to M5.
-[optional_list.cell](../examples/future/optional_list.cell) specifically records
-optional-list type syntax rather than complete optional runtime semantics.
+All current `examples/future/*.cell` files remain rejection contracts.
+`generics.cell`, `enum_payload.cell` and `optional_list.cell` wait on their
+features and belong to M6; `unit_type.cell` belongs to M5. `result.cell`
+stays in `future/` because it `return`s a `String` where
+`Result<String, Int>` is declared, not because construction is missing:
+`Ok`/`Err` exist and [results.cell](../examples/results.cell) is the
+accepted contract. [optional_list.cell](../examples/future/optional_list.cell)
+specifically records optional-list type syntax rather than complete optional
+runtime semantics.
 
 When a feature lands, update its row and move its future fixture into an
 accepted contract with explicit execution/ownership expectations. Never change

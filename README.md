@@ -181,8 +181,9 @@ therefore stays `ineligible`, which rejects, and rejecting is safe. The list
 even contradicted itself, since the paragraph below names R2.a as a rule that
 loops brought in. Cite the header; do not copy it.
 
-Still designed and not implemented: generics, `Result<T,E>`, and enum
-payloads. `.cell`/`.cel` modules pair with
+Still designed and not implemented: generics and enum payloads. Scalar
+`Result<T, E>` constructs and matches in C (`examples/results.cell`);
+LLVM and MLIR refuse those programs. `.cell`/`.cel` modules pair with
 `.body`/`.bod` by stem. See `docs/SPEC.md` section 12 and `docs/OWNERSHIP.md`.
 
 **Loops exist.** `while` is a keyword, with `break` and `continue`; the retained
@@ -200,11 +201,13 @@ enforces.
 ## Checking any of this yourself
 
 `tools/check.sh` is the local compiler gate and its exit code is the verdict.
-Its twelve stages cover build, unit tests, corpus contracts, backend acceptance
+Its fourteen stages cover build, unit tests, corpus contracts, backend acceptance
 agreement, MLIR lowering, execution, disclosed leak fixtures, backend answers,
 AddressSanitizer execution, declared ABI signatures, rule-list agreement
-with `src/cell/borrowck.zig`'s header, and `cell build`/`cell run` through
-the embedded runtime. Signature-only
+with `src/cell/borrowck.zig`'s header, `cell build`/`cell run` through
+the embedded runtime, prelude signatures (stage 13: emitted prototypes match
+`runtime/cell_rt.h`), and `cell test` (stage 14: a directory of programs
+through the run recipe). Signature-only
 fixtures participate in lowering validation. A clean gate can retain explicitly
 pinned defects; those disclosures are separate from release qualification.
 

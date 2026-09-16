@@ -171,9 +171,11 @@ Run it rather than trusting a number here, including this paragraph's.
 `if` / `match` / blocks / struct and list literals lower to C, not placeholder
 comments.
 
-Still not implemented: loops other than `while`, generics, `Result<T,E>`, enum
-payloads, and hex / underscore / exponent literals. `arc` retain/release is
-implemented in the C backend, with the gaps `docs/OWNERSHIP.md` R11 names.
+Still not implemented: loops other than `while`, generics, enum
+payloads, and hex / underscore / exponent literals. Scalar `Result<T, E>`
+constructs and matches in C; LLVM and MLIR refuse those programs. `arc`
+retain/release is implemented in the C backend, with the gaps
+`docs/OWNERSHIP.md` R11 names.
 Stem pairing and `while`/`break`/`continue` are implemented; `for` and `loop`
 are not.
 
@@ -230,7 +232,7 @@ the `docs/SPEC.md` section that specifies it.
 
 | File | Missing feature |
 |---|---|
-| `result.cell` | constructing a `Result<T, E>` (the type itself parses and checks since 2026-09-16, so this file now fails at the checker, not the parser) |
+| `result.cell` | returning a `String` where `Result<String, Int>` is declared (`Ok`/`Err` exist; this file is still a type error) |
 | `generics.cell` | type parameters on functions |
 | `enum_payload.cell` | enum variants carrying data |
 | `optional_list.cell` | `[T]?` and nested optionals |

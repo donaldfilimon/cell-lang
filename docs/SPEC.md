@@ -48,20 +48,23 @@ and not lowered by codegen**. Those are tagged **parsed, not enforced** with
 the reason stated. `if` and `match` used to be in that column (`/*if*/` /
 `/*match*/` placeholders); they now lower to C (section 0.6). Call-site
 ownership prefixes have left that column too (section 0.7). The remaining
-parser-only cases include `T?`, `[T]` as a type, and `use`.
+parser-only cases include `use`. `T?` and `[T]` as types are checked and
+lowered (sections 3.2 and 3.3); `[T]?` still does not parse.
 
 ### 0.2 Status summary
 
 | Status | Constructs |
 |---|---|
-| implemented | 97 |
+| implemented | 106 |
 | partially implemented | 2 |
-| parsed, not enforced | 5 |
-| designed, not implemented | 49 |
-| **total** | **153** |
+| parsed, not enforced | 3 |
+| designed, not implemented | 44 |
+| **total** | **155** |
 
-Counted from the section 12 index on 2026-09-08, not estimated. Recounted the
-same day when R2.b added an `implemented` row, 96 to 97 and 152 to 153; the
+Counted from the section 12 index on 2026-09-08, not estimated. Recounted
+2026-09-16 after optional/Result/list rows left the parser-only and
+designed buckets (97/5/49/153 to 106/3/44/155). On 2026-09-08, when R2.b
+added an `implemented` row, 96 to 97 and 152 to 153; the
 awk command below reports the long qualified statuses as their own buckets, so
 fold every string that STARTS with a status word into that status before
 totalling, and note that BSD `sed` does not take `\|` as alternation, which
@@ -239,8 +242,8 @@ ownership model and the C ABI are not up for negotiation. What has landed:
 | `const Foo = struct { }` | A second item grammar for a meaning the existing one already expresses. The genuinely missing feature underneath it, a top-level `const` value binding, is worth having on its own and is not this. |
 | macros | The other implementation states outright that its expander is not hygienic. A construct that can invisibly introduce a binding can silently change which place a move kills, and the diagnostic would point into expanded source. That is not deferrable in a language whose claim is that ownership is checkable. |
 | `.bod` as a package manifest | Section 1.2 is normative: `.bod` is a body file. See below. |
-| error unions, `!T` and `E!T` | A second spelling of `Result<T, E>` (section 3.4). The other implementation lowers an error union to a tagged `{ok, code, value}` struct; `runtime/cell_rt.h` already defines `cell_result_t { bool ok; int32_t error_code; cell_value_t value; }` for `Result`, the same three fields and the same choice to narrow the error to an integer code. Admitting both is a pure synonym, refused on the `i32`/`f64` grounds above. The real gap was that `Result<T, E>` did not parse (FEATURES TYPE-06); it parses since 2026-09-16, and construction is the gap now. |
-| postfix `?` on an expression, for error propagation | Postfix `?` already means optional in a type (section 3.2, `T?`). Different positions, so a parser could tell them apart, but one glyph would carry two unrelated meanings. Whether Cell wants propagation at all is a separate question, and it cannot be asked usefully until `Result` parses. |
+| error unions, `!T` and `E!T` | A second spelling of `Result<T, E>` (section 3.4). The other implementation lowers an error union to a tagged `{ok, code, value}` struct; `runtime/cell_rt.h` already defines `cell_result_t { bool ok; int32_t error_code; cell_value_t value; }` for `Result`, the same three fields and the same choice to narrow the error to an integer code. Admitting both is a pure synonym, refused on the `i32`/`f64` grounds above. `Result<T, E>` parses and constructs since 2026-09-16 (`Ok`/`Err`, C backend; FEATURES TYPE-06). |
+| postfix `?` on an expression, for error propagation | Postfix `?` already means optional in a type (section 3.2, `T?`). Different positions, so a parser could tell them apart, but one glyph would carry two unrelated meanings. Whether Cell wants propagation at all is a separate question; `Result` already parses and constructs, so the remaining question is whether a second glyph should mean `match` on `Err`. |
 
 **The `.bod` collision, stated normatively.** Another implementation reads
 `.bod` as a package manifest. This specification does not, and a conforming
@@ -255,7 +258,7 @@ the other implementation are neither admitted nor refused yet:
   refuse.** In the other tree `raise` transfers to the immediately enclosing
   `handle` and `propagate` passes the error to the caller, so this is local
   control flow over an error value, not unwinding. It is still sugar over
-  `match` on a `Result`, whose base does not exist yet; its `handle` arms use
+  `match` on a `Result`; its `handle` arms use
   `|e|` captures, which the `switch` row above already refused; and its
   `raise` edge is a new CFG edge that the drop pass and borrowck would have to
   model, which this delta admits only on evidence. `match` on a `Result`
@@ -267,10 +270,10 @@ the other implementation are neither admitted nor refused yet:
   `.bod` or `.body` extensions, per section 1.2.
 
 Every item in this ruling either depends on `Result<T, E>` or is moot without
-it, so parsing `Result<T, E>` (TYPE-06) is the next implementation slice here,
-and the only one that is not a decision. **It landed 2026-09-16** (section 3.4);
-constructing and inspecting a `Result` in Cell source is the slice after it,
-and it needs syntax this specification has not designed yet.
+it. Parsing `Result<T, E>` (TYPE-06) landed 2026-09-16 (section 3.4), and so
+did constructing and inspecting a scalar Result in Cell source (`Ok`/`Err`
+and wrap patterns, C backend). What remains designed is a second spelling
+(`!T`), expression-position `?` propagation, and `error_scope`/`handle`.
 
 **Union stage 4 landed too, and it is the one that changed the language rather
 than its surface: Cell has loops.** `while`, `break` and `continue` are
@@ -2023,12 +2026,12 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | The 11 primitives and their C mapping | implemented |
 | Unknown type name rejection | implemented |
 | Additional integer widths (`Int8`, `UInt32`, ...) | designed, not implemented |
-| `T?` optional syntax | parsed, not enforced |
-| Optional lowering to the tagged struct | designed, not implemented |
+| `T?` optional syntax | implemented (scalar payloads typechecked; `[T]?` and `T??` still do not parse) |
+| Optional lowering to the tagged struct | implemented (scalar payloads, C backend; LLVM/MLIR refuse constructors and patterns) |
 | Optional construction and unwrapping | implemented (scalar payloads, C backend; LLVM/MLIR refuse) |
 | `[T]?` | designed, not implemented |
-| `[T]` list syntax | parsed, not enforced |
-| List lowering to `cell_slice_t` | designed, not implemented |
+| `[T]` list syntax | implemented as a type (no indexing; see 3.3) |
+| List lowering to `cell_slice_t` | implemented (C backend; LLVM/MLIR lower exclusive list parameters) |
 | `Result<T, E>` | implemented (scalar payloads, C backend; LLVM/MLIR refuse) |
 | Generic types | designed, not implemented |
 | Unit type `()` in type position | designed, not implemented |
@@ -2144,6 +2147,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Binding pattern | implemented |
 | Enum variant pattern, bare and qualified | implemented |
 | Literal patterns, including negative numbers | implemented |
+| Wrap patterns `Some`/`None`/`Ok`/`Err` | implemented (scalar payloads, C backend; LLVM/MLIR refuse) |
 | Uppercase-first variant heuristic replaced by resolution | designed, not implemented |
 | Payload, struct, tuple and slice patterns | designed, not implemented |
 | Or-patterns and guards | designed, not implemented |
@@ -2165,7 +2169,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Ownership lowering at the boundary | implemented for all five modes in the C backend (see 10.4) |
 | `const` for `shared` aggregates | implemented |
 | `arc` as `cell_arc_t` | implemented in the C backend, in every position including an un-annotated `let` |
-| `cell_result_t` emission | designed, not implemented |
+| `cell_result_t` emission | implemented (C backend; LLVM/MLIR refuse Result) |
 | Return-value mapping | implemented |
 | Emitted C compiles for declaration-only files | implemented |
 | Emitted C compiles for hello / control_flow / ownership | implemented |
