@@ -122,20 +122,26 @@ pub const Checker = struct {
             }
         }
 
-        // Signatures are resolved only after every named type is registered, so
-        // a function may take a struct declared below it.
+        // Signatures and field types are resolved only after every named type
+        // is registered, so a function may take a struct declared below it and
+        // `struct A { b: B }` may mention `B` before `B` is written.
         for (items) |*item| {
             switch (item.kind) {
                 .fn_def => |f| {
                     const params = try self.arena().alloc(Type, f.params.len);
-                    for (f.params, 0..) |p, i| params[i] = try self.resolveType(&p.ty);
+                    for (f.params, 0..) |p, i| params[i] = try self.resolveType(&p.ty, item.span);
                     const ret = try self.arena().create(Type);
-                    ret.* = if (f.return_type) |rt| try self.resolveType(&rt) else types.t_unit;
+                    ret.* = if (f.return_type) |rt| try self.resolveType(&rt, item.span) else types.t_unit;
                     try self.declare(item.span, f.name, .{
                         .ownership = .copy,
                         .mutable = false,
                         .ty = .{ .func = .{ .params = params, .ret = ret } },
                     });
+                },
+                .struct_def => |s| {
+                    for (s.fields) |field| {
+                        _ = try self.resolveType(&field.ty, item.span);
+                    }
                 },
                 else => {},
             }
@@ -152,7 +158,18 @@ pub const Checker = struct {
     fn checkFn(self: *Checker, span: ast.Span, f: *const ast.FnDef) CheckError!void {
         const saved_return = self.fn_return;
         defer self.fn_return = saved_return;
-        self.fn_return = if (f.return_type) |rt| try self.resolveType(&rt) else types.t_unit;
+
+        // Signatures were resolved in collectItems. Reuse them so an unknown
+        // parameter or return type is reported once, not once per pass.
+        const fn_ty = if (self.lookup(f.name)) |sym| sym.ty else types.t_unknown;
+        const param_tys: []const Type = switch (fn_ty) {
+            .func => |func| func.params,
+            else => &.{},
+        };
+        self.fn_return = switch (fn_ty) {
+            .func => |func| func.ret.*,
+            else => if (f.return_type) |rt| try self.resolveType(&rt, span) else types.t_unit,
+        };
 
         self.pushScope();
         defer self.popScope();
@@ -160,11 +177,12 @@ pub const Checker = struct {
         // Parameters share the function scope with the body's own bindings, so
         // a `let` reusing a parameter name is a duplicate rather than a shadow.
         // A signature and its body are one lexical region here.
-        for (f.params) |p| {
+        for (f.params, 0..) |p, i| {
+            const ty = if (i < param_tys.len) param_tys[i] else try self.resolveType(&p.ty, span);
             try self.declare(span, p.name, .{
                 .ownership = p.ownership,
                 .mutable = p.ownership == .exclusive or p.ownership == .owned,
-                .ty = try self.resolveType(&p.ty),
+                .ty = ty,
             });
         }
 
@@ -210,7 +228,7 @@ pub const Checker = struct {
                 }
             },
             .let => |*l| {
-                const annotated: ?Type = if (l.ty) |t| try self.resolveType(&t) else null;
+                const annotated: ?Type = if (l.ty) |t| try self.resolveType(&t, stmt.span) else null;
                 var bound: Type = annotated orelse types.t_unknown;
                 if (annotated == null) {
                     if (l.value) |*v| {
@@ -688,7 +706,7 @@ pub const Checker = struct {
         };
         const def = self.structs.get(struct_name) orelse return types.t_unknown;
         for (def.fields) |field| {
-            if (std.mem.eql(u8, field.name, f.name)) return try self.resolveType(&field.ty);
+            if (std.mem.eql(u8, field.name, f.name)) return try self.resolveTypeQuiet(&field.ty);
         }
         try self.errf(span, "struct '{s}' has no field '{s}'", .{ struct_name, f.name });
         return types.t_unknown;
@@ -707,7 +725,7 @@ pub const Checker = struct {
             for (def.fields) |field| {
                 if (!std.mem.eql(u8, field.name, fi.name)) continue;
                 found = true;
-                const want = try self.resolveType(&field.ty);
+                const want = try self.resolveTypeQuiet(&field.ty);
                 if (!accepts(want, actual, &fi.value)) {
                     try self.errf(fi.span, "field '{s}' has type {s}, expected {s}", .{
                         fi.name,
@@ -817,37 +835,55 @@ pub const Checker = struct {
 
     // -- types --------------------------------------------------------------
 
-    /// Lower a syntactic type to a semantic one. An unrecognized name becomes
-    /// `unknown` with no diagnostic: reporting it would be a new check on a
-    /// grammar where `codegen.mapPrimitive` already accepts any name and maps
-    /// it to `void*`, and every use of such a value would then error twice.
-    fn resolveType(self: *Checker, te: *const ast.TypeExpr) CheckError!Type {
+    /// Lower a syntactic type to a semantic one. A name is a type iff it is a
+    /// primitive, a declared struct, a declared enum, or a constructed type
+    /// already implemented (`T?`, `Result<T, E>`, `[T]`). Anything else is
+    /// refused at `span` and becomes `unknown`, so later uses of the value do
+    /// not cascade a second diagnostic.
+    fn resolveType(self: *Checker, te: *const ast.TypeExpr, span: ast.Span) CheckError!Type {
+        return self.resolveTypeInner(te, span, true);
+    }
+
+    /// Same lowering as `resolveType`, without a diagnostic. Field types are
+    /// already walked in `collectItems`; a use of the field only needs the
+    /// semantic type.
+    fn resolveTypeQuiet(self: *Checker, te: *const ast.TypeExpr) CheckError!Type {
+        return self.resolveTypeInner(te, ast.Span.none, false);
+    }
+
+    fn resolveTypeInner(
+        self: *Checker,
+        te: *const ast.TypeExpr,
+        span: ast.Span,
+        report: bool,
+    ) CheckError!Type {
         return switch (te.*) {
             .name => |n| blk: {
                 if (types.fromPrimitiveName(n)) |p| break :blk p;
                 if (self.structs.contains(n)) break :blk Type{ .struct_type = n };
                 if (self.enums.contains(n)) break :blk Type{ .enum_type = n };
+                if (report) try self.errf(span, "unknown type '{s}'", .{n});
                 break :blk types.t_unknown;
             },
             .optional => |inner| blk: {
                 const p = try self.arena().create(Type);
-                p.* = try self.resolveType(inner);
+                p.* = try self.resolveTypeInner(inner, span, report);
                 break :blk Type{ .optional = p };
             },
             .list => |inner| blk: {
                 const p = try self.arena().create(Type);
-                p.* = try self.resolveType(inner);
+                p.* = try self.resolveTypeInner(inner, span, report);
                 break :blk Type{ .list = p };
             },
             .result => |r| blk: {
                 const ok = try self.arena().create(Type);
-                ok.* = try self.resolveType(r.ok);
+                ok.* = try self.resolveTypeInner(r.ok, span, report);
                 const e = try self.arena().create(Type);
-                e.* = try self.resolveType(r.err);
+                e.* = try self.resolveTypeInner(r.err, span, report);
                 break :blk Type{ .result = .{ .ok = ok, .err = e } };
             },
             // Ownership is orthogonal to the type: `shared T` is a T.
-            .ref => |r| try self.resolveType(r.inner),
+            .ref => |r| try self.resolveTypeInner(r.inner, span, report),
             .unit => types.t_unit,
         };
     }
@@ -1622,4 +1658,73 @@ test "a list literal argument is type checked against the parameter" {
     );
     try t.expectCount(1);
     try t.expectDiag(0, .err, 3, 18, "argument 1 has type [Bool], expected [Byte]");
+}
+
+test "unknown type names are refused and a declared struct name is accepted" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn misspelled(shared s: Strng) -> Int;
+        \\pub fn no_such_width(shared v: UInt32) -> Int;
+        \\pub fn entirely_invented(shared v: Widget) -> Int;
+        \\pub struct Point {
+        \\    copy x: Int
+        \\}
+        \\pub fn takes_point(shared p: Point) -> Int;
+        \\pub fn takes_enum(copy c: Color) -> Int;
+        \\pub enum Color { Red }
+    );
+    try t.expectCount(3);
+    try t.expectDiag(0, .err, 1, 1, "unknown type 'Strng'");
+    try t.expectDiag(1, .err, 2, 1, "unknown type 'UInt32'");
+    try t.expectDiag(2, .err, 3, 1, "unknown type 'Widget'");
+    try std.testing.expect(t.checker.diagnostics.hasErrors());
+}
+
+test "an unknown name is refused inside T?, Result, a list, and a let" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn opt(copy v: Strng?) -> Int;
+        \\pub fn res(copy v: Result<UInt32, Int>) -> Int;
+        \\pub fn list(shared v: [Widget]) -> Int;
+        \\pub fn local() {
+        \\    let copy x: Missing = 1
+        \\}
+    );
+    try t.expectCount(4);
+    try t.expectDiag(0, .err, 1, 1, "unknown type 'Strng'");
+    try t.expectDiag(1, .err, 2, 1, "unknown type 'UInt32'");
+    try t.expectDiag(2, .err, 3, 1, "unknown type 'Widget'");
+    try t.expectDiag(3, .err, 5, 5, "unknown type 'Missing'");
+}
+
+test "an unknown field type is refused even when the field is unused" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub struct Box {
+        \\    copy x: Widget
+        \\}
+        \\pub fn f() {}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 1, 1, "unknown type 'Widget'");
+}
+
+test "a struct field may name a struct declared later in the file" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub struct A {
+        \\    copy b: B
+        \\}
+        \\pub struct B {
+        \\    copy x: Int
+        \\}
+        \\pub fn f(shared a: A) -> Int {
+        \\    return a.b.x
+        \\}
+    );
+    try t.expectClean();
 }

@@ -23,7 +23,7 @@ operation on the named type. M1-M10 refer to the approved completion program.
 | LEX-02 decimal literals and strings | partial | partial | partial | partial | Escape interpretation incomplete | [primitives](../examples/primitives.cell), [lexer](../src/cell/lexer.zig) | M5 |
 | LEX-03 radix/separator/exponent literals, Unicode names, advanced strings | absent | absent | absent | absent | n/a | [silent literals](../examples/rejected/silent_literals.cell) | M5 |
 | TYPE-01 primitive types and aliases | checked | lowered | lowered | lowered | Primitive modes pass by value | [types](../src/cell/types.zig), [primitives](../examples/primitives.cell) | M5 |
-| TYPE-02 unknown type rejection | absent | partial | refused | refused | Frontend can accept unresolved names | [unknown type](../examples/rejected/unknown_type.cell) | M2 |
+| TYPE-02 unknown type rejection | checked | partial | refused | refused | Unresolved names refused at typecheck (`unknown type 'Strng'`). C codegen still maps an unchecked name to `void*` | [unknown type](../examples/rejected/unknown_type.cell) | M2 |
 | TYPE-03 structs and payload-free enums | checked | lowered | partial | partial | Aggregate destruction incomplete | [structs/enums](../examples/structs_enums.cell) | M4/M6 |
 | TYPE-04 lists and optionals | checked | partial | partial | partial | Scalar `T?` constructs and matches in C (`Some`/`None`); LLVM/MLIR refuse those constructors. Lists still have no indexing | [optionals](../examples/optionals.cell), [primitives](../examples/primitives.cell) | M4/M6 |
 | TYPE-05 explicit unit type | absent | absent | absent | absent | Implicit function unit already exists | [unit type](../examples/future/unit_type.cell) | M5 |

@@ -1,18 +1,15 @@
-// EXPECT: currently-accepted
+// EXPECT: currently-rejected
 // Violates: docs/SPEC.md section 3.1 (unknown type name rejection).
 //
-// `mapPrimitive` knows exactly eleven names and falls through to `void*` for
-// everything else, with no diagnostic. So a misspelled `Strng`, an integer
-// width Cell does not have (`UInt32`), and a type that does not exist at all
-// are indistinguishable from a user struct. The mistake surfaces later as a C
-// error on the first field access, if at all.
+// Closed 2026-09-16 (TYPE-02). Typecheck refuses a name that is not a
+// primitive, a declared struct, a declared enum, or a constructed type
+// already implemented (`T?`, `Result<T, E>`, `[T]`). `Strng` is a misspelling,
+// `UInt32` is a width Cell does not have, and `Widget` does not exist; all
+// three are `unknown type`, not an ownership rule.
 //
-// `no_such_width` was spelled `copy v: UInt32` until R12's parameter clause
-// landed. That clause refuses a `copy` place whose resource shape cannot be
-// resolved, and an unknown type name resolves to exactly that, so the line
-// started reporting R12 instead of demonstrating TYPE-02. The keyword is
-// incidental to this file's subject, so it is now `shared` and the gap it
-// documents is unchanged: all three names below are still accepted as types.
+// `no_such_width` is spelled `shared`, not `copy`, so a regression that
+// started reporting R12 instead of TYPE-02 would still be visible: R12
+// refuses a `copy` place whose resource shape cannot be resolved.
 
 pub fn misspelled(shared s: Strng) -> Int;
 pub fn no_such_width(shared v: UInt32) -> Int;

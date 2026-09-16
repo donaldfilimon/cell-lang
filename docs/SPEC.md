@@ -678,11 +678,14 @@ backends REFUSE those same programs, because neither can call a `static
 inline` runtime helper, so the three backends disagree here by design rather
 than by accident.
 
-**Any other type name silently becomes `void*` with no diagnostic.** `Int8`,
-`UInt32`, `Char`, a misspelled `Strng`, and every user-defined struct or enum
-all map to `void*`. This is the single largest correctness hole in code
-generation: a typo in a type name is not an error, it is an opaque pointer, and
-the resulting C then fails on the first field access. Specified:
+**Any other type name is refused at typecheck** with `unknown type 'Strng'`.
+A name is a type iff it is one of the eleven primitives, a declared struct,
+a declared enum, or a constructed type already implemented (`T?`,
+`Result<T, E>`, `[T]`). Closed 2026-09-16 (TYPE-02);
+`examples/rejected/unknown_type.cell` is `currently-rejected`. Codegen still
+maps an unchecked unknown name to `void*` (`CType.unknown`); `cell check`
+and `cell emit` both run the checker first, so that path is not reachable
+from the CLI. Specified:
 
 > `error: unknown type 'Strng'`
 
@@ -2018,7 +2021,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Construct | Status |
 |---|---|
 | The 11 primitives and their C mapping | implemented |
-| Unknown type name rejection | designed, not implemented |
+| Unknown type name rejection | implemented |
 | Additional integer widths (`Int8`, `UInt32`, ...) | designed, not implemented |
 | `T?` optional syntax | parsed, not enforced |
 | Optional lowering to the tagged struct | designed, not implemented |
