@@ -65,10 +65,13 @@
 //! owning fields is never destroyed at all; `wasMoved` answers "moved
 //! ANYWHERE in the function", so a `var` that is moved and later reassigned
 //! (R3a revival) is never dropped either, even though it holds a fresh,
-//! unmoved value at the function's end -- the revived value leaks too, and
-//! (`emitAssign` releases an `owned` var's old value on a store borrowck
-//! vouches for since 2026-09-16, which covers the revived value's NEXT
-//! store but not the final value at scope end); and
+//! unmoved value at the function's end -- the revived value leaked too.
+//! Both halves are closed for the cases borrowck vouches for (2026-09-16):
+//! `emitAssign` releases an `owned` var's old value on a store from
+//! `assign_liveness`, and `pendingDropsSince` releases a revived var at a
+//! block end or `return` from `exit_liveness`; a `break`/`continue` exit, a
+//! value block's tail, a var moved inside a `while` and a revived record
+//! still leak; and
 //! a local declared inside a VALUE-position block (`emitValueInto`) is not
 //! released at that block's exit, because it may be the value flowing out.
 //! Why block-scoped release is safe for a local whose initializer moves an
@@ -180,7 +183,7 @@
 //! list PLACE bound as `arc` was not boxed at all, because
 //! `cell_arc_from_string` moves its argument while `borrowck.zig` left the
 //! source unmoved (boxed since 2026-09-16 at `let`, at a direct `-> arc`
-//! return and by assignment into a whole `arc` var, for a whole binding, which borrowck now moves; see
+//! return, by assignment into a whole `arc` var and as an `arc` call argument, for a whole binding, which borrowck now moves; see
 //! `isMovedOwnedBinding`). That list is what running programs
 //! has found, not a proof that nothing else dangles; `docs/OWNERSHIP.md` R11
 //! records exactly which positions the search covered, values as well as
@@ -702,7 +705,7 @@ pub const Generator = struct {
         for (body, 0..) |_, i| {
             try self.emitStmt(&body[i], body[i + 1 ..], 1);
         }
-        if (!endsInReturn(body)) try self.emitScopeDrops(1);
+        if (!endsInReturn(body)) try self.emitScopeDrops(1, blockExit(body));
         try out.writeAll("}\n\n");
         self.locals.clearRetainingCapacity();
     }
@@ -760,7 +763,7 @@ pub const Generator = struct {
         for (stmts, 0..) |_, i| {
             try self.emitStmt(&stmts[i], stmts[i + 1 ..], indent);
         }
-        if (!endsInJump(stmts)) try self.emitDropsSince(mark, indent);
+        if (!endsInJump(stmts)) try self.emitDropsSince(mark, indent, blockExit(stmts));
     }
 
     fn emitStmt(self: *Generator, stmt: *const ast.Stmt, rest: []const ast.Stmt, indent: usize) EmitError!void {
@@ -769,7 +772,7 @@ pub const Generator = struct {
             .while_stmt => |w| {
                 try self.writeIndent(indent);
                 try out.writeAll("while (");
-                try self.emitExpr(&w.cond, indent);
+                try self.emitCond(&w.cond, indent);
                 try out.writeAll(") {\n");
                 try self.loop_marks.append(self.arena, self.locals.items.len);
                 try self.emitStmts(w.body, indent + 4);
@@ -813,7 +816,7 @@ pub const Generator = struct {
                     try out.print("(void){s};\n", .{l.name});
                 }
             },
-            .return_stmt => |opt| try self.emitReturnStmt(opt, indent),
+            .return_stmt => |opt| try self.emitReturnStmt(opt, .{ .kind = .return_stmt, .key = @intFromPtr(stmt) }, indent),
             .expr => |e| switch (e.kind) {
                 .if_expr => |i| try self.emitIfStmt(i, indent),
                 .match_expr => |m| try self.emitMatchStmt(m, indent),
@@ -1163,8 +1166,8 @@ pub const Generator = struct {
     /// (`record` shape) is admitted by `needsDrop` exactly when it has drop
     /// glue (R11 row 2); a scalar-only struct is still excluded there, not by
     /// an ownership check, because a struct can be `owned` too.
-    fn pendingDrops(self: *Generator) Alloc![]const Local {
-        return self.pendingDropsSince(0);
+    fn pendingDrops(self: *Generator, exit: ?Exit) Alloc![]const Local {
+        return self.pendingDropsSince(0, exit);
     }
 
     /// `pendingDrops` restricted to the locals at index `mark` and above:
@@ -1172,7 +1175,12 @@ pub const Generator = struct {
     /// gate each one in, and `isShadowedAt` still looks at EVERY later
     /// binding, so a block-local shadowed by a later block-local is
     /// suppressed exactly as at function scope.
-    fn pendingDropsSince(self: *Generator, mark: usize) Alloc![]const Local {
+    ///
+    /// `exit` names the drop point as borrowck recorded it. A non-record
+    /// local that borrowck saw moved is still dropped when borrowck vouches
+    /// that it held a value at this exact exit (an R3a revival); a null exit,
+    /// or one borrowck did not record, keeps the old skip and its leak.
+    fn pendingDropsSince(self: *Generator, mark: usize, exit: ?Exit) Alloc![]const Local {
         const checker = self.checker orelse return &.{};
         var out: std.ArrayList(Local) = .empty;
         var i = self.locals.items.len;
@@ -1183,13 +1191,20 @@ pub const Generator = struct {
             if (!local.droppable) continue;
             if (local.ownership != .owned and local.ownership != .arc) continue;
             if (!try self.needsDrop(local.ty)) continue;
-            if (checker.wasWhollyMoved(local.id)) continue;
-            // A record with only FIELDS moved out is still partly live, and
-            // `emitDropFor` releases exactly its unmoved owning fields. Any
-            // other shape has no field path a move can take (a `copy`
-            // sub-place like `buf.len` never reaches `movePlace`'s record),
-            // so for it any recorded move is a whole move, as before.
-            if (checker.wasMoved(local.id) and local.ty.shape != .record) continue;
+            if (local.ty.shape == .record) {
+                // A record with only FIELDS moved out is still partly live,
+                // and `emitDropFor` releases exactly its unmoved owning
+                // fields. A revived record is not handled: `moved_paths` is
+                // permanent and the glue would not know which value is live.
+                if (checker.wasWhollyMoved(local.id)) continue;
+            } else if (checker.wasMoved(local.id)) {
+                // Any other shape has no field path a move can take (a `copy`
+                // sub-place like `buf.len` never reaches `movePlace`'s
+                // record), so any recorded move is a whole move. It is
+                // released only where borrowck says it was revived.
+                const e = exit orelse continue;
+                if (!checker.liveAtExit(e.kind, e.key, local.id)) continue;
+            }
             try out.append(self.arena, local);
         }
         return out.items;
@@ -1232,13 +1247,13 @@ pub const Generator = struct {
     /// statement-position scopes release their own locals through
     /// `emitDropsSince` at the end of `emitStmts`, so by the time this runs
     /// the function's top-level `let`s are the only ones still visible.
-    fn emitScopeDrops(self: *Generator, indent: usize) EmitError!void {
-        for (try self.pendingDrops()) |local| try self.emitDropFor(indent, local);
+    fn emitScopeDrops(self: *Generator, indent: usize, exit: ?Exit) EmitError!void {
+        for (try self.pendingDrops(exit)) |local| try self.emitDropFor(indent, local);
     }
 
     /// The block-scope drop point: the locals declared since `mark`.
-    fn emitDropsSince(self: *Generator, mark: usize, indent: usize) EmitError!void {
-        for (try self.pendingDropsSince(mark)) |local| try self.emitDropFor(indent, local);
+    fn emitDropsSince(self: *Generator, mark: usize, indent: usize, exit: ?Exit) EmitError!void {
+        for (try self.pendingDropsSince(mark, exit)) |local| try self.emitDropFor(indent, local);
     }
 
     /// The `break`/`continue` drop point: everything declared since the
@@ -1249,7 +1264,9 @@ pub const Generator = struct {
     fn emitLoopExitDrops(self: *Generator, indent: usize) EmitError!void {
         if (self.loop_marks.items.len == 0) return;
         const mark = self.loop_marks.items[self.loop_marks.items.len - 1];
-        try self.emitDropsSince(mark, indent);
+        // No exit key: borrowck's `exit_liveness` records no jump, so a
+        // revived var is not released here and leaks, as before.
+        try self.emitDropsSince(mark, indent, null);
     }
 
     /// The other drop point: before every `return`. When nothing needs
@@ -1268,9 +1285,9 @@ pub const Generator = struct {
     /// the return expression still needs. Emitting straight into `return
     /// <expr>;` and running drops after would be worse: unreachable code
     /// after a `return` never executes.
-    fn emitReturnStmt(self: *Generator, opt: ?ast.Expr, indent: usize) EmitError!void {
+    fn emitReturnStmt(self: *Generator, opt: ?ast.Expr, exit: Exit, indent: usize) EmitError!void {
         const out = self.writer;
-        const to_drop = try self.pendingDrops();
+        const to_drop = try self.pendingDrops(exit);
         const retain = if (opt) |v| try self.returnedArcNeedsRetain(&v) else false;
         if (to_drop.len == 0) {
             try self.writeIndent(indent);
@@ -1583,7 +1600,7 @@ pub const Generator = struct {
         const out = self.writer;
         try self.writeIndent(indent);
         try out.writeAll("if (");
-        try self.emitExpr(i.cond, indent);
+        try self.emitCond(i.cond, indent);
         try out.writeAll(") ");
         try self.emitBranchStmt(i.then_body, indent);
         if (i.else_body) |eb| {
@@ -1606,7 +1623,7 @@ pub const Generator = struct {
             },
             .if_expr => |i| {
                 try out.writeAll("if (");
-                try self.emitExpr(i.cond, indent);
+                try self.emitCond(i.cond, indent);
                 try out.writeAll(") ");
                 try self.emitBranchStmt(i.then_body, indent);
                 if (i.else_body) |eb| {
@@ -1672,12 +1689,12 @@ pub const Generator = struct {
             }
             if (isDefaultPattern(arm.pattern)) {
                 // The pattern matches everything, so the guard IS the test.
-                try self.emitExpr(arm.guard.?, indent + 1);
+                try self.emitCond(arm.guard.?, indent + 1);
             } else {
                 try self.emitPatternTest(arm.pattern, temp, scrut_ty);
                 if (arm.guard) |g| {
                     try out.writeAll(" && (");
-                    try self.emitExpr(g, indent + 1);
+                    try self.emitCond(g, indent + 1);
                     try out.writeAll(")");
                 }
             }
@@ -1905,7 +1922,9 @@ pub const Generator = struct {
             break :blk if (t.kind == .ident) t.kind.ident else null;
         };
         const reach = try self.tailReach(stmts, tail);
-        for (try self.pendingDropsSince(mark)) |local| {
+        // No exit key: the tail can move or read a local after the block's
+        // statements, which is not the state borrowck recorded at its end.
+        for (try self.pendingDropsSince(mark, null)) |local| {
             if (tail_ident) |n| {
                 if (eq(n, local.name) and local.ownership == .arc and dest.ty.shape == .arc) {
                     try self.emitDropFor(indent, local);
@@ -1980,7 +1999,7 @@ pub const Generator = struct {
                         },
                         else => {
                             try self.emitStmt(last, &.{}, indent + 1);
-                            if (!endsInJump(stmts)) try self.emitDropsSince(mark, indent + 1);
+                            if (!endsInJump(stmts)) try self.emitDropsSince(mark, indent + 1, blockExit(stmts));
                         },
                     }
                 }
@@ -1990,7 +2009,7 @@ pub const Generator = struct {
             .if_expr => |i| {
                 try self.writeIndent(indent);
                 try out.writeAll("if (");
-                try self.emitExpr(i.cond, indent);
+                try self.emitCond(i.cond, indent);
                 try out.writeAll(") {\n");
                 try self.emitValueInto(i.then_body, dest, indent + 1);
                 try self.writeIndent(indent);
@@ -2030,6 +2049,43 @@ pub const Generator = struct {
 
     // ── expressions ─────────────────────────────────────────────────────
 
+    /// A binary expression WITHOUT its enclosing parentheses. `emitExpr`
+    /// wraps it, which keeps every operand grouped as written; `emitCond`
+    /// does not, because the `if (...)`/`while (...)` syntax already groups
+    /// it, and `if ((a == 2))` is rejected under `-Werror` by clang's
+    /// `-Wparentheses-equality` (it reads as an intended assignment).
+    fn emitBinary(self: *Generator, b: anytype, indent: usize) EmitError!void {
+        const out = self.writer;
+        try self.emitExpr(b.left, indent);
+        try out.writeAll(switch (b.op) {
+            .add => " + ",
+            .sub => " - ",
+            .mul => " * ",
+            .div => " / ",
+            .eq => " == ",
+            .ne => " != ",
+            .lt => " < ",
+            .le => " <= ",
+            .gt => " > ",
+            .ge => " >= ",
+            .and_op => " && ",
+            .or_op => " || ",
+        });
+        try self.emitExpr(b.right, indent);
+    }
+
+    /// The expression inside an `if (...)`, `while (...)` or match-guard
+    /// `(...)` the caller has already opened. Only the top-level binary loses
+    /// its parentheses; its operands are still emitted by `emitExpr`.
+    fn emitCond(self: *Generator, e: *const ast.Expr, indent: usize) EmitError!void {
+        var c = e;
+        while (c.kind == .annotated) c = c.kind.annotated.value;
+        switch (c.kind) {
+            .binary => |b| try self.emitBinary(b, indent),
+            else => try self.emitExpr(e, indent),
+        }
+    }
+
     fn emitExpr(self: *Generator, e: *const ast.Expr, indent: usize) EmitError!void {
         const out = self.writer;
         switch (e.kind) {
@@ -2041,22 +2097,7 @@ pub const Generator = struct {
             .call => |c| try self.emitCall(c, indent),
             .binary => |b| {
                 try out.writeAll("(");
-                try self.emitExpr(b.left, indent);
-                try out.writeAll(switch (b.op) {
-                    .add => " + ",
-                    .sub => " - ",
-                    .mul => " * ",
-                    .div => " / ",
-                    .eq => " == ",
-                    .ne => " != ",
-                    .lt => " < ",
-                    .le => " <= ",
-                    .gt => " > ",
-                    .ge => " >= ",
-                    .and_op => " && ",
-                    .or_op => " || ",
-                });
-                try self.emitExpr(b.right, indent);
+                try self.emitBinary(b, indent);
                 try out.writeAll(")");
             },
             .unary => |u| try self.emitUnary(u.op, u.operand, indent),
@@ -2449,9 +2490,11 @@ pub const Generator = struct {
     /// A place `emitArcConversion` may box by moving its header: a bare
     /// identifier naming an `owned` binding that borrowck recorded as wholly
     /// moved. borrowck moves a place into a box only at `let arc`, at a
-    /// direct `-> arc T` return, and by assignment into a whole `arc`
-    /// binding (R10, `boxableOwnedBinding`), and refuses the other positions, so this is the only way such a place reaches a boxing
-    /// conversion; the moved source is
+    /// direct `-> arc T` return, by assignment into a whole `arc`
+    /// binding, and as an argument to an `arc` parameter (R10,
+    /// `boxableOwnedBinding`), and refuses the other positions, so this is
+    /// the only way such a place reaches a boxing conversion; the moved
+    /// source is
     /// then skipped by the drop pass and the box owns the buffer. Anything
     /// else keeps the loud `cc` type error.
     fn isMovedOwnedBinding(self: *Generator, arg: *const ast.Expr) bool {
@@ -3418,6 +3461,19 @@ fn endsInJump(body: []const ast.Stmt) bool {
     };
 }
 
+/// A drop point, spelled the way borrowck keyed it in `exit_liveness`.
+const Exit = struct {
+    kind: borrowck.ExitKind,
+    key: usize,
+};
+
+/// The fall-through end of `body`. Null for an empty block, which borrowck
+/// does not record and which declares nothing to drop.
+fn blockExit(body: []const ast.Stmt) ?Exit {
+    if (body.len == 0) return null;
+    return .{ .kind = .block_end, .key = @intFromPtr(body.ptr) };
+}
+
 // ── use analysis, for the (void) casts that keep -Wextra quiet ───────────
 
 fn exprUses(e: *const ast.Expr, name: []const u8) bool {
@@ -4256,6 +4312,58 @@ test "match lowers to a scrutinee temporary and an if chain" {
     try expectContains(e.text, "if (_cell_t1 == cell_Color_Red) {");
     try expectContains(e.text, "} else if (_cell_t1 == cell_Color_Green) {");
     try expectAbsent(e.text, "/*match*/");
+}
+
+test "an equality condition gets one pair of parentheses, not two" {
+    // `if ((a == 2))` is rejected by clang's -Wparentheses-equality under
+    // -Werror. Every condition site goes through `emitCond`: statement and
+    // value `if`, `else if`, `while`, a guard-only arm and a pattern arm's
+    // `&& (guard)`. Operands keep their own parentheses.
+    var e = try emitSource(
+        \\pub enum Color { Red, Green }
+        \\pub fn stmt(copy a: Int, copy b: Int) -> Int {
+        \\  var i = 0
+        \\  while i != a {
+        \\    i = i + 1
+        \\  }
+        \\  if a == 2 {
+        \\    return 1
+        \\  } else if a != b {
+        \\    return 2
+        \\  }
+        \\  if (a + 1) == (b - 1) {
+        \\    return 3
+        \\  }
+        \\  return 0
+        \\}
+        \\pub fn value(copy a: Int) -> Int {
+        \\  let copy v = if a == 3 { 4 } else { 5 }
+        \\  return v
+        \\}
+        \\pub fn guarded(copy c: Color, copy n: Int) -> Int {
+        \\  return match c {
+        \\    Color.Green if n == 5 => 7,
+        \\    _ => 0,
+        \\  }
+        \\}
+        \\pub fn guard_only(copy n: Int) -> Int {
+        \\  return match n {
+        \\    _ if n == 1 => 1,
+        \\    _ => 0,
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "while (i != a) {");
+    try expectContains(e.text, "if (a == 2) {");
+    try expectContains(e.text, "} else if (a != b) {");
+    try expectContains(e.text, "if ((a + 1) == (b - 1)) {");
+    try expectContains(e.text, "if (a == 3) {");
+    try expectContains(e.text, "&& (n == 5)) {");
+    try expectContains(e.text, "if (n == 1) {");
+    try expectAbsent(e.text, "((a == 2))");
+    try expectAbsent(e.text, "((n == 5))");
+    try expectCompiles(e.text);
 }
 
 test "a match without a catch-all arm panics instead of inventing a value" {
@@ -5132,6 +5240,34 @@ test "a returned arc match-arm binding is retained: nested if inside a block arm
     );
 }
 
+test "an owned String or list binding passed to an arc parameter is moved into the box" {
+    // R10's move-into-arc at a call argument, implemented 2026-09-16. The
+    // box is handed to the callee at count 1 and the callee releases it
+    // (R11 row 1), exactly as a boxed literal argument is; the source has
+    // no drop of its own because borrowck moved it.
+    var e = try emitSource(
+        \\pub fn keep(arc s: String);
+        \\pub fn keep_list(arc xs: [Int]);
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  let owned a = make()
+        \\  keep(a)
+        \\}
+        \\pub fn g(owned xs: [Int]) {
+        \\  keep_list(xs)
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectContains(f, "cell_keep(cell_arc_from_string(a));");
+    try expectAbsent(f, "cell_string_free(&a);");
+    try expectAbsent(f, "cell_arc_drop");
+    const g = try fnDef(e.text, "g");
+    try expectContains(g, "cell_keep_list(cell_arc_from_slice(xs));");
+    try expectAbsent(g, "cell_slice_free(&xs);");
+    try expectCompiles(e.text);
+}
+
 test "an owned String or list binding bound as arc is moved into the box" {
     // R10's move-into-arc at `let`, implemented 2026-09-16. Until then this
     // test pinned the opposite: `cell_arc_t b = a;`, a loud C type error,
@@ -5976,7 +6112,9 @@ test "reassigning a moved owned var keeps no pre-drop: its old value is gone" {
     // permanent and branch-conservative, so both answer "moved" and no
     // release is emitted before the store: the old value belongs to `take`.
     // Removing that guard was measured as an AddressSanitizer double free
-    // (exit 134). The reassigned value still leaks (R16's revival leak).
+    // (exit 134). The reassigned value is live at the end of both bodies,
+    // so the scope-end drop releases it (borrowck's `exit_liveness`), and
+    // that is the only release: it comes after the store.
     var e = try emitSource(
         \\pub fn take(owned s: String);
         \\pub fn revive() {
@@ -5995,8 +6133,137 @@ test "reassigning a moved owned var keeps no pre-drop: its old value is gone" {
     defer e.deinit();
     for ([_][]const u8{ "revive", "branch" }) |name| {
         const body = try fnDef(e.text, name);
-        try expectAbsent(body, "cell_string_free(&v);");
+        try expectOccurrences(body, "cell_string_free(&v);", 1);
+        try expectLineBefore(body, "cell_string_free(&v);", "v = cell_string_from_str(cell_str_from_parts(\"b\", 1));");
         try expectAbsent(body, "_cell_t0");
+    }
+    try expectCompiles(e.text);
+}
+
+test "a revived var is released at the exits where borrowck saw it live" {
+    // borrowck's `exit_liveness`, 2026-09-16. Before it, `wasMoved` was
+    // permanent for the scope-end drop, so every one of these leaked the
+    // revived value (measured with the gate's malloc counter).
+    var e = try emitSource(
+        \\pub fn take(owned s: String);
+        \\pub fn at_end() {
+        \\  var owned v: String = "a"
+        \\  take(v)
+        \\  v = "b"
+        \\}
+        \\pub fn at_return(copy c: Int) -> Int {
+        \\  var owned v: String = "a"
+        \\  take(v)
+        \\  if c > 0 {
+        \\    return 2
+        \\  }
+        \\  v = "b"
+        \\  return 3
+        \\}
+        \\pub fn in_block() {
+        \\  {
+        \\    var owned v: String = "a"
+        \\    take(v)
+        \\    v = "b"
+        \\  }
+        \\}
+        \\pub fn param(owned s: String) {
+        \\  take(s)
+        \\  s = "p"
+        \\}
+        \\pub fn list() {
+        \\  var owned xs: [Int] = [1, 2]
+        \\  var owned ys: [Int] = xs
+        \\  xs = [3]
+        \\}
+        \\pub fn loop_local(copy n: Int) {
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    i = i + 1
+        \\    var owned v: String = "a"
+        \\    take(v)
+        \\    if i > n {
+        \\      continue
+        \\    }
+        \\    v = "b"
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    const at_end = try fnDef(e.text, "at_end");
+    try expectOccurrences(at_end, "cell_string_free(&v);", 1);
+    const at_return = try fnDef(e.text, "at_return");
+    // Only the `return 3` path, after the revival; `return 2` has no value.
+    try expectOccurrences(at_return, "cell_string_free(&v);", 1);
+    try expectLineBefore(at_return, "cell_string_free(&v);", "int64_t _cell_t0 = 3;");
+    try expectContains(at_return, "return 2;");
+    const in_block = try fnDef(e.text, "in_block");
+    try expectOccurrences(in_block, "cell_string_free(&v);", 1);
+    const param = try fnDef(e.text, "param");
+    try expectOccurrences(param, "cell_string_free(&s);", 1);
+    const list = try fnDef(e.text, "list");
+    try expectOccurrences(list, "cell_slice_free(&xs);", 1);
+    try expectOccurrences(list, "cell_slice_free(&ys);", 1);
+    // Declared inside the body, so the back edge carries none of its moves:
+    // the body end releases it, the `continue` path does not.
+    const loop_local = try fnDef(e.text, "loop_local");
+    try expectOccurrences(loop_local, "cell_string_free(&v);", 1);
+    try expectLineBefore(loop_local, "cell_string_free(&v);", "v = cell_string_from_str(cell_str_from_parts(\"b\", 1));");
+    try expectCompiles(e.text);
+}
+
+test "a revived var stays unreleased where the path may not hold a value" {
+    // Each shape is accepted by borrowck and would be a double free if the
+    // revival were trusted. `break_after` and `back_edge` were measured as
+    // AddressSanitizer double frees (exit 134) with `loop_moved` and with
+    // the in-loop invalidation removed, respectively.
+    var e = try emitSource(
+        \\pub fn take(owned s: String);
+        \\pub fn one_branch(copy c: Int) {
+        \\  var owned v: String = "a"
+        \\  take(v)
+        \\  if c > 0 {
+        \\    v = "b"
+        \\  }
+        \\}
+        \\pub fn moved_again() {
+        \\  var owned v: String = "a"
+        \\  take(v)
+        \\  v = "b"
+        \\  take(v)
+        \\}
+        \\pub fn break_after(copy n: Int) {
+        \\  var owned v: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    i = i + 1
+        \\    take(v)
+        \\    if i > n {
+        \\      break
+        \\    }
+        \\    v = "b"
+        \\  }
+        \\}
+        \\pub fn back_edge() {
+        \\  var owned v: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    i = i + 1
+        \\    if i > 1 {
+        \\      return
+        \\    }
+        \\    take(v)
+        \\    if i < 2 {
+        \\      continue
+        \\    }
+        \\    v = "b"
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    for ([_][]const u8{ "one_branch", "moved_again", "break_after", "back_edge" }) |name| {
+        const body = try fnDef(e.text, name);
+        try expectAbsent(body, "cell_string_free(&v);");
     }
     try expectCompiles(e.text);
 }
@@ -6004,7 +6271,8 @@ test "reassigning a moved owned var keeps no pre-drop: its old value is gone" {
 test "the owned reassignment pre-drop is decided per store, not per binding" {
     // borrowck's `assign_liveness`, 2026-09-16. A move AFTER the store no
     // longer blocks it; a move BEFORE it (revival) or IN the right side
-    // still does; and a revived var's NEXT store releases the revived value.
+    // still does; a revived var's NEXT store releases the revived value; and
+    // the scope-end drop releases a revived value (`exit_liveness`).
     var e = try emitSource(
         \\pub fn take(owned s: String);
         \\pub fn pass(owned s: String) -> String { return s }
@@ -6028,13 +6296,22 @@ test "the owned reassignment pre-drop is decided per store, not per binding" {
     const later = try fnDef(e.text, "later");
     try expectOccurrences(later, "cell_string_free(&v);", 1);
     try expectLineBefore(later, "cell_take(v);", "v = _cell_t0;");
+    // `pass` hands ownership back, so the store is a revival: no pre-drop
+    // before it, and since `exit_liveness` (2026-09-16) exactly one release
+    // at scope end, after it. This line asserted `expectAbsent` while the
+    // revived value still leaked.
     const selfmove = try fnDef(e.text, "selfmove");
-    try expectAbsent(selfmove, "cell_string_free(&v);");
-    try expectContains(selfmove, "v = cell_pass(v);");
+    try expectOccurrences(selfmove, "cell_string_free(&v);", 1);
+    try expectLineBefore(selfmove, "cell_string_free(&v);", "v = cell_pass(v);");
     const chain = try fnDef(e.text, "chain");
-    // Only the store of "c" releases, and what it releases is "b".
-    try expectOccurrences(chain, "cell_string_free(&v);", 1);
+    // Of the stores only "c" pre-drops, and what it releases is "b"; then
+    // the scope end releases "c", which is live there (`exit_liveness`).
+    // Two frees, one per value that is still owned when its slot is reused
+    // or left; before 2026-09-16 the second was absent and "c" leaked.
+    try expectOccurrences(chain, "cell_string_free(&v);", 2);
     try expectContains(chain, "v = cell_string_from_str(cell_str_from_parts(\"b\", 1));");
+    try expectLineBefore(chain, "cell_string_free(&v);", "cell_string_t _cell_t1 = cell_string_from_str(cell_str_from_parts(\"c\", 1));");
+    try expectContains(chain, "v = _cell_t1;\n  cell_string_free(&v);\n}");
     try expectCompiles(e.text);
 }
 

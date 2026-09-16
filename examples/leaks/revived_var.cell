@@ -1,0 +1,78 @@
+// A var that was moved and then revived by a fresh assignment (R3a) was
+// never released at scope end: borrowck's `wasMoved` is "moved anywhere in
+// the function, permanently", and the scope-end drop read it, so the
+// revived value leaked on every call. OWNERSHIP.md R16's paragraph carried
+// it as the revival leak.
+//
+// Each iteration revives one var at each drop point the fix covers: a
+// function body's end (`at_end`), a `return` (`at_return`), a nested
+// block's end (`in_block`), an `owned` parameter at a body's end
+// (`param`), and a list var (`list`). Five leaks per iteration before.
+//
+// CLOSED 2026-09-16: borrowck records, at every block end and every
+// `return`, whether each visible binding still holds a value on the path it
+// walked (`Checker.exit_liveness`), and codegen releases a moved var at
+// exactly the exits borrowck vouches for.
+//
+// NOT covered, by design: a var moved on one branch and revived on only one
+// (dead after the merge), a var declared outside a `while` and moved inside
+// it (a `break` or the back edge can skip the revival), the `break` and
+// `continue` drop points, a value block's tail, and a record var. Those keep
+// the leak rather than risk a double free.
+//
+// Status: parses, passes `cell check`. LLVM and MLIR refuse it; lives under
+// examples/leaks/ so it is invisible to the top-level corpus, agreement and
+// mlir-lowering loops (see examples/leaks/README.md).
+
+pub fn print_int(copy value: Int);
+
+pub fn sink(owned s: String) {
+}
+
+pub fn sink_list(owned xs: [Int]) {
+}
+
+pub fn at_end() {
+    var owned v: String = "end-a"
+    sink(v)
+    v = "end-b"
+}
+
+pub fn at_return() -> Int {
+    var owned v: String = "return-a"
+    sink(v)
+    v = "return-b"
+    return 1
+}
+
+pub fn in_block() {
+    {
+        var owned v: String = "block-a"
+        sink(v)
+        v = "block-b"
+    }
+}
+
+pub fn param(owned s: String) {
+    sink(s)
+    s = "param-b"
+}
+
+pub fn list() {
+    var owned xs: [Int] = [1, 2, 3]
+    sink_list(xs)
+    xs = [4, 5]
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        at_end()
+        let copy r = at_return()
+        in_block()
+        param("param-a")
+        list()
+        i = i + 1
+    }
+    print_int(i)
+}

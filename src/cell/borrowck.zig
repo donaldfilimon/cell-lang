@@ -8,13 +8,14 @@
 //! binding, an assignment into an `owned` place, an `owned` struct field, a
 //! list-literal element, and a `return` whose declared return type is not
 //! `arc`). The rest of R10 is still designed only, except that
-//! move-into-`arc` is implemented at THREE positions since 2026-09-16, all for
+//! move-into-`arc` is implemented at FOUR positions since 2026-09-16, all for
 //! one source shape, a whole `owned` `String` or list binding
 //! (`boxableOwnedBinding`): `let arc` moves it into the fresh box, a direct
 //! `return` from a `-> arc T` function does (the ordinary R2 return move),
-//! and so does an assignment into a whole `var arc` binding. Every other
-//! owned-into-`arc` source and position (call argument, struct field, a
-//! field target, a block tail) is refused as not implemented. That single clause is here rather than in codegen
+//! so does an assignment into a whole `var arc` binding, and so does passing
+//! it to an `arc` parameter (the callee releases the box). Every other
+//! owned-into-`arc` source and position (struct field, a field target, a
+//! block tail) is refused as not implemented. That single clause is here rather than in codegen
 //! because codegen cannot refuse it: `owned [T]` and `shared [T]` lower to
 //! the SAME C type, so the emitted conversion compiles clean and double frees
 //! the buffer. Its classifier, `arcUniqueSource`, returns a TOTAL verdict:
@@ -245,6 +246,24 @@ const AssignLiveness = struct {
     live: bool,
 };
 
+/// The two scope exits `Checker.exit_liveness` records. A codegen drop point
+/// names one of them together with the same key the checker used.
+pub const ExitKind = enum {
+    /// The fall-through end of a block's statement list, keyed by the
+    /// address of its first statement. A function body is one of these.
+    block_end,
+    /// A `return` statement, keyed by the statement's address.
+    return_stmt,
+};
+
+/// See `Checker.exit_liveness`.
+const ExitLiveness = struct {
+    kind: ExitKind,
+    key: usize,
+    binding: u32,
+    live: bool,
+};
+
 /// A place whose value has been moved out (R2).
 const Dead = struct {
     binding: u32,
@@ -401,6 +420,31 @@ pub const Checker = struct {
     /// anywhere in that body (`moved_paths` is append-only, so "anywhere in
     /// the body" is a range). `while` is the only back edge Cell has.
     assign_liveness: std.ArrayListUnmanaged(AssignLiveness) = .empty,
+    /// One entry per (scope exit, visible binding): whether the binding still
+    /// held a value at that exit on the path the checker was walking. Codegen
+    /// reads it through `liveAtExit` to release a var that was moved and then
+    /// revived (R3a), which `wasMoved` alone leaks at scope end because it is
+    /// permanent for the whole function.
+    ///
+    /// `dead` is the right answer at the exit for the same reason it is at a
+    /// store: `checkIf` and `checkMatch` start every branch from the entry
+    /// state and union the results, so a move on one branch, or a revival on
+    /// only one, leaves the place dead after the merge.
+    ///
+    /// WHY THE LOOP GUARDS. `while` is the only back edge, and R2.a checks
+    /// only the path that reaches the end of the body. A `break` or
+    /// `continue` taken between a move and its revival leaves the loop, or
+    /// reaches the next iteration, with the place moved while every exit the
+    /// checker walked saw it revived. So a binding declared outside a loop
+    /// and moved anywhere in it (the condition included) is never live at an
+    /// exit recorded inside that loop (cleared by `checkWhile` once the body
+    /// is walked) or at any exit after it (`loop_moved`). Bindings declared inside the loop body are
+    /// fresh on every iteration, so the back edge carries none of their moves.
+    exit_liveness: std.ArrayListUnmanaged(ExitLiveness) = .empty,
+    /// Every binding declared outside a `while` and moved inside it. Permanent,
+    /// like `moved`, and safe to keep across functions for the same reason.
+    /// See `exit_liveness`.
+    loop_moved: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// Every binding's name, keyed by id, permanent for the checker's whole
     /// life -- unlike `bindings`, which is truncated when its scope pops,
     /// so it cannot answer this once a function has finished checking.
@@ -466,6 +510,8 @@ pub const Checker = struct {
         self.moved.deinit(self.allocator);
         self.moved_paths.deinit(self.allocator);
         self.assign_liveness.deinit(self.allocator);
+        self.exit_liveness.deinit(self.allocator);
+        self.loop_moved.deinit(self.allocator);
         self.names.deinit(self.allocator);
         self.block_loans.deinit(self.allocator);
         self.temp_loans.deinit(self.allocator);
@@ -644,6 +690,41 @@ pub const Checker = struct {
         return found;
     }
 
+    /// True only when EVERY record for `binding` at the exit (`kind`, `key`)
+    /// found it holding a value that no loop could have moved. False for an
+    /// exit the checker did not record, so a drop point it did not vouch for
+    /// keeps the leak. See `exit_liveness`.
+    pub fn liveAtExit(self: *const Checker, kind: ExitKind, key: usize, binding: u32) bool {
+        var found = false;
+        for (self.exit_liveness.items) |entry| {
+            if (entry.kind != kind or entry.key != key or entry.binding != binding) continue;
+            if (!entry.live) return false;
+            found = true;
+        }
+        return found;
+    }
+
+    /// Record every visible binding's liveness at one scope exit.
+    fn recordExit(self: *Checker, kind: ExitKind, key: usize) Error!void {
+        for (self.bindings.items) |b| {
+            var live = !self.loop_moved.contains(b.id);
+            if (live) {
+                for (self.dead.items) |d| {
+                    if (d.binding == b.id) {
+                        live = false;
+                        break;
+                    }
+                }
+            }
+            try self.exit_liveness.append(self.allocator, .{
+                .kind = kind,
+                .key = key,
+                .binding = b.id,
+                .live = live,
+            });
+        }
+    }
+
     /// True when the binding ITSELF was moved (path `""`), as opposed to
     /// only some of its fields. A wholly moved record is gone and codegen
     /// releases none of it; a record with only fields moved out is still
@@ -686,6 +767,9 @@ pub const Checker = struct {
             self.open_blocks.items[self.open_blocks.items.len - 1].index = i;
             try self.checkStmt(s);
         }
+        // An empty block declares nothing, so no drop point asks about it,
+        // and its slice pointer is not a meaningful key.
+        if (stmts.len > 0) try self.recordExit(.block_end, @intFromPtr(stmts.ptr));
     }
 
     // ── statements ──────────────────────────────────────────────────────
@@ -721,7 +805,11 @@ pub const Checker = struct {
     fn checkWhile(self: *Checker, w: anytype, span: Span) Error!void {
         // Taken before the condition: it runs on every iteration too.
         const liveness_before = self.assign_liveness.items.len;
+        const exits_before = self.exit_liveness.items.len;
         const moved_before = self.moved_paths.items.len;
+        // Taken before the condition, which can declare bindings inside a
+        // value block that are as fresh per iteration as the body's own.
+        const first_loop_id = self.next_binding_id;
         defer self.invalidateLoopStores(liveness_before, moved_before);
 
         try self.checkExpr(@constCast(&w.cond));
@@ -733,6 +821,16 @@ pub const Checker = struct {
         // binding declared in the body dies with it and a named loan created
         // there is truncated on the way out, exactly as in an `if` body.
         try self.checkBlockStmts(w.body);
+
+        // See `exit_liveness`: the back edge and every `break` can carry a
+        // move of an outer binding past the revival the walk saw.
+        for (self.moved_paths.items[moved_before..]) |m| {
+            if (m.binding >= first_loop_id) continue;
+            try self.loop_moved.put(self.allocator, m.binding, {});
+            for (self.exit_liveness.items[exits_before..]) |*entry| {
+                if (entry.binding == m.binding) entry.live = false;
+            }
+        }
 
         // Anything still dead that was declared before the loop was moved in
         // the body and never revived.
@@ -768,6 +866,13 @@ pub const Checker = struct {
     }
 
     fn checkStmt(self: *Checker, stmt: *const ast.Stmt) Error!void {
+        try self.checkStmtKind(stmt);
+        // After the returned expression is checked, so a place it moves out
+        // is dead here and its drop is skipped. See `exit_liveness`.
+        if (stmt.kind == .return_stmt) try self.recordExit(.return_stmt, @intFromPtr(stmt));
+    }
+
+    fn checkStmtKind(self: *Checker, stmt: *const ast.Stmt) Error!void {
         // R0.3 exception 1: every loan created inside a statement and not
         // bound to a name ends when the statement completes.
         const region = self.temp_loans.items.len;
@@ -2028,6 +2133,24 @@ pub const Checker = struct {
                 // like them. Listed shapes are not the enumeration; the
                 // position is. See `refuseUnimplementedArcMove`.
                 const slot_name = if (param) |p| p.name else null;
+                // IMPLEMENTED for one source shape (2026-09-16), the fourth
+                // position after `let`, a direct return and assignment: a
+                // bare `owned` `String` or list binding passed to an `arc`
+                // parameter is MOVED into a fresh box, and the callee
+                // releases that box (cell_rt.h section 7, callee-releases
+                // for `arc`, the same count-1 handoff a boxed literal makes).
+                // A block argument is not opened for an `arc` parameter, so
+                // it keeps the refusal below with every other source shape.
+                if (operand.kind != .block) {
+                    if (try self.boxableOwnedBinding(operand)) |src| {
+                        const note = if (callee_name) |n|
+                            try self.msg("'{s}' was moved here into the 'arc' box passed to '{s}'", .{ src.display, n })
+                        else
+                            try self.msg("'{s}' was moved here into the 'arc' box passed to the call", .{src.display});
+                        try self.movePlace(src, note);
+                        continue;
+                    }
+                }
                 if (try self.refuseUnimplementedArcMove(operand, "pass", "to", "parameter", slot_name)) continue;
             }
             if (mode == .owned) {
@@ -6094,6 +6217,64 @@ test "R10's move into arc: a whole owned String or list binding is moved at retu
     try expectRejectedWith(
         \\pub fn f(owned p: String) -> arc String {
         \\    return match 1 { _ => p }
+        \\}
+    , refused);
+}
+
+test "R10's move into arc: a whole owned String or list binding is moved at a call argument" {
+    // Implemented 2026-09-16, the fourth position. The callee releases the
+    // box (cell_rt.h section 7), so the caller's source must be dead, and
+    // an explicit `arc` prefix on the argument is the same move.
+    try expectAccepted(
+        \\pub fn keep(arc s: String);
+        \\pub fn keep_list(arc xs: [Int]);
+        \\pub fn f(owned p: String, owned xs: [Int]) {
+        \\    keep(p)
+        \\    keep_list(xs)
+        \\}
+        \\pub fn g() {
+        \\    let owned t: String = "t"
+        \\    keep(arc t)
+        \\}
+    );
+    try expectDiagnostics(
+        \\pub fn keep(arc s: String);
+        \\pub fn view(shared s: String) -> Int;
+        \\pub fn f(owned p: String) -> Int {
+        \\    keep(p)
+        \\    return view(p)
+        \\}
+    ,
+        \\t.cell:5:17: error: use of 'p' after it was moved
+        \\t.cell:4:10: note: 'p' was moved here into the 'arc' box passed to 'keep'
+        \\
+    );
+    // Every other source keeps the refusal: a field, an `Int?`, a block
+    // argument (not opened for an `arc` parameter) and a branch value.
+    const refused = "moving an owned place into an 'arc' box is not implemented";
+    try expectRejectedWith(
+        \\pub struct R { owned s: String }
+        \\pub fn keep(arc s: String);
+        \\pub fn f(owned r: R) {
+        \\    keep(r.s)
+        \\}
+    , refused);
+    try expectRejectedWith(
+        \\pub fn keep_opt(arc v: Int?);
+        \\pub fn f(owned p: Int?) {
+        \\    keep_opt(p)
+        \\}
+    , refused);
+    try expectRejectedWith(
+        \\pub fn keep(arc s: String);
+        \\pub fn f(owned p: String) {
+        \\    keep({ p })
+        \\}
+    , refused);
+    try expectRejectedWith(
+        \\pub fn keep(arc s: String);
+        \\pub fn f(owned p: String) {
+        \\    keep(match 1 { _ => p })
         \\}
     , refused);
 }

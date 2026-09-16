@@ -24,9 +24,10 @@ derived-loan propagation remains conservative. See [FEATURES.md](FEATURES.md)
 for the current cross-backend matrix, rather than treating this historical
 summary as an exhaustive rule inventory. **R11** retain-release insertion is implemented in the
 C backend, with the gaps R11 itself names; **R10**'s move-into-`arc` is
-implemented in the checker at `let`, at a direct `-> arc T` return and by
-assignment into a whole `var arc` binding, for a whole `owned` `String` or
-list binding (2026-09-16), and refused everywhere else. R10's other
+implemented in the checker at `let`, at a direct `-> arc T` return, by
+assignment into a whole `var arc` binding and as an argument to an `arc`
+parameter, for a whole `owned` `String` or list binding (2026-09-16), and
+refused everywhere else. R10's other
 direction, an `arc` value made UNIQUE, IS implemented, at six consumption
 sites and with a total verdict that refuses a source it cannot classify. **R2.a**
 (a move inside a loop) landed with `while`. **R18** (an `owned` binding may not
@@ -937,10 +938,12 @@ section 7 already said). The same day the checker began consuming the source
 at ONE position: a `let arc` binding whose source is a whole `owned` `String`
 or list binding is moved into the box (see R11's emptied table below). A
 direct `return` of the same source from a `-> arc T` function followed later
-that day, and an assignment into a whole `var arc` binding third.
+that day, an assignment into a whole `var arc` binding third, and an argument
+to an `arc` parameter fourth (the callee releases the box, per section 7's
+callee-releases rule, so the caller's source is simply dead).
 Everywhere else it refuses and says "not implemented", at five positions
-rather than the sweep's four rows: a binding, a return and an assignment
-(for any other source or target), a call argument, and a struct-literal
+rather than the sweep's four rows: a binding, a return, an assignment and a
+call argument (for any other source or target), and a struct-literal
 field.
 The last two are not in the sweep at all and were found by probing positions
 instead of rows, which is the discipline this rule's own text asks for.
@@ -1271,8 +1274,9 @@ Moving on only one branch (`if c > 0 { let arc a = s }`) leaks `s` when the
 branch is not taken, one allocation over 100 calls, because a branch move is
 recorded conservatively as a move: the leak direction, stated. Still refused
 as not implemented: a field source (`let arc a = r.s`), a source reached
-through a branch, an `Int?` or unresolved-type source, and the other
-positions (assignment, call argument, struct field).
+through a branch, an `Int?` or unresolved-type source, and the struct-field
+position (the assignment and call-argument positions landed the same day
+for the same source shape).
 
 **The assignment position, implemented the same day, third.** `a = p`,
 with `a` a whole `var arc` binding and `p` a whole `owned` `String` or list
@@ -2094,7 +2098,9 @@ ways, and each is a real, documented gap rather than an oversight:
   including the paths where it was not actually moved. That is a real leak,
   and it is intentional: dropping a maybe-moved place risks a double free,
   and leaking is the strictly safer failure.
-- **"Moved" means moved anywhere in the function, once, permanently.** A
+- **"Moved" means moved anywhere in the function, once, permanently.**
+  (Superseded for the scope-end drop and for stores by the two CLOSED
+  entries below; kept as the history they correct.) A
   `var` that is moved and later revived by a fresh assignment (R3a) is
   never dropped either, even though it holds a fresh, unmoved value at the
   function's end. The revived value leaks, and so does every value such a
@@ -2140,6 +2146,24 @@ ways, and each is a real, documented gap rather than an oversight:
   was already moved, any store inside a `while` body that also moves the
   target (even on an iteration where the value is live), and a revived var's
   final value at scope end (the scope-end drop still reads `wasMoved`).
+- **CLOSED the same day: the revived var at scope end.** The scope-end
+  drop is decided per EXIT as well. borrowck records, at every block end
+  and every `return`, whether each visible binding still holds a value on
+  the path it walked (`Checker.exit_liveness`, read by `liveAtExit`), and
+  codegen releases a moved non-record var only at an exit recorded live.
+  `dead` answers per path because `if` and `match` start each branch from
+  the entry state and union the results, so a one-branch move or a
+  one-branch revival stays dead after the merge. `while` needs two guards,
+  because R2.a checks only the path that reaches the end of the body: a
+  binding declared outside a loop and moved anywhere in it is never live at
+  an exit recorded inside that loop, since a `continue` can bring the move
+  to it, nor at any exit after it, since a `break` can skip the revival.
+  Removing either guard was measured as an AddressSanitizer double free
+  (exit 134). `examples/leaks/revived_var.cell` (body end, `return`, nested
+  block, `owned` parameter, list) measured 5000 on both witnesses before
+  and 0 after, pinned in the gate. What still leaks, by design: a var moved
+  inside a `while` it was declared outside of, a `break` or `continue` exit
+  and a value block's tail (neither is recorded), and a revived record.
 
 Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released. What remains out of scope is a field moved on only one branch (it leaks on the other path, pending drop flags) and a partly moved field (the whole field is left unreleased).
 
