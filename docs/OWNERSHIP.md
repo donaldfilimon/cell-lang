@@ -2094,7 +2094,9 @@ ways, and each is a real, documented gap rather than an oversight:
   including the paths where it was not actually moved. That is a real leak,
   and it is intentional: dropping a maybe-moved place risks a double free,
   and leaking is the strictly safer failure.
-- **"Moved" means moved anywhere in the function, once, permanently.** A
+- **"Moved" means moved anywhere in the function, once, permanently.**
+  (Superseded for the scope-end drop and for stores by the two CLOSED
+  entries below; kept as the history they correct.) A
   `var` that is moved and later revived by a fresh assignment (R3a) is
   never dropped either, even though it holds a fresh, unmoved value at the
   function's end. The revived value leaks, and so does every value such a
@@ -2140,6 +2142,24 @@ ways, and each is a real, documented gap rather than an oversight:
   was already moved, any store inside a `while` body that also moves the
   target (even on an iteration where the value is live), and a revived var's
   final value at scope end (the scope-end drop still reads `wasMoved`).
+- **CLOSED the same day: the revived var at scope end.** The scope-end
+  drop is decided per EXIT as well. borrowck records, at every block end
+  and every `return`, whether each visible binding still holds a value on
+  the path it walked (`Checker.exit_liveness`, read by `liveAtExit`), and
+  codegen releases a moved non-record var only at an exit recorded live.
+  `dead` answers per path because `if` and `match` start each branch from
+  the entry state and union the results, so a one-branch move or a
+  one-branch revival stays dead after the merge. `while` needs two guards,
+  because R2.a checks only the path that reaches the end of the body: a
+  binding declared outside a loop and moved anywhere in it is never live at
+  an exit recorded inside that loop, since a `continue` can bring the move
+  to it, nor at any exit after it, since a `break` can skip the revival.
+  Removing either guard was measured as an AddressSanitizer double free
+  (exit 134). `examples/leaks/revived_var.cell` (body end, `return`, nested
+  block, `owned` parameter, list) measured 5000 on both witnesses before
+  and 0 after, pinned in the gate. What still leaks, by design: a var moved
+  inside a `while` it was declared outside of, a `break` or `continue` exit
+  and a value block's tail (neither is recorded), and a revived record.
 
 Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released. What remains out of scope is a field moved on only one branch (it leaks on the other path, pending drop flags) and a partly moved field (the whole field is left unreleased).
 

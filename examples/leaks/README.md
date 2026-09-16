@@ -1,9 +1,10 @@
 # `examples/leaks/`
 
-Nine fixtures: seven, one per measurable gap in `docs/OWNERSHIP.md` R11's
+Ten fixtures: seven, one per measurable gap in `docs/OWNERSHIP.md` R11's
 "Still broken" table and its CLOSED paragraphs (five until 2026-09-15, six
 until 2026-09-16; six of the seven are closed and pinned at 0); the `owned`
-twin of row 5 (`reassigned_owned_var.cell`, closed 2026-09-16); and one
+twin of row 5 (`reassigned_owned_var.cell`, closed 2026-09-16); the R16
+revival leak (`revived_var.cell`, closed 2026-09-16); and one
 regression pin for an implemented feature (`arc_box_move.cell`, below). Each isolates exactly one disclosed `arc` retain/release gap
 and loops it 1000 times so a leak is a stable count, not noise.
 
@@ -32,6 +33,7 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `block_scoped_local.cell` | 4: a block-scoped `arc` local is never released; **CLOSED 2026-09-15**, kept and pinned at 0 |
 | `reassigned_var.cell` | 5: reassigning an `arc` `var` leaked the previous box; **CLOSED 2026-09-15** by the reassignment pre-drop in `emitAssign`, kept and pinned at 0 |
 | `reassigned_owned_var.cell` | not an R11 row: row 5's `owned` twin. Reassigning an `owned` String or list var leaked the old value (4000 before on both witnesses, including two stores whose var is moved only afterwards); **CLOSED 2026-09-16** by extending `emitAssign`'s pre-drop, decided per store from borrowck's `assign_liveness`, pinned at 0. A store whose target was already moved (R3a revival), or that sits in a `while` body moving it, keeps its leak by design and is not measured here |
+| `revived_var.cell` | not an R11 row: OWNERSHIP.md R16's revival leak. A var moved and then revived (R3a) was never released at scope end (5000 before on both witnesses, one per drop point: body end, `return`, nested block end, `owned` parameter, list); **CLOSED 2026-09-16** by borrowck's per-exit liveness (`exit_liveness`), pinned at 0. A one-branch revival, a var moved inside a `while`, `break`/`continue`, a value block's tail and a record var keep their leak by design and are not measured |
 | `value_block_local.cell` | the residual of row 4's closure: an `arc` local declared in a VALUE-position block was not released at that block's exit (measurable since 2026-09-15, when a block began to type as its tail); **CLOSED 2026-09-15** the same evening by `emitValueBlockDrops`, kept and pinned at 0 |
 | `arc_box_move.cell` | not a gap: R10 move-into-`arc` at `let`, at a direct `-> arc` return and by assignment into a whole `var arc`, all IMPLEMENTED 2026-09-16; pinned at 0 as a regression guard (a drift between borrowck's move and codegen's box is a double free or a leak). A move on one branch only leaks by design and is not measured |
 | `partial_move_field.cell` | not a numbered row: a record with one owning field moved out was skipped whole, leaking its other owning field; **CLOSED 2026-09-16** by field-path move records in borrowck and `emitPartialRecordDrop` in codegen, kept and pinned at 0. A field moved on only one branch still leaks by design and is not measured here |

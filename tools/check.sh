@@ -359,6 +359,18 @@ LEAK_REASSIGNED_VAR=0
 # gets no pre-drop (each guard measured as an ASan failure when removed), so
 # R16's revival leak is unchanged and not measured here. Stays pinned at 0.
 LEAK_REASSIGNED_OWNED_VAR=0
+# The revival leak (OWNERSHIP.md R16): a var moved and then revived by a
+# fresh assignment (R3a) was never released at scope end, because the drop
+# admission read borrowck's permanent `wasMoved`. Measured 5000 on both
+# witnesses before the change (`leaks` 5000, counter ALLOC=10000 FREE=5000
+# LIVE=5000) at bb38f95, through this same host and counter.
+# CLOSED 2026-09-16: borrowck records each visible binding's liveness at
+# every block end and every `return` (`exit_liveness`, with a binding moved
+# inside a `while` never live at an exit in or after it) and codegen
+# releases a moved var only where that says live; after, `leaks` 0 and
+# ALLOC=10000 FREE=10000 LIVE=0, ASan clean. Removing either loop guard was
+# measured as an ASan double free (exit 134). Stays pinned at 0.
+LEAK_REVIVED_VAR=0
 # The residual the 2026-09-15 block-scoped release left behind, measurable
 # only since the same day (typing a block by its tail made the program
 # expressible): an `arc` local declared inside a VALUE-position block was not
@@ -881,6 +893,7 @@ else
     run_c_leaks block_scoped_local "" "$LEAK_BLOCK_SCOPED_LOCAL" "R11 row 4, CLOSED 2026-09-15"
     run_c_leaks reassigned_var "" "$LEAK_REASSIGNED_VAR" "R11 row 5, CLOSED 2026-09-15"
     run_c_leaks reassigned_owned_var "" "$LEAK_REASSIGNED_OWNED_VAR" "owned twin of row 5, CLOSED 2026-09-16"
+    run_c_leaks revived_var "" "$LEAK_REVIVED_VAR" "R16 revival leak, CLOSED 2026-09-16"
     run_c_leaks value_block_local "" "$LEAK_VALUE_BLOCK_LOCAL" "R11 value-position block residual, CLOSED 2026-09-15"
     run_c_leaks partial_move_field "" "$LEAK_PARTIAL_MOVE_FIELD" "partial-move residual, CLOSED 2026-09-16"
     run_c_leaks arc_box_move "" "$LEAK_ARC_BOX_MOVE" "R10 move-into-arc at let, return and assignment, implemented 2026-09-16"
