@@ -1046,8 +1046,71 @@ pub const Generator = struct {
             .arc => try self.writer.print("cell_arc_drop({s});\n", .{local.name}),
             // R11 row 2: through the generated glue, by pointer like the two
             // `_free` calls. `needsDrop` admitted this local, so glue exists.
-            .record => try self.writer.print("cell_drop_{s}(&{s});\n", .{ local.ty.name, local.name }),
+            .record => {
+                const partial = if (self.checker) |c| c.wasMoved(local.id) else false;
+                if (partial) {
+                    try self.emitPartialRecordDrop(indent, local);
+                } else {
+                    try self.writer.print("cell_drop_{s}(&{s});\n", .{ local.ty.name, local.name });
+                }
+            },
             else => unreachable, // needsDrop already filtered these out.
+        }
+    }
+
+    /// A record some of whose fields were moved out (`let owned m = p.a`),
+    /// and not the record itself: release every owning field that was NOT
+    /// moved, one call each, in the glue's reverse declaration order.
+    ///
+    /// Before this existed the whole record was skipped, because
+    /// `pendingDrops` read the binding-level `wasMoved`, so `p.b` leaked.
+    /// It never double freed; this keeps it that way by construction. A
+    /// field that was moved in whole OR IN PART is skipped
+    /// (`fieldWasMoved`), and a move borrowck records on only one branch of
+    /// an `if` is recorded as if it happened on every path, so any doubt
+    /// resolves to leaving a field unreleased, never to releasing a buffer
+    /// something else now owns. The indent for the first line is already
+    /// written by `emitDropFor`, which is why it gets the comment.
+    fn emitPartialRecordDrop(self: *Generator, indent: usize, local: Local) EmitError!void {
+        const checker = self.checker.?;
+        const out = self.writer;
+        // Every caller today reaches this through `pendingDrops`, which has
+        // already excluded a wholly moved record. Checked again here anyway,
+        // because `fieldWasMoved` deliberately ignores a whole-binding move:
+        // a caller that forgot the filter would otherwise release every
+        // field of a record something else now owns, a double free.
+        if (checker.wasWhollyMoved(local.id)) {
+            try out.print("/* {s}: moved as a whole, nothing to release */\n", .{local.name});
+            return;
+        }
+        try out.print("/* {s}: fields moved out; releasing only unmoved owning fields */\n", .{local.name});
+        const def = self.findStruct(local.ty.name) orelse return;
+        var i = def.fields.len;
+        while (i > 0) {
+            i -= 1;
+            const f = def.fields[i];
+            if (f.ownership != .owned and f.ownership != .arc) continue;
+            if (checker.fieldWasMoved(local.id, f.name)) continue;
+            const fty = try self.lowerType(&f.ty, f.ownership);
+            switch (fty.shape) {
+                .string => {
+                    try self.writeIndent(indent);
+                    try out.print("cell_string_free(&{s}.{s});\n", .{ local.name, f.name });
+                },
+                .slice => {
+                    try self.writeIndent(indent);
+                    try out.print("cell_slice_free(&{s}.{s});\n", .{ local.name, f.name });
+                },
+                .arc => {
+                    try self.writeIndent(indent);
+                    try out.print("cell_arc_drop({s}.{s});\n", .{ local.name, f.name });
+                },
+                .record => if (try self.recordNeedsDrop(fty.name, 1)) {
+                    try self.writeIndent(indent);
+                    try out.print("cell_drop_{s}(&{s}.{s});\n", .{ fty.name, local.name, f.name });
+                },
+                else => {},
+            }
         }
     }
 
@@ -1087,7 +1150,13 @@ pub const Generator = struct {
             if (!local.droppable) continue;
             if (local.ownership != .owned and local.ownership != .arc) continue;
             if (!try self.needsDrop(local.ty)) continue;
-            if (checker.wasMoved(local.id)) continue;
+            if (checker.wasWhollyMoved(local.id)) continue;
+            // A record with only FIELDS moved out is still partly live, and
+            // `emitDropFor` releases exactly its unmoved owning fields. Any
+            // other shape has no field path a move can take (a `copy`
+            // sub-place like `buf.len` never reaches `movePlace`'s record),
+            // so for it any recorded move is a whole move, as before.
+            if (checker.wasMoved(local.id) and local.ty.shape != .record) continue;
             try out.append(self.arena, local);
         }
         return out.items;
@@ -4439,6 +4508,138 @@ test "an unmoved owned String local is freed at scope end" {
     );
     defer e.deinit();
     try expectContains(e.text, "cell_string_free(&s);");
+}
+
+test "a record with one owning field moved out releases the other field, not the moved one" {
+    // The partial-move leak. `p.a` is moved into `m`, so `m` owns that
+    // buffer and releases it; `p.b` is still `p`'s, and before
+    // `moved_paths` nothing released it because the whole record was
+    // skipped. Counted, not just searched for: a free of `p.a` here would be
+    // a double free, and `expectContains` passes just as happily on two.
+    var e = try emitSource(
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn f() {
+        \\  let owned p: Pair = Pair { a: "x", b: "y" }
+        \\  let owned m: String = p.a
+        \\}
+    );
+    defer e.deinit();
+    try expectOccurrences(e.text, "cell_string_free(&p.b);", 1);
+    try expectAbsent(e.text, "cell_string_free(&p.a);");
+    try expectAbsent(e.text, "cell_drop_Pair(&p);");
+    try expectOccurrences(e.text, "cell_string_free(&m);", 1);
+}
+
+test "a record whose only owning field was moved out releases nothing of its own" {
+    // The case the old all-or-nothing skip happened to get RIGHT, pinned so
+    // the partial drop cannot regress it: the one droppable field is gone,
+    // so releasing it, or calling the glue, would free `m`'s buffer twice.
+    var e = try emitSource(
+        \\pub struct One {
+        \\    owned a: String
+        \\    copy n: Int
+        \\}
+        \\pub fn f() {
+        \\  let owned p: One = One { a: "x", n: 1 }
+        \\  let owned m: String = p.a
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "cell_string_free(&p.a);");
+    try expectAbsent(e.text, "cell_drop_One(&p);");
+    try expectOccurrences(e.text, "cell_string_free(&m);", 1);
+}
+
+test "a field moved on only one branch of an if is left unreleased, the other field is released" {
+    // Borrowck records a move made inside a branch as if it happened on
+    // every path. For a drop that is the leak direction: `p.a` may still be
+    // live on the path that skipped the `if`, and leaving it unreleased is
+    // what keeps the path that DID move it from a double free. `p.b` was
+    // never touched and is released either way.
+    var e = try emitSource(
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(shared c: Bool) {
+        \\  let owned p: Pair = Pair { a: "x", b: "y" }
+        \\  if (c) {
+        \\    take(owned p.a)
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectOccurrences(e.text, "cell_string_free(&p.b);", 1);
+    try expectAbsent(e.text, "cell_string_free(&p.a);");
+    try expectAbsent(e.text, "cell_drop_Pair(&p);");
+}
+
+test "a record moved as a whole after nothing else is still not dropped at all" {
+    // `wasWhollyMoved` is the gate that keeps the partial path from ever
+    // touching a record that went away entirely; `q` now owns both fields.
+    var e = try emitSource(
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn f() {
+        \\  let owned p: Pair = Pair { a: "x", b: "y" }
+        \\  let owned q: Pair = p
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "cell_drop_Pair(&p);");
+    try expectAbsent(e.text, "&p.a");
+    try expectAbsent(e.text, "&p.b");
+    try expectOccurrences(e.text, "cell_drop_Pair(&q);", 1);
+}
+
+test "a record with nothing moved still goes through its drop glue" {
+    // The partial path is taken only when borrowck recorded a move under
+    // the binding; an untouched record keeps the one glue call R11 row 2
+    // introduced, rather than an inline expansion of it.
+    var e = try emitSource(
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn f() {
+        \\  let owned p: Pair = Pair { a: "x", b: "y" }
+        \\}
+    );
+    defer e.deinit();
+    try expectOccurrences(e.text, "cell_drop_Pair(&p);", 1);
+    try expectAbsent(e.text, "fields moved out");
+}
+
+test "a moved field of a nested record leaves that whole field unreleased" {
+    // `p.inner.a` moves only part of `p.inner`, and `fieldWasMoved` answers
+    // for the top-level field as a whole, so `p.inner` is skipped entirely
+    // (its `b` leaks) rather than released through `cell_drop_Inner`, which
+    // would free `m`'s buffer a second time. `p.tag` is untouched and is
+    // released.
+    var e = try emitSource(
+        \\pub struct Inner {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub struct Outer {
+        \\    owned inner: Inner
+        \\    owned tag: String
+        \\}
+        \\pub fn f() {
+        \\  let owned p: Outer = Outer { inner: Inner { a: "x", b: "y" }, tag: "t" }
+        \\  let owned m: String = p.inner.a
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "cell_drop_Inner(&p.inner);");
+    try expectAbsent(e.text, "cell_drop_Outer(&p);");
+    try expectOccurrences(e.text, "cell_string_free(&p.tag);", 1);
 }
 
 test "an unmoved arc local gets cell_arc_drop, by value with no ampersand" {

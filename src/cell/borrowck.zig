@@ -221,6 +221,14 @@ const Place = struct {
     span: Span,
 };
 
+/// One place `movePlace` moved, kept for the checker's whole life. See
+/// `Checker.moved_paths`.
+const MovedPath = struct {
+    binding: u32,
+    /// `""` when the binding itself moved, a dotted field path otherwise.
+    path: []const u8,
+};
+
 /// A place whose value has been moved out (R2).
 const Dead = struct {
     binding: u32,
@@ -343,6 +351,19 @@ pub const Checker = struct {
     /// never reset, so ids are unique for the lifetime of one `Checker`,
     /// and a query by id can never cross a function boundary by accident.
     moved: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// The same moves as `moved`, WITH the field path each one took, and
+    /// permanent for the same reason. `moved` answers "was anything under
+    /// this binding moved", which is everything a scalar, a buffer or a
+    /// handle needs. A record needs to know WHICH fields went: before this
+    /// existed, `let owned m = p.a` made codegen skip `p` entirely, so a
+    /// second owning field `p.b` was released by nothing (the partial-move
+    /// leak). The paths are safe to keep: `placeOf` allocates them from
+    /// `self.arena`, which outlives the per-function `dead` reset. It
+    /// inherits `moved`'s conservatism exactly, since both are written at
+    /// the same point: a move on one branch of an `if` is recorded as if it
+    /// happened on every path, which for a DROP decision fails toward a
+    /// leak and never toward a double free.
+    moved_paths: std.ArrayListUnmanaged(MovedPath) = .empty,
     /// Every binding's name, keyed by id, permanent for the checker's whole
     /// life -- unlike `bindings`, which is truncated when its scope pops,
     /// so it cannot answer this once a function has finished checking.
@@ -405,6 +426,7 @@ pub const Checker = struct {
         self.scopes.deinit(self.allocator);
         self.dead.deinit(self.allocator);
         self.moved.deinit(self.allocator);
+        self.moved_paths.deinit(self.allocator);
         self.names.deinit(self.allocator);
         self.block_loans.deinit(self.allocator);
         self.temp_loans.deinit(self.allocator);
@@ -565,6 +587,31 @@ pub const Checker = struct {
     /// up front, then emits).
     pub fn wasMoved(self: *const Checker, binding: u32) bool {
         return self.moved.contains(binding);
+    }
+
+    /// True when the binding ITSELF was moved (path `""`), as opposed to
+    /// only some of its fields. A wholly moved record is gone and codegen
+    /// releases none of it; a record with only fields moved out is still
+    /// partly live, and its remaining owning fields still need releasing.
+    pub fn wasWhollyMoved(self: *const Checker, binding: u32) bool {
+        for (self.moved_paths.items) |m| {
+            if (m.binding == binding and m.path.len == 0) return true;
+        }
+        return false;
+    }
+
+    /// True when top-level `field` of `binding` was moved, in whole (`field`)
+    /// or in part (`field.x`). Codegen releases a field only when this is
+    /// false, so a partly moved field is left to leak rather than freed
+    /// while something else may own a piece of it. A whole-binding move is
+    /// deliberately NOT reported here: callers check `wasWhollyMoved` first.
+    pub fn fieldWasMoved(self: *const Checker, binding: u32, field: []const u8) bool {
+        for (self.moved_paths.items) |m| {
+            if (m.binding != binding or m.path.len == 0) continue;
+            if (std.mem.eql(u8, m.path, field)) return true;
+            if (m.path.len > field.len and std.mem.startsWith(u8, m.path, field) and m.path[field.len] == '.') return true;
+        }
+        return false;
     }
 
     /// The name `binding` was declared under. See the doc comment on
@@ -2024,6 +2071,7 @@ pub const Checker = struct {
         // too, and unlike `dead` this record is permanent for the binding's
         // whole function, surviving a later R3a revival.
         try self.moved.put(self.allocator, place.binding, {});
+        try self.moved_paths.append(self.allocator, .{ .binding = place.binding, .path = place.path });
     }
 
     /// R4, R5 and R6. `lexical` selects the loan's scope: true for a loan
@@ -3709,7 +3757,7 @@ pub const Checker = struct {
         try self.diagnostics.note(
             self.allocator,
             source.span,
-            "aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead",
+            "aggregate ownership transfer is not implemented; construct a fresh field value instead",
         );
     }
 
@@ -6175,7 +6223,7 @@ test "R2.b is asked at all six owned consumption sites, four of which were live"
         \\}
     ,
         \\t.cell:6:47: error: cannot store the place 'xs' reached through a branch in owned field 'items': the source is not a fresh owned value
-        \\t.cell:6:47: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:6:47: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\
     );
     try expectDiagnostics(
@@ -6283,8 +6331,10 @@ test "R2.b moves bindings but owning resource fields refuse place transfers" {
         \\    let owned n: Int = match c { 0 => 1, _ => 2 }
         \\}
     );
-    // Aggregate partial-move/drop state is absent, so a resource-bearing
-    // owned field refuses a place rather than copying its owning header.
+    // Aggregate ownership transfer is absent, so a resource-bearing owned
+    // field refuses a place rather than copying its owning header: the copy
+    // would leave two owners of one buffer. Scope-end release of a record's
+    // UNMOVED fields exists (`moved_paths`), but it cannot make that safe.
     try expectDiagnostics(
         \\pub struct Box { owned s: String }
         \\pub fn mk() -> String;
@@ -6294,7 +6344,7 @@ test "R2.b moves bindings but owning resource fields refuse place transfers" {
         \\}
     ,
         \\t.cell:5:33: error: cannot store s1 in owned field 's': moving a place into an aggregate is not implemented
-        \\t.cell:5:33: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:5:33: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\
     );
     // List-element transfer WAS a disclosed boundary and is now refused.
@@ -6868,7 +6918,7 @@ test "a resource-bearing struct field resolves a block-local tail and still refu
         \\}
     ,
         \\t.cell:7:9: error: cannot store t in owned field 's': moving a place into an aggregate is not implemented
-        \\t.cell:7:9: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:7:9: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\
     );
 }
@@ -7643,7 +7693,7 @@ test "R7 aliases cannot enter owning resource fields" {
         \\}
     ,
         \\t.cell:12:41: error: cannot store the match binding 'x' aliasing 'buf' in owned field 'data': the source is not a fresh owned value
-        \\t.cell:12:41: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:12:41: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\
     );
 }
@@ -7846,9 +7896,9 @@ test "owned resource fields accept fresh values and refuse every unsafe source c
         \\}
     ,
         \\t.cell:5:31: error: cannot store source in owned field 'name': moving a place into an aggregate is not implemented
-        \\t.cell:5:31: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:5:31: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\t.cell:6:31: error: cannot store source in owned field 'name': moving a place into an aggregate is not implemented
-        \\t.cell:6:31: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:6:31: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\
     );
     try expectDiagnostics(
@@ -7863,11 +7913,11 @@ test "owned resource fields accept fresh values and refuse every unsafe source c
         \\t.cell:2:1: error: cannot return a shared borrow: Cell has no lifetime annotations, so the borrow cannot be proven to outlive the call
         \\t.cell:2:1: note: return an 'owned' or 'arc' value instead
         \\t.cell:4:31: error: cannot store a borrow of 'source' in owned field 'name': a borrow does not transfer ownership
-        \\t.cell:4:31: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:4:31: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\t.cell:5:31: error: cannot store a borrow of 'source' in owned field 'name': a borrow does not transfer ownership
-        \\t.cell:5:31: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:5:31: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\t.cell:6:31: error: cannot store the borrow returned by 'inspect' in owned field 'name': a borrow does not transfer ownership
-        \\t.cell:6:31: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:6:31: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\
     );
 }
@@ -7891,11 +7941,11 @@ test "owning field guard follows field paths and recursive destination shapes" {
         \\}
     ,
         \\t.cell:11:33: error: cannot store inner.name in owned field 'name': moving a place into an aggregate is not implemented
-        \\t.cell:11:33: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:11:33: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\t.cell:12:34: error: cannot store inner in owned field 'inner': moving a place into an aggregate is not implemented
-        \\t.cell:12:34: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:12:34: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\t.cell:13:33: error: cannot store source in owned field 'name': moving a place into an aggregate is not implemented
-        \\t.cell:13:33: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:13:33: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\
     );
 }
@@ -7911,9 +7961,133 @@ test "owning field guard fails closed for unknown and cyclic destination shapes"
         \\}
     ,
         \\t.cell:5:36: error: cannot store a value of unresolved resource shape in owned field 'value': the destination field's resource shape cannot be resolved
-        \\t.cell:5:36: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:5:36: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\t.cell:6:32: error: cannot store a value of unresolved resource shape in owned field 'next': the destination field's resource shape cannot be resolved
-        \\t.cell:6:32: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\t.cell:6:32: note: aggregate ownership transfer is not implemented; construct a fresh field value instead
         \\
+    );
+}
+
+// ── moved_paths: the field-level record codegen's partial drop reads ─────
+
+/// Borrow-check `src` and hand back the checker, so a test can query the
+/// permanent move records the way codegen does after `checkModule`.
+fn checkedFor(gpa: std.mem.Allocator, src: []const u8) !Checker {
+    var lex = lexer.Lexer.init(src, "t.cell");
+    const tokens = try lex.tokenizeAll(gpa);
+    var p = parser.Parser.init(gpa, tokens.items, "t.cell");
+    const module = try gpa.create(ast.Module);
+    module.* = try p.parseModule();
+    var checker: Checker = .init(gpa, "t.cell", null);
+    errdefer checker.deinit();
+    try checker.checkModule(module);
+    return checker;
+}
+
+/// The id borrowck gave the (single) binding named `name`, found through the
+/// same permanent name table codegen uses to cross-check its numbering.
+fn idNamed(checker: *const Checker, name: []const u8) !u32 {
+    var found: ?u32 = null;
+    var it = checker.names.iterator();
+    while (it.next()) |kv| {
+        if (std.mem.eql(u8, kv.value_ptr.*, name)) {
+            if (found != null) return error.AmbiguousName;
+            found = kv.key_ptr.*;
+        }
+    }
+    return found orelse error.NoSuchBinding;
+}
+
+const partial_move_src =
+    \\pub struct Pair {
+    \\    owned a: String
+    \\    owned b: String
+    \\}
+    \\pub fn f() {
+    \\  let owned p: Pair = Pair { a: "x", b: "y" }
+    \\  let owned m: String = p.a
+    \\}
+;
+
+test "moved_paths: a field move is recorded as that field, not as the whole binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var checker = try checkedFor(arena.allocator(), partial_move_src);
+    defer checker.deinit();
+    try std.testing.expect(!checker.hasErrors());
+    const p = try idNamed(&checker, "p");
+    // The binding-level answer is unchanged, which is what every existing
+    // caller of `wasMoved` still relies on.
+    try std.testing.expect(checker.wasMoved(p));
+    try std.testing.expect(!checker.wasWhollyMoved(p));
+    try std.testing.expect(checker.fieldWasMoved(p, "a"));
+    try std.testing.expect(!checker.fieldWasMoved(p, "b"));
+}
+
+test "moved_paths: a whole-binding move is wholly moved and reports no field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var checker = try checkedFor(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn f() {
+        \\  let owned p: Pair = Pair { a: "x", b: "y" }
+        \\  let owned q: Pair = p
+        \\}
+    );
+    defer checker.deinit();
+    const p = try idNamed(&checker, "p");
+    try std.testing.expect(checker.wasWhollyMoved(p));
+    // `fieldWasMoved` deliberately does not report a whole move; callers
+    // check `wasWhollyMoved` first.
+    try std.testing.expect(!checker.fieldWasMoved(p, "a"));
+    try std.testing.expect(!checker.fieldWasMoved(p, "b"));
+    const q = try idNamed(&checker, "q");
+    try std.testing.expect(!checker.wasMoved(q));
+}
+
+test "moved_paths: a nested field path counts against its top-level field only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var checker = try checkedFor(arena.allocator(),
+        \\pub struct Inner {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub struct Outer {
+        \\    owned inner: Inner
+        \\    owned tag: String
+        \\}
+        \\pub fn f() {
+        \\  let owned p: Outer = Outer { inner: Inner { a: "x", b: "y" }, tag: "t" }
+        \\  let owned m: String = p.inner.a
+        \\}
+    );
+    defer checker.deinit();
+    const p = try idNamed(&checker, "p");
+    try std.testing.expect(!checker.wasWhollyMoved(p));
+    try std.testing.expect(checker.fieldWasMoved(p, "inner"));
+    try std.testing.expect(!checker.fieldWasMoved(p, "tag"));
+    // A prefix that is not a whole path segment must not match: `in` is not
+    // `inner`.
+    try std.testing.expect(!checker.fieldWasMoved(p, "in"));
+}
+
+test "moved_paths: a partial move is still ACCEPTED, with no diagnostic" {
+    // The fix lives entirely in what borrowck records, never in what it
+    // refuses: reading the rest of a partly moved record stays legal.
+    try expectAccepted(
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn view(shared s: String) -> Int;
+        \\pub fn f() -> Int {
+        \\  let owned p: Pair = Pair { a: "x", b: "y" }
+        \\  let owned m: String = p.a
+        \\  return view(shared p.b)
+        \\}
     );
 }

@@ -350,6 +350,21 @@ LEAK_REASSIGNED_VAR=0
 # gate went red on the old pin first ("both witnesses agree ... 0"), then
 # the constant moved. Stays pinned at 0: any nonzero reading re-opens it.
 LEAK_VALUE_BLOCK_LOCAL=0
+# Partial-move residual: a record with one owning field moved out
+# (`let owned moved = p.a`) was skipped whole at scope end, because the drop
+# admission read borrowck's binding-level `wasMoved`, so the record's other
+# owning field was released by nothing. Not an OWNERSHIP.md "Still broken"
+# row number; the CLOSED paragraph under that table carries it. Measured 1000
+# on both witnesses (`leaks` 1000, counter ALLOC=2000 FREE=1000 LIVE=1000)
+# through this same host and counter on the tree before the change.
+# CLOSED 2026-09-16: borrowck records each move with its field path and
+# codegen releases exactly the unmoved owning fields
+# (`emitPartialRecordDrop`); after, `leaks` 0 and ALLOC=2000 FREE=2000 LIVE=0.
+# ASan clean on the straight-line, single-owning-field, conditional and
+# read-after-partial-move shapes. Stays pinned at 0: any nonzero reading
+# re-opens it. A CONDITIONAL partial move still leaks the moved field on the
+# path that did not move it, by design; that is not measured here.
+LEAK_PARTIAL_MOVE_FIELD=0
 
 # ---- stage 10 disclosed signature disagreements, pinned by defect ---------
 # Each line is `<example key>:<function>:<leg>` naming a place where the C
@@ -830,6 +845,7 @@ else
     run_c_leaks block_scoped_local "" "$LEAK_BLOCK_SCOPED_LOCAL" "R11 row 4, CLOSED 2026-09-15"
     run_c_leaks reassigned_var "" "$LEAK_REASSIGNED_VAR" "R11 row 5, CLOSED 2026-09-15"
     run_c_leaks value_block_local "" "$LEAK_VALUE_BLOCK_LOCAL" "R11 value-position block residual, CLOSED 2026-09-15"
+    run_c_leaks partial_move_field "" "$LEAK_PARTIAL_MOVE_FIELD" "partial-move residual, CLOSED 2026-09-16"
 fi
 
 # ------------------------------------------- 8. cross-backend answer agreement --

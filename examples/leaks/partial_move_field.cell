@@ -1,0 +1,49 @@
+// R11 partial-move residual: a record with one owning field moved out
+// (`let owned moved: String = p.a`) was skipped whole at scope end, because
+// codegen's drop admission read borrowck's binding-level `wasMoved`, so the
+// record's SECOND owning field, `p.b`, was released by nothing. It never
+// double freed: `moved` releases `a`, and nothing released `b`.
+//
+// CLOSED 2026-09-16: borrowck records each move WITH its field path
+// (`Checker.moved_paths`), and codegen releases exactly the unmoved owning
+// fields of a partially moved record (`emitPartialRecordDrop`). Measured
+// 1000 before on both witnesses, through this same host and counter, on the
+// tree before the change. It stays in the gate BECAUSE it is closed: pinned
+// at 0, any nonzero reading re-opens it.
+//
+// The record is a `while`-body local on purpose. R11 row 4's block-scoped
+// release (CLOSED 2026-09-15) is what gives a loop-body local a drop point at
+// all, so this fixture exercises the partial drop through the same path a
+// real loop takes.
+//
+// What this fixture does NOT cover, stated so nobody reads it as a proof:
+// a field written again after its move (`p.a = "c"`), whose NEW value still
+// leaks because the move record is never revived (R16 at field granularity,
+// measured and described in docs/OWNERSHIP.md), and a CONDITIONAL partial
+// move. Borrowck records a move made on one branch of
+// an `if` as if it happened on every path, so the moved field is left
+// unreleased on the path that did not move it. That is a leak by design
+// (the fail-toward-leak asymmetry codegen.zig's header commits to), not a
+// double free, and closing it needs runtime drop flags.
+//
+// Status: parses, passes `cell check`. LLVM and MLIR refuse it (`String`
+// crossing the C boundary is scalar-first-refused there); lives under
+// examples/leaks/ so it is invisible to the top-level corpus, agreement and
+// mlir-lowering loops (see examples/leaks/README.md).
+
+pub struct Pair {
+    owned a: String
+    owned b: String
+}
+
+pub fn print_int(copy value: Int);
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        let owned p: Pair = Pair { a: "aaaaaaaa", b: "bbbbbbbb" }
+        let owned moved: String = p.a
+        i = i + 1
+    }
+    print_int(i)
+}

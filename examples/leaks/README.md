@@ -1,7 +1,8 @@
 # `examples/leaks/`
 
-Six fixtures, one per measurable gap in `docs/OWNERSHIP.md` R11's "Still
-broken" table and its CLOSED paragraph (five until 2026-09-15; four of the six are closed and pinned at 0). Each isolates exactly one disclosed `arc` retain/release gap
+Seven fixtures, one per measurable gap in `docs/OWNERSHIP.md` R11's "Still
+broken" table and its CLOSED paragraphs (five until 2026-09-15, six until
+2026-09-16; six of the seven are closed and pinned at 0). Each isolates exactly one disclosed `arc` retain/release gap
 and loops it 1000 times so a leak is a stable count, not noise.
 
 **These programs assert leaks that currently exist.** That is deliberate:
@@ -29,6 +30,7 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `block_scoped_local.cell` | 4: a block-scoped `arc` local is never released; **CLOSED 2026-09-15**, kept and pinned at 0 |
 | `reassigned_var.cell` | 5: reassigning an `arc` `var` leaked the previous box; **CLOSED 2026-09-15** by the reassignment pre-drop in `emitAssign`, kept and pinned at 0 |
 | `value_block_local.cell` | the residual of row 4's closure: an `arc` local declared in a VALUE-position block was not released at that block's exit (measurable since 2026-09-15, when a block began to type as its tail); **CLOSED 2026-09-15** the same evening by `emitValueBlockDrops`, kept and pinned at 0 |
+| `partial_move_field.cell` | not a numbered row: a record with one owning field moved out was skipped whole, leaking its other owning field; **CLOSED 2026-09-16** by field-path move records in borrowck and `emitPartialRecordDrop` in codegen, kept and pinned at 0. A field moved on only one branch still leaks by design and is not measured here |
 
 R11's sixth disclosed gap (an `owned` String or list place bound as `arc`) is
 not a runtime leak at all: it is refused as a C type error at compile time, so

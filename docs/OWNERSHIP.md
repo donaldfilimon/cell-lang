@@ -453,8 +453,12 @@ this rule named four and two of the ones it did not name were live:
 
 The struct-field position now classifies the declared destination type. A
 resource-bearing owned field permits only a fresh value; a place, borrow,
-match alias or unresolved source is refused because aggregate transfer and
-partial-move drop state are absent. Scalar and recursively resource-free fields
+match alias or unresolved source is refused because aggregate transfer is
+absent: copying a place into the field would leave two owners of one buffer.
+The scope-end release of a partially moved record's unmoved fields (closed
+2026-09-16, below) does not change that, since it releases each field once
+and cannot tell that another binding shares it. Scalar and recursively
+resource-free fields
 retain the existing behavior. List elements remain a separate transfer and
 release gap.
 
@@ -710,7 +714,8 @@ take(owned t.name)
 was exit 134. `t.name` was a bitwise copy of `s1` at a different place, so R2
 saw no use-after-move and both were freed. The checker now refuses the field
 initializer without pretending to move `s1`; true transfer remains blocked on
-aggregate drop and partial-move state.
+aggregate transfer. Releasing a record's unmoved fields at scope end, closed
+2026-09-16, is a different half and does not unblock it.
 
 Corpus: `examples/rejected/owned_move_through_match_binding.cell`.
 
@@ -1266,13 +1271,50 @@ exits 0, and each has a control at the commit before the glue: the fixture
 (control 3/0/3), so the label, the struct's clone and the two `peek` clones
 now balance; an `owned String` field 1/1/0; a nested `Outer { owned inner:
 Box, arc tag }` 4/4/0; a struct returned fresh 1/1/0; a struct returned as a
-moved local 1/1/0; an uninitialized `var owned b: Box` 1/1/0. Two shapes
-still leak by design and are stated: a struct moved into an `owned` parameter
-1/0/1 (the callee never drops a parameter, which is row 1's shape), and a
-struct with one field moved out 1/0/1 (borrowck marks the whole binding moved
-on a partial move, so the record is skipped entirely, which leaks any second
-owning field rather than freeing the moved one twice). A field STORE still
-does not pre-drop the old value, as before.
+moved local 1/1/0; an uninitialized `var owned b: Box` 1/1/0. One shape
+still leaks by design and is stated: a struct moved into an `owned` parameter
+1/0/1 (the callee never drops a parameter, which is row 1's shape). A field
+STORE still does not pre-drop the old value, as before.
+
+**The partial-move residual is CLOSED (2026-09-16).** It read: a struct with
+one field moved out (`let owned m = p.a`) is skipped entirely, which leaks any
+second owning field rather than freeing the moved one twice. The cause was a
+granularity mismatch, not a missing rule: `movePlace` already recorded the
+moved FIELD PATH in `dead`, but it also marked the whole binding in `moved`,
+and `dead` is reset per function, so codegen could only ask the binding-level
+`wasMoved` and skipped the record. Borrowck now keeps the same moves WITH their
+paths in `moved_paths`, permanent like `moved`, and exposes `wasWhollyMoved`
+and `fieldWasMoved`. Codegen admits a record whose only moves are field moves,
+and `emitPartialRecordDrop` releases each owning field that was not moved, in
+the glue's reverse declaration order; a wholly moved record is still skipped,
+and an untouched one still goes through its glue. No rule was added and no
+program's verdict changed.
+
+Measured on `examples/leaks/partial_move_field.cell`, 1000 iterations, through
+the leak host and malloc counter: `leaks` 1000 and ALLOC=2000 FREE=1000
+LIVE=1000 on the tree before, `leaks` 0 and ALLOC=2000 FREE=2000 LIVE=0 after.
+The gate pins it at 0. AddressSanitizer is clean on four shapes with an owned
+LOCAL as the source (never a parameter, which is never released and would hide
+a double free): the straight-line move, a record whose only owning field was
+moved (still releases nothing of its own), a read of `p.b` after moving `p.a`
+(released after the read), and a move on one branch of an `if` whose callee
+really frees its argument.
+
+Three limits, all in the leak direction and all deliberate. A field moved on
+only ONE branch of an `if` is recorded as moved on every path, exactly as
+`moved` always was, so on the path that did not move it that field leaks;
+closing it needs runtime drop flags. A move of part of a field (`p.inner.a`)
+leaves the whole top-level field `p.inner` unreleased, so `p.inner.b` leaks,
+rather than releasing `p.inner` through its glue and freeing the moved buffer
+a second time. And a field that is written again after being moved out
+(`let owned m = p.a` then `p.a = "c"`) keeps its moved record, because
+`moved_paths` is permanent like `moved` and never revived, so the NEW value
+leaks: this is R16's revival leak at field granularity. Measured over 1000
+iterations with an owned local: `leaks` 2000 and LIVE=2000 on the tree before
+(the whole record skipped, both fields leaking), `leaks` 1000 and LIVE=1000
+after (only the revived value leaking), ASan clean both ways. Releasing the
+revived value would need the revival to clear the record, which is exactly
+the part R16 leaves undone.
 
 **What had to land first, and why it is part of this closure.** Dropping a
 record turns every bitwise alias of its fields that outlives it from a leak
@@ -1955,7 +1997,7 @@ ways, and each is a real, documented gap rather than an oversight:
   would free under that element. Closing it needs the list-element read to
   become a tracked alias or a move, not a drop insertion.
 
-Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. What remains out of scope is the partial-move case: a struct with one field moved out is skipped entirely rather than having its remaining owning fields released.
+Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released. What remains out of scope is a field moved on only one branch (it leaks on the other path, pending drop flags) and a partly moved field (the whole field is left unreleased).
 
 ### R17. Double free is prevented by R2, not by a runtime check
 
