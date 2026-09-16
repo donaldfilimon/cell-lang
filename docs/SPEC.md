@@ -483,7 +483,7 @@ Unicode identifiers are **designed, not implemented**.
 
 **Status: implemented.**
 
-Nineteen words are reserved and can never be used as identifiers:
+Twenty-three words are reserved and can never be used as identifiers:
 
 ```
 fn      let     var     mut     struct   enum
