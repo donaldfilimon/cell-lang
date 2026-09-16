@@ -234,6 +234,16 @@ const MovedPath = struct {
     path: []const u8,
 };
 
+/// See `Checker.assign_liveness`.
+const AssignLiveness = struct {
+    /// Address of the target identifier's name bytes: a stable, unique key
+    /// per assignment site that codegen can compute from its own copy of the
+    /// statement, because the name slice points into the source buffer.
+    key: usize,
+    binding: u32,
+    live: bool,
+};
+
 /// A place whose value has been moved out (R2).
 const Dead = struct {
     binding: u32,
@@ -369,6 +379,27 @@ pub const Checker = struct {
     /// happened on every path, which for a DROP decision fails toward a
     /// leak and never toward a double free.
     moved_paths: std.ArrayListUnmanaged(MovedPath) = .empty,
+    /// One entry per whole-binding reassignment `v = ...` the checker
+    /// accepted, recording whether `v` still held a live value at that store
+    /// (after the right side was checked, so `v = f(v)` counts as moved).
+    /// Codegen reads it through `assignReleasesOldValue` to decide whether
+    /// the old value may be freed before the store.
+    ///
+    /// WHY NOT `wasMoved`. That answer is "moved anywhere in the function",
+    /// so a var moved AFTER its reassignment (a later `return v`) looked
+    /// moved at the store too, and its old value leaked. `dead` answers the
+    /// right question at the right point, lexically.
+    ///
+    /// WHY THE LOOP INVALIDATION. `dead` is lexical, and a `continue` (or the
+    /// back edge after any path) can carry a move made LATER in a `while`
+    /// body to a store EARLIER in the next iteration without `dead` ever
+    /// showing it: `while c { v = "x" \n if d { take(v) \n continue } \n
+    /// v = "y" }` is accepted, and at `v = "x"` on the third iteration the
+    /// value was already handed to `take`. So `checkWhile` clears `live`
+    /// on every entry recorded inside its body whose binding was moved
+    /// anywhere in that body (`moved_paths` is append-only, so "anywhere in
+    /// the body" is a range). `while` is the only back edge Cell has.
+    assign_liveness: std.ArrayListUnmanaged(AssignLiveness) = .empty,
     /// Every binding's name, keyed by id, permanent for the checker's whole
     /// life -- unlike `bindings`, which is truncated when its scope pops,
     /// so it cannot answer this once a function has finished checking.
@@ -433,6 +464,7 @@ pub const Checker = struct {
         self.dead.deinit(self.allocator);
         self.moved.deinit(self.allocator);
         self.moved_paths.deinit(self.allocator);
+        self.assign_liveness.deinit(self.allocator);
         self.names.deinit(self.allocator);
         self.block_loans.deinit(self.allocator);
         self.temp_loans.deinit(self.allocator);
@@ -595,6 +627,22 @@ pub const Checker = struct {
         return self.moved.contains(binding);
     }
 
+    /// True only when EVERY check of the whole-binding assignment whose
+    /// target name starts at `name_ptr` found the target holding a live
+    /// value that no path through an enclosing loop could have moved. False
+    /// for an unknown site, so a store the checker did not vouch for keeps
+    /// the leak. See `assign_liveness`.
+    pub fn assignReleasesOldValue(self: *const Checker, name_ptr: [*]const u8) bool {
+        const key = @intFromPtr(name_ptr);
+        var found = false;
+        for (self.assign_liveness.items) |entry| {
+            if (entry.key != key) continue;
+            if (!entry.live) return false;
+            found = true;
+        }
+        return found;
+    }
+
     /// True when the binding ITSELF was moved (path `""`), as opposed to
     /// only some of its fields. A wholly moved record is gone and codegen
     /// releases none of it; a record with only fields moved out is still
@@ -670,6 +718,11 @@ pub const Checker = struct {
     /// under this rule is still accepted under a real control-flow analysis,
     /// so tightening now and relaxing later never breaks source compatibility.
     fn checkWhile(self: *Checker, w: anytype, span: Span) Error!void {
+        // Taken before the condition: it runs on every iteration too.
+        const liveness_before = self.assign_liveness.items.len;
+        const moved_before = self.moved_paths.items.len;
+        defer self.invalidateLoopStores(liveness_before, moved_before);
+
         try self.checkExpr(@constCast(&w.cond));
 
         const first_inner_id = self.next_binding_id;
@@ -696,6 +749,20 @@ pub const Checker = struct {
                 "'{s}' is declared outside this loop; assign to it before the end of the body to revive it",
                 .{d.display},
             ));
+        }
+    }
+
+    /// A store recorded inside a loop body cannot vouch for its target if
+    /// that binding is moved anywhere in the same body: the back edge can
+    /// bring the move to the store. See `assign_liveness`.
+    fn invalidateLoopStores(self: *Checker, liveness_before: usize, moved_before: usize) void {
+        for (self.assign_liveness.items[liveness_before..]) |*entry| {
+            for (self.moved_paths.items[moved_before..]) |m| {
+                if (m.binding == entry.binding) {
+                    entry.live = false;
+                    break;
+                }
+            }
         }
     }
 
@@ -1455,8 +1522,31 @@ pub const Checker = struct {
             try self.checkExpr(v);
         }
 
+        // Asked here, after the right side, and before the revival below
+        // erases the answer. Only a whole-binding target named by a bare
+        // identifier is recorded; everything else keeps the plain store.
+        if (place.path.len == 0) {
+            if (assignTargetName(&a.target)) |name| {
+                try self.assign_liveness.append(self.allocator, .{
+                    .key = @intFromPtr(name.ptr),
+                    .binding = place.binding,
+                    .live = self.findDead(place) == null,
+                });
+            }
+        }
+
         // R3a: the target is live again.
         self.revive(place);
+    }
+
+    /// The identifier an assignment target names, through annotations.
+    fn assignTargetName(target: *const ast.Expr) ?[]const u8 {
+        var t = target;
+        while (t.kind == .annotated) t = t.kind.annotated.value;
+        return switch (t.kind) {
+            .ident => |n| n,
+            else => null,
+        };
     }
 
     // ── expressions ─────────────────────────────────────────────────────

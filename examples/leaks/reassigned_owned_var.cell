@@ -7,20 +7,43 @@
 // list element since c314a0e, and no other untracked alias of an `owned`
 // String or list is accepted.
 //
-// Each iteration reassigns a String var and a list var once each, so the
-// pre-fix count is 2000 on both witnesses.
+// Each iteration reassigns a String var and a list var in `main`, and one
+// var in each of the two later-move helpers, so the count before any fix
+// was 4000 on both witnesses.
 //
-// NOT covered, by design: a var that is moved ANYWHERE in the function,
-// before the reassignment (R3a revival, where the old value may belong to
-// someone else) or after it (a later `return v` or `take(v)`, because
-// borrowck's `wasMoved` is not flow-sensitive). No pre-drop is emitted for
-// either and the reassigned-away values still leak.
+// Also covered since the same day: a var moved AFTER its reassignment
+// (`later_return`, `later_sink`). The pre-drop is decided per store from
+// borrowck's `assign_liveness`, not from "moved anywhere in the function",
+// so those stores release the old value too; before that they measured one
+// leak per call each.
+//
+// NOT covered, by design: a store whose target was already moved (R3a
+// revival, a one-branch move, `v = pass(v)`), and any store inside a
+// `while` body that also moves the target, because the back edge can carry
+// that move to the store. Those keep the leak, and a revived var's final
+// value still leaks at scope end (`wasMoved` stays permanent for the
+// scope-end drop).
 //
 // Status: parses, passes `cell check`. LLVM and MLIR refuse it; lives under
 // examples/leaks/ so it is invisible to the top-level corpus, agreement and
 // mlir-lowering loops (see examples/leaks/README.md).
 
 pub fn print_int(copy value: Int);
+
+pub fn sink(owned s: String) {
+}
+
+pub fn later_return() -> String {
+    var owned v: String = "later-a"
+    v = "later-b"
+    return v
+}
+
+pub fn later_sink() {
+    var owned v: String = "sunk-a"
+    v = "sunk-b"
+    sink(v)
+}
 
 pub fn main() {
     var i = 0
@@ -29,6 +52,8 @@ pub fn main() {
         s = "second-string"
         var owned xs: [Int] = [1, 2, 3]
         xs = [4, 5]
+        let owned r: String = later_return()
+        later_sink()
         i = i + 1
     }
     print_int(i)

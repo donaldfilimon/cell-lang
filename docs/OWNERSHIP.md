@@ -1291,10 +1291,10 @@ reassigned away from, 100 over 100 calls, and the same program returning a
 plain `-> String` on the tree before this change leaks the same 100: an
 `owned` `var`'s reassignment had no pre-drop then (the `emitAssign`
 pre-drop was `arc`-only), which is not this position's defect. The
-never-moved case closed later the same day (R16 below), but this program
-still measures 100 after that: `v` is RETURNED, a return is a move, and the
-pre-drop's `wasMoved` gate answers "moved anywhere in the function",
-including after the reassignment. A move on only one branch
+never-moved case closed later the same day (R16 below). This program
+still measured 100 after that first fix, because `v` is RETURNED and the
+first pre-drop asked "moved anywhere in the function"; it measures 0 since
+the pre-drop became a per-store decision (R16 below). A move on only one branch
 (`if c > 0 { return p }`) leaks `p` on the path that did not return, 50 over
 50 such calls, and again a plain `-> String` function leaks the same 50: the
 conservative branch move R2 already makes. Still refused at this position: a
@@ -2103,14 +2103,29 @@ ways, and each is a real, documented gap rather than an oversight:
   and 350 after, the 350 being exactly the revival and one-branch leaks
   derived by hand, and ASan clean. Removing the `wasMoved` gate made the
   revival shape an AddressSanitizer double free (exit 134), so that gate is
-  load-bearing, not tidiness. **Its cost, measured:** `wasMoved` is not
-  flow-sensitive, so a var moved LATER than the reassignment (returned, or
-  passed to an `owned` parameter afterwards) also gets no pre-drop and still
-  leaks every value it was reassigned away from (100 over 100 calls for
-  `var owned v = "a" \n v = "b" \n return v` from a `-> arc String`
-  function). Closing that needs a per-assignment "definitely not moved yet"
-  answer from borrowck, not a wider codegen predicate. Records are not
-  covered (a record var keeps the plain store).
+  load-bearing, not tidiness. Records are not covered (a record var keeps
+  the plain store).
+- **CLOSED later the same day: the decision is per STORE, not per binding.**
+  The first version asked `wasMoved`, which is not flow-sensitive, so a var
+  moved only AFTER its reassignment (`v = "b" \n return v`, or a later
+  `take(v)`) got no pre-drop and leaked (100 over 100 calls, measured).
+  borrowck now records, at each whole-binding store, whether the target
+  still holds a value once the right side is checked
+  (`Checker.assign_liveness`, read by `assignReleasesOldValue`), so
+  `v = pass(v)` counts as moved, and a revived var's NEXT store releases the
+  revived value. `dead` is lexical, and a `while` back edge can bring a move
+  made later in the body (including one followed by `continue`) to an
+  earlier store in the next iteration, which the checker accepts; so every
+  store recorded inside a `while` body is cleared when that body moves the
+  same binding anywhere. Both guards were measured by removing them: without
+  the loop clearing, the `continue` program was an ASan double free (exit
+  134); recording every store as live made `v = pass(v)` followed by a read
+  a heap-use-after-free. `examples/leaks/reassigned_owned_var.cell` gained
+  two later-move helpers and reads 4000 before either change, 2000 at
+  `2d95a51`, and 0 after. What still leaks, by design: a store whose target
+  was already moved, any store inside a `while` body that also moves the
+  target (even on an iteration where the value is live), and a revived var's
+  final value at scope end (the scope-end drop still reads `wasMoved`).
 
 Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released. What remains out of scope is a field moved on only one branch (it leaks on the other path, pending drop flags) and a partly moved field (the whole field is left unreleased).
 

@@ -66,8 +66,9 @@
 //! ANYWHERE in the function", so a `var` that is moved and later reassigned
 //! (R3a revival) is never dropped either, even though it holds a fresh,
 //! unmoved value at the function's end -- the revived value leaks too, and
-//! for the same reason `emitAssign` gives a moved `owned` var no pre-drop
-//! (a never-moved one is released before each store since 2026-09-16); and
+//! (`emitAssign` releases an `owned` var's old value on a store borrowck
+//! vouches for since 2026-09-16, which covers the revived value's NEXT
+//! store but not the final value at scope end); and
 //! a local declared inside a VALUE-position block (`emitValueInto`) is not
 //! released at that block's exit, because it may be the value flowing out.
 //! Why block-scoped release is safe for a local whose initializer moves an
@@ -880,12 +881,17 @@ pub const Generator = struct {
         // measured heap-use-after-free at 4c93571).
         //
         // An `owned` `String` or list var is covered too, since 2026-09-16,
-        // but ONLY when borrowck never moved that binding anywhere in the
-        // function (`wasMoved`, permanent and branch-conservative). That is
+        // but ONLY when borrowck vouches for THIS store: the target still
+        // held a value after the right side was checked, and no enclosing
+        // `while` body moves it (`Checker.assignReleasesOldValue`). That is
         // the question the `arc` case never had to ask: a moved `owned`
         // var's old value belongs to whoever took it, so a pre-drop after
-        // `take(v)` (R3a revival) or after a move on one branch is a double
-        // free. Those keep the leak (R16's revival leak). The old reason for
+        // `take(v)` (R3a revival), after a move on one branch, in
+        // `v = pass(v)`, or behind a loop's back edge is a double free or a
+        // use after free (all three guards measured under ASan). Those keep
+        // the leak. The first version asked `wasMoved` ("moved anywhere in
+        // the function"), which also refused a var moved only AFTER the
+        // store, and leaked its old value for no reason. The old reason for
         // excluding `owned` entirely, `[s]` copying the header without a
         // move, is gone: borrowck refuses that list element since c314a0e,
         // and a match-arm binding, a live `shared` borrow, an `owned` struct
@@ -939,9 +945,12 @@ pub const Generator = struct {
                 .owned => {
                     if (local.ty.shape != .string and local.ty.shape != .slice) return null;
                     // No checker means no move facts, and without them the
-                    // pre-drop cannot be proven safe: keep the leak.
+                    // pre-drop cannot be proven safe: keep the leak. The
+                    // checker answers per store, not per binding: whether
+                    // this target still held a value here, with every
+                    // enclosing loop's back edge accounted for.
                     const checker = self.checker orelse return null;
-                    if (checker.wasMoved(local.id)) return null;
+                    if (!checker.assignReleasesOldValue(name.ptr)) return null;
                     return local;
                 },
                 else => return null,
@@ -5963,6 +5972,80 @@ test "reassigning a moved owned var keeps no pre-drop: its old value is gone" {
         try expectAbsent(body, "cell_string_free(&v);");
         try expectAbsent(body, "_cell_t0");
     }
+    try expectCompiles(e.text);
+}
+
+test "the owned reassignment pre-drop is decided per store, not per binding" {
+    // borrowck's `assign_liveness`, 2026-09-16. A move AFTER the store no
+    // longer blocks it; a move BEFORE it (revival) or IN the right side
+    // still does; and a revived var's NEXT store releases the revived value.
+    var e = try emitSource(
+        \\pub fn take(owned s: String);
+        \\pub fn pass(owned s: String) -> String { return s }
+        \\pub fn later() {
+        \\  var owned v: String = "a"
+        \\  v = "b"
+        \\  take(v)
+        \\}
+        \\pub fn selfmove() {
+        \\  var owned v: String = "a"
+        \\  v = pass(v)
+        \\}
+        \\pub fn chain() {
+        \\  var owned v: String = "a"
+        \\  take(v)
+        \\  v = "b"
+        \\  v = "c"
+        \\}
+    );
+    defer e.deinit();
+    const later = try fnDef(e.text, "later");
+    try expectOccurrences(later, "cell_string_free(&v);", 1);
+    try expectLineBefore(later, "cell_take(v);", "v = _cell_t0;");
+    const selfmove = try fnDef(e.text, "selfmove");
+    try expectAbsent(selfmove, "cell_string_free(&v);");
+    try expectContains(selfmove, "v = cell_pass(v);");
+    const chain = try fnDef(e.text, "chain");
+    // Only the store of "c" releases, and what it releases is "b".
+    try expectOccurrences(chain, "cell_string_free(&v);", 1);
+    try expectContains(chain, "v = cell_string_from_str(cell_str_from_parts(\"b\", 1));");
+    try expectCompiles(e.text);
+}
+
+test "a store inside a while body that also moves its target keeps no pre-drop" {
+    // The back edge can carry a move made later in the body, including one
+    // followed by `continue`, to a store earlier in the next iteration.
+    // Without the loop invalidation this exact program was an
+    // AddressSanitizer double free (exit 134), measured.
+    var e = try emitSource(
+        \\pub fn take(owned s: String);
+        \\pub fn loopy() {
+        \\  var owned v: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    v = "x"
+        \\    i = i + 1
+        \\    if i > 1 {
+        \\      take(v)
+        \\      continue
+        \\    }
+        \\    v = "y"
+        \\  }
+        \\}
+        \\pub fn untouched() {
+        \\  var owned v: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    v = "x"
+        \\    i = i + 1
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(try fnDef(e.text, "loopy"), "cell_string_free(&v);");
+    // A loop that never moves its target still releases on every store,
+    // plus once at scope end.
+    try expectOccurrences(try fnDef(e.text, "untouched"), "cell_string_free(&v);", 2);
     try expectCompiles(e.text);
 }
 

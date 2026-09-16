@@ -348,13 +348,16 @@ LEAK_REASSIGNED_VAR=0
 # never-moved `owned` String or list var leaked the old value on every store.
 # Measured 2000 on both witnesses before the change (`leaks` 2000, counter
 # ALLOC=4000 FREE=2000 LIVE=2000), through this same host and counter.
-# CLOSED 2026-09-16: `emitAssign`'s pre-drop covers a droppable `owned`
-# String or list local that borrowck's `wasMoved` says was never moved
-# (the `[s]` header copy that excluded it is refused since c314a0e); after,
-# `leaks` 0 and ALLOC=4000 FREE=4000 LIVE=0, ASan clean. A MOVED var gets no
-# pre-drop (a double free otherwise, measured: exit 134 under ASan when the
-# guard was removed), so R16's revival leak is unchanged and not measured
-# here. Stays pinned at 0.
+# CLOSED 2026-09-16 in two steps: `emitAssign`'s pre-drop covers a droppable
+# `owned` String or list local (the `[s]` header copy that excluded it is
+# refused since c314a0e), first when borrowck's `wasMoved` said the binding
+# was never moved (2d95a51), then per STORE from borrowck's `assign_liveness`,
+# so a var moved only after its reassignment is released too. The fixture's
+# two later-move helpers make the readings 4000 before either step, 2000 at
+# 2d95a51, and 0 after (ALLOC=8000 FREE=8000 LIVE=0), ASan clean. A store
+# whose target was already moved, or sits in a `while` body that moves it,
+# gets no pre-drop (each guard measured as an ASan failure when removed), so
+# R16's revival leak is unchanged and not measured here. Stays pinned at 0.
 LEAK_REASSIGNED_OWNED_VAR=0
 # The residual the 2026-09-15 block-scoped release left behind, measurable
 # only since the same day (typing a block by its tail made the program
