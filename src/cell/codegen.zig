@@ -4653,9 +4653,22 @@ test "an owned String PLACE returned as arc stays loud, like every other positio
     // keyed on a difference between positions, which is the exact shape that
     // produced every use-after-free this file has had. The loud C error is
     // the safe side.
+    //
+    // **`borrowck.zig` now refuses this program outright** (R10's other
+    // direction, the return position, 2026-09-16), so what this test reads is
+    // BEST-EFFORT C for a module the front end rejects, which this backend
+    // has always emitted and the module doc comment states. The refusal
+    // reports and stops, so the returned place is no longer recorded as
+    // moved, and the drop pass therefore spells a release for `p` that the
+    // old text did not have. That difference is only observable through this
+    // harness, which bypasses `check`; through the CLI the program never
+    // reaches codegen. The property under test is unchanged and still holds:
+    // no box is emitted for a place, and the C does not compile
+    // (`cell_arc_t _cell_t0 = p;` is the type error now, `return p;` was
+    // before), so the position stays loud rather than silently unsound.
     try expectContains(e.text,
         \\  cell_string_t p = cell_make();
-        \\  return p;
+        \\  cell_arc_t _cell_t0 = p;
     );
     try expectAbsent(e.text, "cell_arc_from_string(p)");
 }

@@ -863,7 +863,7 @@ revision can relax the rule without invalidating existing programs.
 | `arc` place to a `shared` parameter | yes | borrows the pointee for the call; no retain |
 | `arc` place to an `exclusive` parameter | no | R9. **IMPLEMENTED** in `borrowck.zig` as of the R9 work above, at `createLoan`, which covers every spelling of an exclusive borrow rather than this position alone |
 | `arc` place to an `owned` parameter | no | see below. **IMPLEMENTED** in `borrowck.zig`, the only clause of R10 that is, and enforced at four positions rather than just this one |
-| `owned` place to an `arc` parameter | yes | moved into a fresh `arc` box; the source is dead by R2 |
+| `owned` place to an `arc` parameter | **designed, not implemented** | R10 designs this as a move into a fresh `arc` box with the source dead by R2, and the checker does not do it: the source is NOT consumed. **Refused with an explicit diagnostic as of 2026-09-16** at five positions, rather than left to a `cc` type error. See below |
 | `shared` or `exclusive` borrow to an `arc` parameter | no | see below |
 | `copy` and `arc` on the same declaration | no | see below |
 
@@ -895,6 +895,59 @@ one measured:
 | an `owned` struct field in a literal | a plain owned place was a live double free when the field was later extracted; resource-bearing destinations now require a fresh value |
 | a list-literal ELEMENT, `let owned zss: [[Int]] = [xs, xs]` | **REFUSED since 2026-09-15.** It was accepted and clean at `-Werror`, disclosed here as "not a use-after-free **yet**, only because slice elements are never released". That disclosure named the wrong half of the mechanism and the program was already unsound: the defect is the SOURCE's release, not the element's. Measured under AddressSanitizer at `76128ba` one type down, `fn mks() -> [String] { let owned s = make(); return [s] }` read by its caller reports `heap-use-after-free`, freed by `cell_string_free` on `s`. See R2's list-element clause below |
 | a `return` whose declared return type is not `arc` | a loud `cc` type error (`cell_slice_t x = cell_arc_clone(...)`), which is protection by a coincidence of two C types and is what this rule's own text objects to. `-> arc T` is untouched: it is the legal arc-to-arc case |
+
+#### The other direction: `owned` into `arc`, refused as unimplemented (2026-09-16)
+
+The table row above used to read "yes". `tools/sweep-backends.sh` reported four
+rows, all `C UNCOMPILABLE: initializing 'cell_arc_t'`: `let arc String = param`,
+`let arc [Int] = param`, `let arc Int? = param`, `assign arc <- owned String`.
+That looks like a backend typing bug, and the tempting fix is to box the place
+in codegen, where `emitArcConversion` already has the boxing and declines only
+because `isPlace(arg)` is true.
+
+**It was not a typing bug.** Measured before touching anything: `view(p)` after
+`let arc a = p` is ACCEPTED, while the same use after `let owned q = p` is
+refused as a move. The source is not consumed, so boxing hands the `arc` box a
+buffer the source still frees. Proved by building it that way: with an owned
+LOCAL rather than a parameter, `let owned s = make()` then
+`let arc a = match 1 { _ => s }` emitted `cell_arc_from_string(...)` followed by
+`cell_string_free(&s)` and died under AddressSanitizer, `exit 134`,
+`attempting double-free ... in cell_string_free`. A parameter hides it, because
+parameters are not released today (R11 row 1), which is why the first probes
+looked clean.
+
+So the `cc` error was the only thing holding those programs back, exactly as it
+was for the match-arm inference gap closed in `fc4c81d` the same night. This is
+the second time in one session that a front-end gap was masked by a back-end
+error; closing the back end first would have made the language less safe both
+times.
+
+Implementing the move means deciding who releases the box, which is the same
+question as who releases an `arc` parameter: **R11 row 1**, an ABI change to
+`runtime/cell_rt.h` section 7 and every host. So this refuses and says
+"not implemented", at five positions rather than the sweep's four rows: a
+binding, an assignment, a call argument, a struct-literal field, and a return.
+The last two are not in the sweep at all and were found by probing positions
+instead of rows, which is the discipline this rule's own text asks for.
+
+The refusal is narrow and each exemption was verified to compile and run, not
+merely to pass the checker: a fresh value still boxes (`let arc a = make()`), an
+`arc` source is the legal retain, a `shared` source is a view that
+`cell_arc_from_string(cell_string_from_str(p))` copies rather than aliases, and
+a branch whose arms are fresh values stays accepted. It asks `ownedMoveSource`
+rather than `placeOf`, because `placeOf` returns null for a `match` and a first
+version refused `let arc a = s` while accepting `let arc a = match 1 { _ => s }`
+-- the same program wearing a branch, and the shape that measured exit 134.
+
+Two implementation notes worth keeping. The caller peels the block tail, once
+per path, and the refusal must NOT peel again: `openBlockTail` calls
+`pushScope` and `checkStmt` over the block's statements, so a second peel
+declares every block binding again and drifts `next_binding_id` away from the
+ids codegen agreed to. A revision that peeled inside the helper crashed two
+codegen tests with SIGABRT on exactly that assertion. And the refusal reports
+and stops, so a returned place is no longer recorded as moved; the only visible
+effect is the best-effort C this backend emits for a module the front end
+rejects, which the codegen test for that position now reads and explains.
 
 A list element is refused **context free**, since a list literal copies each
 element by value into a buffer the list owns and no element-level annotation

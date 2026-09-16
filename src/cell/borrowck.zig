@@ -366,6 +366,15 @@ pub const Checker = struct {
     /// refusing would have no memory-safety basis. `-> arc T` is the legal
     /// `arc`-to-`arc` case and is deliberately not flagged.
     fn_return_owned: ?[]const u8 = null,
+    /// The mirror of the flag above: set while checking a function that DOES
+    /// declare `-> arc T`, which makes the return slot R10's other direction
+    /// (see `refuseUnimplementedArcMove`). `fn g(owned p: String) -> arc
+    /// String { return p }` was accepted by the checker and rejected by `cc`,
+    /// the fifth position of this rule and the last one found; the first four
+    /// were a binding, an assignment, a call argument and a struct-literal
+    /// field. Exactly one of these two flags is non-null once a return type is
+    /// declared, and both stay null when none is.
+    fn_return_arc: ?[]const u8 = null,
     /// The function whose body is being walked. Read only by the differential
     /// oracle, which needs the whole body and the parameter list at once,
     /// which the region-walking state above deliberately does not keep.
@@ -439,6 +448,7 @@ pub const Checker = struct {
     fn checkFn(self: *Checker, span: Span, f: *const ast.FnDef) Error!void {
         self.fn_return_borrow = null;
         self.fn_return_owned = null;
+        self.fn_return_arc = null;
         self.current_fn = f;
         defer self.current_fn = null;
         if (f.return_type) |*rt| {
@@ -447,6 +457,7 @@ pub const Checker = struct {
                 .name, .optional, .list, .result, .unit => false,
             };
             if (!returns_arc) self.fn_return_owned = f.name;
+            if (returns_arc) self.fn_return_arc = f.name;
             if (typeIsBorrow(rt)) |kind| {
                 self.fn_return_borrow = kind;
                 // A bodyless `-> shared T` has no return expression to point
@@ -680,6 +691,23 @@ pub const Checker = struct {
                     // two C types, and R10's own text objects to exactly that.
                     // `-> arc T` is untouched: `fresh()` returning its own
                     // `arc` local is the legal arc-to-arc case.
+                    // R10's other direction, the return position. Peeled the
+                    // same way the owned branch below peels, so a block tail
+                    // cannot walk around it.
+                    if (self.fn_return_arc) |fn_name| {
+                        // Peeled here, once. Exclusive with the owned branch
+                        // below, which peels the same way, so the block's
+                        // statements are checked exactly once either way.
+                        switch (try self.openBlockTail(ret)) {
+                            .not_block => {},
+                            .unit => return,
+                            .tail => |t| {
+                                v = t.expr;
+                                depth = t.depth;
+                            },
+                        }
+                        if (try self.refuseUnimplementedArcMove(v, "return", "from", "function", fn_name)) return;
+                    }
                     if (self.fn_return_owned) |fn_name| {
                         switch (try self.openBlockTail(ret)) {
                             .not_block => {},
@@ -834,7 +862,7 @@ pub const Checker = struct {
         var v = written;
         var depth: usize = 0;
         defer self.closeBlockTail(depth);
-        if (l.ownership == .owned) switch (try self.openBlockTail(written)) {
+        if (l.ownership == .owned or l.ownership == .arc) switch (try self.openBlockTail(written)) {
             .not_block => {},
             .unit => return,
             .tail => |t| {
@@ -921,6 +949,12 @@ pub const Checker = struct {
                 try self.createLoan(place, kind, true, l.name);
                 return;
             }
+        }
+        if (l.ownership == .arc) {
+            // R10's other direction, the `let` position. See
+            // `refuseUnimplementedArcMove`: this is the sweep's
+            // `let arc String = param` row and its two siblings.
+            if (try self.refuseUnimplementedArcMove(v, "bind", "to", "binding", l.name)) return;
         }
         if (l.ownership == .owned) {
             // R10, the `let` position. Asked of the whole EXPRESSION's
@@ -1277,6 +1311,11 @@ pub const Checker = struct {
         var depth: usize = 0;
         defer self.closeBlockTail(depth);
 
+        // R10's other direction, the assignment position: the sweep's
+        // `assign arc <- owned String` row. See `refuseUnimplementedArcMove`.
+        if (self.placeOwnership(b, place.path) == .arc) {
+            if (try self.refuseUnimplementedArcMove(&a.value, "assign", "to", "place", place.display)) return;
+        }
         // R10, the assignment position: the same double free as the `let`
         // one, reached by writing into an already-declared `owned` place
         // instead of declaring a new one. Asked of the whole EXPRESSION's
@@ -1397,6 +1436,19 @@ pub const Checker = struct {
                     defer self.closeBlockTail(depth);
                     if (def) |d| {
                         if (findField(d, f.name)) |fld| {
+                            // R10's other direction, the struct-literal field
+                            // position. The sweep does not generate it and it
+                            // is not one of its four rows; found by probing
+                            // the positions rather than the rows, which is the
+                            // discipline this rule's own text asks for.
+                            // `struct Box { arc s: String }` with
+                            // `Box { s: p }` over an `owned` p was accepted by
+                            // the checker and rejected by `cc` with
+                            // `initializing 'void *' with an expression of
+                            // incompatible type 'cell_string_t'`.
+                            if (fld.ownership == .arc) {
+                                if (try self.refuseUnimplementedArcMove(&f.value, "store", "in", "field", f.name)) continue;
+                            }
                             if (fld.ownership == .owned) {
                                 switch (try self.openBlockTail(&f.value)) {
                                     .not_block => {},
@@ -1785,6 +1837,16 @@ pub const Checker = struct {
             // `placeOf` returns null for a `match`, and the early exit under
             // it is exactly how `take(owned match c { 0 => xs, _ => xs })`
             // escaped a rule that refuses `take(owned xs)`.
+            if (mode == .arc) {
+                // R10's other direction, the call-argument position. The
+                // sweep's four rows are all bindings and assignments, so this
+                // one was found by hand: `keep(p)` with `arc s` and an `owned`
+                // p is accepted by the checker and rejected by `cc` exactly
+                // like them. Listed shapes are not the enumeration; the
+                // position is. See `refuseUnimplementedArcMove`.
+                const slot_name = if (param) |p| p.name else null;
+                if (try self.refuseUnimplementedArcMove(operand, "pass", "to", "parameter", slot_name)) continue;
+            }
             if (mode == .owned) {
                 const slot_name = if (param) |p| p.name else null;
                 switch (try self.openBlockTail(operand)) {
@@ -2684,6 +2746,113 @@ pub const Checker = struct {
     /// expression as an ordinary move. `.not_arc` is the ONLY verdict that
     /// passes; `.unknown` is refused with its own wording, so a reader can
     /// tell "this is `arc`" from "this could not be proven not to be".
+    /// R10's move-into-`arc` direction, refused as UNIMPLEMENTED rather than
+    /// enforced as illegal. The mirror of `refuseArcUnique` above, and the
+    /// distinction matters: that one refuses `arc` into `owned` because no
+    /// retain can make it sound, while this one refuses `owned` into `arc`
+    /// because the feature is not built. R10's table calls this row legal and
+    /// says the source is "moved into a fresh `arc` box", and
+    /// `docs/OWNERSHIP.md` has said since it was written that move-into-`arc`
+    /// is not implemented in the checker. Those two sentences were reconciled
+    /// by a diagnostic on 2026-09-16.
+    ///
+    /// WHAT IT WAS BEFORE, and why making it compile was the wrong fix. The
+    /// sweep (`tools/sweep-backends.sh`, 88 probed) reported exactly four
+    /// rows, all one shape: `let arc String = param`, `let arc [Int] = param`,
+    /// `let arc Int? = param`, `assign arc <- owned String`, each
+    /// `C UNCOMPILABLE: initializing 'cell_arc_t'`. `cell check` accepted them
+    /// and `cc` refused them, so the tempting fix was to box the place in
+    /// codegen, where `emitArcConversion` already has the boxing and declines
+    /// only because `isPlace(arg)` is true.
+    ///
+    /// **Measured before touching it: `view(p)` after `let arc a = p` is
+    /// ACCEPTED, while the same use after `let owned q = p` is refused as a
+    /// move.** The source is not consumed. Boxing the place would therefore
+    /// have handed the `arc` box a buffer the source still frees at its own
+    /// scope end, which is a double free manufactured by the fix. The `cc`
+    /// type error was the only thing holding that program back, exactly as it
+    /// was for the match-arm gap closed in `fc4c81d` the same night.
+    ///
+    /// Implementing it properly means the box takes ownership, which is the
+    /// same question as who releases an `arc` parameter, and that is R11 row
+    /// 1: an ABI change to `cell_rt.h` section 7 and every host, deliberately
+    /// its own session. So this refuses and says so, and the refusal is
+    /// narrow: only an `owned` place is caught. A fresh value still boxes
+    /// (`let arc a = make()` compiles and is correct), an `arc` source is the
+    /// legal retain, and a `shared` source is a view that
+    /// `cell_arc_from_string(cell_string_from_str(p))` copies rather than
+    /// aliases, all three verified.
+    fn refuseUnimplementedArcMove(
+        self: *Checker,
+        v: *const ast.Expr,
+        verb: []const u8,
+        prep: []const u8,
+        slot: []const u8,
+        slot_name: ?[]const u8,
+    ) Error!bool {
+        // NOT peeled here. The caller peels, exactly once per path, and this
+        // function must not: `openBlockTail` calls `pushScope` and
+        // `checkStmt` over the block's statements, so peeling a second time
+        // DECLARES every block binding again and drifts `next_binding_id`
+        // away from the ids codegen agreed to. A revision that peeled here
+        // for tidiness crashed two codegen tests with SIGABRT on exactly that
+        // assertion. The peel belongs where the scope is owned.
+
+        // Asked through `ownedMoveSource`, not a bare `placeOf`, and that is
+        // the whole difference between this refusal and an incomplete one.
+        // `placeOf` returns null for a `match` and for a block, so a first
+        // version of this function that used it refused `let arc a = s` while
+        // ACCEPTING `let arc a = match 1 { _ => s }`, which is the same
+        // program wearing a value position. Measured under AddressSanitizer
+        // at that revision: `let owned s = make()` then
+        // `let arc a = match 1 { _ => s }` emitted
+        // `cell_arc_from_string(...)` followed by `cell_string_free(&s)` and
+        // died `exit 134`, `attempting double-free ... in cell_string_free`.
+        // It is the same escape hatch R10's owned direction records one
+        // screen up, and the sweep cannot see it because every row the sweep
+        // generates is direct.
+        // `.place` yields a bare name, so it reads as "'owned' place 's'";
+        // `.unknown` already yields a phrase ("the place 's' reached through
+        // a branch"), so prefixing it would read "'owned' place the place
+        // 's' reached...". The subject is spelled at the site that knows.
+        const site: struct { display: []const u8, span: Span } = switch (try self.ownedMoveSource(v)) {
+            // A literal, a fresh scalar, a borrow, a fresh aggregate, or a
+            // call's temporary. Boxing one is correct and compiles today:
+            // `let arc a = make()` is the shape every arc test uses.
+            .no_owned_place => return false,
+            .place => |place| blk: {
+                const b = self.bindingById(place.binding) orelse return false;
+                const own = self.placeOwnership(b, place.path) orelse return false;
+                // `arc` into `arc` is the legal retain, and a `shared` source
+                // is a view that `cell_arc_from_string(cell_string_from_str(
+                // p))` COPIES rather than aliases. Both verified to compile
+                // and run; neither is this rule's business.
+                if (own != .owned) return false;
+                break :blk .{ .display = try self.msg("'owned' place '{s}'", .{place.display}), .span = place.span };
+            },
+            .unknown => |s| .{ .display = s.display, .span = s.span },
+            .aliases_place => |s| .{ .display = s.display, .span = s.span },
+        };
+
+        const message = if (slot_name) |n|
+            try self.msg(
+                "cannot {s} {s} {s} 'arc' {s} '{s}': moving an owned place into an 'arc' box is not implemented",
+                .{ verb, site.display, prep, slot, n },
+            )
+        else
+            try self.msg(
+                "cannot {s} {s} {s} an 'arc' {s}: moving an owned place into an 'arc' box is not implemented",
+                .{ verb, site.display, prep, slot },
+            );
+        try self.diagnostics.err(self.allocator, site.span, message);
+        try self.diagnostics.note(
+            self.allocator,
+            site.span,
+            "R10 designs this as a move into a fresh 'arc' box, but the checker does not consume the source, so the box and the source's own drop free the same buffer; bind a fresh value to the 'arc' place, or start from an 'arc' source",
+        );
+        return true;
+    }
+
     fn refuseArcUnique(
         self: *Checker,
         src: ArcSource,
@@ -5577,6 +5746,92 @@ test "R10 also looks through an if branch and a block tail, which typecheck alon
         \\t.cell:4:31: error: cannot pass 'arc' value 'xs' to 'owned' parameter 'xs': ownership is shared and cannot be made unique
         \\t.cell:4:31: note: an 'owned' holder frees the value, and the 'arc' box would free it again
         \\
+    );
+}
+
+test "R10's other direction: an owned place may not be moved into an arc box, at five positions" {
+    // NOT symmetry for its own sake. `tools/sweep-backends.sh` reported four
+    // rows, all `C UNCOMPILABLE: initializing 'cell_arc_t'`, which made this
+    // look like a backend typing bug. It is not: the checker does not consume
+    // the source, so boxing the place hands the box a buffer the source still
+    // frees. Measured before the refusal existed, with an owned LOCAL rather
+    // than a parameter, because parameters are not released today and hid it:
+    // `let owned s = make()` then `let arc a = match 1 { _ => s }` emitted
+    // `cell_arc_from_string(...)` and `cell_string_free(&s)` and died
+    // `exit 134`, `attempting double-free ... in cell_string_free`.
+    // Implementing the move means deciding who releases the box, which is
+    // R11 row 1's ABI question, so this refuses and says "not implemented".
+    try expectDiagnostics(
+        \\pub fn f(owned p: String) -> Int {
+        \\    let arc a = p
+        \\    return 0
+        \\}
+    ,
+        \\t.cell:2:17: error: cannot bind 'owned' place 'p' to 'arc' binding 'a': moving an owned place into an 'arc' box is not implemented
+        \\t.cell:2:17: note: R10 designs this as a move into a fresh 'arc' box, but the checker does not consume the source, so the box and the source's own drop free the same buffer; bind a fresh value to the 'arc' place, or start from an 'arc' source
+        \\
+    );
+    // THE VALUE POSITION, and the reason this asks `ownedMoveSource` rather
+    // than `placeOf`. A first version used `placeOf`, which returns null for a
+    // match, and so refused the direct form while accepting this one: the same
+    // program wearing a branch. This is the shape that measured exit 134.
+    try expectDiagnostics(
+        \\pub fn make() -> String {
+        \\    return "hello"
+        \\}
+        \\pub fn main() -> Int {
+        \\    let owned s = make()
+        \\    let arc a = match 1 { _ => s }
+        \\    return 0
+        \\}
+    ,
+        \\t.cell:6:32: error: cannot bind the place 's' reached through a branch to 'arc' binding 'a': moving an owned place into an 'arc' box is not implemented
+        \\t.cell:6:32: note: R10 designs this as a move into a fresh 'arc' box, but the checker does not consume the source, so the box and the source's own drop free the same buffer; bind a fresh value to the 'arc' place, or start from an 'arc' source
+        \\
+    );
+}
+
+test "R10's other direction leaves every legal arc source alone" {
+    // The refusal is narrow by construction, and each of these was verified to
+    // COMPILE and run, not merely to pass the checker. Over-refusing here
+    // would reject the shape every existing arc test is written in.
+    //
+    // A fresh value: what `emitArcConversion` already boxes correctly.
+    try expectAccepted(
+        \\pub fn make() -> String {
+        \\    return "hello"
+        \\}
+        \\pub fn f() -> Int {
+        \\    let arc a = make()
+        \\    return 0
+        \\}
+    );
+    // An `arc` source: the legal arc-to-arc retain, R10's first table row.
+    try expectAccepted(
+        \\pub fn f(arc p: String) -> Int {
+        \\    let arc a = p
+        \\    return 0
+        \\}
+    );
+    // A `shared` source: a view, which `cell_arc_from_string(
+    // cell_string_from_str(p))` COPIES rather than aliases, so there is no
+    // second owner and nothing for this rule to refuse.
+    try expectAccepted(
+        \\pub fn f(shared p: String) -> Int {
+        \\    let arc a = p
+        \\    return 0
+        \\}
+    );
+    // A branch whose arms are fresh values stays accepted: the value position
+    // is peeled to ask about the SOURCE, not refused for being a branch.
+    try expectAccepted(
+        \\pub fn make() -> String {
+        \\    return "hello"
+        \\}
+        \\pub fn f(copy c: Int) -> Int {
+        \\    let arc a = match c { _ => make() }
+        \\    return 0
+        \\}
     );
 }
 
