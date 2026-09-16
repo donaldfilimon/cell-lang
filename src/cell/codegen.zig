@@ -183,7 +183,7 @@
 //! list PLACE bound as `arc` was not boxed at all, because
 //! `cell_arc_from_string` moves its argument while `borrowck.zig` left the
 //! source unmoved (boxed since 2026-09-16 at `let`, at a direct `-> arc`
-//! return and by assignment into a whole `arc` var, for a whole binding, which borrowck now moves; see
+//! return, by assignment into a whole `arc` var and as an `arc` call argument, for a whole binding, which borrowck now moves; see
 //! `isMovedOwnedBinding`). That list is what running programs
 //! has found, not a proof that nothing else dangles; `docs/OWNERSHIP.md` R11
 //! records exactly which positions the search covered, values as well as
@@ -2490,9 +2490,11 @@ pub const Generator = struct {
     /// A place `emitArcConversion` may box by moving its header: a bare
     /// identifier naming an `owned` binding that borrowck recorded as wholly
     /// moved. borrowck moves a place into a box only at `let arc`, at a
-    /// direct `-> arc T` return, and by assignment into a whole `arc`
-    /// binding (R10, `boxableOwnedBinding`), and refuses the other positions, so this is the only way such a place reaches a boxing
-    /// conversion; the moved source is
+    /// direct `-> arc T` return, by assignment into a whole `arc`
+    /// binding, and as an argument to an `arc` parameter (R10,
+    /// `boxableOwnedBinding`), and refuses the other positions, so this is
+    /// the only way such a place reaches a boxing conversion; the moved
+    /// source is
     /// then skipped by the drop pass and the box owns the buffer. Anything
     /// else keeps the loud `cc` type error.
     fn isMovedOwnedBinding(self: *Generator, arg: *const ast.Expr) bool {
@@ -5236,6 +5238,34 @@ test "a returned arc match-arm binding is retained: nested if inside a block arm
         \\      cell_arc_drop(s);
         \\      return _cell_t2;
     );
+}
+
+test "an owned String or list binding passed to an arc parameter is moved into the box" {
+    // R10's move-into-arc at a call argument, implemented 2026-09-16. The
+    // box is handed to the callee at count 1 and the callee releases it
+    // (R11 row 1), exactly as a boxed literal argument is; the source has
+    // no drop of its own because borrowck moved it.
+    var e = try emitSource(
+        \\pub fn keep(arc s: String);
+        \\pub fn keep_list(arc xs: [Int]);
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  let owned a = make()
+        \\  keep(a)
+        \\}
+        \\pub fn g(owned xs: [Int]) {
+        \\  keep_list(xs)
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectContains(f, "cell_keep(cell_arc_from_string(a));");
+    try expectAbsent(f, "cell_string_free(&a);");
+    try expectAbsent(f, "cell_arc_drop");
+    const g = try fnDef(e.text, "g");
+    try expectContains(g, "cell_keep_list(cell_arc_from_slice(xs));");
+    try expectAbsent(g, "cell_slice_free(&xs);");
+    try expectCompiles(e.text);
 }
 
 test "an owned String or list binding bound as arc is moved into the box" {

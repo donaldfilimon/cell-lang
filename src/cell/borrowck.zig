@@ -8,13 +8,14 @@
 //! binding, an assignment into an `owned` place, an `owned` struct field, a
 //! list-literal element, and a `return` whose declared return type is not
 //! `arc`). The rest of R10 is still designed only, except that
-//! move-into-`arc` is implemented at THREE positions since 2026-09-16, all for
+//! move-into-`arc` is implemented at FOUR positions since 2026-09-16, all for
 //! one source shape, a whole `owned` `String` or list binding
 //! (`boxableOwnedBinding`): `let arc` moves it into the fresh box, a direct
 //! `return` from a `-> arc T` function does (the ordinary R2 return move),
-//! and so does an assignment into a whole `var arc` binding. Every other
-//! owned-into-`arc` source and position (call argument, struct field, a
-//! field target, a block tail) is refused as not implemented. That single clause is here rather than in codegen
+//! so does an assignment into a whole `var arc` binding, and so does passing
+//! it to an `arc` parameter (the callee releases the box). Every other
+//! owned-into-`arc` source and position (struct field, a field target, a
+//! block tail) is refused as not implemented. That single clause is here rather than in codegen
 //! because codegen cannot refuse it: `owned [T]` and `shared [T]` lower to
 //! the SAME C type, so the emitted conversion compiles clean and double frees
 //! the buffer. Its classifier, `arcUniqueSource`, returns a TOTAL verdict:
@@ -2132,6 +2133,24 @@ pub const Checker = struct {
                 // like them. Listed shapes are not the enumeration; the
                 // position is. See `refuseUnimplementedArcMove`.
                 const slot_name = if (param) |p| p.name else null;
+                // IMPLEMENTED for one source shape (2026-09-16), the fourth
+                // position after `let`, a direct return and assignment: a
+                // bare `owned` `String` or list binding passed to an `arc`
+                // parameter is MOVED into a fresh box, and the callee
+                // releases that box (cell_rt.h section 7, callee-releases
+                // for `arc`, the same count-1 handoff a boxed literal makes).
+                // A block argument is not opened for an `arc` parameter, so
+                // it keeps the refusal below with every other source shape.
+                if (operand.kind != .block) {
+                    if (try self.boxableOwnedBinding(operand)) |src| {
+                        const note = if (callee_name) |n|
+                            try self.msg("'{s}' was moved here into the 'arc' box passed to '{s}'", .{ src.display, n })
+                        else
+                            try self.msg("'{s}' was moved here into the 'arc' box passed to the call", .{src.display});
+                        try self.movePlace(src, note);
+                        continue;
+                    }
+                }
                 if (try self.refuseUnimplementedArcMove(operand, "pass", "to", "parameter", slot_name)) continue;
             }
             if (mode == .owned) {
@@ -6198,6 +6217,64 @@ test "R10's move into arc: a whole owned String or list binding is moved at retu
     try expectRejectedWith(
         \\pub fn f(owned p: String) -> arc String {
         \\    return match 1 { _ => p }
+        \\}
+    , refused);
+}
+
+test "R10's move into arc: a whole owned String or list binding is moved at a call argument" {
+    // Implemented 2026-09-16, the fourth position. The callee releases the
+    // box (cell_rt.h section 7), so the caller's source must be dead, and
+    // an explicit `arc` prefix on the argument is the same move.
+    try expectAccepted(
+        \\pub fn keep(arc s: String);
+        \\pub fn keep_list(arc xs: [Int]);
+        \\pub fn f(owned p: String, owned xs: [Int]) {
+        \\    keep(p)
+        \\    keep_list(xs)
+        \\}
+        \\pub fn g() {
+        \\    let owned t: String = "t"
+        \\    keep(arc t)
+        \\}
+    );
+    try expectDiagnostics(
+        \\pub fn keep(arc s: String);
+        \\pub fn view(shared s: String) -> Int;
+        \\pub fn f(owned p: String) -> Int {
+        \\    keep(p)
+        \\    return view(p)
+        \\}
+    ,
+        \\t.cell:5:17: error: use of 'p' after it was moved
+        \\t.cell:4:10: note: 'p' was moved here into the 'arc' box passed to 'keep'
+        \\
+    );
+    // Every other source keeps the refusal: a field, an `Int?`, a block
+    // argument (not opened for an `arc` parameter) and a branch value.
+    const refused = "moving an owned place into an 'arc' box is not implemented";
+    try expectRejectedWith(
+        \\pub struct R { owned s: String }
+        \\pub fn keep(arc s: String);
+        \\pub fn f(owned r: R) {
+        \\    keep(r.s)
+        \\}
+    , refused);
+    try expectRejectedWith(
+        \\pub fn keep_opt(arc v: Int?);
+        \\pub fn f(owned p: Int?) {
+        \\    keep_opt(p)
+        \\}
+    , refused);
+    try expectRejectedWith(
+        \\pub fn keep(arc s: String);
+        \\pub fn f(owned p: String) {
+        \\    keep({ p })
+        \\}
+    , refused);
+    try expectRejectedWith(
+        \\pub fn keep(arc s: String);
+        \\pub fn f(owned p: String) {
+        \\    keep(match 1 { _ => p })
         \\}
     , refused);
 }
