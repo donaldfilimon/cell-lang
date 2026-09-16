@@ -18,6 +18,9 @@ Verified with a binary built by `~/.zvm/bin/zig build -Dswift=false`.
 
 ## Running the checks
 
+`tests/` is a separate directory of whole programs `cell test` runs; see
+`tests/README.md`. Gate stage 14 pins that command green, red, and empty.
+
 `tools/check.sh` is the gate: build, tests (with the count printed), the four
 corpus contracts below, backend agreement (LLVM vs MLIR must reach the same
 verdict), and execution (emit, `cc`, link, run, and compare the output) for

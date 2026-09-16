@@ -1,0 +1,6 @@
+// EXPECT-OUTPUT: 5
+pub fn print_int(copy value: Int);
+pub fn host_five() -> Int;
+pub fn main() {
+    print_int(host_five())
+}

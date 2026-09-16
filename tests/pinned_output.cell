@@ -1,0 +1,5 @@
+// EXPECT-OUTPUT: 7
+pub fn print_int(copy value: Int);
+pub fn main() {
+    print_int(3 + 4)
+}

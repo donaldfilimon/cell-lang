@@ -1,0 +1,3 @@
+// Passes on exit status alone: no expectation line.
+pub fn main() {
+}

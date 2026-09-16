@@ -32,6 +32,7 @@ const Usage =
     \\  emit  <file.cell>     Emit code (see --target)
     \\  build <file.cell> [host.c ...]  Compile to an executable with cc (C target only)
     \\  run   <file.cell> [host.c ...]  Build into a temp dir, execute, forward the exit code
+    \\  test  [dir]           Run every .cell program in dir (default tests/) like `run`; see below
     \\  version               Print version
     \\  help                  Show this help
     \\
@@ -53,6 +54,12 @@ const Usage =
     \\between the emitted C and the runtime, and are refused by every other
     \\command, so a .c file is never loaded as Cell source.
     \\
+    \\test runs each program in the directory through the run recipe, in name
+    \\order, pairing <stem>_host.c beside it as its host. A program passes on
+    \\exit 0, and when its source carries `// EXPECT-OUTPUT: <text>`, its
+    \\stdout must equal <text>. Exit 0 all passed, 1 any failed, 2 when the
+    \\directory is missing or holds no program.
+    \\
 ;
 
 /// Every command the dispatcher accepts, and the single source of truth the
@@ -72,7 +79,7 @@ const Usage =
 /// now a `@compileError` on Zig master. `Type.Enum` there carries parallel
 /// `field_names` and `field_values` slices rather than a `fields` array of
 /// structs.
-const Command = enum { check, dump, emit, build, run, version, help };
+const Command = enum { check, dump, emit, build, run, @"test", version, help };
 
 /// Aliases are handled here rather than in the dispatcher so there is one
 /// place where a spelling becomes a Command, and so the test can assert the
@@ -163,6 +170,40 @@ fn parseArgs(args: []const []const u8) ParsedArgs {
 /// `load` accepts removed. A path with no such extension gets `.out`
 /// appended, because returning it unchanged would hand cc the source file
 /// as its own output and overwrite it.
+/// The corpus convention tools/check.sh stage 8 reads: the text after the
+/// first line that STARTS with `// EXPECT-OUTPUT:`, surrounding spaces
+/// trimmed. Null when no such line exists.
+fn expectOutputOf(source: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const marker = "// EXPECT-OUTPUT:";
+        if (std.mem.startsWith(u8, line, marker)) {
+            return std.mem.trim(u8, line[marker.len..], " \t\r");
+        }
+    }
+    return null;
+}
+
+const Outcome = union(enum) {
+    passed,
+    passed_matched,
+    failed_exit: u8,
+    failed_signal: struct { name: []const u8, signo: u8 },
+    failed_output: struct { want: []const u8, got: []const u8 },
+    failed_compile,
+};
+
+fn reportLine(buf: []u8, name: []const u8, outcome: Outcome) []const u8 {
+    return switch (outcome) {
+        .passed => std.fmt.bufPrint(buf, "ok    {s}", .{name}) catch buf[0..0],
+        .passed_matched => std.fmt.bufPrint(buf, "ok    {s} (output matched)", .{name}) catch buf[0..0],
+        .failed_exit => |code| std.fmt.bufPrint(buf, "FAIL  {s} (exit {d})", .{ name, code }) catch buf[0..0],
+        .failed_signal => |sig| std.fmt.bufPrint(buf, "FAIL  {s} (exit {d}: program terminated by signal {s})", .{ name, @as(u16, 128) + sig.signo, sig.name }) catch buf[0..0],
+        .failed_output => |o| std.fmt.bufPrint(buf, "FAIL  {s} (expected output '{s}', got '{s}')", .{ name, o.want, o.got }) catch buf[0..0],
+        .failed_compile => std.fmt.bufPrint(buf, "FAIL  {s} (did not compile)", .{name}) catch buf[0..0],
+    };
+}
+
 fn defaultOutput(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const ext = std.fs.path.extension(path);
     const known = [_][]const u8{ ".cell", ".cel", ".body", ".bod" };
@@ -251,10 +292,11 @@ pub fn main(init: std.process.Init) !void {
 
     const inv: Invocation = switch (parseArgs(args[2..])) {
         .ok => |v| v,
-        .missing_file => {
+        .missing_file => if (command == .@"test") Invocation{ .path = "tests" } else blk: {
             std.debug.print("error: missing file argument\n\n", .{});
             try printUsage(io);
             std.process.exit(1);
+            break :blk Invocation{ .path = "" };
         },
         .missing_out_value => {
             std.debug.print("error: -o needs a path\n", .{});
@@ -282,6 +324,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: -o applies to build only\n", .{});
         std.process.exit(1);
     }
+    if (command == .@"test" and inv.target != .c) {
+        std.debug.print("error: test compiles the C target only; `cell emit --target={s}` prints the textual IR\n", .{@tagName(inv.target)});
+        std.process.exit(1);
+    }
     if (command) |c| {
         if (hostRefusal(c, inv.host_count)) |why| {
             std.debug.print("error: {s}\n", .{why});
@@ -291,6 +337,11 @@ pub fn main(init: std.process.Init) !void {
     const path = inv.path;
     const target = inv.target;
     const cwd = Io.Dir.cwd();
+
+    if (command == .@"test") {
+        const code = try testDir(init, cwd, inv.path);
+        std.process.exit(code);
+    }
 
     if (command == .build or command == .run) {
         // A function rather than inline, so its defers (the staging
@@ -364,7 +415,7 @@ pub fn main(init: std.process.Init) !void {
     // only mechanism that forces the author back to this function. Reaching
     // it at runtime would mean a branch above stopped returning.
     if (command) |c| switch (c) {
-        .check, .dump, .emit, .build, .run, .version, .help => unreachable,
+        .check, .dump, .emit, .build, .run, .@"test", .version, .help => unreachable,
     };
 
     std.debug.print("error: unknown command '{s}'\n\n", .{cmd});
@@ -386,6 +437,19 @@ fn buildOrRun(init: std.process.Init, cwd: Io.Dir, command: Command, inv: Invoca
     var err_buf: [4096]u8 = undefined;
     var err_fw: Io.File.Writer = .init(.stderr(), io, &err_buf);
     const err_w = &err_fw.interface;
+
+    if (command == .run) {
+        if (buildTargetRefusal(inv.target)) |why| {
+            try err_w.print("error: {s}\n", .{why});
+            try err_w.flush();
+            return 1;
+        }
+        const outcome = try runProgram(init, cwd, inv.path, inv.hosts(), false, err_w);
+        return switch (outcome) {
+            .compile_failed => 1,
+            .ran => |r| exitCodeOf(r.term, err_w),
+        };
+    }
 
     if (buildTargetRefusal(inv.target)) |why| {
         try err_w.print("error: {s}\n", .{why});
@@ -454,28 +518,197 @@ fn buildOrRun(init: std.process.Init, cwd: Io.Dir, command: Command, inv: Invoca
         try err_w.flush();
         return 1;
     }
-    if (command == .build) return 0;
+    return 0;
+}
 
-    // Inherited stdio, not `run`: a program that prompts or streams must
-    // see the terminal, and its output must not wait on a pipe.
-    var child = std.process.spawn(io, .{ .argv = &.{out} }) catch |err| {
-        try err_w.print("error: cannot execute '{s}': {s}\n", .{ out, @errorName(err) });
-        try err_w.flush();
-        return 1;
-    };
-    const term = try child.wait(io);
+fn exitCodeOf(term: std.process.Child.Term, err_w: *Io.Writer) u8 {
     return switch (term) {
         .exited => |code| code,
-        // The shell convention, 128 + signal number, so `cell run` from a
-        // script reads like running the binary directly: an assert(false)
-        // aborts and comes back as 134, never as the compiler's own 1.
         .signal => |sig| blk: {
-            try err_w.print("error: program terminated by signal {s}\n", .{@tagName(sig)});
-            try err_w.flush();
+            err_w.print("error: program terminated by signal {s}\n", .{@tagName(sig)}) catch {};
+            err_w.flush() catch {};
             break :blk @truncate(128 + @as(u32, @backingInt(sig)));
         },
         else => 1,
     };
+}
+
+const RunOutcome = union(enum) {
+    compile_failed,
+    ran: struct { term: std.process.Child.Term, stdout: []const u8 },
+};
+
+/// Load, check, emit and stage `path` exactly as `build`/`run` do, compile
+/// with $CC, then execute the result. With `capture` the child's stdout is
+/// collected (for `test`); without it stdio is inherited (for `run`).
+/// The staging directory is removed on every path out.
+fn runProgram(
+    init: std.process.Init,
+    cwd: Io.Dir,
+    path: []const u8,
+    hosts: []const []const u8,
+    capture: bool,
+    err_w: *Io.Writer,
+) !RunOutcome {
+    const arena = init.arena.allocator();
+    const io = init.io;
+
+    if (buildTargetRefusal(.c)) |why| {
+        try err_w.print("error: {s}\n", .{why});
+        try err_w.flush();
+        return .compile_failed;
+    }
+
+    var loaded = cell.load(arena, io, cwd, path, err_w) catch |err| {
+        try err_w.flush();
+        if (err == error.MissingModule or err == error.AmbiguousModule or
+            err == error.PairingMismatch or err == error.ParseFailed)
+            return .compile_failed;
+        return err;
+    };
+    cell.check(arena, &loaded.module, loaded.source, err_w) catch |err| {
+        try err_w.flush();
+        if (err == error.TypeError) return .compile_failed;
+        return err;
+    };
+    try err_w.flush();
+
+    var c_text: Io.Writer.Allocating = .init(arena);
+    cell.emitFor(arena, &loaded.module, loaded.source, &c_text.writer, .c, err_w) catch |err| {
+        try err_w.flush();
+        if (err == error.TypeError) return .compile_failed;
+        return err;
+    };
+    try err_w.flush();
+
+    const tmp_root = std.mem.trimEnd(u8, init.environ_map.get("TMPDIR") orelse "/tmp", "/");
+    const nanos = Io.Clock.real.now(io).nanoseconds;
+    const stage = try std.fmt.allocPrint(arena, "{s}/cell-build-{d}", .{ tmp_root, nanos });
+    cwd.createDirPath(io, stage) catch |err| {
+        try err_w.print("error: cannot create staging directory '{s}': {s}\n", .{ stage, @errorName(err) });
+        try err_w.flush();
+        return .compile_failed;
+    };
+    defer cwd.deleteTree(io, stage) catch {};
+
+    const main_c = try std.fs.path.join(arena, &.{ stage, "main.c" });
+    try cwd.writeFile(io, .{ .sub_path = main_c, .data = c_text.written() });
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ stage, "cell_rt.h" }), .data = embedded_rt_h });
+    try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ stage, "cell_rt.c" }), .data = embedded_rt_c });
+
+    const out = try std.fs.path.join(arena, &.{ stage, "a.out" });
+    const cc = init.environ_map.get("CC") orelse "cc";
+    const argv = try ccArgv(arena, cc, stage, main_c, hosts, out);
+    const compiled = std.process.run(init.gpa, io, .{ .argv = argv }) catch |err| {
+        try err_w.print("error: cannot run '{s}': {s} (set CC to a working C compiler)\n", .{ cc, @errorName(err) });
+        try err_w.flush();
+        return .compile_failed;
+    };
+    defer init.gpa.free(compiled.stdout);
+    defer init.gpa.free(compiled.stderr);
+    if (!compiled.term.success()) {
+        try err_w.writeAll(compiled.stderr);
+        try err_w.print("error: {s} rejected the emitted C for '{s}' (`cell emit {s}` prints it)\n", .{ cc, path, path });
+        try err_w.flush();
+        return .compile_failed;
+    }
+
+    if (!capture) {
+        var child = std.process.spawn(io, .{ .argv = &.{out} }) catch |err| {
+            try err_w.print("error: cannot execute '{s}': {s}\n", .{ out, @errorName(err) });
+            try err_w.flush();
+            return .compile_failed;
+        };
+        const term = try child.wait(io);
+        return .{ .ran = .{ .term = term, .stdout = "" } };
+    }
+    const result = std.process.run(init.gpa, io, .{ .argv = &.{out} }) catch |err| {
+        try err_w.print("error: cannot execute '{s}': {s}\n", .{ out, @errorName(err) });
+        try err_w.flush();
+        return .compile_failed;
+    };
+    init.gpa.free(result.stderr);
+    const stdout = try arena.dupe(u8, result.stdout);
+    init.gpa.free(result.stdout);
+    return .{ .ran = .{ .term = result.term, .stdout = stdout } };
+}
+
+/// `cell test [dir]`. Every `.cell`/`.cel` directly inside `dir`, sorted by
+/// name, run through `runProgram` with `<stem>_host.c` as its host when
+/// that file exists beside it. Returns the process exit code: 0 when every
+/// program passed, 1 when any failed, 2 when `dir` cannot be opened or
+/// holds no program (an empty suite is never green).
+fn testDir(init: std.process.Init, cwd: Io.Dir, dir: []const u8) !u8 {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    var err_buf: [4096]u8 = undefined;
+    var err_fw: Io.File.Writer = .init(.stderr(), io, &err_buf);
+    const err_w = &err_fw.interface;
+    var out_buf: [4096]u8 = undefined;
+    var out_fw: Io.File.Writer = .init(.stdout(), io, &out_buf);
+    const out_w = &out_fw.interface;
+    defer out_w.flush() catch {};
+    defer err_w.flush() catch {};
+
+    var d = cwd.openDir(io, dir, .{ .iterate = true }) catch |err| {
+        try err_w.print("error: cannot open test directory '{s}': {s}\n", .{ dir, @errorName(err) });
+        return 2;
+    };
+    defer d.close(io);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = d.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const ext = std.fs.path.extension(entry.name);
+        if (!std.mem.eql(u8, ext, ".cell") and !std.mem.eql(u8, ext, ".cel")) continue;
+        try names.append(arena, try arena.dupe(u8, entry.name));
+    }
+    if (names.items.len == 0) {
+        try err_w.print("error: no .cell program in '{s}'\n", .{dir});
+        return 2;
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
+    var passed: usize = 0;
+    var failed: usize = 0;
+    for (names.items) |name| {
+        const path = try std.fs.path.join(arena, &.{ dir, name });
+        const stem = name[0 .. name.len - std.fs.path.extension(name).len];
+        const host = try std.fmt.allocPrint(arena, "{s}/{s}_host.c", .{ dir, stem });
+        const has_host = if (cwd.access(io, host, .{})) |_| true else |_| false;
+        const hosts: []const []const u8 = if (has_host) &.{host} else &.{};
+        const source = cwd.readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch "";
+        const want = expectOutputOf(source);
+
+        const outcome: Outcome = switch (try runProgram(init, cwd, path, hosts, true, err_w)) {
+            .compile_failed => .failed_compile,
+            .ran => |r| switch (r.term) {
+                .exited => |code| if (code != 0) Outcome{ .failed_exit = code } else if (want) |w| blk: {
+                    const got = std.mem.trimEnd(u8, r.stdout, "\n");
+                    break :blk if (std.mem.eql(u8, got, w)) Outcome.passed_matched else Outcome{ .failed_output = .{ .want = w, .got = got } };
+                } else .passed,
+                .signal => |sig| blk: {
+                    const tag = @tagName(sig);
+                    const sig_name = if (std.mem.startsWith(u8, tag, "SIG")) tag else try std.fmt.allocPrint(arena, "SIG{s}", .{tag});
+                    break :blk Outcome{ .failed_signal = .{ .name = sig_name, .signo = @truncate(@as(u32, @backingInt(sig))) } };
+                },
+                else => Outcome{ .failed_exit = 1 },
+            },
+        };
+        var line_buf: [512]u8 = undefined;
+        try out_w.print("{s}\n", .{reportLine(&line_buf, name, outcome)});
+        switch (outcome) {
+            .passed, .passed_matched => passed += 1,
+            else => failed += 1,
+        }
+    }
+    try out_w.print("{d} passed, {d} failed\n", .{ passed, failed });
+    return if (failed == 0) 0 else 1;
 }
 
 /// Load (including stem pairing) and typecheck, rendering diagnostics to
@@ -508,7 +741,7 @@ fn printUsage(io: Io) !void {
 /// first whitespace-delimited token of each line. Written as a parser rather
 /// than a second hardcoded list on purpose: a hardcoded list would agree
 /// with the enum while the help text quietly drifted from both.
-fn usageCommands(buf: *[8][]const u8) []const []const u8 {
+fn usageCommands(buf: *[16][]const u8) []const []const u8 {
     const start = std.mem.indexOf(u8, Usage, "COMMANDS:\n").? + "COMMANDS:\n".len;
     const rest = Usage[start..];
     const end = std.mem.indexOf(u8, rest, "\n\n").?;
@@ -528,7 +761,7 @@ test "the usage text documents exactly the commands the dispatcher accepts" {
     // The contract this file can actually check without spawning the binary.
     // A command handled but undocumented is undiscoverable; one documented
     // but unhandled reaches "unknown command" and makes the help a liar.
-    var buf: [8][]const u8 = undefined;
+    var buf: [16][]const u8 = undefined;
     const documented = usageCommands(&buf);
     const names = @typeInfo(Command).@"enum".field_names;
     try std.testing.expectEqual(names.len, documented.len);
@@ -566,12 +799,29 @@ test "parseCommand maps every spelling, including the short aliases" {
     // .cell-to-executable path). Both halves of that gap are commands now.
     try std.testing.expectEqual(Command.build, parseCommand("build").?);
     try std.testing.expectEqual(Command.run, parseCommand("run").?);
+    try std.testing.expectEqual(Command.@"test", parseCommand("test").?);
 
     // Rejections. `-v` lowercase is NOT an alias (it would be ambiguous with
     // a future verbose flag), and the enum's own tag syntax is not a command.
     try std.testing.expect(parseCommand("-v") == null);
-    try std.testing.expect(parseCommand("test") == null);
     try std.testing.expect(parseCommand("") == null);
+}
+
+test "expectOutputOf reads the corpus convention" {
+    try std.testing.expectEqualStrings("42", expectOutputOf("// a\n// EXPECT-OUTPUT: 42\npub fn main() {}\n").?);
+    try std.testing.expectEqualStrings("hello world", expectOutputOf("// EXPECT-OUTPUT:   hello world  \n").?);
+    try std.testing.expect(expectOutputOf("pub fn main() {}\n") == null);
+    try std.testing.expect(expectOutputOf("// see EXPECT-OUTPUT: below\n") == null);
+}
+
+test "reportLine formats every outcome" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("ok    add.cell", reportLine(&buf, "add.cell", .passed));
+    try std.testing.expectEqualStrings("ok    s.cell (output matched)", reportLine(&buf, "s.cell", .passed_matched));
+    try std.testing.expectEqualStrings("FAIL  o.cell (exit 3)", reportLine(&buf, "o.cell", .{ .failed_exit = 3 }));
+    try std.testing.expectEqualStrings("FAIL  o.cell (exit 134: program terminated by signal SIGABRT)", reportLine(&buf, "o.cell", .{ .failed_signal = .{ .name = "SIGABRT", .signo = 6 } }));
+    try std.testing.expectEqualStrings("FAIL  p.cell (expected output '42', got '41')", reportLine(&buf, "p.cell", .{ .failed_output = .{ .want = "42", .got = "41" } }));
+    try std.testing.expectEqualStrings("FAIL  q.cell (did not compile)", reportLine(&buf, "q.cell", .failed_compile));
 }
 
 test "parseArgs: the path, --target=, and -o are order-independent, and a second path is refused" {

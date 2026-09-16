@@ -163,6 +163,9 @@
 #                       this by hand ("Emits ... / Runtime ...") and were
 #                       found inverted once (2026-09-07); a program that
 #                       calls a prelude function links only while this holds.
+#  14. cli test         `cell test tests/` passes; a copy with a program
+#                       that assert(false)s fails with exit 1 and names it;
+#                       an empty directory is exit 2, never green.
 #
 # TRAPS THIS SCRIPT IS WRITTEN AGAINST, each one having actually bitten:
 #
@@ -1875,6 +1878,26 @@ if tools/prelude-signatures.sh "$CELL" > "$TMP/prelude_sigs.txt" 2> "$TMP/prelud
 else
     fail "tools/prelude-signatures.sh could not emit the prelude: $(head -1 "$TMP/prelude_sigs.err")"
 fi
+
+# ------------------------------------------------------------------ 14. cli test --
+printf '\n== cli test (a directory of programs through the run recipe) ==\n'
+"$CELL" test tests > "$TMP/cli_test.out" 2> "$TMP/cli_test.err"; rc=$?
+if [ $rc -eq 0 ] && grep -qx '3 passed, 0 failed' "$TMP/cli_test.out"; then
+    pass "cell test tests/ -> 3 passed, 0 failed"
+else
+    fail "cell test tests/: exit $rc, $(tail -1 "$TMP/cli_test.out"); stderr: $(head -2 "$TMP/cli_test.err" | tr '\n' ' ')"
+fi
+mkdir -p "$TMP/tests-red" && cp tests/*.cell tests/*_host.c "$TMP/tests-red/"
+printf '// EXPECT-OUTPUT: 1\npub fn assert(copy c: Bool);\npub fn main() {\n    assert(false)\n}\n' > "$TMP/tests-red/dies.cell"
+"$CELL" test "$TMP/tests-red" > "$TMP/cli_test_red.out" 2> /dev/null; rc=$?
+if [ $rc -eq 1 ] && grep -qx '3 passed, 1 failed' "$TMP/cli_test_red.out" && grep -q '^FAIL  dies.cell' "$TMP/cli_test_red.out"; then
+    pass "a failing program is reported and exits 1 (dies.cell)"
+else
+    fail "cell test on a red directory: exit $rc, $(tail -1 "$TMP/cli_test_red.out")"
+fi
+mkdir -p "$TMP/tests-empty"
+"$CELL" test "$TMP/tests-empty" > /dev/null 2>&1; rc=$?
+[ $rc -eq 2 ] && pass "an empty directory is exit 2, not green" || fail "cell test on an empty directory exited $rc, want 2"
 
 # ---------------------------------------------------------------- verdict --
 printf '\n== verdict ==\n'

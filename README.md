@@ -141,10 +141,13 @@ and `examples/owned_string.cell` with its host prints 44. Scalar `T?` and
 (`examples/optionals.cell` prints 43, `examples/results.cell` prints 9);
 LLVM and MLIR refuse those programs together with `cannot lower`. Every other
 command refuses a `.c` positional rather than loading it as Cell source.
-There is no `cell test`. The prelude links through `cell build`/`cell run`
-(`examples/prelude.cell` prints 123); gate stage 13 keeps every emitted
-prelude prototype in `runtime/cell_rt.h`. Gate stage 12 pins execution
-answers through this path.
+`cell test [dir]` runs every `.cell` program in a directory (default
+`tests/`) through the run recipe, honours `// EXPECT-OUTPUT:`, and exits 0
+(all passed), 1 (any failed) or 2 (missing directory or no program). An
+empty suite is never green. The prelude links through `cell build`/`cell
+run` (`examples/prelude.cell` prints 123); gate stage 13 keeps every
+emitted prelude prototype in `runtime/cell_rt.h`; stage 14 pins `cell
+test`.
 
 `cell emit --target=llvm` and `cell emit --target=mlir` produce textual LLVM IR
 and MLIR by way of a typed IR in `src/cell/hir.zig`. Their retained execution

@@ -40,7 +40,7 @@ cross-file picture that no single source file states.
 tools/check.sh          # exit code is the verdict
 ```
 
-One command, **thirteen stages** plus a verdict, and its header comment explains
+One command, **fourteen stages** plus a verdict, and its header comment explains
 why each stage earns its place. `zig build test` alone is not the gate: it
 does not run a single `.cell` program, and `zig build examples` checks only
 `hello.cell`. The stages, in the order the script prints them: build, tests
