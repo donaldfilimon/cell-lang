@@ -98,6 +98,10 @@ tools/tests/test-gate-integrity.sh      # tests the gate itself against a fake
 sh tools/check-rule-lists.sh            # stage 11 alone: needs no build, exits 1
                                         # on drift. Run it after editing THIS file,
                                         # which it reads
+sh tools/check-grok-bots.sh             # stage 15 alone: project Grok overlays
+                                        # still name -Dswift=false, tools/check.sh,
+                                        # --test-filter, refAllDecls, and worktree.
+                                        # Exits 1 on drift. Run it after editing .grok/
 ```
 
 Stage 11 greps `README.md`, `AGENTS.md`, this file and `docs/SPEC.md` for

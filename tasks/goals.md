@@ -1,5 +1,12 @@
 # Goals
 
+## Project Grok bots follow Cell's gate
+status: done
+- Project overlays under `.grok/{agents,personas,skills,rules}` shadow the bundled implementer `fmt`/`clippy` bar with `-Dswift=false`, `tools/check.sh`, the `--test-filter`/`refAllDecls` false-green trap, and the canonical-`main`/worktree rule.
+- `tools/check-grok-bots.sh` greps those live files and fails closed if a token or the implementer overlay is dropped; `tools/tests/test-grok-bots.sh` drives that script (eight cases). Wired as gate stage 15.
+- `grok inspect --json` lists `implementer` (agent) and `cell-lang` (skill) as `source.type=project`, twice identical. Inspect has no personas catalog; `.grok/personas/implementer.toml` is loaded by Grok but not listed there.
+- Outcome: an implementer session in this repo is told Cell's gate, not clippy. Not pushed.
+
 ## Next language residuals after a26f8b8
 status: done
 - Parallel slices landed on `main`: hex/bin/oct + separators + exponent floats + unterminated strings (`b0defba`); postfix `a[i]` for String/`[Byte]` (`f5b035e`); R16 field revival (`d3cf2ae`); HIR destination-width integer literals so `widths.cell` runs on C/LLVM/MLIR (`6b717b8`).

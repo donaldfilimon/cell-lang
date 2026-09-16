@@ -166,6 +166,14 @@
 #  14. cli test         `cell test tests/` passes; a copy with a program
 #                       that assert(false)s fails with exit 1 and names it;
 #                       an empty directory is exit 2, never green.
+#  15. grok bots        tools/check-grok-bots.sh: every project-scoped Grok
+#                       bot file under .grok/{agents,personas,skills,rules}
+#                       must name -Dswift=false, tools/check.sh,
+#                       --test-filter, refAllDecls, and worktree, and the
+#                       implementer overlays must exist. Bundled
+#                       implementer still says fmt/clippy;
+#                       this is the check that the overlay did not drift
+#                       back to that bar. Needs no cell binary.
 #
 # TRAPS THIS SCRIPT IS WRITTEN AGAINST, each one having actually bitten:
 #
@@ -1938,6 +1946,19 @@ fi
 mkdir -p "$TMP/tests-empty"
 "$CELL" test "$TMP/tests-empty" > /dev/null 2>&1; rc=$?
 [ $rc -eq 2 ] && pass "an empty directory is exit 2, not green" || fail "cell test on an empty directory exited $rc, want 2"
+
+# ---------------------------------------------------- 15. grok bots --
+# Exit 0 is agreement, 1 is drift, 2 is a setup problem. 2 is a FAIL
+# and not a SKIP: the overlay missing is a repository defect.
+printf '\n== grok bots (project overlays name Cell'\''s gate) ==\n'
+sh tools/check-grok-bots.sh > "$TMP/grok_bots.log" 2>&1
+grok_bots_status=$?
+case "$grok_bots_status" in
+    0) pass "every project Grok bot names -Dswift=false, tools/check.sh, --test-filter, refAllDecls, and worktree" ;;
+    1) fail "Grok bot definitions drifted from Cell's gate (fix .grok/, not this stage)"
+       grep '^DRIFT' "$TMP/grok_bots.log" | sed 's/^/        /' ;;
+    *) fail "tools/check-grok-bots.sh could not run (exit $grok_bots_status): $(tail -1 "$TMP/grok_bots.log")" ;;
+esac
 
 # ---------------------------------------------------------------- verdict --
 printf '\n== verdict ==\n'

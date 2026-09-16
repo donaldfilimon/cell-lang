@@ -1,5 +1,12 @@
 # Todo
 
+## Project Grok bots follow Cell's gate
+
+- [x] Project `.grok/` overlays: implementer agent+persona, cell-lang skill, cell-gate rule
+- [x] `tools/check-grok-bots.sh` fail-closed on `-Dswift=false`, `tools/check.sh`, `--test-filter`, `refAllDecls`, `worktree`
+- [x] `tools/tests/test-grok-bots.sh` drives the real script
+- [x] Gate stage 15; `grok inspect --json` project source, two runs identical
+
 ## Next language residuals after a26f8b8
 
 - [x] LEX-03: hex/bin/oct, digit separators, exponent floats; unterminated string diagnostic
