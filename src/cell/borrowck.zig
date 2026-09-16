@@ -8,12 +8,13 @@
 //! binding, an assignment into an `owned` place, an `owned` struct field, a
 //! list-literal element, and a `return` whose declared return type is not
 //! `arc`). The rest of R10 is still designed only, except that
-//! move-into-`arc` is implemented at TWO positions since 2026-09-16, both for
+//! move-into-`arc` is implemented at THREE positions since 2026-09-16, all for
 //! one source shape, a whole `owned` `String` or list binding
-//! (`boxableOwnedBinding`): `let arc` moves it into the fresh box, and a
-//! direct `return` from a `-> arc T` function does (the ordinary R2 return
-//! move). Every other owned-into-`arc` source and position (assignment, call
-//! argument, struct field, a block tail) is refused as not implemented. That single clause is here rather than in codegen
+//! (`boxableOwnedBinding`): `let arc` moves it into the fresh box, a direct
+//! `return` from a `-> arc T` function does (the ordinary R2 return move),
+//! and so does an assignment into a whole `var arc` binding. Every other
+//! owned-into-`arc` source and position (call argument, struct field, a
+//! field target, a block tail) is refused as not implemented. That single clause is here rather than in codegen
 //! because codegen cannot refuse it: `owned [T]` and `shared [T]` lower to
 //! the SAME C type, so the emitted conversion compiles clean and double frees
 //! the buffer. Its classifier, `arcUniqueSource`, returns a TOTAL verdict:
@@ -1461,7 +1462,19 @@ pub const Checker = struct {
         // R10's other direction, the assignment position: the sweep's
         // `assign arc <- owned String` row. See `refuseUnimplementedArcMove`.
         if (self.placeOwnership(b, place.path) == .arc) {
-            if (try self.refuseUnimplementedArcMove(&a.value, "assign", "to", "place", place.display)) return;
+            // IMPLEMENTED for one source shape (2026-09-16), the same one
+            // `let arc` and a direct return take: a bare `owned` `String` or
+            // list binding stored into a WHOLE `arc` binding. The move is the
+            // shared one at the end of this function, and the C backend's
+            // reassignment pre-drop releases the old box before
+            // `isMovedOwnedBinding` boxes the moved source. A field target
+            // (`r.a = p`, the struct-field store) and a block value keep the
+            // refusal: neither box path was built or measured.
+            const boxable = place.path.len == 0 and a.value.kind != .block and
+                try self.boxableOwnedBinding(&a.value) != null;
+            if (!boxable) {
+                if (try self.refuseUnimplementedArcMove(&a.value, "assign", "to", "place", place.display)) return;
+            }
         }
         // R10, the assignment position: the same double free as the `let`
         // one, reached by writing into an already-declared `owned` place
@@ -2954,8 +2967,8 @@ pub const Checker = struct {
     /// legal retain, and a `shared` source is a view that
     /// `cell_arc_from_string(cell_string_from_str(p))` copies rather than
     /// aliases, all three verified.
-    /// The one source `let arc` and a direct `-> arc T` return may move into
-    /// a box: a whole `owned` binding
+    /// The one source `let arc`, a direct `-> arc T` return and an assignment
+    /// into a whole `arc` binding may move into a box: a whole `owned` binding
     /// whose resolved type is `String` or a list, the two shapes the runtime
     /// boxes by taking the header (`cell_arc_from_string`,
     /// `cell_arc_from_slice`). Null for anything else, including an
@@ -6081,6 +6094,54 @@ test "R10's move into arc: a whole owned String or list binding is moved at retu
     try expectRejectedWith(
         \\pub fn f(owned p: String) -> arc String {
         \\    return match 1 { _ => p }
+        \\}
+    , refused);
+}
+
+test "R10's move into arc: a whole owned String or list binding is moved by assignment" {
+    // Implemented 2026-09-16, the third position, into a WHOLE `arc` binding.
+    try expectAccepted(
+        \\pub fn f(owned p: String, owned xs: [Int]) {
+        \\    var arc a: String = "x"
+        \\    a = p
+        \\    var arc b: [Int] = [1]
+        \\    b = xs
+        \\}
+    );
+    try expectRejectedWith(
+        \\pub fn view(shared s: String) -> Int;
+        \\pub fn f(owned p: String) -> Int {
+        \\    var arc a: String = "x"
+        \\    a = p
+        \\    return view(p)
+        \\}
+    , "use of 'p' after it was moved");
+    const refused = "moving an owned place into an 'arc' box is not implemented";
+    // A field target is the struct-field store, a separate position.
+    try expectRejectedWith(
+        \\pub struct R { arc s: String }
+        \\pub fn f(owned p: String) {
+        \\    var owned r = R { s: "x" }
+        \\    r.s = p
+        \\}
+    , refused);
+    try expectRejectedWith(
+        \\pub fn f(owned p: String) {
+        \\    var arc a: String = "x"
+        \\    a = { p }
+        \\}
+    , "not implemented");
+    try expectRejectedWith(
+        \\pub fn f(owned p: String) {
+        \\    var arc a: String = "x"
+        \\    a = match 1 { _ => p }
+        \\}
+    , refused);
+    try expectRejectedWith(
+        \\pub fn mk() -> Int?;
+        \\pub fn f(owned p: Int?) {
+        \\    var arc a = mk()
+        \\    a = p
         \\}
     , refused);
 }

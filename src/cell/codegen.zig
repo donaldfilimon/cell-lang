@@ -179,8 +179,8 @@
 //! leaked the previous box (CLOSED 2026-09-15); and an `owned` String or
 //! list PLACE bound as `arc` was not boxed at all, because
 //! `cell_arc_from_string` moves its argument while `borrowck.zig` left the
-//! source unmoved (boxed since 2026-09-16 at `let` and at a direct `-> arc`
-//! return for a whole binding, which borrowck now moves; see
+//! source unmoved (boxed since 2026-09-16 at `let`, at a direct `-> arc`
+//! return and by assignment into a whole `arc` var, for a whole binding, which borrowck now moves; see
 //! `isMovedOwnedBinding`). That list is what running programs
 //! has found, not a proof that nothing else dangles; `docs/OWNERSHIP.md` R11
 //! records exactly which positions the search covered, values as well as
@@ -2448,9 +2448,9 @@ pub const Generator = struct {
 
     /// A place `emitArcConversion` may box by moving its header: a bare
     /// identifier naming an `owned` binding that borrowck recorded as wholly
-    /// moved. borrowck moves a place into a box only at `let arc` and at a
-    /// direct `-> arc T` return (R10, `boxableOwnedBinding`) and refuses the
-    /// other positions, so this is the only way such a place reaches a boxing
+    /// moved. borrowck moves a place into a box only at `let arc`, at a
+    /// direct `-> arc T` return, and by assignment into a whole `arc`
+    /// binding (R10, `boxableOwnedBinding`), and refuses the other positions, so this is the only way such a place reaches a boxing
     /// conversion; the moved source is
     /// then skipped by the drop pass and the box owns the buffer. Anything
     /// else keeps the loud `cc` type error.
@@ -5004,6 +5004,32 @@ test "an arc place returned where a non-arc type is declared stays a loud C type
     try expectContains(e.text, "cell_slice_t _cell_t0 = cell_arc_clone(xs);");
     try expectContains(e.text, "cell_string_t _cell_t1 = cell_arc_clone(s);");
     try expectAbsent(e.text, "unbox");
+}
+
+test "an owned String or list binding assigned to an arc var is moved into the box" {
+    // R10's move-into-arc at assignment, implemented 2026-09-16. The
+    // reassignment pre-drop releases the old box, then stores the new one,
+    // which boxes the moved source; the source has no release of its own.
+    var e = try emitSource(
+        \\pub fn f(owned p: String) {
+        \\  var arc a: String = "x"
+        \\  a = p
+        \\}
+        \\pub fn g(owned xs: [Int]) {
+        \\  var arc b: [Int] = [1]
+        \\  b = xs
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectContains(f, "cell_arc_t _cell_t0 = cell_arc_from_string(p);");
+    try expectLineBefore(f, "cell_arc_drop(a);", "cell_arc_t _cell_t0 = cell_arc_from_string(p);");
+    try expectLineBefore(f, "a = _cell_t0;", "cell_arc_drop(a);");
+    try expectAbsent(f, "cell_string_free(&p);");
+    const g = try fnDef(e.text, "g");
+    try expectContains(g, "cell_arc_from_slice(xs);");
+    try expectAbsent(g, "cell_slice_free(&xs);");
+    try expectCompiles(e.text);
 }
 
 test "an owned String or list binding returned as arc is moved into the box" {

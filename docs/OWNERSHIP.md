@@ -24,9 +24,9 @@ derived-loan propagation remains conservative. See [FEATURES.md](FEATURES.md)
 for the current cross-backend matrix, rather than treating this historical
 summary as an exhaustive rule inventory. **R11** retain-release insertion is implemented in the
 C backend, with the gaps R11 itself names; **R10**'s move-into-`arc` is
-implemented in the checker at `let` and at a direct `-> arc T` return for a
-whole `owned` `String` or list binding (2026-09-16) and refused everywhere
-else. R10's other
+implemented in the checker at `let`, at a direct `-> arc T` return and by
+assignment into a whole `var arc` binding, for a whole `owned` `String` or
+list binding (2026-09-16), and refused everywhere else. R10's other
 direction, an `arc` value made UNIQUE, IS implemented, at six consumption
 sites and with a total verdict that refuses a source it cannot classify. **R2.a**
 (a move inside a loop) landed with `while`. **R18** (an `owned` binding may not
@@ -937,10 +937,11 @@ section 7 already said). The same day the checker began consuming the source
 at ONE position: a `let arc` binding whose source is a whole `owned` `String`
 or list binding is moved into the box (see R11's emptied table below). A
 direct `return` of the same source from a `-> arc T` function followed later
-that day, the second position. Everywhere else it refuses and says "not
-implemented", at five positions rather than the sweep's four rows: a binding
-and a return (for any other source), an assignment, a call argument, and a
-struct-literal field.
+that day, and an assignment into a whole `var arc` binding third.
+Everywhere else it refuses and says "not implemented", at five positions
+rather than the sweep's four rows: a binding, a return and an assignment
+(for any other source or target), a call argument, and a struct-literal
+field.
 The last two are not in the sweep at all and were found by probing positions
 instead of rows, which is the discipline this rule's own text asks for.
 
@@ -1272,6 +1273,19 @@ recorded conservatively as a move: the leak direction, stated. Still refused
 as not implemented: a field source (`let arc a = r.s`), a source reached
 through a branch, an `Int?` or unresolved-type source, and the other
 positions (assignment, call argument, struct field).
+
+**The assignment position, implemented the same day, third.** `a = p`,
+with `a` a whole `var arc` binding and `p` a whole `owned` `String` or list
+binding, is accepted; the move is the one every assignment already makes
+of a place source, and the C backend's reassignment pre-drop (R11 row 5)
+releases the old box before storing `cell_arc_from_string(p)`. Measured on
+a program assigning a String and a list into boxes that already hold one:
+0 leaks, `ALLOC=2100 FREE=2100`, ASan clean, printed answer hand-derived;
+`examples/leaks/arc_box_move.cell` now covers this position too (0,
+`ALLOC=24000 FREE=24000`). Still refused here: a field target (`r.s = p`,
+the struct-field store), a block value, a branch value, an `Int?`. A store
+on one branch only leaks `p` on the other path (50 over 50 calls), the
+same conservative branch move as the other two positions.
 
 **The return position, implemented the same day.** `fn f(owned p: String)
 -> arc String { return p }`, the fifth position this rule's refusal found,
