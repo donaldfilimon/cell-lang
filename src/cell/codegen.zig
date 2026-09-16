@@ -1606,6 +1606,14 @@ pub const Generator = struct {
         try out.writeAll(" = ");
         try self.emitExpr(m.scrutinee, indent + 1);
         try out.writeAll(";\n");
+        // -Wunused-variable is part of -Wall. The temporary is read only by a
+        // non-default pattern test or copied into a binding arm, so a match
+        // whose reached arms are all `_` (a leading `_`, or `_ if g` guards)
+        // never reads it. The scrutinee is still evaluated, for its effects.
+        if (!scrutineeTempRead(m.arms)) {
+            try self.writeIndent(indent + 1);
+            try out.print("(void){s};\n", .{temp});
+        }
 
         var tested: usize = 0;
         var default_arm: ?ast.MatchArm = null;
@@ -3190,6 +3198,18 @@ fn intrinsicSymbol(name: []const u8, arity: usize) ?[]const u8 {
 /// A pattern that matches everything, so it closes an if/else chain.
 /// Whether an arm closes the chain. A pattern that matches everything only
 /// does so when no guard can reject it.
+/// Whether `emitMatch` will read its scrutinee temporary: some arm it
+/// reaches (every arm up to and including the first unguarded default) is a
+/// pattern test or a binding copy.
+fn scrutineeTempRead(arms: []const ast.MatchArm) bool {
+    for (arms) |arm| {
+        if (arm.pattern.kind == .binding) return true;
+        if (!isDefaultPattern(arm.pattern)) return true;
+        if (isDefaultArm(arm)) return false;
+    }
+    return false;
+}
+
 fn isDefaultArm(arm: ast.MatchArm) bool {
     return arm.guard == null and isDefaultPattern(arm.pattern);
 }
@@ -3633,6 +3653,35 @@ fn fnDef(haystack: []const u8, name: []const u8) ![]const u8 {
     return error.NotFound;
 }
 
+/// The emitted translation unit compiles as an object at
+/// `-Wall -Wextra -Werror`, the flags the gate's sanitized stage uses.
+fn expectCompiles(text: []const u8) !void {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.c", .data = text });
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{cwd_buf[0..cwd_len]});
+    defer gpa.free(include);
+
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{
+            "cc",     "-std=c11", "-Wall", "-Wextra", "-Werror", "-c",
+            "body.c", "-I",       include, "-o",      "body.o",
+        },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    if (!result.term.success()) {
+        std.debug.print("cc rejected emitted C:\n{s}\n--- source ---\n{s}\n", .{ result.stderr, text });
+        return error.CcRejectedEmittedC;
+    }
+}
+
 fn expectAbsent(haystack: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, haystack, needle) != null) {
         std.debug.print("\nexpected NOT to find:\n{s}\nin:\n{s}\n", .{ needle, haystack });
@@ -4074,6 +4123,32 @@ test "expression position if becomes a statement expression" {
     try expectContains(e.text, "int64_t v = ({");
     try expectContains(e.text, "_cell_t0 = 1;");
     try expectContains(e.text, "_cell_t0 = 2;");
+}
+
+test "a match whose reached arms never read the scrutinee voids its temporary" {
+    // Measured 2026-09-16: `let arc a = match c { _ => make() }` emitted
+    // `int64_t _cell_t4 = c;` with no reader and failed -Werror. The
+    // scrutinee is still evaluated; only the unused-variable warning goes.
+    var e = try emitSource(
+        \\pub fn f(copy c: Int) -> Int {
+        \\  return match c { _ => 7 }
+        \\}
+        \\pub fn g(copy c: Int, copy b: Bool) -> Int {
+        \\  return match c { _ if b => 1, _ => 2 }
+        \\}
+        \\pub fn h(copy c: Int) -> Int {
+        \\  return match c { 1 => 1, _ => 2 }
+        \\}
+        \\pub fn k(copy c: Int) -> Int {
+        \\  return match c { x => x }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(try fnDef(e.text, "f"), "(void)_cell_t");
+    try expectContains(try fnDef(e.text, "g"), "(void)_cell_t");
+    try expectAbsent(try fnDef(e.text, "h"), "(void)_cell_t");
+    try expectAbsent(try fnDef(e.text, "k"), "(void)_cell_t");
+    try expectCompiles(e.text);
 }
 
 test "match lowers to a scrutinee temporary and an if chain" {
