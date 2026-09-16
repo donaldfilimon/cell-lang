@@ -402,11 +402,13 @@ LEAK_VALUE_BLOCK_LOCAL=0
 # re-opens it. A CONDITIONAL partial move still leaks the moved field on the
 # path that did not move it, by design; that is not measured here.
 LEAK_PARTIAL_MOVE_FIELD=0
-# R10 move-into-`arc` at its four IMPLEMENTED positions (`let arc` since
-# f9441cb, a direct `return` from `-> arc T`, an assignment into a whole
-# `var arc` and an argument to an `arc` parameter since 2026-09-16; the
-# assignment case raised the counter figures below to ALLOC=24000
-# FREE=24000, the call case to ALLOC=30000 FREE=30000, measured with the leaks host under ASan). Not an R11
+# R10 move-into-`arc` at its five IMPLEMENTED positions (`let arc` since
+# f9441cb; a direct `return` from `-> arc T`, an assignment into a whole
+# `var arc`, an argument to an `arc` parameter and a struct literal's `arc`
+# field since 2026-09-16; the assignment case raised the counter figures
+# below to ALLOC=24000 FREE=24000, the call case to ALLOC=30000 FREE=30000
+# and the field case to ALLOC=36000 FREE=36000, each measured with the leaks
+# host under ASan before it was pinned). Not an R11
 # row and never a measured leak: both positions were refused until they were
 # built. Pinned because the move is correct only while borrowck records the
 # source as moved AND codegen boxes it and skips its drop; a drift on either
@@ -897,7 +899,7 @@ else
     run_c_leaks revived_var "" "$LEAK_REVIVED_VAR" "R16 revival leak, CLOSED 2026-09-16"
     run_c_leaks value_block_local "" "$LEAK_VALUE_BLOCK_LOCAL" "R11 value-position block residual, CLOSED 2026-09-15"
     run_c_leaks partial_move_field "" "$LEAK_PARTIAL_MOVE_FIELD" "partial-move residual, CLOSED 2026-09-16"
-    run_c_leaks arc_box_move "" "$LEAK_ARC_BOX_MOVE" "R10 move-into-arc at let, return, assignment and call argument, implemented 2026-09-16"
+    run_c_leaks arc_box_move "" "$LEAK_ARC_BOX_MOVE" "R10 move-into-arc at let, return, assignment, call argument and struct-literal field, implemented 2026-09-16"
 fi
 
 # ------------------------------------------- 8. cross-backend answer agreement --

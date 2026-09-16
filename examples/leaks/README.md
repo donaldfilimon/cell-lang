@@ -35,15 +35,15 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `reassigned_owned_var.cell` | not an R11 row: row 5's `owned` twin. Reassigning an `owned` String or list var leaked the old value (4000 before on both witnesses, including two stores whose var is moved only afterwards); **CLOSED 2026-09-16** by extending `emitAssign`'s pre-drop, decided per store from borrowck's `assign_liveness`, pinned at 0. A store whose target was already moved (R3a revival), or that sits in a `while` body moving it, keeps its leak by design and is not measured here |
 | `revived_var.cell` | not an R11 row: OWNERSHIP.md R16's revival leak. A var moved and then revived (R3a) was never released at scope end (5000 before on both witnesses, one per drop point: body end, `return`, nested block end, `owned` parameter, list); **CLOSED 2026-09-16** by borrowck's per-exit liveness (`exit_liveness`), pinned at 0. A one-branch revival, a var moved inside a `while`, `break`/`continue`, a value block's tail and a record var keep their leak by design and are not measured |
 | `value_block_local.cell` | the residual of row 4's closure: an `arc` local declared in a VALUE-position block was not released at that block's exit (measurable since 2026-09-15, when a block began to type as its tail); **CLOSED 2026-09-15** the same evening by `emitValueBlockDrops`, kept and pinned at 0 |
-| `arc_box_move.cell` | not a gap: R10 move-into-`arc` at `let`, at a direct `-> arc` return, by assignment into a whole `var arc` and as an argument to an `arc` parameter, all IMPLEMENTED 2026-09-16; pinned at 0 as a regression guard (a drift between borrowck's move and codegen's box is a double free or a leak). A move on one branch only leaks by design and is not measured |
+| `arc_box_move.cell` | not a gap: R10 move-into-`arc` at `let`, at a direct `-> arc` return, by assignment into a whole `var arc`, as an argument to an `arc` parameter and into a struct literal's `arc` field, all IMPLEMENTED 2026-09-16; pinned at 0 as a regression guard (a drift between borrowck's move and codegen's box is a double free or a leak). A move on one branch only leaks by design and is not measured |
 | `partial_move_field.cell` | not a numbered row: a record with one owning field moved out was skipped whole, leaking its other owning field; **CLOSED 2026-09-16** by field-path move records in borrowck and `emitPartialRecordDrop` in codegen, kept and pinned at 0. A field moved on only one branch still leaks by design and is not measured here |
 
 R11's sixth disclosed gap (an `owned` String or list place bound as `arc`) was
 never a runtime leak: it was a C type error, then a borrowck refusal, and since
 2026-09-16 it is implemented at `let`, at a direct `-> arc T` return, by
-assignment into a whole `var arc` and as an argument to an `arc` parameter,
-for a whole binding. It has no gap
-fixture, because there was never a leak to pin, but all four implemented
+assignment into a whole `var arc`, as an argument to an `arc` parameter and
+into a struct literal's `arc` field, for a whole binding. It has no gap
+fixture, because there was never a leak to pin, but all five implemented
 positions are pinned at 0 by `arc_box_move.cell`: the
 move is correct only while borrowck records the source as moved and codegen
 boxes it and skips its drop, and a drift on either side shows up there.

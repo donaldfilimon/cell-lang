@@ -1,8 +1,9 @@
 // R10 move-into-`arc`, the IMPLEMENTED positions: a whole `owned` `String` or
 // list binding moved into a fresh box at `let arc`, at a direct `return`
 // from a `-> arc T` function, by assignment into a whole `var arc`
-// binding, and as an argument to an `arc` parameter (the callee releases
-// the box). Not an R11 "Still broken" row: until
+// binding, as an argument to an `arc` parameter (the callee releases the
+// box), and into a struct literal's `arc` field (the record's drop glue
+// releases it). Not an R11 "Still broken" row: until
 // 2026-09-16 both positions were refused (a loud C type error before that),
 // so there was never a runtime leak to measure. It is here because the move
 // is only correct while borrowck and codegen agree exactly: borrowck must
@@ -16,8 +17,9 @@
 // Covered: an `owned` String parameter, an `owned` list parameter and an
 // `owned` String local, each returned as `arc`; and an `owned` String local
 // bound with `let arc`; an `owned` String and list local each assigned
-// into a `var arc` that already holds a box; and an `owned` String and list
-// local each passed to an `arc` parameter. NOT covered, by design: a move on only one branch
+// into a `var arc` that already holds a box; an `owned` String and list
+// local each passed to an `arc` parameter; and an `owned` String and list
+// local each stored in a struct literal's `arc` field. NOT covered, by design: a move on only one branch
 // (`if c { return p }`), which leaks the source on the path that did not
 // move it because borrowck records a branch move as if it happened on every
 // path. That is the pre-existing R2 behaviour of a conditional return and
@@ -65,6 +67,17 @@ pub fn box_by_call() {
     keep_list(xs)
 }
 
+pub struct Holder {
+    arc s: String
+    arc xs: [Int]
+}
+
+pub fn box_by_field() {
+    let owned p: String = "field-in"
+    let owned ys: [Int] = [8, 9]
+    let owned h = Holder { s: p, xs: ys }
+}
+
 pub fn main() {
     var i = 0
     while i < 1000 {
@@ -77,6 +90,7 @@ pub fn main() {
         let arc d = u
         box_by_assign()
         box_by_call()
+        box_by_field()
         i = i + 1
     }
     print_int(i)

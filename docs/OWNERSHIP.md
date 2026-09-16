@@ -25,9 +25,9 @@ for the current cross-backend matrix, rather than treating this historical
 summary as an exhaustive rule inventory. **R11** retain-release insertion is implemented in the
 C backend, with the gaps R11 itself names; **R10**'s move-into-`arc` is
 implemented in the checker at `let`, at a direct `-> arc T` return, by
-assignment into a whole `var arc` binding and as an argument to an `arc`
-parameter, for a whole `owned` `String` or list binding (2026-09-16), and
-refused everywhere else. R10's other
+assignment into a whole `var arc` binding, as an argument to an `arc`
+parameter and into a struct literal's `arc` field, for a whole `owned`
+`String` or list binding (2026-09-16), and refused everywhere else. R10's other
 direction, an `arc` value made UNIQUE, IS implemented, at six consumption
 sites and with a total verdict that refuses a source it cannot classify. **R2.a**
 (a move inside a loop) landed with `while`. **R18** (an `owned` binding may not
@@ -938,13 +938,13 @@ section 7 already said). The same day the checker began consuming the source
 at ONE position: a `let arc` binding whose source is a whole `owned` `String`
 or list binding is moved into the box (see R11's emptied table below). A
 direct `return` of the same source from a `-> arc T` function followed later
-that day, an assignment into a whole `var arc` binding third, and an argument
+that day, an assignment into a whole `var arc` binding third, an argument
 to an `arc` parameter fourth (the callee releases the box, per section 7's
-callee-releases rule, so the caller's source is simply dead).
-Everywhere else it refuses and says "not implemented", at five positions
-rather than the sweep's four rows: a binding, a return, an assignment and a
-call argument (for any other source or target), and a struct-literal
-field.
+callee-releases rule, so the caller's source is simply dead), and a struct
+literal's `arc` field fifth (the record's drop glue releases it).
+Everywhere else it refuses and says "not implemented", at the same five
+positions for any other source, and at a field TARGET store (`r.s = p`),
+which does not pre-drop the old box and so stays refused.
 The last two are not in the sweep at all and were found by probing positions
 instead of rows, which is the discipline this rule's own text asks for.
 
@@ -1274,9 +1274,9 @@ Moving on only one branch (`if c > 0 { let arc a = s }`) leaks `s` when the
 branch is not taken, one allocation over 100 calls, because a branch move is
 recorded conservatively as a move: the leak direction, stated. Still refused
 as not implemented: a field source (`let arc a = r.s`), a source reached
-through a branch, an `Int?` or unresolved-type source, and the struct-field
-position (the assignment and call-argument positions landed the same day
-for the same source shape).
+through a branch, an `Int?` or unresolved-type source, and a field TARGET
+store (`r.s = p`); the assignment, call-argument and struct-literal-field
+positions landed the same day for the same source shape.
 
 **The assignment position, implemented the same day, third.** `a = p`,
 with `a` a whole `var arc` binding and `p` a whole `owned` `String` or list

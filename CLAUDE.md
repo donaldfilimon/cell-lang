@@ -20,9 +20,9 @@ cross-file picture that no single source file states.
    **R18** today, **plus one
    clause of R10**: an `arc` value may not be made unique. The rest of R10 is
    not enforced, except move-into-`arc` at `let`, at a direct `-> arc`
-   return, by assignment into a whole `var arc` and as an argument to an
-   `arc` parameter, for a whole `owned` `String` or list binding
-   (2026-09-16). Its header comment is the
+   return, by assignment into a whole `var arc`, as an argument to an
+   `arc` parameter and into a struct literal's `arc` field, for a whole
+   `owned` `String` or list binding (2026-09-16). Its header comment is the
    live list and this line has already drifted from it twice: once dropping
    R9 and the R10 clause entirely, and again missing R7's consumption clause
    until 2026-09-15, when gate stage 11, `tools/check-rule-lists.sh`, began

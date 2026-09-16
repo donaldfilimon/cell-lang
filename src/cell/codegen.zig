@@ -183,7 +183,7 @@
 //! list PLACE bound as `arc` was not boxed at all, because
 //! `cell_arc_from_string` moves its argument while `borrowck.zig` left the
 //! source unmoved (boxed since 2026-09-16 at `let`, at a direct `-> arc`
-//! return, by assignment into a whole `arc` var and as an `arc` call argument, for a whole binding, which borrowck now moves; see
+//! return, by assignment into a whole `arc` var, as an `arc` call argument and into a struct literal's `arc` field, for a whole binding, which borrowck now moves; see
 //! `isMovedOwnedBinding`). That list is what running programs
 //! has found, not a proof that nothing else dangles; `docs/OWNERSHIP.md` R11
 //! records exactly which positions the search covered, values as well as
@@ -2491,10 +2491,10 @@ pub const Generator = struct {
     /// identifier naming an `owned` binding that borrowck recorded as wholly
     /// moved. borrowck moves a place into a box only at `let arc`, at a
     /// direct `-> arc T` return, by assignment into a whole `arc`
-    /// binding, and as an argument to an `arc` parameter (R10,
-    /// `boxableOwnedBinding`), and refuses the other positions, so this is
-    /// the only way such a place reaches a boxing conversion; the moved
-    /// source is
+    /// binding, as an argument to an `arc` parameter, and into a struct
+    /// literal's `arc` field (R10, `boxableOwnedBinding`), and refuses the
+    /// other positions, so this is the only way such a place reaches a
+    /// boxing conversion; the moved source is
     /// then skipped by the drop pass and the box owns the buffer. Anything
     /// else keeps the loud `cc` type error.
     fn isMovedOwnedBinding(self: *Generator, arg: *const ast.Expr) bool {
@@ -5238,6 +5238,32 @@ test "a returned arc match-arm binding is retained: nested if inside a block arm
         \\      cell_arc_drop(s);
         \\      return _cell_t2;
     );
+}
+
+test "an owned String or list binding stored in a struct-literal arc field is moved into the box" {
+    // R10's move-into-arc at a struct-literal field, implemented
+    // 2026-09-16. The literal takes the fresh box and the record's drop
+    // glue releases it (R11 row 2); the source has no drop of its own
+    // because borrowck moved it.
+    var e = try emitSource(
+        \\pub struct Box {
+        \\  arc s: String
+        \\  arc xs: [Int]
+        \\}
+        \\pub fn make() -> String;
+        \\pub fn f(owned ys: [Int]) {
+        \\  let owned a = make()
+        \\  let owned b = Box { s: a, xs: ys }
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectContains(f, ".s = cell_arc_from_string(a)");
+    try expectContains(f, ".xs = cell_arc_from_slice(ys)");
+    try expectAbsent(f, "cell_string_free(&a);");
+    try expectAbsent(f, "cell_slice_free(&ys);");
+    try expectContains(f, "cell_drop_Box(");
+    try expectCompiles(e.text);
 }
 
 test "an owned String or list binding passed to an arc parameter is moved into the box" {

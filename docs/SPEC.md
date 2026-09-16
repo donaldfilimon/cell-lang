@@ -865,9 +865,9 @@ refused at six consumption sites (an `owned` parameter, an `owned` binding, an
 assignment to an `owned` place, an `owned` struct field, a list-literal element,
 and a `return` whose declared return type is not `arc`). There is no NLL,
 and R10's move-into-`arc` is implemented only at `let`, at a direct
-`-> arc T` return, by assignment into a whole `var arc` and as an argument
-to an `arc` parameter, for a whole `owned` `String` or list binding (refused
-elsewhere). The C
+`-> arc T` return, by assignment into a whole `var arc`, as an argument
+to an `arc` parameter and into a struct literal's `arc` field, for a whole
+`owned` `String` or list binding (refused elsewhere). The C
 backend (`codegen.zig`) inserts drops for an unmoved `owned`/`arc` `let`/`var`
 local, block-scoped for statement-position scopes since 2026-09-15 (function
 body, `while` body, bare block, `if` branch, `match` arm body, plus
@@ -997,8 +997,8 @@ moved); and an `owned` String or list **place** bound as `arc` was not boxed,
 because R10's move-into-`arc` was unimplemented in the checker and boxing an
 un-moved place would double free it (refused at five positions by `c6ddda3`,
 and implemented at `let`, at a direct `-> arc` return, by assignment into
-a whole `var arc` and as an `arc` call argument for a whole binding on
-2026-09-16, which empties R11's table).
+a whole `var arc`, as an `arc` call argument and into a struct literal's
+`arc` field for a whole binding on 2026-09-16, which empties R11's table).
 
 **Every one of those is a leak, and that is a measurement, not a category.**
 Two earlier drafts here made the categorical claim and review falsified both:
@@ -1021,9 +1021,9 @@ that nothing dangles.
 R10's `arc`-cannot-be-made-unique clause is now enforced by `borrowck.zig` at
 six consumption sites, which makes it the first clause of R10 to
 land; move-into-`arc` is implemented only at `let`, at a direct
-`-> arc T` return, by assignment into a whole `var arc` and as an argument
-to an `arc` parameter, for a whole `owned` `String` or list binding
-(2026-09-16). Every `arc`-to-`arc` use stays
+`-> arc T` return, by assignment into a whole `var arc`, as an argument
+to an `arc` parameter and into a struct literal's `arc` field, for a whole
+`owned` `String` or list binding (2026-09-16). Every `arc`-to-`arc` use stays
 legal, `-> arc T` returning an `arc` local included: the refusal is scoped to
 making an `arc` value unique, not to `arc`. The count went four to six because
 enumerating positions is what let three separate axes through; the classifier
