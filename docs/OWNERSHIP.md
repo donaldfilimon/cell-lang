@@ -1170,10 +1170,17 @@ typechecker typed every block as `()` (so the typed form was refused) and
 codegen's inference could not see the block's own `let`, so the untyped form
 emitted `int64_t r` and did not compile; both are fixed the same day and pinned
 by tests in `codegen.zig` and `typecheck.zig`. Only `arc` reaches this gap:
-the `owned` form, `let owned s = { let owned t = make() \n t }`, is refused by
-R10 ("cannot bind the unresolved name 't'"), because borrowck resolves a block
-tail after the block's scope has closed; that refusal is safe and is a
-separate scoping limitation.
+the `owned` form, `let owned s = { let owned t = make() \n t }`, is refused
+("cannot bind the unresolved name 't' to 'owned' binding 's'"). Read off
+`borrowck.zig` rather than guessed: the ownership-source walks that R10 and
+R2.b run over an initializer, `arcUniqueSource` and `ownedMoveSource`, both
+descend straight to a block's trailing expression WITHOUT entering the block's
+scope or declaring its `let`s, so a tail that names a block-local reaches
+their `.ident` arm with `lookup` failed and is reported as unresolved. The
+refusal is safe (it is R2.b's "refuse what cannot be resolved", not a wrong
+move), but the message blames ownership for what is a scoping gap in those
+two walks, and fixing it means declaring the block's bindings in a pushed
+scope before asking about the tail.
 
 **A SIXTH gap existed and was never in this table. It is closed by REFUSAL, so
 it gets no fixture and changes no constant in the gate.** `let owned ys: [Int] =

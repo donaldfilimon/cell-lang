@@ -268,7 +268,9 @@ trap 'rm -rf "$TMP"' EXIT
 # 1785990's. They were re-measured (3 runs, both witnesses) on the tree that
 # the closing commit changed, whose parent is 82f222e; a commit cannot cite
 # its own hash, so the hash below is that parent and the codegen it names is
-# "82f222e plus the row-4 commit that follows it".
+# "82f222e plus the codegen commits that follow it the same day" (4cf7852,
+# block-scoped release; 973c23c, block-tail typing and inference, which added
+# the sixth fixture). The gate re-verified every pin on each of those trees.
 LEAKS_MEASURED_AT=82f222e903afdd01cdc9a384a000ffc2a8df70cc
 
 # R11 row 1: a Cell body never releases its own `arc` parameter.
