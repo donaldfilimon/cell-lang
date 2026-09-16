@@ -184,6 +184,7 @@ are not.
 | `backends.cell` | the cross-backend agreement case: scalar-only, carried by C, LLVM and MLIR alike, and all three print `24` |
 | `borrows.cell` | every borrow spelling (`shared`/`&`, `exclusive`/`&mut`/`&var`/`&exclusive`) and the keyword-wins rule for mixing |
 | `loops.cell` | `while`, both spellings, plus `break` and `continue`; prints 55 through all three backends |
+| `comparisons.cell` | `==` and `!=` as the whole condition of `if`, `else if` and `while`; prints 621 through all three backends, and is the corpus's only guard against the doubled `if ((a == 2))` that clang rejects under `-Werror` |
 | `while_is_now_a_loop.cell` | the same program that once passed and silently did nothing, now looping correctly; its header records all four meanings it has had |
 
 ## Running `arc.cell`, the one example with a C host

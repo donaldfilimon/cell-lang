@@ -1,0 +1,60 @@
+// `==` and `!=` as the WHOLE condition of an `if`, an `else if` and a
+// `while`. (A match guard takes the same path; codegen.zig's unit test
+// covers it, since a guard is not carried by all three backends.)
+//
+// This file exists because no example did that, and the C backend emitted
+// `if ((a == 2))` for it: the binary expression brought its own parentheses
+// and the statement added a second pair. clang rejects that under
+// `-Wall -Wextra -Werror` (`-Wparentheses-equality`, which reads doubled
+// parentheses around `==` as a mistyped assignment), so every such program
+// failed to build while `cell check` accepted it. The whole-corpus -Werror
+// build in tools/check.sh never saw it because no file here had the shape.
+// Fixed 2026-09-16: a condition's top-level binary is emitted without its
+// own parentheses (`emitCond` in src/cell/codegen.zig); operands keep theirs.
+//
+// Scalar only, so all three backends carry it and all three print 621:
+//   count(5)       14   (i == 2 adds 10 once; i != 3 adds 1 four times)
+//   settle(7)       7   (`while i == 0` runs once)
+//   classify(1)   100   (`if x == 1`)
+//   classify(2)   300   (neither branch)
+//   classify(5)   200   (`else if x != 2`)
+// If a backend prints anything else it has a bug.
+// EXPECT-OUTPUT: 621
+
+pub fn print_int(copy value: Int);
+
+pub fn count(copy n: Int) -> Int {
+    var i = 0
+    var hits = 0
+    while i != n {
+        if i == 2 {
+            hits = hits + 10
+        }
+        if i != 3 {
+            hits = hits + 1
+        }
+        i = i + 1
+    }
+    return hits
+}
+
+pub fn settle(copy n: Int) -> Int {
+    var i = 0
+    while i == 0 {
+        i = n
+    }
+    return i
+}
+
+pub fn classify(copy x: Int) -> Int {
+    if x == 1 {
+        return 100
+    } else if x != 2 {
+        return 200
+    }
+    return 300
+}
+
+pub fn main() {
+    print_int(count(copy 5) + settle(copy 7) + classify(copy 1) + classify(copy 2) + classify(copy 5))
+}

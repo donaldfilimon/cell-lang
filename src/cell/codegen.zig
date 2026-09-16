@@ -769,7 +769,7 @@ pub const Generator = struct {
             .while_stmt => |w| {
                 try self.writeIndent(indent);
                 try out.writeAll("while (");
-                try self.emitExpr(&w.cond, indent);
+                try self.emitCond(&w.cond, indent);
                 try out.writeAll(") {\n");
                 try self.loop_marks.append(self.arena, self.locals.items.len);
                 try self.emitStmts(w.body, indent + 4);
@@ -1583,7 +1583,7 @@ pub const Generator = struct {
         const out = self.writer;
         try self.writeIndent(indent);
         try out.writeAll("if (");
-        try self.emitExpr(i.cond, indent);
+        try self.emitCond(i.cond, indent);
         try out.writeAll(") ");
         try self.emitBranchStmt(i.then_body, indent);
         if (i.else_body) |eb| {
@@ -1606,7 +1606,7 @@ pub const Generator = struct {
             },
             .if_expr => |i| {
                 try out.writeAll("if (");
-                try self.emitExpr(i.cond, indent);
+                try self.emitCond(i.cond, indent);
                 try out.writeAll(") ");
                 try self.emitBranchStmt(i.then_body, indent);
                 if (i.else_body) |eb| {
@@ -1672,12 +1672,12 @@ pub const Generator = struct {
             }
             if (isDefaultPattern(arm.pattern)) {
                 // The pattern matches everything, so the guard IS the test.
-                try self.emitExpr(arm.guard.?, indent + 1);
+                try self.emitCond(arm.guard.?, indent + 1);
             } else {
                 try self.emitPatternTest(arm.pattern, temp, scrut_ty);
                 if (arm.guard) |g| {
                     try out.writeAll(" && (");
-                    try self.emitExpr(g, indent + 1);
+                    try self.emitCond(g, indent + 1);
                     try out.writeAll(")");
                 }
             }
@@ -1990,7 +1990,7 @@ pub const Generator = struct {
             .if_expr => |i| {
                 try self.writeIndent(indent);
                 try out.writeAll("if (");
-                try self.emitExpr(i.cond, indent);
+                try self.emitCond(i.cond, indent);
                 try out.writeAll(") {\n");
                 try self.emitValueInto(i.then_body, dest, indent + 1);
                 try self.writeIndent(indent);
@@ -2030,6 +2030,43 @@ pub const Generator = struct {
 
     // ── expressions ─────────────────────────────────────────────────────
 
+    /// A binary expression WITHOUT its enclosing parentheses. `emitExpr`
+    /// wraps it, which keeps every operand grouped as written; `emitCond`
+    /// does not, because the `if (...)`/`while (...)` syntax already groups
+    /// it, and `if ((a == 2))` is rejected under `-Werror` by clang's
+    /// `-Wparentheses-equality` (it reads as an intended assignment).
+    fn emitBinary(self: *Generator, b: anytype, indent: usize) EmitError!void {
+        const out = self.writer;
+        try self.emitExpr(b.left, indent);
+        try out.writeAll(switch (b.op) {
+            .add => " + ",
+            .sub => " - ",
+            .mul => " * ",
+            .div => " / ",
+            .eq => " == ",
+            .ne => " != ",
+            .lt => " < ",
+            .le => " <= ",
+            .gt => " > ",
+            .ge => " >= ",
+            .and_op => " && ",
+            .or_op => " || ",
+        });
+        try self.emitExpr(b.right, indent);
+    }
+
+    /// The expression inside an `if (...)`, `while (...)` or match-guard
+    /// `(...)` the caller has already opened. Only the top-level binary loses
+    /// its parentheses; its operands are still emitted by `emitExpr`.
+    fn emitCond(self: *Generator, e: *const ast.Expr, indent: usize) EmitError!void {
+        var c = e;
+        while (c.kind == .annotated) c = c.kind.annotated.value;
+        switch (c.kind) {
+            .binary => |b| try self.emitBinary(b, indent),
+            else => try self.emitExpr(e, indent),
+        }
+    }
+
     fn emitExpr(self: *Generator, e: *const ast.Expr, indent: usize) EmitError!void {
         const out = self.writer;
         switch (e.kind) {
@@ -2041,22 +2078,7 @@ pub const Generator = struct {
             .call => |c| try self.emitCall(c, indent),
             .binary => |b| {
                 try out.writeAll("(");
-                try self.emitExpr(b.left, indent);
-                try out.writeAll(switch (b.op) {
-                    .add => " + ",
-                    .sub => " - ",
-                    .mul => " * ",
-                    .div => " / ",
-                    .eq => " == ",
-                    .ne => " != ",
-                    .lt => " < ",
-                    .le => " <= ",
-                    .gt => " > ",
-                    .ge => " >= ",
-                    .and_op => " && ",
-                    .or_op => " || ",
-                });
-                try self.emitExpr(b.right, indent);
+                try self.emitBinary(b, indent);
                 try out.writeAll(")");
             },
             .unary => |u| try self.emitUnary(u.op, u.operand, indent),
@@ -4256,6 +4278,58 @@ test "match lowers to a scrutinee temporary and an if chain" {
     try expectContains(e.text, "if (_cell_t1 == cell_Color_Red) {");
     try expectContains(e.text, "} else if (_cell_t1 == cell_Color_Green) {");
     try expectAbsent(e.text, "/*match*/");
+}
+
+test "an equality condition gets one pair of parentheses, not two" {
+    // `if ((a == 2))` is rejected by clang's -Wparentheses-equality under
+    // -Werror. Every condition site goes through `emitCond`: statement and
+    // value `if`, `else if`, `while`, a guard-only arm and a pattern arm's
+    // `&& (guard)`. Operands keep their own parentheses.
+    var e = try emitSource(
+        \\pub enum Color { Red, Green }
+        \\pub fn stmt(copy a: Int, copy b: Int) -> Int {
+        \\  var i = 0
+        \\  while i != a {
+        \\    i = i + 1
+        \\  }
+        \\  if a == 2 {
+        \\    return 1
+        \\  } else if a != b {
+        \\    return 2
+        \\  }
+        \\  if (a + 1) == (b - 1) {
+        \\    return 3
+        \\  }
+        \\  return 0
+        \\}
+        \\pub fn value(copy a: Int) -> Int {
+        \\  let copy v = if a == 3 { 4 } else { 5 }
+        \\  return v
+        \\}
+        \\pub fn guarded(copy c: Color, copy n: Int) -> Int {
+        \\  return match c {
+        \\    Color.Green if n == 5 => 7,
+        \\    _ => 0,
+        \\  }
+        \\}
+        \\pub fn guard_only(copy n: Int) -> Int {
+        \\  return match n {
+        \\    _ if n == 1 => 1,
+        \\    _ => 0,
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "while (i != a) {");
+    try expectContains(e.text, "if (a == 2) {");
+    try expectContains(e.text, "} else if (a != b) {");
+    try expectContains(e.text, "if ((a + 1) == (b - 1)) {");
+    try expectContains(e.text, "if (a == 3) {");
+    try expectContains(e.text, "&& (n == 5)) {");
+    try expectContains(e.text, "if (n == 1) {");
+    try expectAbsent(e.text, "((a == 2))");
+    try expectAbsent(e.text, "((n == 5))");
+    try expectCompiles(e.text);
 }
 
 test "a match without a catch-all arm panics instead of inventing a value" {
