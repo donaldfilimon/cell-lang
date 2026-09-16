@@ -4151,6 +4151,33 @@ test "a match whose reached arms never read the scrutinee voids its temporary" {
     try expectCompiles(e.text);
 }
 
+test "TYPE-06: a Result type lowers to cell_result_t and is passed through, never dropped" {
+    // Parsing arrived 2026-09-16 with no construction syntax, so a Result
+    // value only enters a body from a declared callee or a parameter. It has
+    // no drop spelling (`hasDropCall(.result)` is false), so an owned one is
+    // leaked rather than released, the safe side, even though R11 row 1 now
+    // admits the parameter to the drop pass.
+    var e = try emitSource(
+        \\pub fn read() -> Result<Int, String>;
+        \\pub fn relay() -> Result<Int, String> {
+        \\  return read()
+        \\}
+        \\pub fn keep(owned r: Result<Int, String>) -> Result<Int, String> {
+        \\  return r
+        \\}
+        \\pub fn ignore(owned r: Result<Int, String>) -> Int {
+        \\  return 1
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_result_t cell_read(void);");
+    try expectContains(try fnDef(e.text, "relay"), "return cell_read();");
+    try expectContains(try fnDef(e.text, "keep"), "return r;");
+    try expectAbsent(e.text, "_free(&r)");
+    try expectAbsent(e.text, "cell_arc_drop");
+    try expectCompiles(e.text);
+}
+
 test "match lowers to a scrutinee temporary and an if chain" {
     var e = try emitSource(
         \\pub enum Color { Red, Green, Blue }

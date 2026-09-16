@@ -606,6 +606,24 @@ pub const Parser = struct {
         }
         const name = try self.expectIdent();
         var ty: ast.TypeExpr = .{ .name = name };
+        if (self.check(.lt)) {
+            // `Result<T, E>` is the one type that takes arguments (SPEC 3.4).
+            // Any other `Name<` is refused here, at the `<`, rather than left
+            // to fail as a stray token further on. The lexer has no `>>`
+            // token, so a nested `Result<Int, Result<Int, Int>>` closes one
+            // `>` at a time.
+            if (!std.mem.eql(u8, name, "Result")) {
+                return self.fail("generic types are not implemented; only Result<T, E> takes type arguments");
+            }
+            _ = self.match(.lt);
+            const ok = try self.allocator.create(ast.TypeExpr);
+            ok.* = try self.parseType();
+            if (!self.match(.comma)) return self.fail("Result takes exactly two type arguments, Result<T, E>");
+            const err = try self.allocator.create(ast.TypeExpr);
+            err.* = try self.parseType();
+            if (!self.match(.gt)) return self.fail("Result takes exactly two type arguments, Result<T, E>");
+            ty = .{ .result = .{ .ok = ok, .err = err } };
+        }
         if (self.match(.question)) {
             const p = try self.allocator.create(ast.TypeExpr);
             p.* = ty;
@@ -777,6 +795,49 @@ fn parseForTest(src: []const u8) !TestParse {
     var p = Parser.init(alloc, toks.items, "t.cell");
     const module = try p.parseModule();
     return .{ .arena = arena, .module = module };
+}
+
+/// The parse error message for a source that must not parse.
+fn parseErrorFor(src: []const u8) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var lex = lexer.Lexer.init(src, "t.cell");
+    const toks = try lex.tokenizeAll(alloc);
+    var p = Parser.init(alloc, toks.items, "t.cell");
+    if (p.parseModule()) |_| return error.ParsedButShouldNot else |_| {}
+    return (p.last_error orelse return error.NoErrorRecorded).message;
+}
+
+test "Result<T, E> parses as a result type, nested and optional" {
+    var tp = try parseForTest(
+        \\pub fn read(shared p: String) -> Result<Int, Result<[Int], String>>?;
+    );
+    defer tp.deinit();
+    const f = tp.module.items[0].kind.fn_def;
+    const ret = f.return_type.?;
+    // `?` wraps the whole Result, as it wraps a whole `[Int]`.
+    const inner = ret.optional.*;
+    try std.testing.expectEqualStrings("Int", inner.result.ok.name);
+    // The nested `>>` closes one `>` at a time: the lexer has no shift token.
+    const nested = inner.result.err.result;
+    try std.testing.expectEqualStrings("Int", nested.ok.list.name);
+    try std.testing.expectEqualStrings("String", nested.err.name);
+}
+
+test "type arguments are refused on anything but Result, and Result takes two" {
+    try std.testing.expectEqualStrings(
+        "generic types are not implemented; only Result<T, E> takes type arguments",
+        try parseErrorFor("pub fn f(owned v: Vec<Int>);"),
+    );
+    try std.testing.expectEqualStrings(
+        "Result takes exactly two type arguments, Result<T, E>",
+        try parseErrorFor("pub fn f() -> Result<Int>;"),
+    );
+    try std.testing.expectEqualStrings(
+        "Result takes exactly two type arguments, Result<T, E>",
+        try parseErrorFor("pub fn f() -> Result<Int, Int, Int>;"),
+    );
 }
 
 /// The single statement of the single function in a parsed module.

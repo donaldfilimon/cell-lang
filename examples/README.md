@@ -219,7 +219,7 @@ the `docs/SPEC.md` section that specifies it.
 
 | File | Missing feature |
 |---|---|
-| `result.cell` | `Result<T, E>` and generic type arguments |
+| `result.cell` | constructing a `Result<T, E>` (the type itself parses and checks since 2026-09-16, so this file now fails at the checker, not the parser) |
 | `generics.cell` | type parameters on functions |
 | `enum_payload.cell` | enum variants carrying data |
 | `optional_list.cell` | `[T]?` and nested optionals |

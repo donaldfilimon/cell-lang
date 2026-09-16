@@ -1,6 +1,8 @@
-// DOES NOT PARSE. There is no `<` `>` handling anywhere in parseType, so a
-// generic type argument list is a parse error at the closing paren of the
-// parameter list. SPEC section 3.4.
+// PARSES since 2026-09-16 and FAILS `cell check`: nothing in Cell constructs a
+// Result, so the body cannot turn `path` into one, and the checker refuses a
+// `String` returned where `Result<String, Int>` is declared. It stays here
+// until construction syntax exists (SPEC section 3.4). It used to be a parse
+// error at the `<`.
 pub fn read_file(shared path: String) -> Result<String, Int> {
     return path
 }

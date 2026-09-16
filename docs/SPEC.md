@@ -239,7 +239,7 @@ ownership model and the C ABI are not up for negotiation. What has landed:
 | `const Foo = struct { }` | A second item grammar for a meaning the existing one already expresses. The genuinely missing feature underneath it, a top-level `const` value binding, is worth having on its own and is not this. |
 | macros | The other implementation states outright that its expander is not hygienic. A construct that can invisibly introduce a binding can silently change which place a move kills, and the diagnostic would point into expanded source. That is not deferrable in a language whose claim is that ownership is checkable. |
 | `.bod` as a package manifest | Section 1.2 is normative: `.bod` is a body file. See below. |
-| error unions, `!T` and `E!T` | A second spelling of `Result<T, E>` (section 3.4). The other implementation lowers an error union to a tagged `{ok, code, value}` struct; `runtime/cell_rt.h` already defines `cell_result_t { bool ok; int32_t error_code; cell_value_t value; }` for `Result`, the same three fields and the same choice to narrow the error to an integer code. Admitting both is a pure synonym, refused on the `i32`/`f64` grounds above. The real gap is that `Result<T, E>` does not parse yet (FEATURES TYPE-06). |
+| error unions, `!T` and `E!T` | A second spelling of `Result<T, E>` (section 3.4). The other implementation lowers an error union to a tagged `{ok, code, value}` struct; `runtime/cell_rt.h` already defines `cell_result_t { bool ok; int32_t error_code; cell_value_t value; }` for `Result`, the same three fields and the same choice to narrow the error to an integer code. Admitting both is a pure synonym, refused on the `i32`/`f64` grounds above. The real gap was that `Result<T, E>` did not parse (FEATURES TYPE-06); it parses since 2026-09-16, and construction is the gap now. |
 | postfix `?` on an expression, for error propagation | Postfix `?` already means optional in a type (section 3.2, `T?`). Different positions, so a parser could tell them apart, but one glyph would carry two unrelated meanings. Whether Cell wants propagation at all is a separate question, and it cannot be asked usefully until `Result` parses. |
 
 **The `.bod` collision, stated normatively.** Another implementation reads
@@ -268,7 +268,9 @@ the other implementation are neither admitted nor refused yet:
 
 Every item in this ruling either depends on `Result<T, E>` or is moot without
 it, so parsing `Result<T, E>` (TYPE-06) is the next implementation slice here,
-and the only one that is not a decision.
+and the only one that is not a decision. **It landed 2026-09-16** (section 3.4);
+constructing and inspecting a `Result` in Cell source is the slice after it,
+and it needs syntax this specification has not designed yet.
 
 **Union stage 4 landed too, and it is the one that changed the language rather
 than its surface: Cell has loops.** `while`, `break` and `continue` are
@@ -745,16 +747,35 @@ yet.
 
 ### 3.4 Result
 
-**Status: designed, not implemented.**
+**Status: the type parses and checks (2026-09-16); values cannot be made or
+inspected in Cell source.**
 
 ```cell
 Result<Int, IoError>
 ```
 
-`Result<T, E>` is the fallible-return type. **It does not parse.** There is no
-`<` `>` handling anywhere in `parseType`; measured, `owned r: Result<Int,
-String>` is a parse error at the closing paren of the parameter list. The AST
-node `TypeExpr.result` exists and nothing constructs it.
+`Result<T, E>` is the fallible-return type. `parseType` accepts exactly two
+type arguments, `Result<T, E>`, composing with `[T]` and `T?`
+(`Result<Int, Int>?` is an optional Result) and nesting
+(`Result<Int, Result<Int, Int>>`; the lexer has no `>>` token). `Result` is the
+only name that takes type arguments: any other `Name<` is a parse error that
+says generic types are not implemented, and `Result<T>` or three arguments is
+a parse error too.
+
+**What a program can do with one today is pass it through.** No syntax
+constructs a `Result` (there is no `Ok(v)`/`Err(e)`) and no `match` pattern
+inspects one, so a `Result` value enters a body only from a declared callee or
+a parameter, and leaves only by return or as an argument. That makes a
+bodyless declaration, `pub fn read() -> Result<Int, IoError>;`, the useful form:
+a host-provided fallible function is now declarable. The type checker refuses a
+non-`Result` value in a `Result` slot (`let owned r: Result<Int, Int> = 1`, or
+returning a `String` from a `-> Result<String, Int>` body). The C backend lowers
+the type to `cell_result_t`; LLVM and MLIR refuse it at the span. A `Result` has
+no drop spelling, so an `owned` one is never released: the leak direction, and
+the stated boundary for a resource-bearing `T` or `E`, whose payload layout in
+`cell_value_t` is not designed. `let arc r: Result<Int, Int> = read()` is a loud
+C type error (a `cell_result_t` does not initialize a `cell_arc_t`), the same
+refusal as other unboxable `arc` shapes.
 
 The runtime defines the target layout:
 
@@ -1799,7 +1820,7 @@ for primitives, strings, slices, optionals, structs, payload-free enums, and
 | `copy String` | `cell_string_t` from `cell_string_clone` | `cell_string_t` (no clone call) |
 | `[T]` | `cell_slice_t { ptr, len, cap }`, type-erased, `elem_size` at each call site | `cell_slice_t` |
 | `T?` | tagged `{ bool has_value; T value; }` | `CELL_DEFINE_OPTIONAL` instance |
-| `Result<T, E>` | `cell_result_t { ok, error_code, cell_value_t value }` | does not parse |
+| `Result<T, E>` | `cell_result_t { ok, error_code, cell_value_t value }` | parses and checks; pass-through only, no construction (3.4) |
 | struct | C struct, same field order, each field lowered by its own ownership | `cell_<Name>` |
 | payload-free enum | distinct integer type of width `int32_t` | `typedef int32_t cell_<Name>` |
 
@@ -1988,7 +2009,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | `[T]?` | designed, not implemented |
 | `[T]` list syntax | parsed, not enforced |
 | List lowering to `cell_slice_t` | designed, not implemented |
-| `Result<T, E>` | designed, not implemented |
+| `Result<T, E>` | type parses, checks and lowers to C (pass-through only); construction and inspection designed-not-implemented; LLVM/MLIR refuse |
 | Generic types | designed, not implemented |
 | Unit type `()` in type position | designed, not implemented |
 | Implicit unit from an omitted `->` | implemented |
