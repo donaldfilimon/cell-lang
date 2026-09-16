@@ -191,6 +191,13 @@ const Binding = struct {
     /// Struct type name, when it could be resolved from the declaration or the
     /// initializing struct literal. Needed to read field annotations.
     struct_name: ?[]const u8,
+    /// The declared or inferred TYPE, when one could be resolved. Read only by
+    /// the resource-shape refusals (`checkCopyBinding`, the list-element site),
+    /// and deliberately kept separate from `struct_name`: that field feeds R9
+    /// and R10's total verdicts, so widening its inference would move those
+    /// answers, while widening this one cannot. Null means "unresolved", which
+    /// every reader treats as permit-and-disclose rather than refuse.
+    ty: ?ast.TypeExpr = null,
     decl_span: Span,
     /// R7. Defaults to `.not_an_arm` so the two non-arm `declare` sites are
     /// unchanged; only `checkMatch` ever sets it.
@@ -448,6 +455,16 @@ pub const Checker = struct {
                 if (f.body == null) try self.reportEscapingReturn(span, kind);
             }
         }
+        // R12 at the parameter position, asked BEFORE the bodyless return so a
+        // declared-only `fn f(copy b: Box);` is refused too: its caller is what
+        // duplicates the header, and that call site exists whether or not this
+        // module carries the body.
+        for (f.params) |p| {
+            if (p.ownership == .copy) {
+                try self.refuseResourceCopy(span, "parameter", p.name, p.ty);
+            }
+        }
+
         const body = f.body orelse return;
 
         // A fresh scope per function. This is what keeps a parameter of one
@@ -469,6 +486,7 @@ pub const Checker = struct {
                 // parameter is not a `var`.
                 .mutable = p.ownership == .owned or p.ownership == .exclusive,
                 .struct_name = typeStructName(&p.ty),
+                .ty = p.ty,
                 .decl_span = .none,
             });
         }
@@ -770,12 +788,26 @@ pub const Checker = struct {
             try self.checkLetInit(l, v);
         }
 
+        // `Binding.ty` resolves independently of `struct_name` above, and the
+        // order is declared-type first so a written annotation always wins.
+        var binding_ty: ?ast.TypeExpr = if (l.ty) |t| t else null;
+        if (binding_ty == null) {
+            if (l.value) |*v| binding_ty = try self.inferBindingType(v);
+        }
+        if (binding_ty == null) {
+            if (struct_name) |n| binding_ty = .{ .name = n };
+        }
+        if (l.ownership == .copy) {
+            try self.refuseResourceCopy(span, "binding", l.name, binding_ty);
+        }
+
         _ = try self.declare(.{
             .id = 0,
             .name = l.name,
             .ownership = l.ownership,
             .mutable = l.mutable,
             .struct_name = struct_name,
+            .ty = binding_ty,
             .decl_span = span,
         });
     }
@@ -1456,6 +1488,17 @@ pub const Checker = struct {
                 for (items) |*item| {
                     // R2.b: a block element is opened first (see
                     // `openBlockTail`); `v` is what this site consumes.
+                    //
+                    // The watermark is read BEFORE the block opens, so a place
+                    // whose binding id is at or above it was declared inside
+                    // this element's own block. That is the discriminator the
+                    // resource refusal below needs: a block-local YIELDED as
+                    // the tail is excluded from `emitValueBlockDrops`, so the
+                    // element is its only owner and nothing releases it twice,
+                    // while an OUTER place keeps its own header and is
+                    // released at its own scope end. Ids are monotonic
+                    // (`declare`), which is what makes the comparison sound.
+                    const outer_watermark = self.next_binding_id;
                     var v: *const ast.Expr = item;
                     var depth: usize = 0;
                     defer self.closeBlockTail(depth);
@@ -1486,12 +1529,32 @@ pub const Checker = struct {
                             try self.refuseUnknownMove(s, "store", "in", "list element", null);
                             continue;
                         },
+                        // A place whose type OWNS RESOURCES is refused: the
+                        // element copies its header and the source keeps one,
+                        // so the source's release dangles the element. See
+                        // `refuseListElementMove` for the ASan measurement
+                        // that falsified this site's previous justification.
+                        // A place whose type resolves to no resources (`[n]`
+                        // over an `Int`, `[b]` over a scalar-only record) is
+                        // still a plain read, and an UNRESOLVED type still
+                        // reads, because this predicate gates a refusal.
+                        .place => |pl| {
+                            if (pl.binding < outer_watermark) blk: {
+                                const b = self.bindingById(pl.binding) orelse break :blk;
+                                if (try self.placeResourceShape(b, pl.path)) |shape| {
+                                    if (shape == .resources) {
+                                        try self.refuseListElementMove(pl);
+                                        continue;
+                                    }
+                                }
+                            }
+                        },
                         // R7, and it READS here, for the same reason as the
                         // struct field above: `[x]` with an aliasing `x` and
                         // `[s1]` with the scrutinee are one gap, R11's
                         // element release, and neither is a double free today
                         // (measured at `4698dbc`, exit 0).
-                        .aliases_place, .place, .no_owned_place => {},
+                        .aliases_place, .no_owned_place => {},
                     }
                     try self.checkExpr(v);
                 }
@@ -3200,6 +3263,143 @@ pub const Checker = struct {
     /// scalar-only record hide inside a `copy` field.
     fn fieldResourceShape(self: *Checker, field: *const ast.Field) Error!ResourceShape {
         return self.resourceShapeOwned(&field.ty, field.ownership);
+    }
+
+    const PlaceType = struct { ty: ast.TypeExpr, ownership: Ownership };
+
+    /// The type a place carries, when it resolved. An empty path answers with
+    /// the binding's own inferred type; a non-empty one walks the struct table
+    /// exactly as `placeOwnership` does and answers with the last field's
+    /// declared type AND keyword, because `shared [Byte]` and `owned [Byte]`
+    /// lower to the same `cell_slice_t` and only the keyword tells them apart.
+    fn placeTypeOf(self: *const Checker, b: *const Binding, path: []const u8) ?PlaceType {
+        if (path.len == 0) {
+            const t = b.ty orelse return null;
+            return .{ .ty = t, .ownership = b.ownership };
+        }
+        var current: ?[]const u8 = b.struct_name;
+        var result: ?PlaceType = null;
+        var it = std.mem.splitScalar(u8, path, '.');
+        while (it.next()) |segment| {
+            const struct_name = current orelse return null;
+            const def = self.structs.get(struct_name) orelse return null;
+            const field = findField(def, segment) orelse return null;
+            result = .{ .ty = field.ty, .ownership = field.ownership };
+            current = typeStructName(&field.ty);
+        }
+        return result;
+    }
+
+    /// The resource shape of a place. Null means its type could not be
+    /// resolved, which every caller discloses rather than refuses: this
+    /// predicate gates REFUSALS, so an unresolved answer must not invent one.
+    fn placeResourceShape(self: *Checker, b: *const Binding, path: []const u8) Error!?ResourceShape {
+        const t = self.placeTypeOf(b, path) orelse return null;
+        return try self.resourceShapeOwned(&t.ty, t.ownership);
+    }
+
+    /// The type of a `let` initializer, for `Binding.ty`. Only shapes whose
+    /// type is readable WITHOUT a typechecker are answered; everything else is
+    /// null. Kept separate from the `struct_name` inference in `checkLet` on
+    /// purpose (see `Binding.ty`): widening this cannot move an R9 or R10
+    /// verdict, and widening that one can.
+    fn inferBindingType(self: *Checker, e: *const ast.Expr) Error!?ast.TypeExpr {
+        switch (e.kind) {
+            .annotated => |a| return try self.inferBindingType(a.value),
+            .int => return .{ .name = "Int" },
+            .float => return .{ .name = "Float" },
+            .string => return .{ .name = "String" },
+            .bool => return .{ .name = "Bool" },
+            .struct_lit => |sl| return .{ .name = sl.name },
+            .call => |c| {
+                if (c.callee.kind != .ident) return null;
+                const sig = self.fns.get(c.callee.kind.ident) orelse return null;
+                return sig.return_type;
+            },
+            // A borrow's binding is not an owner, but what a `copy` of it
+            // duplicates is the REFERENT's header, so answer with that.
+            .unary => |u| switch (u.op) {
+                .ref_shared, .ref_exclusive => return try self.inferBindingType(u.operand),
+                .neg, .not => return null,
+            },
+            .ident, .field => {
+                const place = (try self.placeOf(e)) orelse return null;
+                const b = self.bindingById(place.binding) orelse return null;
+                const t = self.placeTypeOf(b, place.path) orelse return null;
+                return t.ty;
+            },
+            else => return null,
+        }
+    }
+
+    /// R12's duplication clause, at the binding and parameter positions.
+    ///
+    /// A `copy` place is bitwise-duplicated and never retained, so when its
+    /// type owns resources the duplicate is a second header over one buffer.
+    /// Struct FIELDS have refused this since `checkStructFields`; bindings and
+    /// parameters did not, and three routes reached it, all measured accepted
+    /// and all emitting a plain `cell_Box x = y;`: `let copy snap = buf`,
+    /// `let copy snap = v` through an exclusive borrow, and `fn f(copy b: Box)`.
+    /// They were harmless only while a `record` was never dropped. R11 row 2's
+    /// drop glue is exactly what turns each of them into a double free, so the
+    /// refusal lands ahead of it rather than after.
+    ///
+    /// A null type is PERMITTED, not refused: `let copy c = s` over a bare
+    /// `String` binding declared without a type still resolves nothing here
+    /// and is disclosed in `docs/OWNERSHIP.md` R12 instead.
+    fn refuseResourceCopy(
+        self: *Checker,
+        at: Span,
+        what: []const u8,
+        name: []const u8,
+        ty: ?ast.TypeExpr,
+    ) Error!void {
+        const t = ty orelse return;
+        switch (try self.resourceShapeOwned(&t, .copy)) {
+            .no_resources => return,
+            .resources, .unknown => {},
+        }
+        try self.diagnostics.err(
+            self.allocator,
+            at,
+            try self.msg(
+                "cannot declare copy {s} '{s}': its type may own resources and copying its header would create two owners",
+                .{ what, name },
+            ),
+        );
+        try self.diagnostics.note(
+            self.allocator,
+            at,
+            "use an 'owned' or 'arc' place, or take a 'shared' borrow; resource-bearing copy places are unsupported",
+        );
+    }
+
+    /// The list-element position's R2 refusal.
+    ///
+    /// `[s]` copies the element's header into the list's buffer and leaves the
+    /// source binding live, so the source is released at its scope end while
+    /// the list still holds the freed pointer. The site's own comment used to
+    /// argue this was safe "because slice elements are never released"; that
+    /// is the wrong half of the mechanism. Measured at `76128ba` with
+    /// AddressSanitizer: `fn mks() -> [String] { let owned s = make(); return
+    /// [s] }` read by the caller reports `heap-use-after-free`, freed by
+    /// `cell_string_free` on the SOURCE. It is a live defect today for
+    /// `String`, independent of R11 row 2, and row 2's drop glue would extend
+    /// the identical shape to every record.
+    fn refuseListElementMove(self: *Checker, p: Place) Error!void {
+        try self.diagnostics.err(
+            self.allocator,
+            p.span,
+            try self.msg(
+                "cannot store '{s}' in an 'owned' list element: a list literal copies the element's header by value and the source keeps its own",
+                .{p.display},
+            ),
+        );
+        try self.diagnostics.note(
+            self.allocator,
+            p.span,
+            "the source is released at its scope end while the list still holds the same buffer; build the element from a fresh value instead",
+        );
     }
 
     fn resourceShapeOwned(
@@ -5793,13 +5993,24 @@ test "R2.b moves bindings but owning resource fields refuse place transfers" {
         \\t.cell:5:33: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
         \\
     );
-    // List-element transfer remains a separate disclosed boundary.
-    try expectAccepted(
+    // List-element transfer WAS a disclosed boundary and is now refused.
+    // This program was accepted until R2's list-element clause landed, on the
+    // argument that slice elements are never released. That argument covered
+    // the wrong half: the defect is the SOURCE's release, not the element's.
+    // `xs` keeps its own header, `cell_slice_free(&xs)` runs at its scope end,
+    // and `zss`'s element is left pointing at the freed buffer. The same shape
+    // one type down was measured under AddressSanitizer at `76128ba` and
+    // reported `heap-use-after-free`; see `refuseListElementMove`.
+    try expectDiagnostics(
         \\pub fn fresh() -> [Int];
         \\pub fn main() {
         \\    let owned xs: [Int] = fresh()
         \\    let owned zss: [[Int]] = [xs]
         \\}
+    ,
+        \\t.cell:4:31: error: cannot store 'xs' in an 'owned' list element: a list literal copies the element's header by value and the source keeps its own
+        \\t.cell:4:31: note: the source is released at its scope end while the list still holds the same buffer; build the element from a fresh value instead
+        \\
     );
 }
 
@@ -5836,6 +6047,176 @@ test "R2.b over-refuses a match over copy places, and the workaround is a name" 
         \\    let copy r = match c { 0 => a, _ => b }
         \\    return copy r
         \\}
+    );
+}
+
+test "R12 refuses a copy place whose type owns resources, by all three routes" {
+    // THE PRECONDITION FOR R11 ROW 2. Each of these three was ACCEPTED and
+    // emitted a plain `cell_Box snap = buf;` (measured at `76128ba`, three
+    // separate `cell emit` runs). That was harmless only while a `record` was
+    // never dropped. Row 2's drop glue drops both names, which is a double
+    // free of one `cell_string_t`, so the refusal has to land first.
+    //
+    // Route 1: a direct `copy` of an owned record.
+    try expectDiagnostics(
+        \\pub fn make() -> String;
+        \\pub struct Box { owned s: String, copy n: Int }
+        \\pub fn mk() -> Box {
+        \\    let owned buf = Box { s: make(), n: 1 }
+        \\    let copy snap = buf
+        \\    return snap
+        \\}
+    ,
+        \\t.cell:5:5: error: cannot declare copy binding 'snap': its type may own resources and copying its header would create two owners
+        \\t.cell:5:5: note: use an 'owned' or 'arc' place, or take a 'shared' borrow; resource-bearing copy places are unsupported
+        \\
+    );
+    // Route 2: THROUGH an exclusive borrow, which is the route a type read off
+    // the initializer alone would miss -- `v` is a borrow, and what the copy
+    // duplicates is its referent's header. `inferBindingType` answers with the
+    // referent for exactly this case.
+    try expectDiagnostics(
+        \\pub fn make() -> String;
+        \\pub struct Box { owned s: String, copy n: Int }
+        \\pub fn mk() -> Box {
+        \\    var owned buf = Box { s: make(), n: 1 }
+        \\    let exclusive v = &mut buf
+        \\    let copy snap = v
+        \\    return snap
+        \\}
+    ,
+        \\t.cell:6:5: error: cannot declare copy binding 'snap': its type may own resources and copying its header would create two owners
+        \\t.cell:6:5: note: use an 'owned' or 'arc' place, or take a 'shared' borrow; resource-bearing copy places are unsupported
+        \\
+    );
+    // Route 3: the parameter position. The caller is what duplicates the
+    // header, so this is refused at the declaration whether or not a body
+    // follows; the bodyless spelling is the second case below.
+    try expectDiagnostics(
+        \\pub struct Box { owned s: String, copy n: Int }
+        \\pub fn f(copy b: Box) -> Box { return b }
+    ,
+        \\t.cell:2:1: error: cannot declare copy parameter 'b': its type may own resources and copying its header would create two owners
+        \\t.cell:2:1: note: use an 'owned' or 'arc' place, or take a 'shared' borrow; resource-bearing copy places are unsupported
+        \\
+    );
+    try expectDiagnostics(
+        \\pub struct Box { owned s: String, copy n: Int }
+        \\pub fn f(copy b: Box) -> Int;
+    ,
+        \\t.cell:2:1: error: cannot declare copy parameter 'b': its type may own resources and copying its header would create two owners
+        \\t.cell:2:1: note: use an 'owned' or 'arc' place, or take a 'shared' borrow; resource-bearing copy places are unsupported
+        \\
+    );
+    // A bare `String` reaches it too, through the call-return and the
+    // source-place routes rather than through a struct name.
+    try expectDiagnostics(
+        \\pub fn make() -> String;
+        \\pub fn main() {
+        \\    let copy s = make()
+        \\}
+    ,
+        \\t.cell:3:5: error: cannot declare copy binding 's': its type may own resources and copying its header would create two owners
+        \\t.cell:3:5: note: use an 'owned' or 'arc' place, or take a 'shared' borrow; resource-bearing copy places are unsupported
+        \\
+    );
+}
+
+test "R12's copy clause leaves scalar places alone, which is most of the corpus" {
+    // THE OVER-REFUSAL CONTROLS. A refusal keyed on a resource shape is only
+    // as good as its negative answer, and every `copy` in `examples/` is one
+    // of these shapes. A scalar-only record is the interesting one: it has a
+    // struct name, so a rule keyed on "is it a record" rather than on the
+    // shape would refuse it.
+    try expectAccepted(prelude ++
+        \\pub fn main() {
+        \\    let owned buf = Buffer { data: [], len: 0 }
+        \\    let copy n = buf.len
+        \\    let copy m = 1
+        \\}
+    );
+    try expectAccepted(
+        \\pub struct Point { copy x: Int, copy y: Int }
+        \\pub fn dist(copy a: Point, copy b: Point) -> Int { return a.x - b.x }
+        \\pub fn main() {
+        \\    let owned p = Point { x: 1, y: 2 }
+        \\    let copy q = p
+        \\    let copy d = dist(copy p, copy q)
+        \\}
+    );
+    // An `arc` binding of the same resource-bearing type is NOT refused: an
+    // `arc` place retains rather than duplicating, which is R12's other half.
+    try expectAccepted(
+        \\pub fn make() -> String;
+        \\pub fn main() {
+        \\    let arc s = make()
+        \\    let arc alias = s
+        \\}
+    );
+}
+
+test "R2 refuses an owned place in a list element, and still accepts a fresh one" {
+    // The measurement behind the refusal, so the next reader does not have to
+    // re-derive it: emitted at `76128ba`, `mks` freed `s` BEFORE returning the
+    // list that held its header, and the caller's read reported
+    // `heap-use-after-free` under AddressSanitizer with `cell_string_free` as
+    // the freeing frame. A live defect for `String`, independent of R11.
+    try expectDiagnostics(
+        \\pub fn make() -> String;
+        \\pub fn mks() -> [String] {
+        \\    let owned s = make()
+        \\    return [s]
+        \\}
+    ,
+        \\t.cell:4:13: error: cannot store 's' in an 'owned' list element: a list literal copies the element's header by value and the source keeps its own
+        \\t.cell:4:13: note: the source is released at its scope end while the list still holds the same buffer; build the element from a fresh value instead
+        \\
+    );
+    // A record element is the same defect, and is what R11 row 2's drop glue
+    // would otherwise have created for every record on the day it landed.
+    try expectDiagnostics(
+        \\pub fn make() -> String;
+        \\pub struct Box { owned s: String, copy n: Int }
+        \\pub fn mk() -> [Box] {
+        \\    let owned buf = Box { s: make(), n: 1 }
+        \\    return [buf]
+        \\}
+    ,
+        \\t.cell:5:13: error: cannot store 'buf' in an 'owned' list element: a list literal copies the element's header by value and the source keeps its own
+        \\t.cell:5:13: note: the source is released at its scope end while the list still holds the same buffer; build the element from a fresh value instead
+        \\
+    );
+    // THE OVER-REFUSAL CONTROLS. A fresh value has no source to outlive it, a
+    // scalar place owns nothing, and a `copy` place is duplicable by R12.
+    try expectAccepted(
+        \\pub fn make() -> String;
+        \\pub fn main() {
+        \\    let owned n = 3
+        \\    let owned xs: [Int] = [n]
+        \\    let owned ys: [String] = [make()]
+        \\}
+    );
+    // And the block-tail local, which the watermark in the list arm exists to
+    // keep: `t` is the block's VALUE, excluded from `emitValueBlockDrops`, so
+    // the element is its only owner. An OUTER place reached through the same
+    // block tail keeps its own header and is refused.
+    try expectAccepted(block_prelude ++
+        \\pub fn main() {
+        \\    let owned xs: [String] = [{
+        \\        let owned t = make()
+        \\        t
+        \\    }]
+        \\}
+    );
+    try expectDiagnostics(block_prelude ++
+        \\pub fn main() {
+        \\    let owned s = make()
+        \\    let owned xs: [String] = [{ s }]
+        \\}
+    ,
+        \\t.cell:5:33: error: cannot store 's' in an 'owned' list element: a list literal copies the element's header by value and the source keeps its own
+        \\t.cell:5:33: note: the source is released at its scope end while the list still holds the same buffer; build the element from a fresh value instead
+        \\
     );
 }
 
@@ -6511,16 +6892,19 @@ test "R14's rebinding clause reads the loan, not only the annotation" {
     // exactly the enumeration this file keeps being caught by; `holdsBorrow`
     // asks both.
     //
-    // The witness is `var copy` rather than the `var owned` this test used to
-    // write, because R18 now refuses `var owned e = &mut buf` at the `let`
-    // and no loan is created for it. `copy` still reaches the loan branch, so
-    // the clause under test still has a live case; the `owned` spelling is
-    // pinned by the R18 test below instead. Both halves stay covered.
+    // The witness has now moved TWICE, and the reason is recorded because the
+    // clause under test is not what keeps changing. It was `var owned`, which
+    // R18 refuses at the `let` so no loan is created; then `var copy`, which
+    // R12's binding clause now refuses because `Buffer` owns a `[Byte]` and
+    // copying its header would make two owners of one buffer. `var arc` is the
+    // third duplicable spelling and still reaches the loan branch, so the
+    // clause keeps a live case. The other two spellings are pinned by the R18
+    // and R12 tests respectively, so all three halves stay covered.
     try expectDiagnostics(prelude ++
         \\pub fn main() {
         \\    let owned buf = Buffer { data: [], len: 0 }
         \\    let owned other = Buffer { data: [], len: 0 }
-        \\    var copy e = &mut buf
+        \\    var arc e = &mut buf
         \\    e = &mut other
         \\}
     ,

@@ -893,7 +893,7 @@ one measured:
 | `let owned ys: [Int] = xs` | ASan double free, exit 134 |
 | `ys = xs`, writing into an `owned` place | ASan double free, exit 134 |
 | an `owned` struct field in a literal | a plain owned place was a live double free when the field was later extracted; resource-bearing destinations now require a fresh value |
-| a list-literal ELEMENT, `let owned zss: [[Int]] = [xs, xs]` | accepted, and clean at `-Werror`. Not a use-after-free **yet**, only because slice elements are never released; closing that separately disclosed gap detonates it |
+| a list-literal ELEMENT, `let owned zss: [[Int]] = [xs, xs]` | **REFUSED since 2026-09-15.** It was accepted and clean at `-Werror`, disclosed here as "not a use-after-free **yet**, only because slice elements are never released". That disclosure named the wrong half of the mechanism and the program was already unsound: the defect is the SOURCE's release, not the element's. Measured under AddressSanitizer at `76128ba` one type down, `fn mks() -> [String] { let owned s = make(); return [s] }` read by its caller reports `heap-use-after-free`, freed by `cell_string_free` on `s`. See R2's list-element clause below |
 | a `return` whose declared return type is not `arc` | a loud `cc` type error (`cell_slice_t x = cell_arc_clone(...)`), which is protection by a coincidence of two C types and is what this rule's own text objects to. `-> arc T` is untouched: it is the legal arc-to-arc case |
 
 A list element is refused **context free**, since a list literal copies each
@@ -901,6 +901,40 @@ element by value into a buffer the list owns and no element-level annotation
 exists to say otherwise. That over-refuses an `arc` element in a list bound as
 `arc`, which is safe today; over-refusing is the direction this rule takes on
 purpose.
+
+**R2's list-element clause, added 2026-09-15, and the disclosure it replaced.**
+The same position refuses an `owned` PLACE whose type carries resources, and
+the reason is worth stating because this file argued the opposite for weeks. A
+list literal copies the element's header into the list's buffer and leaves the
+source binding live, so the source is released at its own scope end while the
+list still points at the freed allocation. The site's own comment justified
+reading instead of moving on the grounds that "it is not a use-after-free today
+only because slice elements are never released". Slice-element release is a
+real gap, but it is not this one, and the program was already broken without
+it:
+
+```
+fn mks() -> [String] { let owned s = make(); return [s] }
+```
+
+emits `cell_string_free(&s)` BEFORE the `return`, so the returned list's
+element points at freed memory. A caller that reads it reports
+`heap-use-after-free` under AddressSanitizer, with `cell_string_free` as the
+freeing frame; measured at `76128ba`. This was a live defect for `String`
+independent of R11, and R11 row 2's per-record drop glue would have created the
+identical shape for every record on the day it landed, which is why the refusal
+is a precondition of that work rather than a follow-up to it.
+
+Three answers, and the negative ones are what keep the rule usable. A place
+whose type resolves to **no resources** still reads, so `[n]` over an `Int` and
+`[b]` over a scalar-only record are unchanged. A place whose type cannot be
+resolved still reads, because this predicate gates a refusal and an unresolved
+answer must not invent one; that residual is stated rather than hidden. And a
+BLOCK-LOCAL yielded as the element's tail is accepted, because
+`emitValueBlockDrops` excludes the tail from the block's drops, so the element
+is its only owner. The discriminator is a binding-id watermark read before the
+block opens, not the block's presence: an OUTER place reached through a block
+tail (`[{ s }]`) keeps its own header and is refused like any other.
 
 **THE REFUSAL IS ASKED OF THE EXPRESSION, NOT OF A PLACE, AND IT WAS NOT
 ALWAYS.** Each of the four positions above used to ask `placeOf` first and only
@@ -1480,6 +1514,35 @@ pub fn main() {
 `copy` does **not** exempt a place from R14: a `copy` binding declared with
 `let` is still immutable, and assigning to it is still an error. Copyability
 and mutability are independent, and the current checker already treats them so.
+
+**`copy` BINDINGS and PARAMETERS are refused on a resource-bearing type too,
+since 2026-09-15, and until then only fields were.** A `copy` place is
+bitwise-duplicated and never retained, so when its type owns resources the
+duplicate is a second header over one allocation. Three routes reached it, all
+measured accepted at `76128ba` and all emitting a plain `cell_Box snap = buf;`:
+
+```cell
+let copy snap = buf                 // 1. direct, over an owned record
+let exclusive v = &mut buf          // 2. through a borrow, whose REFERENT
+let copy snap = v                   //    is what the copy duplicates
+pub fn f(copy b: Box) -> Box { ... } // 3. the parameter position
+```
+
+They were harmless only while a `record` was never dropped. R11 row 2's drop
+glue drops both names, which is a double free of one `cell_string_t`, so this
+refusal had to land before it and not after. Route 2 is the one a rule reading
+the initializer's own type would miss, so the binding type is resolved through
+the borrow to its referent. The parameter case is asked before the bodyless
+early return, because the CALLER is what duplicates the header and that call
+site exists whether or not this module carries the body.
+
+The negative answers are pinned by their own tests: a scalar-only record is
+still copyable although it has a struct name, every `copy` in `examples/` is
+untouched, and an `arc` binding of the same resource-bearing type is still
+accepted, because an `arc` place retains rather than duplicating. A binding
+whose type resolves to nothing at all is PERMITTED rather than refused, which
+is the stated residual here: `let copy c = s` over a `String` binding declared
+with neither an annotation nor a resolvable initializer reaches no verdict.
 
 `copy` is an assertion by the programmer, not yet a derived property for every
 position. Struct declarations now reject `copy` fields whose declared type is

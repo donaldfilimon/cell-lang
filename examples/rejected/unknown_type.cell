@@ -6,7 +6,14 @@
 // width Cell does not have (`UInt32`), and a type that does not exist at all
 // are indistinguishable from a user struct. The mistake surfaces later as a C
 // error on the first field access, if at all.
+//
+// `no_such_width` was spelled `copy v: UInt32` until R12's parameter clause
+// landed. That clause refuses a `copy` place whose resource shape cannot be
+// resolved, and an unknown type name resolves to exactly that, so the line
+// started reporting R12 instead of demonstrating TYPE-02. The keyword is
+// incidental to this file's subject, so it is now `shared` and the gap it
+// documents is unchanged: all three names below are still accepted as types.
 
 pub fn misspelled(shared s: Strng) -> Int;
-pub fn no_such_width(copy v: UInt32) -> Int;
+pub fn no_such_width(shared v: UInt32) -> Int;
 pub fn entirely_invented(shared v: Widget) -> Int;
