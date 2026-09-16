@@ -2836,11 +2836,12 @@ pub const Checker = struct {
     /// type error was the only thing holding that program back, exactly as it
     /// was for the match-arm gap closed in `fc4c81d` the same night.
     ///
-    /// Implementing it properly means the box takes ownership, which is the
-    /// same question as who releases an `arc` parameter, and that is R11 row
-    /// 1: an ABI change to `cell_rt.h` section 7 and every host, deliberately
-    /// its own session. So this refuses and says so, and the refusal is
-    /// narrow: only an `owned` place is caught. A fresh value still boxes
+    /// Implementing it properly means consuming the source when it is boxed.
+    /// Who releases the box was R11 row 1's question, answered 2026-09-16,
+    /// and the same day `let arc` began moving a whole `owned` `String` or
+    /// list binding (`boxableOwnedBinding`, asked by the `let` site BEFORE
+    /// this refusal). Every other source and position still refuses here,
+    /// and the refusal is narrow: only an `owned` place is caught. A fresh value still boxes
     /// (`let arc a = make()` compiles and is correct), an `arc` source is the
     /// legal retain, and a `shared` source is a view that
     /// `cell_arc_from_string(cell_string_from_str(p))` copies rather than

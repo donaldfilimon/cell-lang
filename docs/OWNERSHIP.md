@@ -929,12 +929,15 @@ the second time in one session that a front-end gap was masked by a back-end
 error; closing the back end first would have made the language less safe both
 times.
 
-Implementing the move means consuming the source when it is boxed, which the
-checker does not do today. Who releases the box was the other half, and R11
-row 1 answered it on 2026-09-16 (the holder releases it, a callee included,
-exactly as `runtime/cell_rt.h` section 7 already said); releasing a box does not
-box a place, so the refusal stands. It refuses and says "not implemented", at five positions rather than the sweep's four rows: a
-binding, an assignment, a call argument, a struct-literal field, and a return.
+Implementing the move means consuming the source when it is boxed. Who
+releases the box was the other half, and R11 row 1 answered it on 2026-09-16
+(the holder releases it, a callee included, exactly as `runtime/cell_rt.h`
+section 7 already said). The same day the checker began consuming the source
+at ONE position: a `let arc` binding whose source is a whole `owned` `String`
+or list binding is moved into the box (see R11's emptied table below).
+Everywhere else it refuses and says "not implemented", at five positions
+rather than the sweep's four rows: a binding (for any other source), an
+assignment, a call argument, a struct-literal field, and a return.
 The last two are not in the sweep at all and were found by probing positions
 instead of rows, which is the discipline this rule's own text asks for.
 
