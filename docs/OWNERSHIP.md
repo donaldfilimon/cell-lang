@@ -1222,8 +1222,20 @@ reads it. A block under an `if` or `match` arm is not the consumed expression
 and is still refused, now saying so ("the block-local binding 't' reached
 through a branch"). A block that yields no value is checked once and the
 site stops; falling through to the generic walk would declare its `let`s
-twice and break the binding-id lockstep with codegen, and a test pins a
-later binding's id. Measured under AddressSanitizer with the malloc counter,
+twice and break the binding-id lockstep with codegen. What pins that is a
+SINGLE-WALK test at the assignment and the call site, not an id canary: a
+move of an outer place inside the valueless block (`s2 = { eat(owned s1) }`)
+is accepted, where a second walk would report `s1` used after its move
+(borrowck's own ids stay self-consistent across a double walk, so a
+later-binding canary cannot see one; `cf964b3` shipped exactly that weaker
+test and claimed more for it, corrected the same night). A borrow as the
+tail gets the bare answer too, and the bare answer at these three sites is
+a COPY, not R18: `return { let owned t = make() \n &t }`, `eat(owned { ...
+&t })` and `s2 = { ... &t }` are accepted exactly as `return &t`, `eat(owned
+&t)` and `s2 = &t` are, and all lower a `str` view into a fresh owning
+`String` through `cell_string_from_str`; the block forms then leave `t` to
+the value-block residual (ASan + counter: ALLOC=2 FREE=1 LIVE=1, no report)
+where the bare form frees it after the copy. No new route opened. Measured under AddressSanitizer with the malloc counter,
 each shape beside its plain-place control: `return { let owned t = make() \n
 t }` and `return { s1 }` both ALLOC=1 FREE=1 LIVE=0, equal to `return s1`;
 `s2 = { ... t }` and `s2 = { s1 }` both ALLOC=2 FREE=1 LIVE=1, equal to

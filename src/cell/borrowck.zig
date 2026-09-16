@@ -6133,27 +6133,34 @@ test "a block-local tail reached through a BRANCH is still refused, and says so"
     );
 }
 
-test "a valueless block at a consumption site is checked once, and a later binding keeps its id" {
-    // The unit case must not fall through to `checkExpr`, which would
-    // declare the block's `let` a second time and advance the binding id
-    // counter past codegen's. The proof is indirect: `t` is moved, so a
-    // second declaration of it would report nothing new, but `u`'s use
-    // after its move must still be reported at the right binding.
-    try expectDiagnostics(block_prelude ++
+test "a valueless block at an assignment is walked exactly once" {
+    // The `.unit` arm must RETURN, not fall through to `checkExpr`. The
+    // discriminator is a move of an OUTER place inside the block: a second
+    // walk would see `s1` already moved and report a use-after-move. A
+    // canary on a later binding's line would not catch this, because
+    // borrowck's own ids stay self-consistent across a double walk; only
+    // codegen's `wasMoved` lookups would drift. The typecheck unit mismatch
+    // is not in the way: this harness runs borrowck alone.
+    try expectAccepted(block_prelude ++
         \\pub fn main() {
+        \\    let owned s1 = make()
         \\    var owned s2 = make()
         \\    s2 = {
-        \\        let owned t = make()
-        \\        eat(owned t)
+        \\        eat(owned s1)
         \\    }
-        \\    let owned u = make()
-        \\    eat(owned u)
-        \\    eat(owned u)
         \\}
-    ,
-        \\t.cell:11:15: error: use of 'u' after it was moved
-        \\t.cell:10:15: note: 'u' was moved here by the call to 'eat'
-        \\
+    );
+}
+
+test "a valueless block at a call argument is walked exactly once" {
+    // The `.unit` arm `continue`s the argument loop; same discriminator.
+    try expectAccepted(block_prelude ++
+        \\pub fn main() {
+        \\    let owned s1 = make()
+        \\    eat(owned {
+        \\        eat(owned s1)
+        \\    })
+        \\}
     );
 }
 
