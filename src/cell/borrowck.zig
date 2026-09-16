@@ -1549,12 +1549,23 @@ pub const Checker = struct {
                                 }
                             }
                         },
-                        // R7, and it READS here, for the same reason as the
-                        // struct field above: `[x]` with an aliasing `x` and
-                        // `[s1]` with the scrutinee are one gap, R11's
-                        // element release, and neither is a double free today
-                        // (measured at `4698dbc`, exit 0).
-                        .aliases_place, .no_owned_place => {},
+                        // R7. This arm READ until 2026-09-16, on the same
+                        // retracted justification as `.place` above ("neither
+                        // is a double free today, measured at `4698dbc`"). A
+                        // match-arm binding is a bitwise alias of the
+                        // scrutinee, the scrutinee is released at its own
+                        // scope end, and the element keeps the header:
+                        // `fn f() -> [String] { let owned s = make(); return
+                        // match s { x => [x] } }` read by its caller reports
+                        // AddressSanitizer heap-use-after-free, freed by
+                        // `cell_string_free` on `s` (measured at `81e6709`).
+                        // The refusal is the one every other consumption site
+                        // already applies to an alias.
+                        .aliases_place => |s| {
+                            try self.refuseScrutineeAlias(s, "store", "in", "list element", null);
+                            continue;
+                        },
+                        .no_owned_place => {},
                     }
                     try self.checkExpr(v);
                 }
@@ -6217,6 +6228,32 @@ test "R2 refuses an owned place in a list element, and still accepts a fresh one
         \\t.cell:5:33: error: cannot store 's' in an 'owned' list element: a list literal copies the element's header by value and the source keeps its own
         \\t.cell:5:33: note: the source is released at its scope end while the list still holds the same buffer; build the element from a fresh value instead
         \\
+    );
+}
+
+test "R7 refuses a match-arm alias in a list element, the other half of R2's list clause" {
+    // The advisor caught this after the `.place` half landed: the same site
+    // still read an ALIAS, on the same justification the `.place` half had
+    // just retracted. Measured before the fix, `cell check` accepted this and
+    // the caller's read reported heap-use-after-free under AddressSanitizer,
+    // with `cell_string_free` on the scrutinee as the freeing frame.
+    try expectDiagnostics(
+        \\pub fn make() -> String;
+        \\pub fn f() -> [String] {
+        \\    let owned s = make()
+        \\    return match s { x => [x] }
+        \\}
+    ,
+        \\t.cell:4:28: error: cannot store the match binding 'x' aliasing 's' in an 'owned' list element: the scrutinee still owns the value
+        \\t.cell:4:28: note: R7 does not move the scrutinee yet, so a match binding is an alias and not a second owner; consuming it frees a buffer the scrutinee's own drop frees again
+        \\
+    );
+    // THE OVER-REFUSAL CONTROL: a fresh value in every arm is not an alias.
+    try expectAccepted(
+        \\pub fn make() -> String;
+        \\pub fn f(copy c: Int) -> [String] {
+        \\    return match c { 0 => [make()], _ => [] }
+        \\}
     );
 }
 

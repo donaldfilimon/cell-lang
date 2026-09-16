@@ -6388,8 +6388,19 @@ test "the owning-header guard is keyed on the drop call, so records still copy" 
     // change removes, and narrowing it to none would reinstate the double
     // free above. Since R11 row 2 a record CAN be dropped, through
     // `needsDrop`; this guard deliberately still keys on `hasDropCall`, which
-    // is why that predicate was added beside it rather than widened. The
-    // `Buffer` here is scalar-only, so it is copyable under R12's clause too.
+    // is why that predicate was added beside it rather than widened.
+    //
+    // Read this before trusting the test's second half. `emitForTest` runs
+    // the lexer, the parser and the generator and NO borrowck, so `emitSource`
+    // emits for a program `cell check` refuses. Since c314a0e that is this
+    // program: `let copy text = &mut name` resolves through the borrow to
+    // `String`, and R12's binding clause refuses it (verified with `cell
+    // check`). The `Buffer` half is scalar-only and stays accepted. The String
+    // half is kept, as a REJECTED program, because what it pins is the
+    // generator's guard and not the front end: for the three runtime shapes
+    // the guard makes a `copy` of a borrow a POINTER (`cell_string_t *text`),
+    // never a header copy, so R12's refusal of it is the safe direction and
+    // an over-refusal, not a soundness need. Stated in OWNERSHIP.md R12.
     var e = try emitSource(
         \\pub struct Buffer { copy len: Int }
         \\pub fn make_text() -> String;

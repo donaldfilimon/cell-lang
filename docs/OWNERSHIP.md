@@ -936,6 +936,16 @@ is its only owner. The discriminator is a binding-id watermark read before the
 block opens, not the block's presence: an OUTER place reached through a block
 tail (`[{ s }]`) keeps its own header and is refused like any other.
 
+The clause has an ALIAS half, and it was missed by the commit that added the
+place half. A match-arm binding is a bitwise alias of the scrutinee (R7), the
+scrutinee is released at its own scope end, and the element keeps the header:
+`fn f() -> [String] { let owned s = make(); return match s { x => [x] } }`
+read by its caller reported AddressSanitizer `heap-use-after-free`, freed by
+`cell_string_free` on `s`, measured at `81e6709` the same night, on the same
+retracted "slice elements are never released" justification. The list site now
+applies R7's `refuseScrutineeAlias` to an alias, as every other consumption site
+already did; a fresh value in every arm is still accepted.
+
 **THE REFUSAL IS ASKED OF THE EXPRESSION, NOT OF A PLACE, AND IT WAS NOT
 ALWAYS.** Each of the four positions above used to ask `placeOf` first and only
 then whether that place was `arc`. A `match` is valued and is not a place, so
@@ -1592,6 +1602,17 @@ accepted, because an `arc` place retains rather than duplicating. A binding
 whose type resolves to nothing at all is PERMITTED rather than refused, which
 is the stated residual here: `let copy c = s` over a `String` binding declared
 with neither an annotation nor a resolvable initializer reaches no verdict.
+
+One named over-refusal, in the safe direction. `let copy text = &mut name`
+over a `String` is refused, because the binding's type resolves through the
+borrow to its referent. For the three runtime shapes the C backend's
+owning-header guard makes a `copy` of a borrow a POINTER (`cell_string_t *text
+= &name;`), never a header copy, so that particular program was never a second
+owner. It is refused anyway rather than special-cased, because the exemption
+would be an enumeration of the shapes this backend happens to alias today,
+asserted in the front end, which is the reasoning failure this file keeps
+cataloguing; the codegen test that pins the guard keeps the program as a
+rejected one and says so.
 
 `copy` is an assertion by the programmer, not yet a derived property for every
 position. Struct declarations now reject `copy` fields whose declared type is
