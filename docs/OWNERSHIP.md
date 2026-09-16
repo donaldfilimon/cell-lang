@@ -1143,8 +1143,37 @@ section carries that count and is the authority for it.
 |---|---|
 | A Cell body never releases its own `arc` parameter (no parameter is dropped), so every call-site retain into one leaks a reference | by construction; `examples/arc_host.c` is the ABI-correct contrast, and `examples/arc.cell` reports 0 leaks because of it |
 | A struct holding an `arc` field is never dropped, so rule 4's retain leaks | `record` shapes are excluded from `hasDropCall` |
-| Reassigning an `arc` `var` leaks the previous box (`var arc v = "one"` then `v = "two"`), the same class as the R3a-revival leak R16 documents for `owned` | `leaks`: **3 leaks / 64 bytes** for a single reassignment |
 | An `owned` String or list PLACE bound as `arc` (**the reverse direction**; `arc` into `owned` is refused outright by R10 above) is not boxed at all, and is left as a C type error rather than a silent double free | see retain rule 1 above. Re-measured: `let arc b = a` with an `owned` String `a` still emits `cell_arc_t b = a;` and `cc` rejects it, `initializing 'cell_arc_t' with an expression of incompatible type 'cell_string_t'` |
+
+**CLOSED (row 5), and gone from the table above.** Reassigning an `arc` `var`
+(`var arc v = "one"` then `v = "two"`) leaked the previous box: `leaks` read 3
+leaks / 64 bytes for one reassignment, and `examples/leaks/reassigned_var.cell`
+pinned it at **3000 over 1000 iterations** on both witnesses. Closed
+2026-09-15 (night): `emitAssign` evaluates the new value into a temporary,
+drops the old box, then stores. The temporary is not optional, because `v = v`
+and `v = mk(v)` read the old box while computing the new one. Scoped to a
+whole-binding target naming a droppable `arc` local, and that scope is the
+soundness argument: borrowck never marks an `arc` place moved, every alias of
+the box that survives a statement is refcounted (a clone at `let arc b = v`, a
+retain at a field store, a clone at `return`), a `shared` view holds it only
+for the call, and R4 refuses the assignment while a borrow of `v` is live
+(pinned: "cannot assign to 'v' while it is borrowed as shared"; a borrow that
+is dead by then under NLL is accepted and never read again). `owned` is
+deliberately NOT covered: `[s]` copies the header without marking `s` moved,
+so a pre-drop at `s = make()` would free under a list element; that stays
+R16's revival leak, stated there. A droppable var declared without an
+initializer is now zero-initialized, which also fixes a latent defect: `var
+arc v: String` never assigned ran its scope-end drop on garbage. Falsified
+before re-pinning: the gate went red on the old constant with both witnesses
+agreeing at 0, then `LEAK_REASSIGNED_VAR` moved to 0, where it stays.
+Measured under ASan with the malloc counter, all `-Werror` clean, no report:
+`v = "two"` then read 6/6/0, equal to two independent `let arc`s; `v = v`
+3/3/0; `v = mk(v)` through an `arc`-returning callee 3/3/0; `let arc b = v
+\n v = "two" \n inspect(b)` 6/6/0 (the clone keeps `b`'s box: 1 -> 2 -> 1,
+no double free); an uninitialized var assigned twice 6/6/0 and never
+assigned 0/0/0; a dead `shared` borrow before the reassignment 6/6/0; and
+`var owned s = make() \n s = make()` still 2/1/1, pinning that `owned` is
+untouched. Four of the six fixtures are now closed and pinned at 0.
 
 **CLOSED, and the row is gone from the table above rather than left in it with
 a strikethrough.** An `arc` value unboxed for a `shared` parameter without ever
@@ -1679,7 +1708,13 @@ ways, and each is a real, documented gap rather than an oversight:
 - **"Moved" means moved anywhere in the function, once, permanently.** A
   `var` that is moved and later revived by a fresh assignment (R3a) is
   never dropped either, even though it holds a fresh, unmoved value at the
-  function's end. The revived value leaks.
+  function's end. The revived value leaks. The plain `owned` reassignment
+  (`var owned s = make() \n s = make()`, no move anywhere) leaks the old
+  value too, and it is left that way on purpose while `arc` vars get a
+  pre-drop (R11 row 5, closed 2026-09-15): a list literal `[s]` copies the
+  header without marking `s` moved, so freeing the old value on `s = ...`
+  would free under that element. Closing it needs the list-element read to
+  become a tracked alias or a move, not a drop insertion.
 
 Also out of scope: a `struct` with owning fields is never destroyed (its
 fields would need a generated per-struct drop function, a separate task),

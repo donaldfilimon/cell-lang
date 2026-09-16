@@ -6182,6 +6182,26 @@ test "a block tail that is a borrow alias of the block's own local cannot leave 
     );
 }
 
+test "R4 refuses reassigning an arc var while a shared borrow of it is live, which the row 5 pre-drop relies on" {
+    // codegen's reassignment pre-drop (R11 row 5) frees the old box before
+    // the store; a view of that box surviving the statement would dangle.
+    // It cannot: this is the refusal. A borrow that is DEAD by then (NLL)
+    // is accepted and never read again.
+    try expectDiagnostics(
+        \\pub fn inspect(shared s: String) -> Int { return 1 }
+        \\pub fn main() {
+        \\    var arc v = "one"
+        \\    let shared w = &v
+        \\    v = "two"
+        \\    inspect(w)
+        \\}
+    ,
+        \\t.cell:5:5: error: cannot assign to 'v' while it is borrowed as shared
+        \\t.cell:4:21: note: the shared borrow starts here and lasts to the end of this block
+        \\
+    );
+}
+
 test "R2.a does not fire for a place declared inside the loop body" {
     // A binding created fresh each iteration is not moved across the back
     // edge, so there is nothing to catch. Getting this wrong would reject

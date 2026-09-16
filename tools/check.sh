@@ -42,7 +42,7 @@
 #                       examples/leaks/*.cell isolates each measurable gap in
 #                       its own program (six fixtures since 2026-09-15: the
 #                       value-position block residual joined the five, and
-#                       THREE of the six are closed and pinned at 0). THESE FIXTURES ASSERT LEAKS THAT
+#                       FOUR of the six are closed and pinned at 0). THESE FIXTURES ASSERT LEAKS THAT
 #                       CURRENTLY EXIST, ON PURPOSE: that is the entire value.
 #                       A later change that closes one of R11's gaps makes a
 #                       pinned number here go DOWN, which is visible instead
@@ -297,8 +297,16 @@ LEAK_UNBOUND_SHARED_TEMP=0
 # The codegen tests that pin the drop start at "an arc local declared in a
 # while body is released at the end of every iteration" in src/cell/codegen.zig.
 LEAK_BLOCK_SCOPED_LOCAL=0
-# R11 row 5: reassigning an `arc` `var` leaks the previous box.
-LEAK_REASSIGNED_VAR=3000
+# R11 row 5: reassigning an `arc` `var` leaked the previous box.
+# CLOSED 2026-09-15 (night): `emitAssign` evaluates the new value into a
+# temporary, drops the old box, then stores, for a whole-binding target
+# naming a droppable `arc` local (never `owned`: `[s]` copies the header
+# without marking `s` moved, so a pre-drop there would free under a list
+# element). A droppable var declared without an initializer is now
+# zero-initialized so the first pre-drop is a no-op. The gate went red on
+# the old pin first ("both witnesses agree ... 0"), then the constant moved.
+# Stays pinned at 0: any nonzero reading here re-opens row 5.
+LEAK_REASSIGNED_VAR=0
 # The residual the 2026-09-15 block-scoped release left behind, measurable
 # only since the same day (typing a block by its tail made the program
 # expressible): an `arc` local declared inside a VALUE-position block was not
@@ -793,7 +801,7 @@ else
     run_c_leaks struct_arc_field "" "$LEAK_STRUCT_ARC_FIELD" "R11 row 2 @ ${LEAKS_MEASURED_AT}"
     run_c_leaks unbound_shared_temp examples/arc_host.c "$LEAK_UNBOUND_SHARED_TEMP" "R11 row 3, CLOSED @ 460b9a3"
     run_c_leaks block_scoped_local "" "$LEAK_BLOCK_SCOPED_LOCAL" "R11 row 4, CLOSED 2026-09-15"
-    run_c_leaks reassigned_var "" "$LEAK_REASSIGNED_VAR" "R11 row 5 @ ${LEAKS_MEASURED_AT}"
+    run_c_leaks reassigned_var "" "$LEAK_REASSIGNED_VAR" "R11 row 5, CLOSED 2026-09-15"
     run_c_leaks value_block_local "" "$LEAK_VALUE_BLOCK_LOCAL" "R11 value-position block residual, CLOSED 2026-09-15"
 fi
 

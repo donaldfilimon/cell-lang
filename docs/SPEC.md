@@ -899,7 +899,8 @@ last one releases it.
   Two things stay legal and the rule has to be read as scoped to exclude them:
   a `shared` borrow of an `arc` place (R10's table requires it), and
   reassigning a `var arc` handle, which rebinds the reference rather than
-  mutating the shared value and is R11's leak. One more thing is scoped
+  mutating the shared value (it was R11's row 5 leak until 2026-09-15; the
+  C backend now drops the old box after evaluating the new value). One more thing is scoped
   precisely rather than generously: R9 prints its own message for a write
   through a MUTABLE `arc` holder, which today means a `var arc` binding. A
   write through a `let arc` binding or an `arc` parameter is refused too, but
@@ -930,8 +931,10 @@ value unboxed for a `shared` parameter without ever being bound used to drop
 its handle on the floor (closed 2026-09-07); an `arc` local declared inside a
 block used to be never released while release was function-scoped, which
 inside a `while` body was unbounded (closed 2026-09-15 by block-scoped
-release in `codegen.zig`); reassigning an `arc` `var` leaks the previous box;
-and an `owned` String or list **place** bound as `arc` is not boxed, because
+release in `codegen.zig`); reassigning an `arc` `var` leaked the previous box
+until the same night (closed by a pre-drop in `emitAssign`, scoped to `arc`
+because an `owned` var may be aliased by a list element that never marks it
+moved); and an `owned` String or list **place** bound as `arc` is not boxed, because
 R10's move-into-`arc` is unimplemented in the checker and boxing an un-moved
 place would double free it.
 

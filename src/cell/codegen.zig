@@ -698,6 +698,13 @@ pub const Generator = struct {
                 if (l.value) |v| {
                     try out.writeAll(" = ");
                     try self.emitArgLike(&v, ty, indent);
+                } else if (hasDropCall(ty.shape)) {
+                    // A droppable local declared without an initializer is
+                    // zero-initialized, so the scope-end drop (which ran on
+                    // garbage before 2026-09-15) and the reassignment
+                    // pre-drop above are both no-ops until the first write:
+                    // all three runtime drops return on a zeroed value.
+                    try out.print(" = ({s}){{0}}", .{ty.text});
                 }
                 try out.writeAll(";\n");
                 try self.pushLocal(l.name, ty, l.ownership, true, false);
@@ -760,8 +767,32 @@ pub const Generator = struct {
     /// hand-written path.
     fn emitAssign(self: *Generator, a: anytype, indent: usize) EmitError!void {
         const out = self.writer;
-        try self.writeIndent(indent);
         var want = try self.inferExpr(&a.target);
+        // R11 row 5: reassigning an `arc` var releases the previous box.
+        // Scoped to a whole-binding target naming a droppable `arc` local,
+        // because that is the one target whose old value is provably live
+        // and held exactly once here: borrowck never marks an `arc` place
+        // moved, every alias that survives a statement is refcounted (a
+        // clone at `let arc b = v`, a retain at a field store, a clone at
+        // `return`), a `shared` view holds it only for the call, and R4
+        // refuses this assignment while a borrow of `v` is live. `owned` is
+        // deliberately NOT covered: `[s]` copies the header without marking
+        // `s` moved, so a pre-drop there would free under a list element
+        // (R16's revival leak, left as a leak). The RHS goes into a temporary
+        // FIRST, because `v = v` and `v = mk(v)` read the old box.
+        if (self.reassignedArcLocal(&a.target)) |local| {
+            const temp = try self.nextTemp();
+            try self.writeIndent(indent);
+            try self.writeDecl(want, temp);
+            try out.writeAll(" = ");
+            try self.emitArgLike(&a.value, want, indent);
+            try out.writeAll(";\n");
+            try self.emitDropFor(indent, local);
+            try self.writeIndent(indent);
+            try out.print("{s} = {s};\n", .{ local.name, temp });
+            return;
+        }
+        try self.writeIndent(indent);
         if (want.pointee) |pointee| {
             try out.writeAll("*");
             want = pointee.*;
@@ -770,6 +801,26 @@ pub const Generator = struct {
         try out.writeAll(" = ");
         try self.emitArgLike(&a.value, want, indent);
         try out.writeAll(";\n");
+    }
+
+    /// The innermost visible local an assignment target names, when it is a
+    /// droppable `arc` binding (see `emitAssign`). A field path, a deref
+    /// through a borrow, a parameter, and every other ownership answer null
+    /// and keep the plain emission.
+    fn reassignedArcLocal(self: *Generator, target: *const ast.Expr) ?Local {
+        var t = target;
+        while (t.kind == .annotated) t = t.kind.annotated.value;
+        if (t.kind != .ident) return null;
+        const name = t.kind.ident;
+        var i = self.locals.items.len;
+        while (i > 0) {
+            i -= 1;
+            const local = self.locals.items[i];
+            if (!eq(local.name, name)) continue;
+            if (!local.droppable or local.ownership != .arc or !hasDropCall(local.ty.shape)) return null;
+            return local;
+        }
+        return null;
     }
 
     // ── drop insertion (task 3) ────────────────────────────────────────
@@ -5097,6 +5148,65 @@ test "tail reach is transitive through two aliases and an assignment, and unrela
     defer e.deinit();
     try expectAbsent(e.text, "cell_string_free(&t);");
     try expectLineBefore(e.text, "cell_string_free(&junk);", "_cell_t0 = w;");
+}
+
+test "reassigning an arc var evaluates the value into a temporary, drops the old box, then stores" {
+    // R11 row 5, CLOSED 2026-09-15. examples/leaks/reassigned_var.cell read
+    // 3000 on both witnesses before and 0 after; the gate went red on the
+    // old pin before the constant moved.
+    var e = try emitSource(
+        \\pub fn inspect(shared s: String) -> Int { return 1 }
+        \\pub fn f() {
+        \\  var arc v = "one"
+        \\  v = "two"
+        \\  inspect(v)
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_arc_t _cell_t0 = cell_arc_from_string(");
+    try expectLineBefore(e.text, "cell_arc_drop(v);", "cell_arc_t _cell_t0 = cell_arc_from_string(cell_string_from_str(cell_str_from_parts(\"two\", 3)));");
+    try expectLineBefore(e.text, "v = _cell_t0;", "cell_arc_drop(v);");
+}
+
+test "reassigning an owned var is untouched: the list-element read is an untracked alias" {
+    // `[s]` copies the header without marking `s` moved, so a pre-drop at
+    // `s = make()` would free under the element. Left as R16's revival leak.
+    var e = try emitSource(
+        \\pub fn make() -> String { return "abc" }
+        \\pub fn f() {
+        \\  var owned s = make()
+        \\  s = make()
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "_cell_t0");
+    try expectLineBefore(e.text, "cell_string_free(&s);", "s = cell_make();");
+}
+
+test "a droppable var declared without an initializer is zero-initialized" {
+    // Before this the scope-end drop ran on garbage, and the reassignment
+    // pre-drop would have too.
+    var e = try emitSource(
+        \\pub fn f() {
+        \\  var arc v: String
+        \\  v = "one"
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_arc_t v = (cell_arc_t){0};");
+    try expectLineBefore(e.text, "v = _cell_t0;", "cell_arc_drop(v);");
+}
+
+test "an arc field store is not a reassignment pre-drop: the record is never dropped (row 2)" {
+    var e = try emitSource(
+        \\struct Box { arc s: String }
+        \\pub fn f() {
+        \\  var owned b = Box { s: "one" }
+        \\  b.s = "two"
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "cell_arc_drop(b.s);");
 }
 
 test "a value-position block's tail resolves through a nested block, and later bindings keep their ids" {

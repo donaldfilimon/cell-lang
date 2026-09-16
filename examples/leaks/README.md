@@ -1,7 +1,7 @@
 # `examples/leaks/`
 
 Six fixtures, one per measurable gap in `docs/OWNERSHIP.md` R11's "Still
-broken" table and its CLOSED paragraph (five until 2026-09-15; three of the six are closed and pinned at 0). Each isolates exactly one disclosed `arc` retain/release gap
+broken" table and its CLOSED paragraph (five until 2026-09-15; four of the six are closed and pinned at 0). Each isolates exactly one disclosed `arc` retain/release gap
 and loops it 1000 times so a leak is a stable count, not noise.
 
 **These programs assert leaks that currently exist.** That is deliberate:
@@ -27,7 +27,7 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `struct_arc_field.cell` | 2: a struct holding an `arc` field is never dropped |
 | `unbound_shared_temp.cell` | 3: an unbound `arc` temporary unboxed for a `shared` parameter |
 | `block_scoped_local.cell` | 4: a block-scoped `arc` local is never released; **CLOSED 2026-09-15**, kept and pinned at 0 |
-| `reassigned_var.cell` | 5: reassigning an `arc` `var` leaks the previous box |
+| `reassigned_var.cell` | 5: reassigning an `arc` `var` leaked the previous box; **CLOSED 2026-09-15** by the reassignment pre-drop in `emitAssign`, kept and pinned at 0 |
 | `value_block_local.cell` | the residual of row 4's closure: an `arc` local declared in a VALUE-position block was not released at that block's exit (measurable since 2026-09-15, when a block began to type as its tail); **CLOSED 2026-09-15** the same evening by `emitValueBlockDrops`, kept and pinned at 0 |
 
 R11's sixth disclosed gap (an `owned` String or list place bound as `arc`) is
