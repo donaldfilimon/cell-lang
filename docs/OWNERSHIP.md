@@ -1078,8 +1078,9 @@ refuse `arc` outright and emit no drops at all):
   absence test.
 - Release rule 1 was function-scoped rather than block-scoped until
   2026-09-15; it is now block-scoped for every statement-position scope
-  (value-position blocks excepted, see the CLOSED paragraph under "Still
-  broken"), and reverse creation order holds within each scope.
+  and, since the same evening, for value-position blocks too (see the CLOSED
+  paragraph under "Still broken" for the one exclusion), and reverse creation
+  order holds within each scope.
 - Release rule 2's "except the one being returned" is paid for on the retain
   side instead: a returned `arc` local is cloned into the return temporary, so
   the drop that follows takes the count back to exactly the reference the
@@ -1165,10 +1166,34 @@ the `leaks` count and the malloc counter's LIVE, with the other four fixtures
 unchanged. Safe against a loop body that moves an OUTER place because R2.a
 already refuses that program (the back edge would use it dead); an outer `arc`
 place is cloned into the body's local and the per-iteration drop releases that
-clone. **Residual, stated and MEASURED:** a local declared inside a
-VALUE-position block (`let arc r = { let arc a = ...; a }`) is still not
-released at that block's exit: `examples/leaks/value_block_local.cell` reads
-**3000 leaks over 1000 iterations** on both witnesses and the gate pins it.
+clone. **Residual, stated and MEASURED, then CLOSED the same evening:** a
+local declared inside a VALUE-position block (`let arc r = { let arc a = ...;
+a }`) was not released at that block's exit: `examples/leaks/value_block_local.cell`
+read **3000 leaks over 1000 iterations** on both witnesses and the gate
+pinned it. `emitValueBlockDrops` now releases a value block's own locals
+after its tail is lowered into the destination, with ONE exclusion and ONE
+exception. The exclusion: any local the tail still USES is left alone,
+because the conversion into the declared type happens outside the statement
+expression (`return { let owned t = make() \n &t }` copies the view with
+`cell_string_from_str` around the braces; a read tail at a list element is
+`_cell_t0 = t` with no copy), so freeing inside would hand the copy freed
+memory; that over-refuses a tail like `f(&t)` returning a scalar, stated
+rather than optimised. The exception, which is what closes this fixture: a
+tail that is a bare identifier naming a block-local `arc` binding lowered
+into an `arc` destination was CLONED (`_cell_t0 = cell_arc_clone(a)`), so
+dropping `a` after it is 1 -> 2 -> 1; no other destination shape gets that,
+in particular not one `emitValueExpr` lowered to `int64` for want of a type.
+A moved local is already excluded by `wasMoved`, which is how an `owned` tail
+moved out of the block needs no drop. Falsified before re-pinning: the gate
+went red on the old constant with both witnesses agreeing at 0, then
+`LEAK_VALUE_BLOCK_LOCAL` moved to 0, where it stays. Measured under ASan with
+the malloc counter beside controls: the fixture shape and `let arc r = a`
+both 3/3/0; `-> arc String { return { let arc a ... a } }` and `return a`
+both 3/3/0; an `arc` parameter passed the block and passed `a` both 3/0/3
+(row 1); `let owned r = { let owned junk = make() \n let owned t = make()
+\n t }` 2/2/0 with `junk` freed and `t` not; the borrow tail 2/1/1 with no
+report (the leak of `t` there is the exclusion, and the alternative is a
+use-after-free); no ASan report anywhere.
 That program became expressible on 2026-09-15 itself: until then the
 typechecker typed every block as `()` (so the typed form was refused) and
 codegen's inference could not see the block's own `let`, so the untyped form
@@ -1242,9 +1267,10 @@ t }` and `return { s1 }` both ALLOC=1 FREE=1 LIVE=0, equal to `return s1`;
 `s2 = s1` (the LIVE=1 is row 5, the old value of `s2`); `eat(owned { ... t
 })` and `eat(owned { s1 })` both ALLOC=1 FREE=0 LIVE=1, equal to `eat(owned
 s1)` (row 1, the parameter); no ASan report anywhere, all compiled under
-`-Wall -Wextra -Werror`. **Residual, stated:** an unmoved local inside any
-value-position block is still not released (the row 4 residual above, pinned
-at 3000), and the list element and struct field keep the transfer gaps they
+`-Wall -Wextra -Werror`. **Residual, stated:** an unmoved local a value-position
+block's tail still uses is not released (the exclusion in the row 4 closure
+above; `[{ let owned t = make() \n t }]` leaks `t` rather than dangling the
+element), and the list element and struct field keep the transfer gaps they
 already had.
 
 **A SIXTH gap existed and was never in this table. It is closed by REFUSAL, so
@@ -1626,9 +1652,11 @@ ways, and each is a real, documented gap rather than an oversight:
   popped before the function-end drop could see it). `emitStmts` now drops
   a statement-position block's own locals at its closing brace, and
   `break`/`continue` drop everything declared since the enclosing loop
-  opened, so this row of the list is closed for statement position. What
-  remains of it: a local declared inside a VALUE-position block (a block
-  used as an expression) is still not released at that block's exit.
+  opened, so this row of the list is closed for statement position, and
+  `emitValueBlockDrops` closes it for value position the same evening. What
+  remains of it: a local a value block's TAIL still uses (a borrowed view,
+  a place read into a list element) is left unreleased, because the
+  conversion into the destination type runs outside the braces.
 - **Conservative on moves, in the leak-safe direction.** Borrowck's move
   tracking merges branches conservatively (a move in one arm of an `if`
   marks the place moved for everything after it, whether or not that arm

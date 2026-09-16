@@ -1,23 +1,25 @@
-// R11 residual left by the 2026-09-15 block-scoped release: an `arc` local
-// declared inside a VALUE-position block (a block used as an expression) is
-// not released at that block's exit. `emitValueInto` owns those blocks and
-// keeps its own mark without emitting drops, because the block's value may be
-// the very local, and whether releasing it after the conversion into the
-// destination is balanced depends on whether borrowck marks it moved into
-// the destination, which it does not (an `arc` place is never made dead,
-// R10 by design). So `a` is boxed, `r` receives a clone of it, `r` is
-// released at the end of the `while` body (block-scoped release), and `a`'s
-// own reference is never released: one box leaks per iteration.
+// R11 residual left by the 2026-09-15 block-scoped release, CLOSED the same
+// evening: an `arc` local declared inside a VALUE-position block (a block
+// used as an expression) was not released at that block's exit. `emitValueInto`
+// owned those blocks and kept its own mark without emitting drops, because
+// the block's value may be the very local. It now calls `emitValueBlockDrops`
+// after the tail is lowered into the destination: `a` is boxed, `r` receives
+// a CLONE of it (`_cell_t0 = cell_arc_clone(a)`), `a`'s own reference is
+// dropped right after (1 -> 2 -> 1), and `r` is released at the end of the
+// `while` body. Measured 0 on both witnesses; it read 3000 on both before,
+// and the gate went red on the old pin before the constant moved.
 //
 // This program could not be written before 2026-09-15: the typed form was
 // refused (the typechecker typed every block as unit) and the untyped form
 // emitted `int64_t r` and did not compile. Typing a block by its tail
 // expression made it expressible, and the leaks README's rule is one fixture
-// per measurable gap, so this pins it the day it became measurable.
+// per measurable gap, so this pinned it the day it became measurable, and
+// stays pinned at 0 now that it is closed.
 //
 // The `owned` form of the same program, `let owned s = { let owned t =
-// make() \n t }`, is refused by R10 ("cannot bind the unresolved name 't'"),
-// so `arc` is the only owning shape that reaches this gap today.
+// make() \n t }`, was refused until b608d59 the same day and is now a move
+// (`t` needs no drop); `arc` is the shape where the release itself matters,
+// which is why this fixture is `arc`.
 //
 // Status: parses, passes `cell check`. LLVM and MLIR refuse it (arc is
 // scalar-first-refused there, same as examples/arc.cell). Lives under

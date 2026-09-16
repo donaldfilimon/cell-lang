@@ -1499,6 +1499,52 @@ pub const Generator = struct {
         try out.writeAll("})");
     }
 
+    /// Release the locals a VALUE-position block declared, once its tail has
+    /// been lowered into `dest`. This is the value-position half of the
+    /// block-scoped release `emitStmts` does for statement-position blocks,
+    /// and it was left out on 2026-09-15 for one reason: the block's value
+    /// may BE one of those locals, and freeing it after the lowering is
+    /// balanced only when the lowering copied it.
+    ///
+    /// The lowering into the DECLARED type happens outside these braces
+    /// (`emitValueExpr` wraps the statement expression in the conversion),
+    /// so anything the tail still references must survive the closing
+    /// brace. `return { let owned t = make() \n &t }` emits
+    /// `cell_str_t _cell_t0 = cell_string_as_str(&t)` inside and
+    /// `cell_string_from_str(...)` around: free `t` inside and the view is
+    /// copied from freed memory. A read tail at a list element is the same
+    /// shape without the copy (`_cell_t0 = t`, and slice elements are never
+    /// released). So the rule is: every local the tail USES is skipped,
+    /// which is over-conservative for a tail like `f(&t)` that returns a
+    /// scalar, and that is stated rather than optimised away.
+    ///
+    /// ONE exception closes `examples/leaks/value_block_local.cell`: a tail
+    /// that is a bare identifier naming a block-local `arc` binding, lowered
+    /// into an `arc` destination. The arc-to-arc conversion CLONED it
+    /// (`_cell_t0 = cell_arc_clone(a)`), so dropping `a` after is 1 -> 2 -> 1
+    /// and the box is released when `dest` is. Any other destination shape
+    /// (`shared`, an unknown lowered to `int64` by `emitValueExpr`) may hold
+    /// the handle uncloned, so no scalar-destination shortcut is taken.
+    /// A moved local (`wasMoved`) is already excluded by `pendingDropsSince`,
+    /// which is how an `owned` tail moved out of the block needs no drop.
+    fn emitValueBlockDrops(self: *Generator, mark: usize, tail: *const ast.Expr, dest: Dest, indent: usize) EmitError!void {
+        const tail_ident: ?[]const u8 = blk: {
+            var t = tail;
+            while (t.kind == .annotated) t = t.kind.annotated.value;
+            break :blk if (t.kind == .ident) t.kind.ident else null;
+        };
+        for (try self.pendingDropsSince(mark)) |local| {
+            if (tail_ident) |n| {
+                if (eq(n, local.name) and local.ownership == .arc and dest.ty.shape == .arc) {
+                    try self.emitDropFor(indent, local);
+                    continue;
+                }
+            }
+            if (exprUses(tail, local.name)) continue;
+            try self.emitDropFor(indent, local);
+        }
+    }
+
     /// Emit `e` as statements that leave its value in `dest`.
     ///
     /// The leaf case routes through `emitConversion` rather than writing a
@@ -1544,8 +1590,14 @@ pub const Generator = struct {
                     }
                     const last = &stmts[stmts.len - 1];
                     switch (last.kind) {
-                        .expr => |le| try self.emitValueInto(&le, dest, indent + 1),
-                        else => try self.emitStmt(last, &.{}, indent + 1),
+                        .expr => |le| {
+                            try self.emitValueInto(&le, dest, indent + 1);
+                            try self.emitValueBlockDrops(mark, &le, dest, indent + 1);
+                        },
+                        else => {
+                            try self.emitStmt(last, &.{}, indent + 1);
+                            if (!endsInJump(stmts)) try self.emitDropsSince(mark, indent + 1);
+                        },
                     }
                 }
                 try self.writeIndent(indent);
@@ -4711,17 +4763,12 @@ test "an arc local declared in a statement-position match arm body is released a
     try expectOccurrences(e.text, "cell_arc_drop(a);", 1);
 }
 
-test "a local declared in a VALUE-position block is still not released: pinned residual" {
-    // `emitValueInto` owns value-position blocks and does not release
-    // their locals, because the block's value may be that very place. When
-    // block-scoped release reaches value position, this test should flip to
-    // expecting the drop, not be deleted. examples/leaks/value_block_local.cell
-    // measures this residual (3000 over 1000 iterations) and the gate pins it.
-    //
-    // History: until 2026-09-15 this program emitted `int64_t r = ({` and did
-    // not compile, because `inferExpr` could not see the block's own `let`
-    // when `letType` asked (the block had not been emitted yet). Now the
-    // destination is typed and the tail is cloned into it.
+test "an arc local that is a VALUE-position block's tail is released after the clone" {
+    // CLOSED 2026-09-15 (evening): `emitValueBlockDrops`. The destination is
+    // `arc`, so the tail was lowered as `cell_arc_clone(a)`, and `a`'s own
+    // reference is dropped after it: 1 -> 2 -> 1, and `r`'s release frees
+    // the box. examples/leaks/value_block_local.cell measures this at 0 on
+    // both witnesses; it read 3000 before.
     var e = try emitSource(
         \\pub fn f() {
         \\  let arc r = {
@@ -4731,47 +4778,63 @@ test "a local declared in a VALUE-position block is still not released: pinned r
         \\}
     );
     defer e.deinit();
-    try expectAbsent(e.text, "cell_arc_drop(a);");
     try expectContains(e.text, "cell_arc_t r = ({");
-    try expectContains(e.text, "_cell_t0 = cell_arc_clone(a);");
+    try expectLineBefore(e.text, "cell_arc_drop(a);", "_cell_t0 = cell_arc_clone(a);");
     try expectContains(e.text, "cell_arc_drop(r);");
 }
 
-test "a return block whose tail is an outer owned place moves it: no drop of the source" {
-    // Borrowck records the move through `openBlockTail`, so `pendingDrops`
-    // at the `return` skips `s1`; the block hands the buffer to the caller
-    // once. Measured 2026-09-15 under ASan with the malloc counter:
-    // ALLOC=1 FREE=1 LIVE=0 for this shape, for the block-local tail below,
-    // and for the plain `return s1` control.
+test "an owned local a VALUE-position block does not use in its tail is released, and the moved tail is not" {
+    var e = try emitSource(
+        \\pub fn make() -> String { return "abc" }
+        \\pub fn f() {
+        \\  let owned r = {
+        \\    let owned junk = make()
+        \\    let owned t = make()
+        \\    t
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectLineBefore(e.text, "cell_string_free(&junk);", "_cell_t0 = t;");
+    try expectAbsent(e.text, "cell_string_free(&t);");
+    try expectContains(e.text, "cell_string_free(&r);");
+}
+
+test "an owned local READ as a list element's block tail is not released: the element would dangle" {
+    // The list element site reads a block tail rather than moving it, and
+    // slice elements are never released, so `t` is copied by value into the
+    // buffer. Freeing it here would leave the element pointing at freed
+    // memory; ASan cannot see it (elements are never read back), so this
+    // assertion is the only witness. The leak is the disclosed list-element
+    // gap, unchanged.
+    var e = try emitSource(
+        \\pub fn make() -> String { return "abc" }
+        \\pub fn f() {
+        \\  let owned xs: [String] = [{
+        \\    let owned t = make()
+        \\    t
+        \\  }]
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "_cell_t2 = t;");
+    try expectAbsent(e.text, "cell_string_free(&t);");
+}
+
+test "a local the VALUE-position block's tail borrows is not released before the copy outside the braces" {
+    // `cell_string_from_str(...)` wraps the statement expression, so the
+    // view `_cell_t0` must still point at live memory at the closing brace.
     var e = try emitSource(
         \\pub fn make() -> String { return "abc" }
         \\pub fn mk() -> String {
-        \\    let owned s1 = make()
-        \\    return { s1 }
+        \\  return {
+        \\    let owned t = make()
+        \\    &t
+        \\  }
         \\}
     );
     defer e.deinit();
-    try expectContains(e.text, "_cell_t0 = s1;");
-    try expectAbsent(e.text, "cell_string_free(&s1);");
-}
-
-test "a call argument block whose tail is the block's own owned local frees nothing itself" {
-    // `t` is moved into the parameter, so the value-position block emits no
-    // drop for it and the callee owns the buffer (R11 row 1 decides whether
-    // the callee releases it; this test pins only that the caller does not).
-    var e = try emitSource(
-        \\pub fn make() -> String { return "abc" }
-        \\pub fn eat(owned s: String) { }
-        \\pub fn main() {
-        \\    eat(owned {
-        \\        let owned t = make()
-        \\        t
-        \\    })
-        \\}
-    );
-    defer e.deinit();
-    try expectContains(e.text, "cell_eat(({");
-    try expectContains(e.text, "_cell_t0 = t;");
+    try expectContains(e.text, "_cell_t0 = cell_string_as_str(&t);");
     try expectAbsent(e.text, "cell_string_free(&t);");
 }
 

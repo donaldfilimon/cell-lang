@@ -83,6 +83,8 @@ done
 # A VALUE-position block whose tail is a block-local. Added 2026-09-15 after
 # `let arc r = { let arc a = "x" \n a }` passed `cell check` and emitted an
 # `int64_t r` that cc refused: no row above contains a block used as a value.
+# Since the same evening these rows also exercise `emitValueBlockDrops` (the
+# value block releases its own locals after the tail lands).
 for mode in owned arc copy; do
     for ty in String "[Int]" Int; do
         probe "value block tail $mode $ty" "pub fn mk() -> $ty;
