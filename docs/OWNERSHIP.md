@@ -1277,7 +1277,9 @@ printed sum fell from 2800 to 1800 because the strong counts `observe` reports
 are no longer inflated by leaked references (1800 is the hand-derived answer);
 R10's accepted neighbours from `c6ddda3` (`let arc a = p` over an `arc` and a
 `shared` parameter, a fresh value, a branch of fresh values) 300 -> 0, ASan
-clean. The struct moved into an `owned` parameter that row 2 below records as
+clean; an `owned [Int]` parameter consumed, passed onward, and returned
+(the fourth `needsDrop` shape, a slice) 300 -> 0, ASan clean. The struct moved
+into an `owned` parameter that row 2 below records as
 1/0/1 is inside that matrix and now measures 0. `examples/arc.cell` still
 prints 13 and `examples/owned_string.cell` 44, both ASan clean.
 
