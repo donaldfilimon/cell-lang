@@ -11,7 +11,10 @@ cross-file picture that no single source file states.
 1. `AGENTS.md` **Toolchain and gates** and **Status honesty**: the Zig-master
    pin, why every command needs `-Dswift=false`, and what is enforced versus
    parsed versus only designed.
-2. `docs/SPEC.md` section 12, the construct-by-construct status index, and
+2. `docs/FEATURES.md`, the capability matrix and the current-status entry
+   point (per row: frontend, each backend, ownership boundary, evidence,
+   milestone), then `docs/SPEC.md` section 12, the construct-by-construct
+   status index, and
    `docs/OWNERSHIP.md` for the numbered rules `borrowck.zig` implements
    (R1, R2, **R2.a**, **R2.b**, R3, R3a, R4, R5, R6, **R7's consumption clause**, R8, **R9**, R14, R15 and
    **R18** today, **plus one
@@ -64,11 +67,73 @@ the four contracts are.
 
 MLIR stages **SKIP loudly** when `mlir-opt`/`mlir-translate`/`llc` are missing,
 and the verdict says the run was weaker. They are in the Homebrew keg, not on
-PATH; override with `LLVM_BIN=`.
+PATH; override with `LLVM_BIN=`. The leaks stage skips the same way without
+the macOS `leaks` tool, and the sanitizer stage when `cc` cannot link ASan.
+A skipped stage is counted in the verdict; read it as a weaker run, not a
+pass.
+
+The gate runs well past two minutes. Redirect it to a log and read the exit
+code from the command itself, then confirm against the `== verdict ==` line.
+
+### Beside the gate
+
+```sh
+.claude/skills/run-cell-lang/driver.sh --expect 42 examples/hello.cell
+                                        # one program through all three backends;
+                                        # checks exit status as well as output
+python3 tools/qualify.py --strict       # the gate plus a preserved JSON report
+                                        # (revision, fingerprints, tool versions,
+                                        # counts, skips); default output under
+                                        # .cell-cache/qualification/
+tools/sweep-backends.sh                 # differential HUNTING tool: generates
+                                        # programs across mode x type x position
+                                        # and reports LLVM/MLIR verdict splits and
+                                        # accepted programs whose C fails cc.
+                                        # Deliberately NOT a gate stage; run by hand
+                                        # after changing ownership lowering
+tools/tests/test-gate-integrity.sh      # tests the gate itself against a fake
+                                        # `cell` (sources check.sh with
+                                        # CELL_GATE_LIBRARY_ONLY=1)
+sh tools/check-rule-lists.sh            # stage 11 alone: needs no build, exits 1
+                                        # on drift. Run it after editing THIS file,
+                                        # which it reads
+```
+
+Stage 11 greps `README.md`, `AGENTS.md`, this file and `docs/SPEC.md` for
+every R-token in `borrowck.zig`'s header. Trimming the rule list in *Read
+first* above turns the gate red.
 
 **Do not trust a test count written here.** It moved 254 -> 289 in a single
 evening, and an execution-check count with it. Run the gate and read its own
 output; the count is the one thing this file cannot keep current.
+
+## Adding an example means declaring its contract
+
+`examples/README.md` is authoritative; the shape is:
+
+- `examples/*.cell` must pass `cell check`; `examples/future/*.cell` must
+  fail it (move a file up and rewrite its header when the feature lands);
+  `examples/rejected/*.cell` each carry a
+  `// EXPECT: currently-accepted` or `// EXPECT: currently-rejected` line and are
+  checked against it; `examples/pairing/` is the stem-pairing contract.
+- `// EXPECT-OUTPUT: <text>` in a runnable example pins its answer for the
+  backend-answers stage. Without it three backends agreeing is the whole
+  check, and three backends can agree on a wrong number.
+- A `<name>_host.c` beside an example is the hand-written host for its
+  bodyless declarations; the gate's `run_c_host` rows and `cell run` accept
+  it as a `.c` positional.
+- `examples/leaks/` is a separate directory on purpose, invisible to the
+  corpus loops. Each fixture loops one retain/release shape 1000 times and
+  its count is a **pinned constant in `tools/check.sh`**, measured by two
+  witnesses (`leaks -atExit` behind `leak_host.c`, plus the injected
+  `malloc_counter`). A count that moves is information about codegen: a
+  drop means a gap closed (update the constant, cite the commit, update
+  `docs/OWNERSHIP.md`'s row), a rise means a regression. Never loosen a pin.
+- The corpus only carries the shapes someone wrote. The gate's header
+  records that its silent backend defects were found by review, not by a
+  stage, and stayed invisible until an example carried the shape, so a
+  compiler fix for a silent class is half a fix until the corpus has the
+  other half.
 
 ## Tests
 
@@ -85,8 +150,9 @@ zig test src/cell/borrowck.zig --test-filter "R5"
 
 **`--test-filter` fails toward a false green, and here it is worse than the
 usual warning.** A filter matching nothing exits 0. It does not print
-"All 0 tests passed" either: `src/root.zig:145` is an ANONYMOUS
-`test { refAllDecls(@This()); }`, so it has no name for a filter to exclude and
+"All 0 tests passed" either: the anonymous `test { refAllDecls(@This()); }`
+block, the first `test` in `src/root.zig` (a line number written here
+drifted within a week), has no name for a filter to exclude and
 always runs. A typo'd filter therefore prints a plausible
 
     1/1 root.test_0...OK
@@ -157,7 +223,11 @@ last-use over that graph) and `abi.zig` (AAPCS64 classification) are leaf
 modules importing only `hir`/`cfg`/`types`, kept that way so neither backend
 can smuggle target knowledge past them. `liveness.zig` is `cfg.zig`'s only
 consumer and has none of its own yet: it is scaffolding for a precise drop pass
-and for NLL, and "nothing uses this" is expected rather than a defect. It
+and for NLL, and "nothing uses this" is expected rather than a defect. Do not
+confuse it with the liveness `borrowck.zig` already computes on the AST
+(named-loan NLL, which is decidable on the AST because R8 keeps every borrow
+inside its block, and the per-store `assign_liveness` codegen reads to decide
+an owned reassignment's pre-drop): those are what is enforced today. `liveness.zig`
 correlates its op lists to `cfg.Block`s by mirroring `cfg.Builder`'s traversal
 function for function, so **the two walks must change together**; a drift
 misaligns every list against the wrong block.
