@@ -7,8 +7,11 @@
 //! refused at six consumption sites (an `owned` parameter, an `owned`
 //! binding, an assignment into an `owned` place, an `owned` struct field, a
 //! list-literal element, and a `return` whose declared return type is not
-//! `arc`). The rest of R10, in particular move-into-`arc`, is
-//! still designed only. That single clause is here rather than in codegen
+//! `arc`). The rest of R10 is still designed only, except that
+//! move-into-`arc` is implemented at ONE position since 2026-09-16: `let arc`
+//! moves a whole `owned` `String` or list binding into the fresh box
+//! (`boxableOwnedBinding`); every other owned-into-`arc` source and position
+//! is refused as not implemented. That single clause is here rather than in codegen
 //! because codegen cannot refuse it: `owned [T]` and `shared [T]` lower to
 //! the SAME C type, so the emitted conversion compiles clean and double frees
 //! the buffer. Its classifier, `arcUniqueSource`, returns a TOTAL verdict:
@@ -998,9 +1001,21 @@ pub const Checker = struct {
             }
         }
         if (l.ownership == .arc) {
-            // R10's other direction, the `let` position. See
-            // `refuseUnimplementedArcMove`: this is the sweep's
-            // `let arc String = param` row and its two siblings.
+            // R10's other direction, the `let` position, IMPLEMENTED for one
+            // source shape (2026-09-16): a bare `owned` binding of `String`
+            // or list type is MOVED into the fresh box, which the C backend
+            // builds with `cell_arc_from_string`/`cell_arc_from_slice`, and
+            // the moved source is no longer dropped. Every other source keeps
+            // the refusal below: a field path, a branch, an `Int?`, and an
+            // unresolved type. See `refuseUnimplementedArcMove`.
+            if (try self.boxableOwnedBinding(v)) |place| {
+                const note = try self.msg(
+                    "'{s}' was moved here into the 'arc' box '{s}'",
+                    .{ place.display, l.name },
+                );
+                try self.movePlace(place, note);
+                return;
+            }
             if (try self.refuseUnimplementedArcMove(v, "bind", "to", "binding", l.name)) return;
         }
         if (l.ownership == .owned) {
@@ -2830,6 +2845,27 @@ pub const Checker = struct {
     /// legal retain, and a `shared` source is a view that
     /// `cell_arc_from_string(cell_string_from_str(p))` copies rather than
     /// aliases, all three verified.
+    /// The one source `let arc` may move into a box: a whole `owned` binding
+    /// whose resolved type is `String` or a list, the two shapes the runtime
+    /// boxes by taking the header (`cell_arc_from_string`,
+    /// `cell_arc_from_slice`). Null for anything else, including an
+    /// unresolved type, so the caller falls through to the refusal.
+    fn boxableOwnedBinding(self: *Checker, v: *const ast.Expr) Error!?Place {
+        const place = switch (try self.ownedMoveSource(v)) {
+            .place => |p| p,
+            else => return null,
+        };
+        if (place.path.len != 0) return null;
+        const b = self.bindingById(place.binding) orelse return null;
+        if (b.ownership != .owned) return null;
+        const ty = b.ty orelse return null;
+        return switch (ty) {
+            .list => place,
+            .name => |n| if (std.mem.eql(u8, n, "String")) place else null,
+            else => null,
+        };
+    }
+
     fn refuseUnimplementedArcMove(
         self: *Checker,
         v: *const ast.Expr,
@@ -4688,6 +4724,18 @@ fn expectAccepted(src: []const u8) !void {
     try expectDiagnostics(src, "");
 }
 
+/// `src` draws an error whose text contains `needle`.
+fn expectRejectedWith(src: []const u8, needle: []const u8) !void {
+    var h: Harness = .init();
+    defer h.deinit();
+    var buf: [4096]u8 = undefined;
+    const out = try h.run(src, &buf, false);
+    if (std.mem.indexOf(u8, out, needle) == null) {
+        std.debug.print("\nexpected an error containing:\n{s}\ngot:\n{s}\n", .{ needle, out });
+        return error.TestExpectedRejection;
+    }
+}
+
 /// A `Buffer` with one `owned` field and one `copy` field, plus the four
 /// helpers the rules' examples call. Kept on one line each so a test's own
 /// statements start at a predictable line.
@@ -5809,8 +5857,11 @@ test "R10's other direction: an owned place may not be moved into an arc box, at
     // `exit 134`, `attempting double-free ... in cell_string_free`.
     // Implementing the move means deciding who releases the box, which is
     // R11 row 1's ABI question, so this refuses and says "not implemented".
+    // The direct `let arc a = p` with `p: owned String` WAS this case; it is
+    // implemented since 2026-09-16 (see the test after this one), so the
+    // direct form is pinned with a source the box cannot take: an `Int?`.
     try expectDiagnostics(
-        \\pub fn f(owned p: String) -> Int {
+        \\pub fn f(owned p: Int?) -> Int {
         \\    let arc a = p
         \\    return 0
         \\}
@@ -5837,6 +5888,37 @@ test "R10's other direction: an owned place may not be moved into an arc box, at
         \\t.cell:6:32: note: R10 designs this as a move into a fresh 'arc' box, but the checker does not consume the source, so the box and the source's own drop free the same buffer; bind a fresh value to the 'arc' place, or start from an 'arc' source
         \\
     );
+}
+
+test "R10's move into arc: a whole owned String or list binding is moved at let" {
+    // Implemented 2026-09-16 for this one source shape. The move is real:
+    // the source is dead afterwards, exactly as after `let owned q = p`.
+    try expectAccepted(
+        \\pub fn f(owned p: String, owned xs: [Int]) -> Int {
+        \\    let arc a = p
+        \\    let arc b = xs
+        \\    return 0
+        \\}
+    );
+    try expectDiagnostics(
+        \\pub fn view(shared s: String) -> Int;
+        \\pub fn f(owned p: String) -> Int {
+        \\    let arc a = p
+        \\    return view(p)
+        \\}
+    ,
+        \\t.cell:4:17: error: use of 'p' after it was moved
+        \\t.cell:3:17: note: 'p' was moved here into the 'arc' box 'a'
+        \\
+    );
+    // A field is still refused: a partial move into a box is not built.
+    try expectRejectedWith(
+        \\pub struct R { owned s: String }
+        \\pub fn f(owned r: R) -> Int {
+        \\    let arc a = r.s
+        \\    return 0
+        \\}
+    , "moving an owned place into an 'arc' box is not implemented");
 }
 
 test "R10's other direction leaves every legal arc source alone" {

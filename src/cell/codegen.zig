@@ -173,10 +173,11 @@
 //! never released at all while release was function-scoped, which inside a
 //! `while` body was unbounded (CLOSED 2026-09-15 by the block-scope drop
 //! point in `emitStmts`, pinned at 0 in the gate); reassigning an `arc` `var`
-//! leaks the previous box; and an `owned` String or list PLACE bound as
-//! `arc` is not boxed at all, because `cell_arc_from_string` moves its
-//! argument while `borrowck.zig` leaves the source unmoved, and a loud C
-//! type error beats a silent double free. That list is what running programs
+//! leaked the previous box (CLOSED 2026-09-15); and an `owned` String or
+//! list PLACE bound as `arc` was not boxed at all, because
+//! `cell_arc_from_string` moves its argument while `borrowck.zig` left the
+//! source unmoved (boxed since 2026-09-16 at `let` for a whole binding,
+//! which borrowck now moves; see `isMovedOwnedBinding`). That list is what running programs
 //! has found, not a proof that nothing else dangles; `docs/OWNERSHIP.md` R11
 //! records exactly which positions the search covered, values as well as
 //! places.
@@ -2327,13 +2328,12 @@ pub const Generator = struct {
     ///      `cell_arc_from_string`/`cell_arc_from_slice`, not a clone.
     ///
     /// WHAT CASE 3 REFUSES TO DO, and why the refusal is the safe answer.
-    /// An `owned` String or list PLACE is not boxed. `cell_arc_from_string`
-    /// MOVES its argument into the box, and `borrowck.zig`'s `checkLet`
-    /// moves an initializer place only for `.owned`, while an `.arc`
-    /// argument merely `readPlace`s it (R10's move-into-arc is unimplemented
-    /// in the front end). So the source local is still unmoved, the drop
-    /// pass still schedules its `cell_string_free`, and boxing it here would
-    /// emit a silent double free. Falling through instead leaves a C type
+    /// An `owned` String or list PLACE is not boxed unless borrowck moved it.
+    /// `cell_arc_from_string` MOVES its argument into the box, so boxing a
+    /// place the drop pass still schedules would emit a silent double free.
+    /// Since 2026-09-16 `checkLet` moves a whole `owned` `String` or list
+    /// binding bound to `let arc`, and `isMovedOwnedBinding` admits exactly
+    /// that place; every other place still declines. Falling through instead leaves a C type
     /// error, which is loud, and which this backend's module comment already
     /// prefers over plausible wrong code. A literal, a call result, and a
     /// `shared` view are all boxed, because none of them is a local the drop
@@ -2390,14 +2390,16 @@ pub const Generator = struct {
                 return true;
             },
             .string => {
-                if (have.pointer or isPlace(arg)) return false;
+                if (have.pointer) return false;
+                if (isPlace(arg) and !self.isMovedOwnedBinding(arg)) return false;
                 try out.writeAll("cell_arc_from_string(");
                 try self.emitExpr(arg, indent);
                 try out.writeAll(")");
                 return true;
             },
             .slice => {
-                if (have.pointer or isPlace(arg)) return false;
+                if (have.pointer) return false;
+                if (isPlace(arg) and !self.isMovedOwnedBinding(arg)) return false;
                 try out.writeAll("cell_arc_from_slice(");
                 try self.emitExpr(arg, indent);
                 try out.writeAll(")");
@@ -2405,6 +2407,28 @@ pub const Generator = struct {
             },
             else => return false,
         }
+    }
+
+    /// A place `emitArcConversion` may box by moving its header: a bare
+    /// identifier naming an `owned` binding that borrowck recorded as wholly
+    /// moved. borrowck moves a place into a box only at `let arc` (R10,
+    /// `boxableOwnedBinding`) and refuses the other positions, so this is the
+    /// only way such a place reaches a boxing conversion; the moved source is
+    /// then skipped by the drop pass and the box owns the buffer. Anything
+    /// else keeps the loud `cc` type error.
+    fn isMovedOwnedBinding(self: *Generator, arg: *const ast.Expr) bool {
+        const checker = self.checker orelse return false;
+        const e = unwrapAnnotated(arg);
+        if (e.kind != .ident) return false;
+        var i = self.locals.items.len;
+        while (i > 0) {
+            i -= 1;
+            const local = self.locals.items[i];
+            if (!eq(local.name, e.kind.ident)) continue;
+            if (!local.droppable or local.ownership != .owned) return false;
+            return checker.wasWhollyMoved(local.id);
+        }
+        return false;
     }
 
     /// THE FUNNEL. Every position that lowers a value into a destination with
@@ -5052,24 +5076,32 @@ test "a returned arc match-arm binding is retained: nested if inside a block arm
     );
 }
 
-test "an owned String place bound as arc is left as a loud C type error" {
+test "an owned String or list binding bound as arc is moved into the box" {
+    // R10's move-into-arc at `let`, implemented 2026-09-16. Until then this
+    // test pinned the opposite: `cell_arc_t b = a;`, a loud C type error,
+    // because borrowck did not consume `a` and boxing it would have freed the
+    // buffer twice. borrowck now moves `a` (`boxableOwnedBinding`), so the
+    // box takes the header and `a` has no drop of its own.
     var e = try emitSource(
         \\pub fn make() -> String;
+        \\pub fn list() -> [Int];
         \\pub fn f() {
         \\  let owned a = make()
         \\  let arc b = a
         \\}
+        \\pub fn g(owned xs: [Int]) {
+        \\  let arc b = xs
+        \\}
     );
     defer e.deinit();
-    // cell_arc_from_string MOVES its argument, and borrowck's checkLet moves
-    // an initializer place only for `.owned` (R10's move-into-arc is
-    // unimplemented in the front end), so `a` is still scheduled for its own
-    // cell_string_free. Boxing here would emit a silent double free. Not
-    // boxing leaves a type error the C compiler reports, which is this
-    // backend's stated preference over plausible wrong code.
-    try expectAbsent(e.text, "cell_arc_from_string");
-    try expectContains(e.text, "cell_arc_t b = a;");
-    try expectContains(e.text, "cell_string_free(&a);");
+    const f = try fnDef(e.text, "f");
+    try expectContains(f, "cell_arc_t b = cell_arc_from_string(a);");
+    try expectAbsent(f, "cell_string_free(&a);");
+    try expectOccurrences(f, "cell_arc_drop(b);", 1);
+    const g = try fnDef(e.text, "g");
+    try expectContains(g, "cell_arc_t b = cell_arc_from_slice(xs);");
+    try expectAbsent(g, "cell_slice_free(&xs);");
+    try expectCompiles(e.text);
 }
 
 test "a returned arc FIELD is retained when the function drops nothing" {

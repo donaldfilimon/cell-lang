@@ -23,8 +23,9 @@ Named-loan NLL slices 1 and 2 are enforced as described in section 0.3;
 derived-loan propagation remains conservative. See [FEATURES.md](FEATURES.md)
 for the current cross-backend matrix, rather than treating this historical
 summary as an exhaustive rule inventory. **R11** retain-release insertion is implemented in the
-C backend, with the gaps R11 itself names; **R10**'s move-into-`arc` is not
-implemented in the checker, which is why one of those gaps exists. R10's other
+C backend, with the gaps R11 itself names; **R10**'s move-into-`arc` is
+implemented in the checker at `let` for a whole `owned` `String` or list
+binding (2026-09-16) and refused everywhere else. R10's other
 direction, an `arc` value made UNIQUE, IS implemented, at six consumption
 sites and with a total verdict that refuses a source it cannot classify. **R2.a**
 (a move inside a loop) landed with `while`. **R18** (an `owned` binding may not
@@ -1245,7 +1246,26 @@ section carries that count and is the authority for it.
 
 | Gap | Evidence |
 |---|---|
-| An `owned` String or list PLACE bound as `arc` (**the reverse direction**; `arc` into `owned` is refused outright by R10 above) is not boxed at all, and is left as a C type error rather than a silent double free | see retain rule 1 above. Re-measured: `let arc b = a` with an `owned` String `a` still emits `cell_arc_t b = a;` and `cc` rejects it, `initializing 'cell_arc_t' with an expression of incompatible type 'cell_string_t'` |
+
+The table is empty since 2026-09-16. Its last row, **an `owned` String or list
+PLACE bound as `arc`** (the reverse of R10's refused direction), was never a
+leak once `c6ddda3` refused it at five positions, and it is now implemented at
+the one position where it was measured: `let arc a = s` with `s` a whole
+`owned` binding of `String` or list type MOVES `s` into the box.
+`borrowck.zig`'s `boxableOwnedBinding` records the move (a later use of `s` is
+a use after move, and a move inside a loop is refused by R2.a), and
+`codegen.zig`'s `isMovedOwnedBinding` lets `emitArcConversion` box that place
+with `cell_arc_from_string`/`cell_arc_from_slice`, which take the header; the
+moved source has no drop of its own, so the box's release is the only one.
+Measured with both witnesses and under AddressSanitizer on a program that
+boxes an owned parameter, an owned local (then retains the box), and an owned
+list: 0 leaks, `ALLOC=900 FREE=900`, ASan clean, printed sum hand-derived.
+Moving on only one branch (`if c > 0 { let arc a = s }`) leaks `s` when the
+branch is not taken, one allocation over 100 calls, because a branch move is
+recorded conservatively as a move: the leak direction, stated. Still refused
+as not implemented: a field source (`let arc a = r.s`), a source reached
+through a branch, an `Int?` or unresolved-type source, and the other four
+positions (assignment, call argument, struct field, return).
 
 **CLOSED (row 1), and gone from the table above.** A Cell body never
 released its own `arc` parameter, because no parameter was dropped, so every

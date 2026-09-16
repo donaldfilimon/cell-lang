@@ -32,9 +32,10 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `value_block_local.cell` | the residual of row 4's closure: an `arc` local declared in a VALUE-position block was not released at that block's exit (measurable since 2026-09-15, when a block began to type as its tail); **CLOSED 2026-09-15** the same evening by `emitValueBlockDrops`, kept and pinned at 0 |
 | `partial_move_field.cell` | not a numbered row: a record with one owning field moved out was skipped whole, leaking its other owning field; **CLOSED 2026-09-16** by field-path move records in borrowck and `emitPartialRecordDrop` in codegen, kept and pinned at 0. A field moved on only one branch still leaks by design and is not measured here |
 
-R11's sixth disclosed gap (an `owned` String or list place bound as `arc`) is
-not a runtime leak at all: it is refused as a C type error at compile time, so
-there is nothing for `leaks` to measure and no fixture for it here.
+R11's sixth disclosed gap (an `owned` String or list place bound as `arc`) was
+never a runtime leak: it was a C type error, then a borrowck refusal, and since
+2026-09-16 it is implemented at `let` for a whole binding, measured at 0 with
+both witnesses outside the gate. There is no fixture for it here.
 
 Run them all, with the pinned expected counts, via `tools/check.sh`'s `leaks`
 stage. That stage SKIPS loudly (not silently) when the macOS `leaks` tool is
