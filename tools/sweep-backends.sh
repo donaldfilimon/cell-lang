@@ -28,7 +28,8 @@
 # owned value-block rows now reach `cc`, and still 88 probed / 5 reported.
 # Re-run once more at b290c43 (value-position release, `emitValueBlockDrops`):
 # 88 probed / 5 reported, the same five, so the release changed no
-# backend agreement. RESULT ON 2026-09-08 at 8eb1a21, 78 programs probed and 5 reported:
+# backend agreement. Re-run at 4c93571 (R11 row 5, the `arc` reassignment
+# pre-drop, which the `assign arc <-` rows exercise): 88 / 5, the same five. RESULT ON 2026-09-08 at 8eb1a21, 78 programs probed and 5 reported:
 # no new defect. Everything it
 # reported belonged to ONE disclosed gap, R10's unimplemented move-into-`arc`
 # in the front end, where `let arc x = <owned place>` and the assignment form

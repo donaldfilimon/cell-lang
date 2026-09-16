@@ -1156,9 +1156,20 @@ whole-binding target naming a droppable `arc` local, and that scope is the
 soundness argument: borrowck never marks an `arc` place moved, every alias of
 the box that survives a statement is refcounted (a clone at `let arc b = v`, a
 retain at a field store, a clone at `return`), a `shared` view holds it only
-for the call, and R4 refuses the assignment while a borrow of `v` is live
+for the call, R4 refuses the assignment while a borrow of `v` is live
 (pinned: "cannot assign to 'v' while it is borrowed as shared"; a borrow that
-is dead by then under NLL is accepted and never read again). `owned` is
+is dead by then under NLL is accepted and never read again), and R7's write
+clause refuses it while a match-arm binding aliasing `v` is in scope. That
+last clause was MISSING when this closed at `4c93571`, and the list above
+read as exhaustive while it was not: an arm binding is an unretained copy of
+the handle (R7 makes it an alias, not a loan, so R4 never saw it), and
+`match v { x => { v = "two" \n print(x) } }` passed `cell check`, took the
+old box to zero at the store and read freed memory at `print(x)`: AddressSanitizer
+heap-use-after-free, exit 134, flat and inside a `while` body, found by the
+advisor pass the same night and closed in borrowck beside R4 ("cannot assign
+to 'v' while the match binding 'x' aliases it"), for every ownership, since
+the `owned` form leaks today and would dangle the moment `owned`
+reassignment gets its own pre-drop. `owned` is
 deliberately NOT covered: `[s]` copies the header without marking `s` moved,
 so a pre-drop at `s = make()` would free under a list element; that stays
 R16's revival leak, stated there. A droppable var declared without an

@@ -199,6 +199,9 @@ const Binding = struct {
     /// Arena-allocated by `placeOf` (or a slice of the source), so it outlives
     /// the match. Only meaningful when `arm_origin == .alias`.
     arm_scrutinee: ?[]const u8 = null,
+    /// The binding the aliased scrutinee place is rooted at, for R7's write
+    /// clause (`checkAssign`). Only meaningful when `arm_origin == .alias`.
+    arm_scrutinee_binding: ?u32 = null,
 };
 
 /// A place: a binding plus a field path relative to it.
@@ -1120,6 +1123,39 @@ pub const Checker = struct {
             return;
         }
 
+        // R7's write clause (added 2026-09-15, night). An arm binding is an
+        // ALIAS of the scrutinee: not a copy and not a loan, so R5's check
+        // above never sees it, and codegen emits it as an unretained handle
+        // copy. Writing the scrutinee while such an alias is in scope is a
+        // write under an untracked view. For an `arc` var the R11 row 5
+        // pre-drop takes the old box to zero at the store and the alias
+        // reads freed memory: `match v { x => { v = "two" \n print(x) } }`
+        // was an AddressSanitizer heap-use-after-free at 4c93571, flat and
+        // inside a `while`. Refused for every ownership, not only `arc`: the
+        // `owned` form merely leaks today and would dangle the moment
+        // `owned` reassignment gets its own pre-drop. Asked of the ROOT
+        // binding, so a write anywhere under the scrutinee's root is refused
+        // while any arm alias of that root is visible; a sibling-field write
+        // is over-refused, in the leak-safe direction.
+        if (self.visibleArmAliasOf(place.binding)) |alias| {
+            try self.diagnostics.err(
+                self.allocator,
+                place.span,
+                try self.msg(
+                    "cannot assign to '{s}' while the match binding '{s}' aliases it",
+                    .{ place.display, alias.name },
+                ),
+            );
+            try self.diagnostics.note(
+                self.allocator,
+                alias.decl_span,
+                "R7: a match binding aliases the scrutinee rather than copying or borrowing it, and lasts to the end of its arm; assign after the match, or bind a copy of the value before it",
+            );
+            try self.checkExpr(&a.value);
+            self.revive(place);
+            return;
+        }
+
         // R14's second clause: a binding that already holds a borrow may not
         // be reassigned. R14 already refuses this for a `let`, by
         // immutability; `var` reached here and nothing stopped it.
@@ -1583,6 +1619,7 @@ pub const Checker = struct {
                     .decl_span = arm.pattern.span,
                     .arm_origin = arm_origin,
                     .arm_scrutinee = if (scrutinee_place) |p| p.display else null,
+                    .arm_scrutinee_binding = if (scrutinee_place) |p| p.binding else null,
                 });
             }
             try self.checkExpr(arm.body);
@@ -1937,6 +1974,21 @@ pub const Checker = struct {
         } else {
             try self.temp_loans.append(self.allocator, loan);
         }
+    }
+
+    /// The innermost visible match-arm binding that aliases a place rooted
+    /// at `binding`, for R7's write clause. Every entry of `bindings` is in
+    /// scope (scopes shrink it on pop), so a plain scan is the visibility
+    /// test.
+    fn visibleArmAliasOf(self: *const Checker, binding: u32) ?*const Binding {
+        var i = self.bindings.items.len;
+        while (i > 0) {
+            i -= 1;
+            const b = &self.bindings.items[i];
+            if (b.arm_origin != .alias) continue;
+            if (b.arm_scrutinee_binding) |root| if (root == binding) return b;
+        }
+        return null;
     }
 
     /// R3a: assigning to a place revives it and everything under it.
@@ -6199,6 +6251,81 @@ test "R4 refuses reassigning an arc var while a shared borrow of it is live, whi
         \\t.cell:5:5: error: cannot assign to 'v' while it is borrowed as shared
         \\t.cell:4:21: note: the shared borrow starts here and lasts to the end of this block
         \\
+    );
+}
+
+test "R7 write clause: assigning to the scrutinee while an arm binding aliases it is refused" {
+    // Measured at 4c93571 before this clause existed: `cell check` exit 0,
+    // ASan heap-use-after-free at `print(x)`, because the row 5 pre-drop
+    // released the box `x` still pointed at. Flat and inside a `while`.
+    try expectDiagnostics(
+        \\pub fn print(shared s: String);
+        \\pub fn main() {
+        \\    var arc v = "one"
+        \\    match v {
+        \\        x => {
+        \\            v = "two"
+        \\            print(x)
+        \\        }
+        \\    }
+        \\}
+    ,
+        \\t.cell:6:13: error: cannot assign to 'v' while the match binding 'x' aliases it
+        \\t.cell:5:9: note: R7: a match binding aliases the scrutinee rather than copying or borrowing it, and lasts to the end of its arm; assign after the match, or bind a copy of the value before it
+        \\
+    );
+    try expectDiagnostics(
+        \\pub fn print(shared s: String);
+        \\pub fn main() {
+        \\    var arc v = "one"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        match v {
+        \\            x => {
+        \\                v = "two"
+        \\                print(x)
+        \\            }
+        \\        }
+        \\        i = i + 1
+        \\    }
+        \\}
+    ,
+        \\t.cell:8:17: error: cannot assign to 'v' while the match binding 'x' aliases it
+        \\t.cell:7:13: note: R7: a match binding aliases the scrutinee rather than copying or borrowing it, and lasts to the end of its arm; assign after the match, or bind a copy of the value before it
+        \\
+    );
+}
+
+test "R7 write clause covers owned scrutinees too, and an assignment after the match is fine" {
+    try expectDiagnostics(
+        \\pub fn make() -> String;
+        \\pub fn print(shared s: String);
+        \\pub fn main() {
+        \\    var owned s = make()
+        \\    match s {
+        \\        x => {
+        \\            s = make()
+        \\            print(x)
+        \\        }
+        \\    }
+        \\}
+    ,
+        \\t.cell:7:13: error: cannot assign to 's' while the match binding 'x' aliases it
+        \\t.cell:6:9: note: R7: a match binding aliases the scrutinee rather than copying or borrowing it, and lasts to the end of its arm; assign after the match, or bind a copy of the value before it
+        \\
+    );
+    try expectAccepted(
+        \\pub fn print(shared s: String);
+        \\pub fn main() {
+        \\    var arc v = "one"
+        \\    match v {
+        \\        x => {
+        \\            print(x)
+        \\        }
+        \\    }
+        \\    v = "two"
+        \\    print(v)
+        \\}
     );
 }
 

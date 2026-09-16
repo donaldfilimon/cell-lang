@@ -774,8 +774,12 @@ pub const Generator = struct {
         // and held exactly once here: borrowck never marks an `arc` place
         // moved, every alias that survives a statement is refcounted (a
         // clone at `let arc b = v`, a retain at a field store, a clone at
-        // `return`), a `shared` view holds it only for the call, and R4
-        // refuses this assignment while a borrow of `v` is live. `owned` is
+        // `return`), a `shared` view holds it only for the call, R4
+        // refuses this assignment while a borrow of `v` is live, and R7's
+        // write clause refuses it while a match-arm binding aliases `v`
+        // (an arm binding is an UNRETAINED copy of the handle: without that
+        // refusal `match v { x => { v = "two" \n print(x) } }` was a
+        // measured heap-use-after-free at 4c93571). `owned` is
         // deliberately NOT covered: `[s]` copies the header without marking
         // `s` moved, so a pre-drop there would free under a list element
         // (R16's revival leak, left as a leak). The RHS goes into a temporary
