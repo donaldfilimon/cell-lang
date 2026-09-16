@@ -45,9 +45,13 @@
 //! that made this call, and the CALLEE it was moved into is a different
 //! function's problem -- see `Local.droppable`); neither is a match-arm
 //! binding (its C value is a bitwise copy of the scrutinee temporary, and
-//! dropping it risks freeing whatever the scrutinee itself still owns); nor
-//! is a `record` (struct) shape (recursive field drops need a generated
-//! per-struct function, which is a separate task).
+//! dropping it risks freeing whatever the scrutinee itself still owns). A
+//! `record` (struct) shape IS dropped since 2026-09-15 (R11 row 2): every
+//! struct with an `owned` or `arc` field whose lowered type needs a drop
+//! gets a generated `static inline void cell_drop_<Name>(cell_<Name> *r)`
+//! after the typedefs, and a local of that type is released through it.
+//! The predicate is `needsDrop`, deliberately separate from `hasDropCall`
+//! (see that function's comment for why widening it would be wrong).
 //!
 //! Borrowck's move tracking is deliberately conservative -- a move on only
 //! one branch of an `if` marks the place moved for the rest of the function
@@ -158,7 +162,8 @@
 //! argued to be one (`docs/OWNERSHIP.md` R11 carries the numbers): a Cell
 //! body never releases its own `arc` parameter, because no parameter is
 //! dropped, so every call-site retain into one leaks a reference; a struct
-//! holding an `arc` field is never dropped, so the field's retain leaks; an
+//! holding an `arc` field was never dropped, so the field's retain leaked
+//! (CLOSED 2026-09-15 by per-struct drop glue, pinned at 0 in the gate); an
 //! `arc` value unboxed for a `shared` parameter without ever being bound
 //! (`inspect(shared fresh())`) drops its handle on the floor (CLOSED
 //! 2026-09-07, pinned at 0 in the gate); a block-scoped `arc` local was
@@ -431,6 +436,7 @@ pub const Generator = struct {
         }
 
         try self.emitOptionalInstances();
+        try self.emitDropGlue(module);
 
         var wrote_prototype = false;
         for (module.items) |item| {
@@ -698,12 +704,15 @@ pub const Generator = struct {
                 if (l.value) |v| {
                     try out.writeAll(" = ");
                     try self.emitArgLike(&v, ty, indent);
-                } else if (hasDropCall(ty.shape)) {
+                } else if (try self.needsDrop(ty)) {
                     // A droppable local declared without an initializer is
                     // zero-initialized, so the scope-end drop (which ran on
                     // garbage before 2026-09-15) and the reassignment
                     // pre-drop above are both no-ops until the first write:
-                    // all three runtime drops return on a zeroed value.
+                    // all three runtime drops return on a zeroed value
+                    // (`cell_arc_drop` returns on a NULL refcount, the two
+                    // `_free`s hand `free` a NULL), and a record's glue is
+                    // those same calls over zeroed fields.
                     try out.print(" = ({s}){{0}}", .{ty.text});
                 }
                 try out.writeAll(";\n");
@@ -829,15 +838,108 @@ pub const Generator = struct {
 
     // ── drop insertion (task 3) ────────────────────────────────────────
 
-    /// The drop vocabulary in runtime/cell_rt.h: a `record` (struct) case is
-    /// deliberately absent, since a struct with owning fields needs a
-    /// generated per-struct drop function this task does not build (see the
-    /// module doc comment).
+    /// The drop vocabulary in runtime/cell_rt.h, and ONLY that: the three
+    /// shapes the runtime can release directly. A `record` is deliberately
+    /// absent here even though records are dropped now (R11 row 2), because
+    /// this predicate is also the key of the owning-header guard in
+    /// `emitValueInto`, which makes a record COPY into a slot rather than
+    /// take a pointer, and a test pins that ("records still copy"). Whether a
+    /// scope exit releases a value is `needsDrop`'s question, asked of the
+    /// whole type; whether the runtime has a call for a shape is this one.
     fn hasDropCall(shape: Shape) bool {
         return switch (shape) {
             .string, .slice, .arc => true,
             else => false,
         };
+    }
+
+    /// R11 row 2. Whether a value of this type is released at scope end. The
+    /// three runtime shapes always are; a `record` is when it has drop glue,
+    /// which `recordNeedsDrop` decides from its fields.
+    fn needsDrop(self: *Generator, ty: CType) Alloc!bool {
+        if (hasDropCall(ty.shape)) return true;
+        if (ty.shape != .record) return false;
+        return self.recordNeedsDrop(ty.name, 0);
+    }
+
+    /// A struct needs glue when some field is `owned` or `arc` AND its
+    /// lowered type needs a drop, recursively through nested records. The
+    /// keyword is checked FIRST and the lowering carries it: `shared [Byte]`
+    /// and `owned [Byte]` both lower to `cell_slice_t`, and only the keyword
+    /// says which one this struct owns; `arc Point` lowers to `cell_arc_t`
+    /// while `arc Int` stays `int64_t`, and only the lowering knows which.
+    /// A `copy` field of a resource-bearing type cannot exist (borrowck
+    /// refuses the declaration), and a `shared`/`exclusive` field cannot
+    /// either. The depth guard is for a self-referential struct the
+    /// typechecker does not refuse; such a type has no finite C layout
+    /// anyway, so answering "no glue" for it costs nothing real.
+    fn recordNeedsDrop(self: *Generator, name: []const u8, depth: usize) Alloc!bool {
+        if (depth > 16) return false;
+        const def = self.findStruct(name) orelse return false;
+        for (def.fields) |f| {
+            if (f.ownership != .owned and f.ownership != .arc) continue;
+            const fty = try self.lowerType(&f.ty, f.ownership);
+            if (hasDropCall(fty.shape)) return true;
+            if (fty.shape == .record and try self.recordNeedsDrop(fty.name, depth + 1)) return true;
+        }
+        return false;
+    }
+
+    /// The glue itself, one function per struct that `recordNeedsDrop`
+    /// answers yes for. Emitted in two passes AFTER every typedef: all
+    /// prototypes, then all definitions, so a nested record's glue resolves
+    /// whatever order the structs were written in. (The typedefs themselves
+    /// are emitted in source order and a struct naming a LATER struct by
+    /// value already fails `cc` on the typedef, so glue order cannot make that
+    /// case worse; it is recorded in OWNERSHIP.md as its own gap.)
+    ///
+    /// `static inline __attribute__((unused))`, and the attribute is not
+    /// decoration: a struct that is declared and never constructed in a module
+    /// (`examples/arc.cell`'s `Session`, or any helper struct a program only
+    /// nests) leaves its glue uncalled, and clang's `-Wunused-function` fires
+    /// on an unused `static inline` in the defining file, which `-Werror`
+    /// turns into a failed build. Measured before this line was written: seven
+    /// probe programs all failed `cc` on `cell_drop_Outer`. GCC-style
+    /// attributes are already part of this backend's contract through
+    /// `cell_rt.h` (`cell_panic` is `__attribute__((noreturn))`).
+    ///
+    /// Field order is REVERSE declaration order, matching `pendingDrops`'s
+    /// convention for locals: a later field may reference an earlier one.
+    fn emitDropGlue(self: *Generator, module: *const ast.Module) EmitError!void {
+        const out = self.writer;
+        var any = false;
+        for (module.items) |item| {
+            if (item.kind != .struct_def) continue;
+            const sd = item.kind.struct_def;
+            if (!try self.recordNeedsDrop(sd.name, 0)) continue;
+            try out.print("static inline __attribute__((unused)) void cell_drop_{s}(cell_{s} *r);\n", .{ sd.name, sd.name });
+            any = true;
+        }
+        if (any) try out.writeAll("\n");
+        for (module.items) |item| {
+            if (item.kind != .struct_def) continue;
+            const sd = item.kind.struct_def;
+            if (!try self.recordNeedsDrop(sd.name, 0)) continue;
+            try out.print("// R11 row 2: drop glue for `{s}`, one release per owning field.\n", .{sd.name});
+            try out.print("static inline __attribute__((unused)) void cell_drop_{s}(cell_{s} *r) {{\n", .{ sd.name, sd.name });
+            var i = sd.fields.len;
+            while (i > 0) {
+                i -= 1;
+                const f = sd.fields[i];
+                if (f.ownership != .owned and f.ownership != .arc) continue;
+                const fty = try self.lowerType(&f.ty, f.ownership);
+                switch (fty.shape) {
+                    .string => try out.print("  cell_string_free(&r->{s});\n", .{f.name}),
+                    .slice => try out.print("  cell_slice_free(&r->{s});\n", .{f.name}),
+                    .arc => try out.print("  cell_arc_drop(r->{s});\n", .{f.name}),
+                    .record => if (try self.recordNeedsDrop(fty.name, 1)) {
+                        try out.print("  cell_drop_{s}(&r->{s});\n", .{ fty.name, f.name });
+                    },
+                    else => {},
+                }
+            }
+            try out.writeAll("}\n\n");
+        }
     }
 
     /// One of the three drop calls, chosen by shape alone: `local.ownership`
@@ -852,7 +954,10 @@ pub const Generator = struct {
             .string => try self.writer.print("cell_string_free(&{s});\n", .{local.name}),
             .slice => try self.writer.print("cell_slice_free(&{s});\n", .{local.name}),
             .arc => try self.writer.print("cell_arc_drop({s});\n", .{local.name}),
-            else => unreachable, // hasDropCall already filtered these out.
+            // R11 row 2: through the generated glue, by pointer like the two
+            // `_free` calls. `needsDrop` admitted this local, so glue exists.
+            .record => try self.writer.print("cell_drop_{s}(&{s});\n", .{ local.ty.name, local.name }),
+            else => unreachable, // needsDrop already filtered these out.
         }
     }
 
@@ -869,8 +974,9 @@ pub const Generator = struct {
     /// `Local.droppable`), an `owned` or `arc` ownership annotation (never
     /// `shared`, `exclusive`, or `copy`), and `!checker.wasMoved(id)` (never
     /// a place borrowck considers moved, maybe-moved included). A struct
-    /// (`record` shape) is excluded by `hasDropCall`, not by an ownership
-    /// check, because a struct can be `owned` too.
+    /// (`record` shape) is admitted by `needsDrop` exactly when it has drop
+    /// glue (R11 row 2); a scalar-only struct is still excluded there, not by
+    /// an ownership check, because a struct can be `owned` too.
     fn pendingDrops(self: *Generator) Alloc![]const Local {
         return self.pendingDropsSince(0);
     }
@@ -890,7 +996,7 @@ pub const Generator = struct {
             if (self.isShadowedAt(i)) continue;
             if (!local.droppable) continue;
             if (local.ownership != .owned and local.ownership != .arc) continue;
-            if (!hasDropCall(local.ty.shape)) continue;
+            if (!try self.needsDrop(local.ty)) continue;
             if (checker.wasMoved(local.id)) continue;
             try out.append(self.arena, local);
         }
@@ -1091,7 +1197,10 @@ pub const Generator = struct {
     ///     drop would run between the return temporary and the `return`.
     ///     Retaining is exactly balanced: 1 -> 2 -> 1.
     ///   - a FIELD (`s.name`, `s->name`) belongs to the record, which this
-    ///     backend never drops. An earlier version of this function declined
+    ///     backend did not drop when this was written (it does now, through
+    ///     R11 row 2's glue, and the argument below is unchanged by that: the
+    ///     glue releases the record's OWN reference at its scope end, which is
+    ///     still not the caller's). An earlier version of this function declined
     ///     a `.field` root, reasoning that the record is never released so
     ///     there is no release to balance. That reasoned about the wrong
     ///     quantity: what matters is the reference the CALLER is about to
@@ -4173,9 +4282,9 @@ test "an arc place stored in a struct field is cloned" {
         \\}
     );
     defer e.deinit();
-    // R11 rule 4. Note the struct itself is never dropped by this backend,
-    // so this retain leaks; that is the documented record-shape gap in the
-    // drop pass, not a defect in the retain.
+    // R11 rule 4. The struct's own reference is released by its generated
+    // glue at scope end since 2026-09-15 (row 2), so this retain is balanced
+    // by `cell_drop_Session`; the retain itself is what this test pins.
     try expectContains(e.text, "(cell_Session){ .name = cell_arc_clone(n) }");
 }
 
@@ -5201,7 +5310,15 @@ test "a droppable var declared without an initializer is zero-initialized" {
     try expectLineBefore(e.text, "v = _cell_t0;", "cell_arc_drop(v);");
 }
 
-test "an arc field store is not a reassignment pre-drop: the record is never dropped (row 2)" {
+test "an arc field store is not a reassignment pre-drop: the record is released by its glue, not per store (row 2)" {
+    // Two claims, and until 2026-09-15 this test made only the first and its
+    // title made a second that is no longer true. A FIELD store does not
+    // pre-drop the old box (that is the stated field-store residual: "one"
+    // is overwritten unreleased). The record itself IS dropped now, through
+    // R11 row 2's glue at scope end, which releases whatever the field holds
+    // at that point ("two"). Asserting the glue call is what keeps this test
+    // from passing vacuously: the old needle `cell_arc_drop(b.s)` was never
+    // how any drop of a record would be spelled.
     var e = try emitSource(
         \\struct Box { arc s: String }
         \\pub fn f() {
@@ -5211,6 +5328,8 @@ test "an arc field store is not a reassignment pre-drop: the record is never dro
     );
     defer e.deinit();
     try expectAbsent(e.text, "cell_arc_drop(b.s);");
+    try expectContains(e.text, "cell_drop_Box(&b);");
+    try expectContains(e.text, "  cell_arc_drop(r->s);\n");
 }
 
 test "a value-position block's tail resolves through a nested block, and later bindings keep their ids" {
@@ -5261,6 +5380,105 @@ test "an owned block tail is moved into the let, and bindings after the block ke
     try expectOccurrences(e.text, "cell_string_free(&s);", 1);
     try expectAbsent(e.text, "cell_string_free(&t)");
     try expectContains(e.text, "cell_arc_drop(z);");
+}
+
+test "R11 row 2: a struct with an arc field gets drop glue and its local is released" {
+    // The pinned fixture's shape (`examples/leaks/struct_arc_field.cell`),
+    // which measured 3000 leaks on both witnesses before this and 0 after.
+    var e = try emitSource(
+        \\struct Session { arc name: String, copy id: Int }
+        \\pub fn f() {
+        \\  let owned sess = Session { name: "session", id: 1 }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "static inline __attribute__((unused)) void cell_drop_Session(cell_Session *r);");
+    try expectContains(e.text, "static inline __attribute__((unused)) void cell_drop_Session(cell_Session *r) {\n  cell_arc_drop(r->name);\n}");
+    try expectContains(e.text, "cell_drop_Session(&sess);");
+}
+
+test "R11 row 2: nested record glue recurses, and releases fields in reverse order" {
+    // `tag` is declared after `inner`, so it is released first, matching
+    // `pendingDrops`'s reverse-declaration convention for locals. The nested
+    // call resolves whatever order the structs were written in, because
+    // every prototype precedes every definition.
+    var e = try emitSource(
+        \\struct Outer { owned inner: Box, arc tag: String }
+        \\struct Box { owned s: String, copy n: Int }
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  let owned o = Outer { inner: Box { s: make(), n: 1 }, tag: "t" }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "void cell_drop_Outer(cell_Outer *r);\nstatic inline __attribute__((unused)) void cell_drop_Box(cell_Box *r);");
+    try expectContains(e.text, "  cell_arc_drop(r->tag);\n  cell_drop_Box(&r->inner);\n}");
+    try expectContains(e.text, "  cell_string_free(&r->s);\n}");
+    try expectContains(e.text, "cell_drop_Outer(&o);");
+}
+
+test "R11 row 2: a scalar-only struct gets no glue and no drop" {
+    // THE OVER-EMISSION CONTROL. `needsDrop` keys on the fields, not on the
+    // shape: a record with nothing to release is not a drop candidate, and
+    // emitting glue for it would be an empty function per struct.
+    var e = try emitSource(
+        \\struct Point { copy x: Int, copy y: Int }
+        \\pub fn f() {
+        \\  let owned p = Point { x: 1, y: 2 }
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "cell_drop_Point");
+}
+
+test "R11 row 2: a struct that is moved, partially moved, or returned is not dropped" {
+    // Three shapes `pendingDrops` must skip, each measured under ASan with the
+    // malloc counter at the tree that added the glue. A partial move marks
+    // the whole binding moved in borrowck, so the record is skipped entirely:
+    // that leaks `n`'s nothing and `s`'s nothing here (the field went to
+    // `eat`), and would leak a SECOND owning field if there were one, which
+    // is the stated residual and the safe direction. A move into an `owned`
+    // parameter hands the record to a callee that does not drop parameters
+    // (R11 row 1's shape, not this row's). A returned local is the caller's.
+    var e = try emitSource(
+        \\struct Box { owned s: String, copy n: Int }
+        \\pub fn make() -> String;
+        \\pub fn eat(owned s: String) { }
+        \\pub fn take(owned b: Box) { }
+        \\pub fn partial() {
+        \\  let owned b = Box { s: make(), n: 1 }
+        \\  eat(owned b.s)
+        \\}
+        \\pub fn moved() {
+        \\  let owned b = Box { s: make(), n: 1 }
+        \\  take(b)
+        \\}
+        \\pub fn returned() -> Box {
+        \\  let owned b = Box { s: make(), n: 1 }
+        \\  return b
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_eat(b.s);");
+    try expectContains(e.text, "cell_take(b);");
+    try expectContains(e.text, "return b;");
+    try expectAbsent(e.text, "cell_drop_Box(&b);");
+}
+
+test "R11 row 2: an uninitialized droppable struct var is zero-initialized, then released" {
+    // Same rule as the three runtime shapes: the glue over a zeroed record is
+    // three no-ops, so the scope-end drop is safe before the first write.
+    var e = try emitSource(
+        \\struct Box { owned s: String, copy n: Int }
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  var owned b: Box
+        \\  b = Box { s: make(), n: 1 }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_Box b = (cell_Box){0};");
+    try expectContains(e.text, "cell_drop_Box(&b);");
 }
 
 test "a shared or copy local is never dropped" {
@@ -5478,10 +5696,12 @@ test "a returned arc field survives the caller releasing it, compiled and run" {
     // crash: broken, it still exits 0 and AddressSanitizer stays silent,
     // because nothing dereferences the record's now-dangling field
     // afterwards. Reaching the actual use-after-free takes a second `peek`
-    // (see the task report's F4). And it does not show a clean heap: the
-    // record's own reference is never released, since this backend does not
-    // drop a `record` shape, so this program ends with the box alive at
-    // count 1. That is the disclosed struct-field leak, and it is why
+    // (see the task report's F4). And when this was written it did not show
+    // a clean heap either: the record's own reference was never released,
+    // since this backend did not drop a `record` shape, so the program ended
+    // with the box alive at count 1. Since 2026-09-15 row 2's glue releases
+    // it and `examples/arc_return_field.cell` measures 0 on both witnesses
+    // under the gate's recipe; the sentence is kept because it is why
     // `examples/arc.cell` rather than this test carries the zero-leak
     // evidence. It is also the correct side of the asymmetry: before the
     // retain, the same program left the record pointing at a box the
@@ -6161,11 +6381,15 @@ test "a by-value binding of an owning header keeps the loud reference spelling" 
 
 test "the owning-header guard is keyed on the drop call, so records still copy" {
     // The guard's boundary, both sides in one module. A record has no drop
-    // call, so a by-value binding of a borrowed record is a real copy and
-    // defect 3 stays fixed; a String has one, so the same spelling keeps the
-    // reference. Pinned together because widening the guard to every shape
-    // would silently reinstate the alias this whole change removes, and
-    // narrowing it to none would reinstate the double free above.
+    // CALL (`hasDropCall`), so a by-value binding of a borrowed record is a
+    // real copy and defect 3 stays fixed; a String has one, so the same
+    // spelling keeps the reference. Pinned together because widening the
+    // guard to every shape would silently reinstate the alias this whole
+    // change removes, and narrowing it to none would reinstate the double
+    // free above. Since R11 row 2 a record CAN be dropped, through
+    // `needsDrop`; this guard deliberately still keys on `hasDropCall`, which
+    // is why that predicate was added beside it rather than widened. The
+    // `Buffer` here is scalar-only, so it is copyable under R12's clause too.
     var e = try emitSource(
         \\pub struct Buffer { copy len: Int }
         \\pub fn make_text() -> String;
@@ -6254,10 +6478,14 @@ test "row 5: a struct literal field of declared type String converts" {
     );
     defer e.deinit();
     try expectContains(e.text, ".name = cell_string_from_str(cell_str_from_parts(\"ab\", 2))");
-    // A record has no generated drop, so the field's buffer is never freed.
-    // Pinned rather than left implicit: this is a disclosed leak, and the
-    // test would be lying if it read as though the field were managed.
+    // The field's buffer is freed through the record's generated glue (R11
+    // row 2), never by name: `cell_string_free(&b...)` is still absent, and
+    // until 2026-09-15 that absence was the whole assertion, which would have
+    // kept passing after the glue landed while its comment called the field
+    // unmanaged. Both halves are pinned now.
     try expectAbsent(e.text, "cell_string_free(&b");
+    try expectContains(e.text, "cell_drop_B(&b);");
+    try expectContains(e.text, "  cell_string_free(&r->name);\n");
 }
 
 test "row 6: an assignment's right side converts, with the only literal on the assignment" {

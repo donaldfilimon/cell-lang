@@ -1176,8 +1176,57 @@ section carries that count and is the authority for it.
 | Gap | Evidence |
 |---|---|
 | A Cell body never releases its own `arc` parameter (no parameter is dropped), so every call-site retain into one leaks a reference | by construction; `examples/arc_host.c` is the ABI-correct contrast, and `examples/arc.cell` reports 0 leaks because of it |
-| A struct holding an `arc` field is never dropped, so rule 4's retain leaks | `record` shapes are excluded from `hasDropCall` |
 | An `owned` String or list PLACE bound as `arc` (**the reverse direction**; `arc` into `owned` is refused outright by R10 above) is not boxed at all, and is left as a C type error rather than a silent double free | see retain rule 1 above. Re-measured: `let arc b = a` with an `owned` String `a` still emits `cell_arc_t b = a;` and `cc` rejects it, `initializing 'cell_arc_t' with an expression of incompatible type 'cell_string_t'` |
+
+**CLOSED (row 2), and gone from the table above.** A struct holding an `arc`
+field was never dropped, so rule 4's retain leaked: `examples/leaks/struct_arc_field.cell`
+pinned it at **3000 over 1000 iterations** on both witnesses. Closed
+2026-09-15 (late night) by per-struct drop glue in `codegen.zig`: every struct
+with an `owned` or `arc` field whose lowered type needs a drop gets a generated
+`static inline __attribute__((unused)) void cell_drop_<Name>(cell_<Name> *r)`
+after the typedefs, prototypes first and definitions second so a nested
+record's glue resolves whatever order the structs were written in, releasing
+its owning fields in reverse declaration order and recursing into nested
+records. A droppable local of that type is released through it at scope end,
+and a droppable `var` of that type declared without an initializer is
+zero-initialized so the glue is a no-op before the first write. The predicate
+is `needsDrop`, deliberately separate from `hasDropCall`, because that one
+also keys the owning-header guard that makes a record COPY into a slot and a
+test pins that behaviour. The attribute is measured, not cautious: clang's
+`-Wunused-function` fires on an unused `static inline` in the defining file,
+and a struct that is declared but never constructed (`examples/arc.cell`'s
+`Session`) leaves its glue uncalled.
+
+Measured under AddressSanitizer with the malloc counter, every program below
+exits 0, and each has a control at the commit before the glue: the fixture
+3000/3000/0 (control 3000/0/3000); `examples/arc_return_field.cell` 3/3/0
+(control 3/0/3), so the label, the struct's clone and the two `peek` clones
+now balance; an `owned String` field 1/1/0; a nested `Outer { owned inner:
+Box, arc tag }` 4/4/0; a struct returned fresh 1/1/0; a struct returned as a
+moved local 1/1/0; an uninitialized `var owned b: Box` 1/1/0. Two shapes
+still leak by design and are stated: a struct moved into an `owned` parameter
+1/0/1 (the callee never drops a parameter, which is row 1's shape), and a
+struct with one field moved out 1/0/1 (borrowck marks the whole binding moved
+on a partial move, so the record is skipped entirely, which leaks any second
+owning field rather than freeing the moved one twice). A field STORE still
+does not pre-drop the old value, as before.
+
+**What had to land first, and why it is part of this closure.** Dropping a
+record turns every bitwise alias of its fields that outlives it from a leak
+into a use-after-free or double free. Three such aliases were accepted by
+borrowck: a `copy` binding of a resource-bearing record, direct or through an
+exclusive borrow, and a `copy` parameter of one (R12's binding and parameter
+clauses, `c314a0e`). A fourth, an `owned` place in a list-literal element, was
+already a MEASURED heap-use-after-free for `String` (R2's list-element clause,
+same commit). Both refusals are described under their own rules.
+
+**A typedef-order gap, found while placing the glue and recorded rather than
+fixed.** `struct A { owned b: B }` followed by `struct B { ... }` passes
+`cell check`, and the emitted typedefs come out in source order, so `cell_A`
+names `cell_B` before it exists and `cc` refuses the file
+(`unknown type name 'cell_B'`). That predates the glue and the glue cannot
+make it worse, since its prototypes and definitions all follow every typedef;
+it is its own gap in the C backend's declaration ordering.
 
 **CLOSED (row 5), and gone from the table above.** Reassigning an `arc` `var`
 (`var arc v = "one"` then `v = "two"`) leaked the previous box: `leaks` read 3
@@ -1790,14 +1839,7 @@ ways, and each is a real, documented gap rather than an oversight:
   would free under that element. Closing it needs the list-element read to
   become a tracked alias or a move, not a drop insertion.
 
-Also out of scope: a `struct` with owning fields is never destroyed (its
-fields would need a generated per-struct drop function, a separate task),
-and a parameter is never dropped (its value's ownership already transferred
-to this function's *caller*'s intent, and only the function that consumed it
-by moving it further would be the one to drop it -- which nothing here does
-yet either, so a value moved into a function call also leaks today). R16 is
-therefore **not complete**: what changed is that Cell no longer leaks
-*every* `owned`/`arc` local unconditionally, not that it now leaks none.
+Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. What remains out of scope is the partial-move case: a struct with one field moved out is skipped entirely rather than having its remaining owning fields released.
 
 ### R17. Double free is prevented by R2, not by a runtime check
 

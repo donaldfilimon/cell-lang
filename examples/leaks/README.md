@@ -24,7 +24,7 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | Fixture | R11 row |
 |---|---|
 | `param_never_released.cell` | 1: a Cell body never releases its own `arc` parameter |
-| `struct_arc_field.cell` | 2: a struct holding an `arc` field is never dropped |
+| `struct_arc_field.cell` | 2: a struct holding an `arc` field was never dropped. CLOSED 2026-09-15 by per-struct drop glue, pinned at 0 |
 | `unbound_shared_temp.cell` | 3: an unbound `arc` temporary unboxed for a `shared` parameter |
 | `block_scoped_local.cell` | 4: a block-scoped `arc` local is never released; **CLOSED 2026-09-15**, kept and pinned at 0 |
 | `reassigned_var.cell` | 5: reassigning an `arc` `var` leaked the previous box; **CLOSED 2026-09-15** by the reassignment pre-drop in `emitAssign`, kept and pinned at 0 |

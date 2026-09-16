@@ -42,7 +42,7 @@
 #                       examples/leaks/*.cell isolates each measurable gap in
 #                       its own program (six fixtures since 2026-09-15: the
 #                       value-position block residual joined the five, and
-#                       FOUR of the six are closed and pinned at 0). THESE FIXTURES ASSERT LEAKS THAT
+#                       FIVE of the six are closed and pinned at 0). THESE FIXTURES ASSERT LEAKS THAT
 #                       CURRENTLY EXIST, ON PURPOSE: that is the entire value.
 #                       A later change that closes one of R11's gaps makes a
 #                       pinned number here go DOWN, which is visible instead
@@ -275,8 +275,25 @@ LEAKS_MEASURED_AT=82f222e903afdd01cdc9a384a000ffc2a8df70cc
 
 # R11 row 1: a Cell body never releases its own `arc` parameter.
 LEAK_PARAM_NEVER_RELEASED=3000
-# R11 row 2: a struct holding an `arc` field is never dropped.
-LEAK_STRUCT_ARC_FIELD=3000
+# R11 row 2: a struct holding an `arc` field was never dropped.
+# CLOSED 2026-09-15 (late night): every struct with an `owned` or `arc` field
+# whose lowered type needs a drop gets a generated
+# `static inline __attribute__((unused)) void cell_drop_<Name>(cell_<Name> *r)`
+# after the typedefs (prototypes first, then definitions, so nesting order does
+# not matter), and a droppable local of that type is released through it by
+# `pendingDrops`. The predicate is `needsDrop`, kept separate from
+# `hasDropCall` because that one also keys the owning-header guard that makes
+# records COPY into a slot. Two borrowck refusals landed first in c314a0e as
+# preconditions: a `copy` binding or parameter of a resource-bearing type
+# (three accepted routes would each have become a double free the day this
+# glue landed), and an `owned` resource-bearing place in a list element (a
+# MEASURED live heap-use-after-free for `String`, independent of this row).
+# The gate went red on the old pin first ("both witnesses agree ... 0"), then
+# the constant moved. A struct with one field moved out is still never
+# dropped (borrowck marks the whole binding moved), which leaks rather than
+# double-frees; that and the field-store pre-drop are the stated residuals.
+# Stays pinned at 0: any nonzero reading here re-opens row 2.
+LEAK_STRUCT_ARC_FIELD=0
 # R11 row 3: an `arc` value unboxed for a `shared` parameter without ever
 # being bound (`inspect(shared fresh())`) drops its handle on the floor.
 # This is the one row whose count matches docs/OWNERSHIP.md's own prose
@@ -798,7 +815,7 @@ else
     }
 
     run_c_leaks param_never_released "" "$LEAK_PARAM_NEVER_RELEASED" "R11 row 1 @ ${LEAKS_MEASURED_AT}"
-    run_c_leaks struct_arc_field "" "$LEAK_STRUCT_ARC_FIELD" "R11 row 2 @ ${LEAKS_MEASURED_AT}"
+    run_c_leaks struct_arc_field "" "$LEAK_STRUCT_ARC_FIELD" "R11 row 2, CLOSED 2026-09-15"
     run_c_leaks unbound_shared_temp examples/arc_host.c "$LEAK_UNBOUND_SHARED_TEMP" "R11 row 3, CLOSED @ 460b9a3"
     run_c_leaks block_scoped_local "" "$LEAK_BLOCK_SCOPED_LOCAL" "R11 row 4, CLOSED 2026-09-15"
     run_c_leaks reassigned_var "" "$LEAK_REASSIGNED_VAR" "R11 row 5, CLOSED 2026-09-15"

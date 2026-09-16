@@ -31,11 +31,14 @@
 // Measured against the compiler at `99d2971^`: exit 134, "AddressSanitizer:
 // heap-use-after-free". Do not "simplify" this file down to one call.
 //
-// The struct's own reference is never released, because R11 row 2 discloses
-// that a struct holding an `arc` field is never dropped. That leak is a known,
-// measured gap with its own fixture in examples/leaks/, not something this
-// file is trying to fix; leaking is the safe side of the error, and the point
-// here is that the program no longer DANGLES.
+// The struct's own reference was never released while R11 row 2 was open (a
+// struct holding an `arc` field was never dropped), so this file used to end
+// with the box alive. Since 2026-09-15 row 2's generated `cell_drop_Session`
+// releases it at `main`'s end, and the arithmetic balances: the label's box,
+// the struct's clone and the two `peek` clones all come back, 3 allocations
+// and 3 frees under the gate's malloc counter, 0 live (it was 3/0/3 on the
+// tree before the glue). The point here is still that the program does not
+// DANGLE; that it is now also leak-free is row 2's closure, measured here.
 //
 // The printed value is `s.id`, a plain 7, and it is deliberately not the thing
 // under test. What this file measures is whether the program is memory-safe,

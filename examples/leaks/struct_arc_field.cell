@@ -1,10 +1,14 @@
-// R11 gap 2 (docs/OWNERSHIP.md, "Still broken" table, row 2): a struct
-// holding an `arc` field is never dropped, so rule 4's retain (boxing the
-// literal into `name`, `cell_arc_clone`/`cell_arc_from_string` at the
-// struct-literal field) leaks. `record` shapes are excluded from
-// `hasDropCall` outright, so this holds no matter what ownership the
-// STRUCT binding itself carries (`owned Session` here; `codegen.zig` never
-// emits a free for it, arc field included).
+// R11 gap 2 (docs/OWNERSHIP.md, formerly "Still broken" table row 2, now a
+// CLOSED paragraph): a struct holding an `arc` field was never dropped, so
+// rule 4's retain (boxing the literal into `name`, `cell_arc_from_string` at
+// the struct-literal field) leaked. `record` shapes were excluded from
+// `hasDropCall` outright, so it held no matter what ownership the STRUCT
+// binding carried. CLOSED 2026-09-15 (late night): `codegen.zig` now emits
+// `cell_drop_Session(cell_Session *r)` glue after the typedef and releases
+// `sess` through it at the end of every iteration, so this measures 0 on
+// both witnesses (it was 3000 on both, through the same host and counter,
+// on the tree before the glue). It stays in the gate BECAUSE it is closed:
+// pinned at 0, any nonzero reading re-opens row 2.
 //
 // This fixture avoids binding a separate `arc` local: `name` is boxed
 // directly from a string literal in the struct literal (BOX, R11 retain

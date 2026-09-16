@@ -64,7 +64,11 @@ pub fn main() {
 // See examples/rejected/arc_mutation.cell.
 //
 // `Session` is declared and not constructed on purpose. Its `arc name` field
-// shows the struct lowering (`cell_arc_t name;`), but a struct is not dropped
-// by this backend at all, so building one here would leak the field's retain
-// and spoil the refcount arithmetic this file is measuring. The struct-field
-// retain of R11 rule 4 is covered by a codegen test instead.
+// shows the struct lowering (`cell_arc_t name;`), and since 2026-09-15 also
+// the generated drop glue (`cell_drop_Session`), which is emitted for a
+// declared struct whether or not the module constructs one; that uncalled
+// glue is exactly why the glue is `__attribute__((unused))`, and this file's
+// clean `-Werror` compile in the gate's corpus stage is the pin for it.
+// Not constructing one here keeps the refcount arithmetic this file measures
+// about the label alone. The struct-field retain of R11 rule 4 is covered by
+// a codegen test instead.
