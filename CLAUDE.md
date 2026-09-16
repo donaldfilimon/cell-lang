@@ -137,11 +137,12 @@ in explains most surprises:
   Retains reach two kinds of position by two deliberately different routes,
   and the split is not accidental: `emitArcConversion` is **type-directed** and
   serves argument and value slots, while `returnedArcNeedsRetain` is a
-  **position policy** for `return`, which alone carries R11's exception that a
-  returned parameter must not be retained. Do not "simplify" these into one
-  function; that exception is a fact about the position, not the type, and
-  merging them means passing a mode flag into a clean type-directed
-  conversion.
+  **position policy** for `return`: it retains every returned `arc` place,
+  including a match-arm binding whose `droppable` is false. It carried a
+  parameter exemption until R11 row 1 closed on 2026-09-16, when parameters
+  began to be released. Do not "simplify" these into one function; the
+  return answer is a fact about the position, not the type, and merging them
+  means passing a mode flag into a clean type-directed conversion.
 - **`--target=llvm` and `--target=mlir` go through `hir.lower`** and are
   deliberately **scalar-first**. They refuse `String`, `[T]`, `T?`, `Result`,
   `arc`, and most aggregates crossing the C boundary with a `cannot lower`

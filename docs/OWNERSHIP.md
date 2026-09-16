@@ -917,9 +917,10 @@ buffer the source still frees. Proved by building it that way: with an owned
 LOCAL rather than a parameter, `let owned s = make()` then
 `let arc a = match 1 { _ => s }` emitted `cell_arc_from_string(...)` followed by
 `cell_string_free(&s)` and died under AddressSanitizer, `exit 134`,
-`attempting double-free ... in cell_string_free`. A parameter hides it, because
-parameters are not released today (R11 row 1), which is why the first probes
-looked clean.
+`attempting double-free ... in cell_string_free`. A parameter hid it, because
+parameters were not released then (R11 row 1, closed 2026-09-16), which is why
+the first probes looked clean; with row 1 closed a parameter source would fail
+the same way, so the refusal below now guards parameters as well.
 
 So the `cc` error was the only thing holding those programs back, exactly as it
 was for the match-arm inference gap closed in `fc4c81d` the same night. This is
@@ -927,10 +928,11 @@ the second time in one session that a front-end gap was masked by a back-end
 error; closing the back end first would have made the language less safe both
 times.
 
-Implementing the move means deciding who releases the box, which is the same
-question as who releases an `arc` parameter: **R11 row 1**, an ABI change to
-`runtime/cell_rt.h` section 7 and every host. So this refuses and says
-"not implemented", at five positions rather than the sweep's four rows: a
+Implementing the move means consuming the source when it is boxed, which the
+checker does not do today. Who releases the box was the other half, and R11
+row 1 answered it on 2026-09-16 (the holder releases it, a callee included,
+exactly as `runtime/cell_rt.h` section 7 already said); releasing a box does not
+box a place, so the refusal stands. It refuses and says "not implemented", at five positions rather than the sweep's four rows: a
 binding, an assignment, a call argument, a struct-literal field, and a return.
 The last two are not in the sweep at all and were found by probing positions
 instead of rows, which is the discipline this rule's own text asks for.
@@ -1243,8 +1245,41 @@ section carries that count and is the authority for it.
 
 | Gap | Evidence |
 |---|---|
-| A Cell body never releases its own `arc` parameter (no parameter is dropped), so every call-site retain into one leaks a reference | by construction; `examples/arc_host.c` is the ABI-correct contrast, and `examples/arc.cell` reports 0 leaks because of it |
 | An `owned` String or list PLACE bound as `arc` (**the reverse direction**; `arc` into `owned` is refused outright by R10 above) is not boxed at all, and is left as a C type error rather than a silent double free | see retain rule 1 above. Re-measured: `let arc b = a` with an `owned` String `a` still emits `cell_arc_t b = a;` and `cc` rejects it, `initializing 'cell_arc_t' with an expression of incompatible type 'cell_string_t'` |
+
+**CLOSED (row 1), and gone from the table above.** A Cell body never
+released its own `arc` parameter, because no parameter was dropped, so every
+call-site retain into one leaked a reference; `owned` parameters leaked the
+same way. `examples/leaks/param_never_released.cell` pinned it at **3000 over
+1000 iterations** on both witnesses. Closed 2026-09-16 in `codegen.zig`, and
+the answer was already written down: `runtime/cell_rt.h` section 7 says an
+`owned` argument is one the callee frees and an `arc` argument is one the
+callee releases, so the fix is the callee doing it rather than a new ABI.
+`emitFn` now admits every parameter to the drop pass, where the existing
+filters decide (an `owned` or `arc` annotation, and `wasMoved`), so a
+`shared` or `copy` parameter is still never released and a parameter moved
+onward, returned, or rebound is left to its new holder. Every accepted route
+by which an `owned` parameter can escape goes through `movePlace`: a direct
+return, a block tail, a `let`, and a call argument were each checked, and a
+struct-literal field, a list element, and a branch are refused outright. The
+second half is `returnedArcNeedsRetain`, which lost its one exception: a
+returned `arc` parameter is no longer the caller's reference handed back, so
+it is retained and then released at scope end, 1 -> 2 -> 1, the same as a
+local. `Local.is_param` existed only for that exception and went with it.
+
+Measured with both witnesses and under AddressSanitizer, each against the
+binary before the change: the fixture 3000 -> 0; a matrix of parameter shapes
+(`arc` returned directly, passed onward, rebound then returned, used as a
+`match` scrutinee; `owned` passed onward, returned directly, returned through a
+block tail, rebound then returned, consumed; a struct with two owning fields
+passed whole and with one field moved out) 900 -> 0, ASan clean, and its
+printed sum fell from 2800 to 1800 because the strong counts `observe` reports
+are no longer inflated by leaked references (1800 is the hand-derived answer);
+R10's accepted neighbours from `c6ddda3` (`let arc a = p` over an `arc` and a
+`shared` parameter, a fresh value, a branch of fresh values) 300 -> 0, ASan
+clean. The struct moved into an `owned` parameter that row 2 below records as
+1/0/1 is inside that matrix and now measures 0. `examples/arc.cell` still
+prints 13 and `examples/owned_string.cell` 44, both ASan clean.
 
 **CLOSED (row 2), and gone from the table above.** A struct holding an `arc`
 field was never dropped, so rule 4's retain leaked: `examples/leaks/struct_arc_field.cell`
@@ -1272,8 +1307,9 @@ exits 0, and each has a control at the commit before the glue: the fixture
 now balance; an `owned String` field 1/1/0; a nested `Outer { owned inner:
 Box, arc tag }` 4/4/0; a struct returned fresh 1/1/0; a struct returned as a
 moved local 1/1/0; an uninitialized `var owned b: Box` 1/1/0. One shape
-still leaks by design and is stated: a struct moved into an `owned` parameter
-1/0/1 (the callee never drops a parameter, which is row 1's shape). A field
+still leaked by design then: a struct moved into an `owned` parameter 1/0/1
+(the callee never dropped a parameter, which was row 1's shape, closed
+2026-09-16 above). A field
 STORE still does not pre-drop the old value, as before.
 
 **The partial-move residual is CLOSED (2026-09-16).** It read: a struct with

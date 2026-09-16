@@ -5803,7 +5803,7 @@ test "R10's other direction: an owned place may not be moved into an arc box, at
     // look like a backend typing bug. It is not: the checker does not consume
     // the source, so boxing the place hands the box a buffer the source still
     // frees. Measured before the refusal existed, with an owned LOCAL rather
-    // than a parameter, because parameters are not released today and hid it:
+    // than a parameter, because parameters were not released then and hid it:
     // `let owned s = make()` then `let arc a = match 1 { _ => s }` emitted
     // `cell_arc_from_string(...)` and `cell_string_free(&s)` and died
     // `exit 134`, `attempting double-free ... in cell_string_free`.

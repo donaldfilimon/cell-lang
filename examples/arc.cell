@@ -39,9 +39,10 @@ pub fn observe(arc name: String) -> Int;
 /// A returned `arc` is returned already retained: the caller owns that
 /// reference and must release it. See docs/OWNERSHIP.md R11.
 ///
-/// This body returns its own parameter, so the caller's call-site retain is
-/// the reference handed back and nothing extra is emitted here. R11 rule 3
-/// holds by construction: a parameter is never dropped.
+/// This body returns its own parameter. Since R11 row 1 closed (2026-09-16)
+/// the parameter is released at scope end like any `arc` local, so the
+/// return takes a retain first: 1 -> 2 -> 1, and the caller owns the one
+/// reference left, which is R11 rule 3.
 pub fn share_name(arc name: String) -> arc String {
     return name
 }

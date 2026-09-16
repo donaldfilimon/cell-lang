@@ -283,8 +283,17 @@ trap 'rm -rf "$TMP"' EXIT
 # the sixth fixture). The gate re-verified every pin on each of those trees.
 LEAKS_MEASURED_AT=82f222e903afdd01cdc9a384a000ffc2a8df70cc
 
-# R11 row 1: a Cell body never releases its own `arc` parameter.
-LEAK_PARAM_NEVER_RELEASED=3000
+# R11 row 1: a Cell body never released its own `arc` parameter.
+# CLOSED 2026-09-16: `emitFn` admits every parameter to the drop pass, which
+# still filters on an `owned` or `arc` annotation and on `wasMoved`, so the
+# callee releases what runtime/cell_rt.h section 7 already said it owns, and
+# `returnedArcNeedsRetain` lost its parameter exemption (a returned parameter
+# is now retained, then released at scope end, 1 -> 2 -> 1). Measured 3000 ->
+# 0 on both witnesses through this stage's host and counter. The `owned`
+# half closed with it, and R10's refusal of an owned place moved into an
+# `arc` box stays: releasing a box and boxing a place are separate jobs.
+# Pinned at 0 because it is closed: any nonzero reading re-opens row 1.
+LEAK_PARAM_NEVER_RELEASED=0
 # R11 row 2: a struct holding an `arc` field was never dropped.
 # CLOSED 2026-09-15 (late night): every struct with an `owned` or `arc` field
 # whose lowered type needs a drop gets a generated
@@ -299,9 +308,10 @@ LEAK_PARAM_NEVER_RELEASED=3000
 # glue landed), and an `owned` resource-bearing place in a list element (a
 # MEASURED live heap-use-after-free for `String`, independent of this row).
 # The gate went red on the old pin first ("both witnesses agree ... 0"), then
-# the constant moved. A struct with one field moved out is still never
-# dropped (borrowck marks the whole binding moved), which leaks rather than
-# double-frees; that and the field-store pre-drop are the stated residuals.
+# the constant moved. A struct with one field moved out was still never
+# dropped then (borrowck marked the whole binding moved), which leaked rather
+# than double-freed; that residual closed 2026-09-16 (LEAK_PARTIAL_MOVE_FIELD
+# below), and the field-store pre-drop is the one still stated.
 # Stays pinned at 0: any nonzero reading here re-opens row 2.
 LEAK_STRUCT_ARC_FIELD=0
 # R11 row 3: an `arc` value unboxed for a `shared` parameter without ever
@@ -839,7 +849,7 @@ else
         fi
     }
 
-    run_c_leaks param_never_released "" "$LEAK_PARAM_NEVER_RELEASED" "R11 row 1 @ ${LEAKS_MEASURED_AT}"
+    run_c_leaks param_never_released "" "$LEAK_PARAM_NEVER_RELEASED" "R11 row 1, CLOSED 2026-09-16"
     run_c_leaks struct_arc_field "" "$LEAK_STRUCT_ARC_FIELD" "R11 row 2, CLOSED 2026-09-15"
     run_c_leaks unbound_shared_temp examples/arc_host.c "$LEAK_UNBOUND_SHARED_TEMP" "R11 row 3, CLOSED @ 460b9a3"
     run_c_leaks block_scoped_local "" "$LEAK_BLOCK_SCOPED_LOCAL" "R11 row 4, CLOSED 2026-09-15"

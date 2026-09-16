@@ -41,15 +41,17 @@
 //! `emitModule` runs one `borrowck.Checker` over the whole module before
 //! emitting anything, and every `Local` records the id `Checker.declare`
 //! assigned to the SAME source declaration, so `Checker.wasMoved` can be
-//! asked directly. A parameter is never dropped (its owner is the caller
-//! that made this call, and the CALLEE it was moved into is a different
-//! function's problem -- see `Local.droppable`); neither is a match-arm
-//! binding (its C value is a bitwise copy of the scrutinee temporary, and
-//! dropping it risks freeing whatever the scrutinee itself still owns). A
-//! `record` (struct) shape IS dropped since 2026-09-15 (R11 row 2): every
-//! struct with an `owned` or `arc` field whose lowered type needs a drop
-//! gets a generated `static inline void cell_drop_<Name>(cell_<Name> *r)`
-//! after the typedefs, and a local of that type is released through it.
+//! asked directly. An `owned` or `arc` parameter IS dropped since
+//! 2026-09-16 (R11 row 1): `runtime/cell_rt.h` section 7 makes the callee
+//! responsible for both, so a parameter enters the pass exactly like a
+//! `let`, and a parameter moved onward is skipped by the same `wasMoved`
+//! check. A match-arm binding is never dropped (its C value is a bitwise
+//! copy of the scrutinee temporary, and dropping it risks freeing whatever
+//! the scrutinee itself still owns). A `record` (struct) shape IS dropped
+//! since 2026-09-15 (R11 row 2): every struct with an `owned` or `arc`
+//! field whose lowered type needs a drop gets a generated
+//! `static inline void cell_drop_<Name>(cell_<Name> *r)` after the
+//! typedefs, and a local of that type is released through it.
 //! The predicate is `needsDrop`, deliberately separate from `hasDropCall`
 //! (see that function's comment for why widening it would be wrong).
 //!
@@ -160,8 +162,9 @@
 //!
 //! Known gaps, every one of them MEASURED as a leak with `leaks` rather than
 //! argued to be one (`docs/OWNERSHIP.md` R11 carries the numbers): a Cell
-//! body never releases its own `arc` parameter, because no parameter is
-//! dropped, so every call-site retain into one leaks a reference; a struct
+//! body never released its own `arc` parameter, because no parameter was
+//! dropped, so every call-site retain into one leaked a reference (CLOSED
+//! 2026-09-16, pinned at 0 in the gate); a struct
 //! holding an `arc` field was never dropped, so the field's retain leaked
 //! (CLOSED 2026-09-15 by per-struct drop glue, pinned at 0 in the gate); an
 //! `arc` value unboxed for a `shared` parameter without ever being bound
@@ -291,30 +294,20 @@ const Local = struct {
     /// The id borrowck assigned to this exact declaration. See the module
     /// doc comment's id-numbering agreement.
     id: u32,
-    /// True only for a `let`/`var` local. False for a parameter and for a
-    /// match-arm binding, both of which are excluded from dropping for
-    /// reasons the module doc comment gives; kept separate from the
-    /// `ownership` check because a parameter can itself be `owned` and
-    /// must still never be dropped.
+    /// True for a `let`/`var` local and for a parameter (R11 row 1). False
+    /// for a match-arm binding, which the module doc comment excludes from
+    /// dropping, and cleared by `pushLocal` when it cannot positively confirm
+    /// a binding id. Only a candidate: `pendingDropsSince` still requires an
+    /// `owned` or `arc` annotation and an unmoved place.
+    ///
+    /// This is not a return-retain question. A match-arm binding is
+    /// undroppable and is still retained when returned, because it is a
+    /// bitwise copy of a scrutinee this function may be releasing. A field
+    /// named `is_param` once carried that distinction, and removing it on a
+    /// derivation that missed the BLOCK arm body (`match s { b => { return b }
+    /// }`) reopened a use-after-free; since R11 row 1 no declared binding
+    /// is exempt from the retain, so the field went away with the exemption.
     droppable: bool,
-    /// True for a parameter alone. It is NOT the negation of `droppable`,
-    /// and the difference is a use-after-free, measured twice.
-    ///
-    /// A match-arm binding is undroppable too, and it is a bitwise copy of a
-    /// scrutinee this function may itself be about to release, so returning
-    /// it without a retain dangles. An earlier revision REMOVED this field
-    /// after deriving that a match-arm binding could not reach
-    /// `returnedArcNeedsRetain`. That derivation tested two forms of an arm
-    /// body, `b => b` and a trailing `match`, and missed the third: an arm
-    /// body may be a BLOCK, and a block's contents are statements, so
-    /// `match s { b => { return b } }` parses, passes `cell check`, and
-    /// reached the ident branch. Enumerate the forms of a construct before
-    /// asserting a property of all of them.
-    ///
-    /// `pushLocal` also clears `droppable` when it cannot positively confirm
-    /// a binding id, so `!droppable` conflates three unrelated conditions and
-    /// only one of them is R11 rule 3's exception.
-    is_param: bool = false,
 };
 
 /// Where a value-position `if`, `match`, or `block` must leave its result,
@@ -678,9 +671,11 @@ pub const Generator = struct {
         self.current_fn = f.name;
         self.current_ret_ty = if (f.return_type) |rt| try self.lowerType(&rt, .owned) else CType.void_type;
         for (f.params) |p| {
-            // Decision: a parameter is never dropped (see the module doc
-            // comment), regardless of its own ownership annotation.
-            try self.pushLocal(p.name, try self.lowerType(&p.ty, p.ownership), p.ownership, false, true);
+            // An `owned` or `arc` parameter is the callee's to release
+            // (runtime/cell_rt.h section 7), so it enters the drop pass like
+            // a `let`; `pendingDropsSince` still filters on its ownership and
+            // on `wasMoved`. R11 row 1, closed 2026-09-16.
+            try self.pushLocal(p.name, try self.lowerType(&p.ty, p.ownership), p.ownership, true);
         }
 
         try self.writeSignature(f);
@@ -806,7 +801,7 @@ pub const Generator = struct {
                     try out.print(" = ({s}){{0}}", .{ty.text});
                 }
                 try out.writeAll(";\n");
-                try self.pushLocal(l.name, ty, l.ownership, true, false);
+                try self.pushLocal(l.name, ty, l.ownership, true);
                 // -Wunused-variable is part of -Wall.
                 if (!stmtsUse(rest, l.name)) {
                     try self.writeIndent(indent);
@@ -1343,18 +1338,18 @@ pub const Generator = struct {
     /// returned `arc` is returned ALREADY RETAINED, and the caller owns that
     /// reference and must release it).
     ///
-    /// The rule is stated as an exception rather than as a list, because a
-    /// list is what got this wrong the first time. **Retain every returned
-    /// `arc` place except a parameter returned directly.** A parameter is
-    /// the one reference this frame received pre-retained from its caller
-    /// and hands straight back, so cloning it would leak. Everything else
-    /// belongs to something that outlives this return or that this return is
-    /// about to release:
+    /// The rule has no exception since R11 row 1 closed (2026-09-16):
+    /// **retain every returned `arc` place this function can name.** Until
+    /// then a PARAMETER returned directly was exempt, because no parameter
+    /// was released and its caller's retain was the reference handed back.
+    /// Now a parameter is released at scope end like any local, so it takes
+    /// the local's argument below. Every returned place belongs to something
+    /// that outlives this return or that this return is about to release:
     ///
-    ///   - a LOCAL is always still in `pendingDrops`, because borrowck never
-    ///     makes an `arc` place dead (`isDuplicable`, R10 by design), so the
-    ///     drop would run between the return temporary and the `return`.
-    ///     Retaining is exactly balanced: 1 -> 2 -> 1.
+    ///   - a LOCAL or a PARAMETER is always still in `pendingDrops`, because
+    ///     borrowck never makes an `arc` place dead (`isDuplicable`, R10 by
+    ///     design), so the drop would run between the return temporary and
+    ///     the `return`. Retaining is exactly balanced: 1 -> 2 -> 1.
     ///   - a FIELD (`s.name`, `s->name`) belongs to the record, which this
     ///     backend did not drop when this was written (it does now, through
     ///     R11 row 2's glue, and the argument below is unchanged by that: the
@@ -1371,25 +1366,20 @@ pub const Generator = struct {
     ///   - a MATCH-ARM binding is a bitwise copy of a scrutinee this
     ///     function may itself be dropping, so it is a local in every way
     ///     that matters here even though `droppable` is false for it. This
-    ///     is why the exception tests `is_param` and NOT `!droppable`.
+    ///     is why the answer never consults `droppable`.
     ///
     /// **That last case was once thought unreachable, and removing the
-    /// distinction on that belief reopened a use-after-free.** An arm body
-    /// can be a BLOCK, and a block's contents are statements, so
+    /// exception's guard on that belief reopened a use-after-free.** An arm
+    /// body can be a BLOCK, and a block's contents are statements, so
     /// `match s { b => { return b } }` parses and reaches here; a nested `if`
     /// inside such a block is a second form. The two forms that ARE rejected
     /// (`b => return b`, since `return` is not an expression, and a trailing
     /// `match`, which is not a return) are the two the earlier derivation
     /// tested. Both regression forms now have tests.
     ///
-    /// **The cost of restoring it, stated rather than left implicit.** When
-    /// the scrutinee is an `arc` PARAMETER, the arm binding copies a
-    /// reference this function never releases, so a bare return would have
-    /// been correct and the clone leaks one reference instead. That is the
-    /// safe side of the asymmetry and the trade is deliberate: the same
-    /// binding shape dangles when the scrutinee is a local, and codegen
-    /// cannot tell the two apart here without tracking the scrutinee's own
-    /// place through the arm.
+    /// The leak this once cost (an arm binding over an `arc` PARAMETER was
+    /// cloned while the parameter was never released) closed with R11 row 1:
+    /// the parameter is released now, so the clone is exactly balanced.
     fn returnedArcNeedsRetain(self: *Generator, v: *const ast.Expr) Alloc!bool {
         const place = unwrapAnnotated(v);
         if (!isPlace(place)) return false;
@@ -1400,7 +1390,7 @@ pub const Generator = struct {
                 var i = self.locals.items.len;
                 while (i > 0) {
                     i -= 1;
-                    if (eq(self.locals.items[i].name, n)) return !self.locals.items[i].is_param;
+                    if (eq(self.locals.items[i].name, n)) return true;
                 }
                 // Not a binding this function declared. Nothing here can be
                 // releasing it, so a retain would only leak; but nothing
@@ -1697,7 +1687,7 @@ pub const Generator = struct {
             // borrowck's own hardcoded assumption for this binding (R7 is
             // not implemented there either); it has no effect while
             // `droppable` is false.
-            try self.pushLocal(name, scrut_ty, .owned, false, false);
+            try self.pushLocal(name, scrut_ty, .owned, false);
             if (!exprUses(arm.body, name)) {
                 try self.writeIndent(indent);
                 try self.writer.print("(void){s};\n", .{name});
@@ -3101,7 +3091,6 @@ pub const Generator = struct {
             .ownership = ownership,
             .id = 0,
             .droppable = false,
-            .is_param = false,
         });
     }
 
@@ -3114,7 +3103,7 @@ pub const Generator = struct {
         return null;
     }
 
-    /// `droppable` is true only from the `let`/`var` call site; see
+    /// `droppable` is true from the `let`/`var` and parameter call sites; see
     /// `Local.droppable`. Assigns the next id from `next_binding_id`,
     /// which must be incremented here and only here, at exactly the three
     /// call sites that mirror borrowck's own `declare` (see the module doc
@@ -3125,7 +3114,6 @@ pub const Generator = struct {
         ty: CType,
         ownership: ast.Ownership,
         droppable: bool,
-        is_param: bool,
     ) Alloc!void {
         const id = self.next_binding_id;
         self.next_binding_id += 1;
@@ -3171,7 +3159,6 @@ pub const Generator = struct {
             .ownership = ownership,
             .id = id,
             .droppable = may_drop,
-            .is_param = is_param,
         });
     }
 
@@ -3623,6 +3610,27 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
         std.debug.print("\nexpected to find:\n{s}\nin:\n{s}\n", .{ needle, haystack });
         return error.NotFound;
     }
+}
+
+/// The definition of one emitted function, from its signature line to its
+/// closing brace, so a text assertion about one body is not satisfied or
+/// broken by another. Since R11 row 1 closed, a callee with an `owned` or
+/// `arc` parameter releases it, so a text-wide `expectAbsent` on a free
+/// also matches every such callee in the same source.
+fn fnDef(haystack: []const u8, name: []const u8) ![]const u8 {
+    var buf: [128]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&buf, " cell_{s}(", .{name});
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, from, needle)) |at| {
+        const eol = std.mem.indexOfScalarPos(u8, haystack, at, '\n') orelse break;
+        if (haystack[eol - 1] == '{') {
+            const end = std.mem.indexOfPos(u8, haystack, eol, "\n}\n") orelse break;
+            return haystack[at .. end + 3];
+        }
+        from = eol;
+    }
+    std.debug.print("\nno definition of cell_{s} in:\n{s}\n", .{ name, haystack });
+    return error.NotFound;
 }
 
 fn expectAbsent(haystack: []const u8, needle: []const u8) !void {
@@ -4437,7 +4445,7 @@ test "a moved value is not dropped" {
         \\}
     );
     defer e.deinit();
-    try expectAbsent(e.text, "cell_string_free");
+    try expectAbsent(try fnDef(e.text, "f"), "cell_string_free");
 }
 
 test "a value moved in one branch of an if is not dropped" {
@@ -4458,7 +4466,7 @@ test "a value moved in one branch of an if is not dropped" {
         \\}
     );
     defer e.deinit();
-    try expectAbsent(e.text, "cell_string_free");
+    try expectAbsent(try fnDef(e.text, "f"), "cell_string_free");
 }
 
 test "a value moved by being returned is not dropped" {
@@ -4682,8 +4690,12 @@ test "an arc place passed to an arc parameter is cloned at the call site" {
     // Written with the `arc n` prefix on purpose: that reaches codegen as an
     // `.annotated` wrapper, and a retain rule that failed to see through it
     // would silently skip the clone at exactly the spelling examples/arc.cell
-    // uses. R11 rule 2.
-    try expectContains(e.text, "return cell_observe(cell_arc_clone(n));");
+    // uses. R11 rule 2. The parameter's own reference is released after
+    // the call (R11 row 1), so the clone is what keeps the callee's alive.
+    const f = try fnDef(e.text, "f");
+    try expectContains(f, "cell_observe(cell_arc_clone(n));");
+    try expectBefore(f, "cell_observe(cell_arc_clone(n));", "cell_arc_drop(n);");
+    try expectOccurrences(f, "cell_arc_drop(n);", 1);
 }
 
 test "an arc place passed to a shared parameter is NOT cloned" {
@@ -4699,10 +4711,10 @@ test "an arc place passed to a shared parameter is NOT cloned" {
     // is the one that catches over-retaining, which the safety asymmetry
     // otherwise encourages, so the absence is asserted explicitly.
     try expectAbsent(e.text, "cell_arc_clone");
-    try expectContains(
-        e.text,
-        "return cell_inspect(cell_string_as_str((const cell_string_t *)n.ptr));",
-    );
+    const call = "cell_inspect(cell_string_as_str((const cell_string_t *)n.ptr));";
+    try expectContains(e.text, call);
+    // The parameter's own release comes after the borrow ends.
+    try expectBefore(e.text, call, "cell_arc_drop(n);");
 }
 
 test "an arc place bound to a new arc binding is cloned, not re-boxed" {
@@ -4820,19 +4832,14 @@ test "an arc place returned where a non-arc type is declared stays a loud C type
     // the box's drop glue frees the same buffer again. A refcount does not
     // govern the buffer, so no retain fixes it.
     //
-    // Returning an `arc` place from an `owned`-returning function is a
-    // make-unique position that R10 does not yet reach, so this C type error
-    // is the only thing refusing it. Keeping it loud is the whole point.
-    try expectContains(e.text,
-        \\cell_slice_t cell_f(cell_arc_t xs) {
-        \\  return xs;
-        \\}
-    );
-    try expectContains(e.text,
-        \\cell_string_t cell_g(cell_arc_t s) {
-        \\  return s;
-        \\}
-    );
+    // borrowck refuses both returns as R10 make-unique positions today,
+    // and this C type error is the second, independent refusal behind it.
+    // Keeping it loud is the whole point. Since R11 row 1 the parameter is
+    // released, so the return goes through a retained temporary, and the
+    // temporary's C type is still the declared non-`arc` one.
+    try expectContains(e.text, "cell_slice_t _cell_t0 = cell_arc_clone(xs);");
+    try expectContains(e.text, "cell_string_t _cell_t1 = cell_arc_clone(s);");
+    try expectAbsent(e.text, "unbox");
 }
 
 test "an owned String PLACE returned as arc stays loud, like every other position" {
@@ -4874,20 +4881,23 @@ test "an owned String PLACE returned as arc stays loud, like every other positio
     try expectAbsent(e.text, "cell_arc_from_string(p)");
 }
 
-test "a returned arc parameter is neither retained nor released" {
+test "a returned arc parameter is retained once and released once" {
     var e = try emitSource(
         \\pub fn share(arc n: String) -> arc String {
         \\  return n
         \\}
     );
     defer e.deinit();
-    // R11 rule 3, still holding by construction: a parameter is not
-    // droppable, so this function's pendingDrops is empty and the return
-    // takes the byte-for-byte unchanged path. The caller's call-site retain
-    // IS the reference handed back.
-    try expectContains(e.text, "  return n;\n");
-    try expectAbsent(e.text, "cell_arc_clone");
-    try expectAbsent(e.text, "cell_arc_drop");
+    // R11 rule 3 with row 1 closed: the parameter is released at scope
+    // end like any `arc` local, so the returned reference is a fresh
+    // retain taken before that release. 1 -> 2 -> 1, and the caller owns
+    // the one left.
+    const f = try fnDef(e.text, "share");
+    try expectContains(f, "cell_arc_t _cell_t0 = cell_arc_clone(n);");
+    try expectBefore(f, "cell_arc_clone(n);", "cell_arc_drop(n);");
+    try expectOccurrences(f, "cell_arc_clone", 1);
+    try expectOccurrences(f, "cell_arc_drop", 1);
+    try expectContains(f, "return _cell_t0;");
 }
 
 test "a returned arc match-arm binding is retained: return inside a BLOCK arm body" {
@@ -4899,7 +4909,7 @@ test "a returned arc match-arm binding is retained: return inside a BLOCK arm bo
         \\}
     );
     defer e.deinit();
-    // THE REGRESSION TEST. `Local.is_param` was removed after a derivation
+    // THE REGRESSION TEST. `Local.is_param` was once removed after a derivation
     // concluded that a match-arm binding could not reach
     // `returnedArcNeedsRetain`. That derivation checked `b => return b`
     // (rejected: `return` is not an expression) and a trailing `match`
@@ -5660,8 +5670,8 @@ test "a return block whose tail is an outer owned place moves it: no drop of the
 
 test "a call argument block whose tail is the block's own owned local frees nothing itself" {
     // `t` is moved into the parameter, so the value-position block emits no
-    // drop for it and the callee owns the buffer (R11 row 1 decides whether
-    // the callee releases it; this test pins only that the caller does not).
+    // drop for it and the callee owns the buffer (the callee releases it
+    // since R11 row 1; this test pins only that the caller does not).
     var e = try emitSource(
         \\pub fn make() -> String { return "abc" }
         \\pub fn eat(owned s: String) { }
@@ -5898,8 +5908,9 @@ test "R11 row 2: a struct that is moved, partially moved, or returned is not dro
     // that leaks `n`'s nothing and `s`'s nothing here (the field went to
     // `eat`), and would leak a SECOND owning field if there were one, which
     // is the stated residual and the safe direction. A move into an `owned`
-    // parameter hands the record to a callee that does not drop parameters
-    // (R11 row 1's shape, not this row's). A returned local is the caller's.
+    // parameter hands the record to the callee, which releases it (R11 row
+    // 1, so `take`'s own body does drop `b`). A returned local is the
+    // caller's.
     var e = try emitSource(
         \\struct Box { owned s: String, copy n: Int }
         \\pub fn make() -> String;
@@ -5922,7 +5933,10 @@ test "R11 row 2: a struct that is moved, partially moved, or returned is not dro
     try expectContains(e.text, "cell_eat(b.s);");
     try expectContains(e.text, "cell_take(b);");
     try expectContains(e.text, "return b;");
-    try expectAbsent(e.text, "cell_drop_Box(&b);");
+    try expectAbsent(try fnDef(e.text, "partial"), "cell_drop_Box(&b);");
+    try expectAbsent(try fnDef(e.text, "moved"), "cell_drop_Box(&b);");
+    try expectAbsent(try fnDef(e.text, "returned"), "cell_drop_Box(&b);");
+    try expectOccurrences(try fnDef(e.text, "take"), "cell_drop_Box(&b);", 1);
 }
 
 test "R11 row 2: an uninitialized droppable struct var is zero-initialized, then released" {
@@ -5955,13 +5969,52 @@ test "a shared or copy local is never dropped" {
     try expectAbsent(e.text, "cell_arc_drop");
 }
 
-test "a parameter is never dropped" {
+test "R11 row 1: an unmoved owned parameter is released by the callee" {
+    // runtime/cell_rt.h section 7: the caller relinquishes an `owned`
+    // argument, so the callee frees it. Before 2026-09-16 no parameter was
+    // ever dropped and every such argument leaked.
     var e = try emitSource(
         \\pub fn f(owned s: String) {
         \\}
     );
     defer e.deinit();
+    try expectOccurrences(try fnDef(e.text, "f"), "cell_string_free(&s);", 1);
+}
+
+test "R11 row 1: an owned parameter moved onward or returned is not released" {
+    // The double-free direction: once the parameter is moved, the new
+    // holder frees it, so this frame must not.
+    var e = try emitSource(
+        \\pub fn sink(owned s: String) -> Int;
+        \\pub fn onward(owned s: String) -> Int {
+        \\  return sink(owned s)
+        \\}
+        \\pub fn back(owned s: String) -> String {
+        \\  return s
+        \\}
+        \\pub fn tail(owned s: String) -> String {
+        \\  return { s }
+        \\}
+        \\pub fn rebind(owned s: String) -> String {
+        \\  let owned t: String = s
+        \\  return t
+        \\}
+    );
+    defer e.deinit();
+    for ([_][]const u8{ "onward", "back", "tail", "rebind" }) |name| {
+        try expectAbsent(try fnDef(e.text, name), "cell_string_free");
+    }
+}
+
+test "R11 row 1: shared and copy parameters are still never released" {
+    var e = try emitSource(
+        \\pub fn f(shared s: String, copy n: Int) -> Int {
+        \\  return n
+        \\}
+    );
+    defer e.deinit();
     try expectAbsent(e.text, "cell_string_free");
+    try expectAbsent(e.text, "cell_arc_drop");
 }
 
 test "a program that allocates and frees an owned local runs clean under cc" {
@@ -5977,10 +6030,10 @@ test "a program that allocates and frees an owned local runs clean under cc" {
     // missing.
     //
     // `kept` is unmoved and must be freed once. `given` is moved into
-    // `sink` (an `owned` parameter), so it must NOT be freed here -- `sink`
-    // itself does not free it either (decision: a parameter is never
-    // dropped), so it leaks, which is the accepted gap this task documents,
-    // not a bug this test is checking for. What this test actually proves
+    // `sink` (an `owned` parameter), so it must NOT be freed here; `sink`
+    // frees it (R11 row 1, since 2026-09-16), which makes this program a
+    // double-free detector for the parameter release too. What this test
+    // actually proves
     // is that the emitted drop compiles and runs without corrupting the
     // heap: a real double free of `kept`'s buffer would either abort
     // (verified directly, by fault injection, on a smaller program in the
@@ -6433,8 +6486,8 @@ test "an unbound arc temporary's release balances, compiled and run under ASan" 
         \\}
     );
     defer e.deinit();
-    try expectContains(e.text, "cell_arc_t _cell_t1 = cell_fresh();");
-    try expectContains(e.text, "cell_arc_t _cell_t3 = cell_dup(cell_arc_clone(a));");
+    try expectContains(e.text, "cell_arc_t _cell_t2 = cell_fresh();");
+    try expectContains(e.text, "cell_arc_t _cell_t4 = cell_dup(cell_arc_clone(a));");
 
     const io = std.testing.io;
     const gpa = std.testing.allocator;
@@ -7080,7 +7133,7 @@ test "an arc value returned from a -> String body is still refused by cc" {
         \\}
     );
     defer e.deinit();
-    try expectContains(e.text, "return a;");
+    try expectContains(e.text, "cell_string_t _cell_t0 = cell_arc_clone(a);");
     try expectAbsent(e.text, "cell_string_from_str");
 }
 

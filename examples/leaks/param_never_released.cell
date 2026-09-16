@@ -1,7 +1,12 @@
 // R11 gap 1 (docs/OWNERSHIP.md, "Still broken" table, row 1): a Cell body
-// never releases its own `arc` parameter, because no parameter is dropped
-// (`Local.droppable` excludes every parameter, arc included), so every
-// reference handed into one leaks. `examples/arc_host.c`'s `cell_observe` is
+// never released its own `arc` parameter, because no parameter was dropped
+// (`Local.droppable` excluded every parameter, arc included), so every
+// reference handed into one leaked.
+//
+// CLOSED 2026-09-16: `owned` and `arc` parameters now enter the drop pass,
+// and this fixture measures 0 on both witnesses (it was 3000, three
+// allocations per leaked `arc String` box, on both). It stays in the gate
+// BECAUSE it is closed; the history below describes the shape it measures. `examples/arc_host.c`'s `cell_observe` is
 // the ABI-correct contrast: it honours `runtime/cell_rt.h` section 7 by
 // dropping the `arc` parameter it is handed, which is exactly what a
 // Cell-bodied `consume` below never does.

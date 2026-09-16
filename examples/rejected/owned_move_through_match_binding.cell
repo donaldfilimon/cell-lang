@@ -97,10 +97,12 @@
 // THE NAMED OVER-REFUSALS, all in the safe direction and all measured exit 0
 // before this rule: a struct FIELD as scrutinee, an `owned` parameter as
 // scrutinee, a `shared String` parameter or borrow as scrutinee, a field of an
-// aliasing arm binding, and `let owned y = x` inside an arm. Each is a latent
-// double free held open only by a disclosed R11 gap (a record is never
-// dropped, a slice element is never released, an `owned` parameter is never
-// dropped, an arm binding is never dropped). The file's standing choice is to
+// aliasing arm binding, and `let owned y = x` inside an arm. Each was a latent
+// double free held open only by a disclosed R11 gap (a record was never
+// dropped, a slice element is never released, an `owned` parameter was never
+// dropped, an arm binding is never dropped). Two of those gaps have since
+// closed (record drop glue 2026-09-15, parameter release 2026-09-16), so
+// those two refusals now guard live double frees, not latent ones. The file's standing choice is to
 // refuse a latent case alongside the live ones rather than leave it as a trap
 // for the change that lands those drops.
 //
