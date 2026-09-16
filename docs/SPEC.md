@@ -55,10 +55,10 @@ lowered (sections 3.2 and 3.3); `[T]?` still does not parse.
 
 | Status | Constructs |
 |---|---|
-| implemented | 106 |
+| implemented | 108 |
 | partially implemented | 2 |
 | parsed, not enforced | 3 |
-| designed, not implemented | 44 |
+| designed, not implemented | 42 |
 | **total** | **155** |
 
 Counted from the section 12 index on 2026-09-08, not estimated. Recounted
@@ -806,14 +806,24 @@ Generic types in general (user-written `Vec<T>`, type parameters on `fn`) are
 
 ### 3.5 Unit
 
-**Status: designed, not implemented.**
+**Status: implemented (return type). Unit values are not first-class.**
 
 The unit type is written `()` and is the type of a function with no `->`
-clause. It maps to C `void`. **It does not parse in type position**:
-`parseType` requires an identifier, so `-> ()` is a parse error. Omitting the
-`->` clause is the only way to express it today, and that works because
-`FnDef.return_type` is `?TypeExpr` and codegen emits `void` for `null`. The AST
-node `TypeExpr.unit` exists and nothing constructs it.
+clause, or with an explicit `-> ()`. It maps to C `void`. `parseType`
+constructs `TypeExpr.unit` for `( )` with only whitespace inside the parens
+(the lexer has already dropped that whitespace, so `( )` and `()` are the
+same tokens). Anything else inside the parens is a parse error: tuples are
+not implemented, and `(Int)` is not a grouped `Int`. Omitting `->` remains
+legal and is the same type.
+
+Unit is a return type, not a value. A `let` of `()` (annotated or inferred
+from a unit initializer), a parameter of `()`, or a struct field of `()` is
+refused: there is no runtime representation, and C `void` is not a valid type
+for those positions. There is no unit literal; `()` in expression position is
+still a parenthesized expression, so `return ()` does not parse. A bare
+`return` in a `-> ()` function is legal, the same as in a function with no
+`->`. LLVM and MLIR already emit void functions for omitted `->`; explicit
+`()` is the same IR.
 
 ### 3.6 Struct types
 
@@ -1491,8 +1501,8 @@ swallow the body. The condition must be `Bool`.
 
 A `while` is a **statement, not an expression**, unlike `if`. An `if` produces
 a value from its branches; a loop produces nothing, and modelling it as an
-expression would force a unit value this language cannot name (section 3.5:
-`()` does not parse in type position).
+expression would force a unit value. `()` is a return type only (section 3.5);
+unit values are not first-class.
 
 `for`, `loop`, and iteration over a collection remain designed. There is no
 iteration protocol, no range value, and no indexing operator (section 3.3), so
@@ -1548,7 +1558,8 @@ pub fn host_write(shared msg: String) -> Int;
 - Each parameter needs a type. There are no default values, no variadics, no
   named arguments at the call site, and no generic parameters.
 - Trailing commas in the parameter list are not accepted.
-- Omitting `->` means the return type is unit, emitted as C `void`.
+- Omitting `->` means the return type is unit, emitted as C `void`. An
+  explicit `-> ()` is the same type (section 3.5).
 - A function with `;` instead of a block is a **declaration**: it emits a C
   prototype and no definition. This is the mechanism behind body files
   (section 1.2) and behind the prelude's host intrinsics, and it is the only
@@ -2034,7 +2045,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | List lowering to `cell_slice_t` | implemented (C backend; LLVM/MLIR lower exclusive list parameters) |
 | `Result<T, E>` | implemented (scalar payloads, C backend; LLVM/MLIR refuse) |
 | Generic types | designed, not implemented |
-| Unit type `()` in type position | designed, not implemented |
+| Unit type `()` in type position | implemented (return type; bindings of `()` are refused) |
 | Implicit unit from an omitted `->` | implemented |
 | Struct types in type position | parsed, not enforced |
 | Enum types | implemented |

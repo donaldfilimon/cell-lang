@@ -156,8 +156,8 @@ pub const Stmt = struct {
         /// A STATEMENT, not an expression, unlike `if`. An `if` is an
         /// expression because it produces a value from its branches; a loop
         /// produces nothing, and modelling it as an expression would force a
-        /// unit value this language cannot name (SPEC 3.5: `()` does not parse
-        /// in type position).
+        /// unit value. `()` is a return type only (SPEC 3.5); unit values are
+        /// not first-class.
         while_stmt: struct { cond: Expr, body: []Stmt },
         break_stmt,
         continue_stmt,

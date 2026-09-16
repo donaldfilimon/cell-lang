@@ -1,0 +1,11 @@
+// Explicit unit type `()` in type position (SPEC 3.5, FEATURES TYPE-05).
+//
+// Status: parses and passes `cell check`. `-> ()` is the same unit as an
+// omitted `->`, lowered to C `void` (and to a void function in LLVM/MLIR).
+// Unit values are not first-class: a `let` of `()`, a parameter of `()`, or
+// a struct field of `()` is refused. Tuples are not implemented; anything
+// inside the parens is a parse error.
+
+pub fn nothing() -> () {
+    return
+}

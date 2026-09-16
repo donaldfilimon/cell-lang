@@ -26,7 +26,7 @@ operation on the named type. M1-M10 refer to the approved completion program.
 | TYPE-02 unknown type rejection | checked | partial | refused | refused | Unresolved names refused at typecheck (`unknown type 'Strng'`). C codegen still maps an unchecked name to `void*` | [unknown type](../examples/rejected/unknown_type.cell) | M2 |
 | TYPE-03 structs and payload-free enums | checked | lowered | partial | partial | Aggregate destruction incomplete | [structs/enums](../examples/structs_enums.cell) | M4/M6 |
 | TYPE-04 lists and optionals | checked | partial | partial | partial | Scalar `T?` constructs and matches in C (`Some`/`None`); LLVM/MLIR refuse those constructors. Lists still have no indexing | [optionals](../examples/optionals.cell), [primitives](../examples/primitives.cell) | M4/M6 |
-| TYPE-05 explicit unit type | absent | absent | absent | absent | Implicit function unit already exists | [unit type](../examples/future/unit_type.cell) | M5 |
+| TYPE-05 explicit unit type | checked | lowered | lowered | lowered | `()` is a return type only; a `let`/parameter/field of unit is refused | [unit type](../examples/unit_type.cell) | M5 |
 | TYPE-06 generic types/functions and typed Result | checked | partial | refused | refused | Scalar `Result<T, E>` constructs and matches in C (`Ok`/`Err`); `E` is Int32 or a payload-free enum. Other generics refused at parse. No drop (an owned Result leaks) | [results](../examples/results.cell), [generics](../examples/future/generics.cell) | M6 |
 | OWN-01 five ownership modes and owned default | checked | partial | partial | partial | Resource-bearing copy fields and non-fresh owned-field transfers are refused | [binding modes](../examples/let_binding_modes.cell), [owned field alias](../examples/rejected/owned_field_alias.cell) | M4 |
 | OWN-02 move/borrow/alias checking | partial | n/a | n/a | n/a | Exact enforced clauses live in borrowck header | [borrow checker](../src/cell/borrowck.zig) | M2/M4 |
@@ -54,13 +54,14 @@ operation on the named type. M1-M10 refer to the approved completion program.
 
 All current `examples/future/*.cell` files remain rejection contracts.
 `generics.cell`, `enum_payload.cell` and `optional_list.cell` wait on their
-features and belong to M6; `unit_type.cell` belongs to M5. `result.cell`
-stays in `future/` because it `return`s a `String` where
-`Result<String, Int>` is declared, not because construction is missing:
-`Ok`/`Err` exist and [results.cell](../examples/results.cell) is the
-accepted contract. [optional_list.cell](../examples/future/optional_list.cell)
-specifically records optional-list type syntax rather than complete optional
-runtime semantics.
+features and belong to M6. `result.cell` stays in `future/` because it
+`return`s a `String` where `Result<String, Int>` is declared, not because
+construction is missing: `Ok`/`Err` exist and
+[results.cell](../examples/results.cell) is the accepted contract.
+[optional_list.cell](../examples/future/optional_list.cell) specifically
+records optional-list type syntax rather than complete optional runtime
+semantics. `()` in type position landed as TYPE-05;
+[unit_type.cell](../examples/unit_type.cell) is the accepted contract.
 
 When a feature lands, update its row and move its future fixture into an
 accepted contract with explicit execution/ownership expectations. Never change

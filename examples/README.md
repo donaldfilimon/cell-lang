@@ -198,6 +198,7 @@ are not.
 | `loops.cell` | `while`, both spellings, plus `break` and `continue`; prints 55 through all three backends |
 | `comparisons.cell` | `==` and `!=` as the whole condition of `if`, `else if` and `while`; prints 621 through all three backends, and is the corpus's only guard against the doubled `if ((a == 2))` that clang rejects under `-Werror` |
 | `while_is_now_a_loop.cell` | the same program that once passed and silently did nothing, now looping correctly; its header records all four meanings it has had |
+| `unit_type.cell` | explicit `()` in type position: `-> ()` is the same unit as an omitted `->`; a `let` of `()` is refused |
 
 ## Running `arc.cell`, the one example with a C host
 
@@ -236,7 +237,6 @@ the `docs/SPEC.md` section that specifies it.
 | `generics.cell` | type parameters on functions |
 | `enum_payload.cell` | enum variants carrying data |
 | `optional_list.cell` | `[T]?` and nested optionals |
-| `unit_type.cell` | `()` in type position |
 
 ## The rejected corpus
 

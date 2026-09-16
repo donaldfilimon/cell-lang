@@ -129,7 +129,10 @@ pub const Checker = struct {
             switch (item.kind) {
                 .fn_def => |f| {
                     const params = try self.arena().alloc(Type, f.params.len);
-                    for (f.params, 0..) |p, i| params[i] = try self.resolveType(&p.ty, item.span);
+                    for (f.params, 0..) |p, i| {
+                        params[i] = try self.resolveType(&p.ty, item.span);
+                        try self.refuseUnitValue(item.span, params[i]);
+                    }
                     const ret = try self.arena().create(Type);
                     ret.* = if (f.return_type) |rt| try self.resolveType(&rt, item.span) else types.t_unit;
                     try self.declare(item.span, f.name, .{
@@ -140,7 +143,8 @@ pub const Checker = struct {
                 },
                 .struct_def => |s| {
                     for (s.fields) |field| {
-                        _ = try self.resolveType(&field.ty, item.span);
+                        const field_ty = try self.resolveType(&field.ty, item.span);
+                        try self.refuseUnitValue(item.span, field_ty);
                     }
                 },
                 else => {},
@@ -230,6 +234,8 @@ pub const Checker = struct {
             .let => |*l| {
                 const annotated: ?Type = if (l.ty) |t| try self.resolveType(&t, stmt.span) else null;
                 var bound: Type = annotated orelse types.t_unknown;
+                const annotated_unit = annotated != null and annotated.?.tag() == .unit;
+                if (annotated_unit) try self.refuseUnitValue(stmt.span, types.t_unit);
                 if (annotated == null) {
                     if (l.value) |*v| {
                         if (v.kind == .wrap and v.kind.wrap.ctor != .some) {
@@ -246,7 +252,9 @@ pub const Checker = struct {
                 if (l.value) |*v| {
                     const actual = try self.checkExpr(v);
                     if (annotated) |want| {
-                        if (!accepts(want, actual, v)) {
+                        // A `let` of `()` is already refused above. Skip the
+                        // mismatch so a unit initializer does not cascade.
+                        if (!annotated_unit and !accepts(want, actual, v)) {
                             try self.errf(
                                 v.span,
                                 "cannot initialize a binding of type {s} with a value of type {s}",
@@ -255,6 +263,7 @@ pub const Checker = struct {
                         }
                     } else {
                         bound = actual;
+                        try self.refuseUnitValue(stmt.span, actual);
                     }
                 }
                 try self.declare(stmt.span, l.name, .{
@@ -835,11 +844,20 @@ pub const Checker = struct {
 
     // -- types --------------------------------------------------------------
 
+    /// `()` is a return type, not a value. A parameter, field, or `let` of
+    /// unit has no runtime representation, and C `void` is not a valid type
+    /// for any of those positions.
+    fn refuseUnitValue(self: *Checker, span: ast.Span, ty: Type) CheckError!void {
+        if (ty.tag() == .unit) {
+            try self.errf(span, "() is not a first-class value; only a function return type may be ()", .{});
+        }
+    }
+
     /// Lower a syntactic type to a semantic one. A name is a type iff it is a
     /// primitive, a declared struct, a declared enum, or a constructed type
-    /// already implemented (`T?`, `Result<T, E>`, `[T]`). Anything else is
-    /// refused at `span` and becomes `unknown`, so later uses of the value do
-    /// not cascade a second diagnostic.
+    /// already implemented (`T?`, `Result<T, E>`, `[T]`). Unit is not a name;
+    /// it is `()`. Anything else is refused at `span` and becomes `unknown`,
+    /// so later uses of the value do not cascade a second diagnostic.
     fn resolveType(self: *Checker, te: *const ast.TypeExpr, span: ast.Span) CheckError!Type {
         return self.resolveTypeInner(te, span, true);
     }
@@ -1658,6 +1676,57 @@ test "a list literal argument is type checked against the parameter" {
     );
     try t.expectCount(1);
     try t.expectDiag(0, .err, 3, 18, "argument 1 has type [Bool], expected [Byte]");
+}
+
+test "-> () is the same unit as an omitted arrow" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn nothing() -> () {
+        \\    return
+        \\}
+        \\pub fn also() {
+        \\    return
+        \\}
+        \\pub fn declared() -> ();
+    );
+    try t.expectClean();
+}
+
+test "a let of () is refused" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn nothing() -> () {
+        \\    return
+        \\}
+        \\pub fn f() {
+        \\    let copy u: () = nothing()
+        \\}
+        \\pub fn g() {
+        \\    let copy v = nothing()
+        \\}
+        \\pub fn takes(copy u: ());
+    );
+    try t.expectCount(3);
+    try t.expectDiag(0, .err, 10, 1, "() is not a first-class value; only a function return type may be ()");
+    try t.expectDiag(1, .err, 5, 5, "() is not a first-class value; only a function return type may be ()");
+    try t.expectDiag(2, .err, 8, 5, "() is not a first-class value; only a function return type may be ()");
+}
+
+test "unknown type names are still refused" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn ok() -> () {
+        \\    return
+        \\}
+        \\pub fn misspelled(shared s: Strng) -> ();
+        \\pub fn no_such_width(shared v: UInt32) -> Int;
+    );
+    try t.expectCount(2);
+    try t.expectDiag(0, .err, 4, 1, "unknown type 'Strng'");
+    try t.expectDiag(1, .err, 5, 1, "unknown type 'UInt32'");
 }
 
 test "unknown type names are refused and a declared struct name is accepted" {

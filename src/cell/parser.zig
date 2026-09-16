@@ -630,26 +630,39 @@ pub const Parser = struct {
             p.* = inner;
             return .{ .ref = .{ .ownership = own, .inner = p } };
         }
-        const name = try self.expectIdent();
-        var ty: ast.TypeExpr = .{ .name = name };
-        if (self.check(.lt)) {
-            // `Result<T, E>` is the one type that takes arguments (SPEC 3.4).
-            // Any other `Name<` is refused here, at the `<`, rather than left
-            // to fail as a stray token further on. The lexer has no `>>`
-            // token, so a nested `Result<Int, Result<Int, Int>>` closes one
-            // `>` at a time.
-            if (!std.mem.eql(u8, name, "Result")) {
-                return self.fail("generic types are not implemented; only Result<T, E> takes type arguments");
+        var ty: ast.TypeExpr = blk: {
+            // `()` is the unit type (SPEC 3.5). The lexer has already dropped
+            // whitespace, so `( )` is the same tokens as `()`. Anything inside
+            // the parens is a tuple, which this grammar does not have: fail
+            // closed rather than taking the first element as a grouped type.
+            if (self.match(.l_paren)) {
+                if (!self.match(.r_paren)) {
+                    return self.fail("tuples are not implemented; () is the unit type");
+                }
+                break :blk .unit;
             }
-            _ = self.match(.lt);
-            const ok = try self.allocator.create(ast.TypeExpr);
-            ok.* = try self.parseType();
-            if (!self.match(.comma)) return self.fail("Result takes exactly two type arguments, Result<T, E>");
-            const err = try self.allocator.create(ast.TypeExpr);
-            err.* = try self.parseType();
-            if (!self.match(.gt)) return self.fail("Result takes exactly two type arguments, Result<T, E>");
-            ty = .{ .result = .{ .ok = ok, .err = err } };
-        }
+            const name = try self.expectIdent();
+            var named: ast.TypeExpr = .{ .name = name };
+            if (self.check(.lt)) {
+                // `Result<T, E>` is the one type that takes arguments (SPEC 3.4).
+                // Any other `Name<` is refused here, at the `<`, rather than left
+                // to fail as a stray token further on. The lexer has no `>>`
+                // token, so a nested `Result<Int, Result<Int, Int>>` closes one
+                // `>` at a time.
+                if (!std.mem.eql(u8, name, "Result")) {
+                    return self.fail("generic types are not implemented; only Result<T, E> takes type arguments");
+                }
+                _ = self.match(.lt);
+                const ok = try self.allocator.create(ast.TypeExpr);
+                ok.* = try self.parseType();
+                if (!self.match(.comma)) return self.fail("Result takes exactly two type arguments, Result<T, E>");
+                const err = try self.allocator.create(ast.TypeExpr);
+                err.* = try self.parseType();
+                if (!self.match(.gt)) return self.fail("Result takes exactly two type arguments, Result<T, E>");
+                named = .{ .result = .{ .ok = ok, .err = err } };
+            }
+            break :blk named;
+        };
         if (self.match(.question)) {
             const p = try self.allocator.create(ast.TypeExpr);
             p.* = ty;
@@ -888,6 +901,32 @@ test "parse fn" {
     defer tp.deinit();
     try std.testing.expectEqual(@as(usize, 1), tp.module.items.len);
     try std.testing.expectEqualStrings("add", tp.module.items[0].kind.fn_def.name);
+}
+
+test "-> () parses as the unit type" {
+    var tp = try parseForTest(
+        \\pub fn nothing() -> ();
+        \\pub fn spaced() -> ( );
+        \\pub fn local() {
+        \\    let copy u: () = 1
+        \\}
+    );
+    defer tp.deinit();
+    try std.testing.expect(tp.module.items[0].kind.fn_def.return_type.? == .unit);
+    try std.testing.expect(tp.module.items[1].kind.fn_def.return_type.? == .unit);
+    const stmt = tp.module.items[2].kind.fn_def.body.?[0];
+    try std.testing.expect(stmt.kind.let.ty.? == .unit);
+}
+
+test "(Int) is not the unit type" {
+    try std.testing.expectEqualStrings(
+        "tuples are not implemented; () is the unit type",
+        try parseErrorFor("pub fn f() -> (Int);"),
+    );
+    try std.testing.expectEqualStrings(
+        "tuples are not implemented; () is the unit type",
+        try parseErrorFor("pub fn f(copy v: (Int));"),
+    );
 }
 
 test "spans point at the right line and column" {
