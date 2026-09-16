@@ -25,6 +25,8 @@ zig build test -Dswift=false               # library + CLI tests + runtime harne
 zig build test-runtime -Dswift=false       # C ABI harness alone (exercises weak-symbol fallbacks)
 ./zig-out/bin/cell check examples/hello.cell
 ./zig-out/bin/cell emit --target=c|llvm|mlir examples/hello.cell
+./zig-out/bin/cell run examples/hello.cell          # build to $TMPDIR with $CC, run, forward the exit status
+./zig-out/bin/cell build examples/hello.cell -o hello  # C target only; no *_host.c linking
 ```
 
 **Full gate** (build + tests + corpus contracts + backend agreement + execution):

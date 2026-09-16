@@ -126,6 +126,18 @@ for `examples/arc.cell` linked with `examples/arc_host.c`. A current
 qualification report, rather than these present source descriptions, is the
 evidence that those contracts pass on a particular revision and machine.
 
+`cell run examples/hello.cell` compiles that file's C against an embedded copy
+of the runtime with `$CC` (default `cc`) in a temporary directory, executes
+it, and returns the program's own exit status (a signal death comes back as
+128 plus the signal number, the shell convention). `cell build -o hello
+examples/hello.cell` leaves the executable behind instead; without `-o` the
+output is the source stem. Both are the C path only (`--target=llvm`/`mlir`
+are refused with a pointer to `emit`), and neither links a hand-written C
+host, so `examples/arc.cell` still goes through `emit` and `cc` by hand. There
+is no `cell test`, and the prelude's group 3 declarations still resolve to no
+symbol: `cell build` reports that as cc's undefined-symbol link error. Gate
+stage 12 pins the three execution answers through this path.
+
 `cell emit --target=llvm` and `cell emit --target=mlir` produce textual LLVM IR
 and MLIR by way of a typed IR in `src/cell/hir.zig`. Their retained execution
 contracts expect `examples/backends.cell` to print `24` through all three

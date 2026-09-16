@@ -3,7 +3,10 @@
 // This is a MODULE FILE in the sense of docs/SPEC.md section 1.2: it declares
 // and does not define. Every function here is bodyless, so `cell emit` gives a
 // C prototype and no definition, and the symbol must come from somewhere else
-// at link time.
+// at link time. Since 2026-09-16 `cell build`/`cell run` make that concrete:
+// a program calling a group 3 name compiles and then fails in cc's link step
+// with an undefined `cell_<name>` symbol, which is the honest shape of "no
+// implementation exists".
 //
 // STATUS. Everything in this file parses and passes `cell check`. Verified
 // against commit 9fb12af:

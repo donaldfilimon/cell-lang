@@ -30,6 +30,11 @@ pub fn build(b: *std.Build) void {
         },
     });
     exe_mod.addIncludePath(b.path("runtime"));
+    // `cell build`/`cell run` embed the runtime so a built program never
+    // depends on the caller's checkout. Both modules that compile main.zig
+    // need the same two names or @embedFile fails at the test build.
+    exe_mod.addAnonymousImport("cell_rt_h", .{ .root_source_file = b.path("runtime/cell_rt.h") });
+    exe_mod.addAnonymousImport("cell_rt_c", .{ .root_source_file = b.path("runtime/cell_rt.c") });
     exe_mod.addCSourceFile(.{
         .file = b.path("runtime/cell_rt.c"),
         .flags = &c_flags,
@@ -106,6 +111,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     test_exe_mod.addIncludePath(b.path("runtime"));
+    test_exe_mod.addAnonymousImport("cell_rt_h", .{ .root_source_file = b.path("runtime/cell_rt.h") });
+    test_exe_mod.addAnonymousImport("cell_rt_c", .{ .root_source_file = b.path("runtime/cell_rt.c") });
     test_exe_mod.addCSourceFile(.{
         .file = b.path("runtime/cell_rt.c"),
         .flags = &c_flags,

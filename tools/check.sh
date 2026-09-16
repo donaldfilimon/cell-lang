@@ -147,6 +147,14 @@
 #                       invites re-implementing a rule that already exists.
 #                       Appended as the last stage so the ten cross-references
 #                       above keep their numbers.
+#  12. cli build/run    `cell run` and `cell build` (added 2026-09-16, closing
+#                       the goal's opening gap 5: "no .cell to executable
+#                       path"). Stage 6 is the oracle; this proves the CLI
+#                       reproduces its recipe from the runtime the binary
+#                       embeds, forwards the program's exit status, refuses
+#                       the textual targets and a second source file, writes
+#                       nothing for a rejected program, and leaves no staging
+#                       directory behind.
 #
 # TRAPS THIS SCRIPT IS WRITTEN AGAINST, each one having actually bitten:
 #
@@ -1686,6 +1694,73 @@ case "$rule_lists_status" in
        grep '^DRIFT' "$TMP/rule_lists.log" | sed 's/^/        /' ;;
     *) fail "tools/check-rule-lists.sh could not run (exit $rule_lists_status): $(tail -1 "$TMP/rule_lists.log")" ;;
 esac
+
+# ------------------------------------------------------------ 12. cli build/run --
+# Stage 6 is the oracle: it emits, compiles against runtime/cell_rt.c and runs
+# three programs by hand. This stage proves `cell run` and `cell build`
+# reproduce that recipe on their own, from the runtime the binary EMBEDS
+# rather than the checkout's copy, with the same three pinned answers. The
+# negatives matter as much: a rejected program must exit 1 and leave no file
+# at the output path, `build` must refuse the textual targets, and a second
+# positional must be refused rather than dropped (the old arg loop dropped
+# it silently, which is how `cell build a.cell b.cell` would have compiled
+# a.cell and said nothing). A program's exit code must come back through
+# `run` unchanged: that is what makes `cell run` usable from a script.
+printf '\n== cli build/run (stage 6 through the CLI, embedded runtime) ==\n'
+for pair in hello:42 backends:24 loops:55; do
+    ex=${pair%%:*}; want=${pair##*:}
+    got=$("$CELL" run "examples/$ex.cell" 2> "$TMP/run_$ex.err"); rc=$?
+    if [ $rc -eq 0 ] && [ "$got" = "$want" ]; then
+        pass "cell run $ex -> $got"
+    else
+        fail "cell run $ex -> '$got' (exit $rc), want $want; stderr: $(head -3 "$TMP/run_$ex.err" | tr '\n' ' ')"
+    fi
+done
+"$CELL" build examples/hello.cell -o "$TMP/hello_built" 2> "$TMP/build_hello.err"
+if [ $? -eq 0 ] && [ -x "$TMP/hello_built" ] && [ "$("$TMP/hello_built")" = "42" ]; then
+    pass "cell build -o writes a runnable executable (hello -> 42)"
+else
+    fail "cell build -o: $(head -3 "$TMP/build_hello.err" | tr '\n' ' ')"
+fi
+# Default output name: the stem. Built from a copy so the corpus stays clean.
+cp examples/hello.cell "$TMP/stemtest.cell"
+case "$CELL" in /*) cell_abs=$CELL ;; *) cell_abs=$PWD/$CELL ;; esac
+( cd "$TMP" && "$cell_abs" build stemtest.cell > /dev/null 2>&1 ) && [ -x "$TMP/stemtest" ] && [ "$("$TMP/stemtest")" = "42" ] \
+    && pass "cell build without -o writes the source stem (stemtest -> 42)" \
+    || fail "cell build without -o did not produce a runnable $TMP/stemtest"
+# Exit-status forwarding, measured on a program that asserts false: the
+# runtime aborts (SIGABRT, 6), and the shell convention for a signal death
+# is 128 + the number, so 134. Before this was pinned, `run` mapped every
+# signal to 1, which is the compiler's own refusal code, so a script could
+# not tell "the program died" from "the program did not compile".
+if grep -q 'cell_assert' runtime/cell_rt.h; then
+    printf 'pub fn assert(copy c: Bool);\npub fn main() {\n    assert(false)\n}\n' > "$TMP/dies.cell"
+    "$CELL" run "$TMP/dies.cell" > /dev/null 2>&1; rc=$?
+    [ $rc -eq 134 ] \
+        && pass "cell run forwards a signal death as 128+signo (assert(false) -> 134)" \
+        || fail "cell run of an aborting program returned $rc, want 134 (128 + SIGABRT)"
+fi
+# Negatives.
+rm -f "$TMP/must_not_exist"
+"$CELL" build examples/rejected/move_in_loop.cell -o "$TMP/must_not_exist" > /dev/null 2> "$TMP/build_rej.err"; rc=$?
+if [ $rc -eq 1 ] && [ ! -e "$TMP/must_not_exist" ] && grep -q 'error:' "$TMP/build_rej.err"; then
+    pass "cell build of a rejected program exits 1 with the diagnostic and writes nothing"
+else
+    fail "cell build of examples/rejected/move_in_loop.cell: exit $rc, output present: $([ -e "$TMP/must_not_exist" ] && echo yes || echo no)"
+fi
+"$CELL" build examples/hello.cell --target=llvm > /dev/null 2> "$TMP/build_llvm.err"; rc=$?
+[ $rc -eq 1 ] && grep -q 'cell emit --target=llvm' "$TMP/build_llvm.err" \
+    && pass "cell build --target=llvm is refused and points at emit" \
+    || fail "cell build --target=llvm: exit $rc, stderr: $(head -1 "$TMP/build_llvm.err")"
+"$CELL" build examples/hello.cell examples/loops.cell > /dev/null 2> "$TMP/build_two.err"; rc=$?
+[ $rc -eq 1 ] && grep -q 'unexpected argument' "$TMP/build_two.err" \
+    && pass "a second source file is refused, not silently dropped" \
+    || fail "cell build with two sources: exit $rc, stderr: $(head -1 "$TMP/build_two.err")"
+# Nothing staged is left behind: every run above removes its own directory.
+leftover=$(/bin/ls -d "${TMPDIR:-/tmp}"/cell-build-* 2>/dev/null | wc -l | tr -d ' ')
+[ "$leftover" = "0" ] \
+    && pass "no cell-build-* staging directory left under \${TMPDIR:-/tmp}" \
+    || fail "$leftover cell-build-* staging directories left under ${TMPDIR:-/tmp}"
 
 # ---------------------------------------------------------------- verdict --
 printf '\n== verdict ==\n'

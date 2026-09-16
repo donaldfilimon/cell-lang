@@ -395,7 +395,11 @@ module. `examples/pairing/` is the worked pair.
 `cell <command> <file>` compiles exactly one file. There is no module
 resolution, no include path, no package manager, and no linking of a module to
 its body file. A `use` declaration (section 8.4) is recorded and emitted as a C
-comment.
+comment. Since 2026-09-16 `cell build` and `cell run` take that one file's C
+through `$CC` together with an embedded copy of the runtime; they add no second
+unit, no host source, and no target other than C, so the compilation unit is
+unchanged and a bodyless declaration with no runtime symbol surfaces as a link
+error rather than a compiler diagnostic.
 
 ---
 
