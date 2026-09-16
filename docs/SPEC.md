@@ -691,7 +691,7 @@ implemented**.
 
 ### 3.2 Optional types
 
-**Status: parsed, not enforced.**
+**Status: implemented for scalar payloads, C backend only (2026-09-16).**
 
 ```cell
 Int?
@@ -701,15 +701,17 @@ String?
 `T?` denotes a value that is either a `T` or absent, written as a postfix `?`
 on a type name.
 
-The parser builds `TypeExpr.optional` faithfully. Codegen maps it to `void*`
-for every `T`, including `Int?`. There is no `none` literal, no `some`
-constructor, no unwrap operator, no optional chaining, and no flow-sensitive
-narrowing: **an optional value cannot be produced or consumed in Cell today**,
-only named in a signature.
+Constructors are `Some(e)` and `None`. Patterns are `Some(x)`, `Some(_)`, and
+`None`. Payloads this slice admits are the scalar primitives (`Int`, `Int32`,
+`UInt`, `Float`, `Float32`, `Bool`, `Byte`); anything else is refused.
+`None` needs a declared optional slot (`let a: Int? = None`); `Some(e)` is
+complete from its operand. LLVM and MLIR refuse constructors and patterns
+together with `cannot lower`.
 
-The runtime has already chosen the representation (section 10.3): a tagged
-struct `{ bool has_value; T value; }`, deliberately not a sentinel, because
-every bit pattern of `int64_t` is a legal `Int`. Codegen does not emit it.
+The runtime representation (section 10.3) is a tagged struct
+`{ bool has_value; T value; }`, deliberately not a sentinel, because every
+bit pattern of `int64_t` is a legal `Int`. The C backend emits the
+predefined `cell_opt_*` instances.
 
 **`[T]?` does not parse.** The postfix `?` is only accepted after a bare type
 name, never after a `]`. Measured: `shared a: [Int]?` is a parse error. Nested
@@ -751,8 +753,7 @@ yet.
 
 ### 3.4 Result
 
-**Status: the type parses and checks (2026-09-16); values cannot be made or
-inspected in Cell source.**
+**Status: implemented for scalar payloads, C backend only (2026-09-16).**
 
 ```cell
 Result<Int, IoError>
@@ -766,20 +767,17 @@ only name that takes type arguments: any other `Name<` is a parse error that
 says generic types are not implemented, and `Result<T>` or three arguments is
 a parse error too.
 
-**What a program can do with one today is pass it through.** No syntax
-constructs a `Result` (there is no `Ok(v)`/`Err(e)`) and no `match` pattern
-inspects one, so a `Result` value enters a body only from a declared callee or
-a parameter, and leaves only by return or as an argument. That makes a
-bodyless declaration, `pub fn read() -> Result<Int, IoError>;`, the useful form:
-a host-provided fallible function is now declarable. The type checker refuses a
-non-`Result` value in a `Result` slot (`let owned r: Result<Int, Int> = 1`, or
-returning a `String` from a `-> Result<String, Int>` body). The C backend lowers
-the type to `cell_result_t`; LLVM and MLIR refuse it at the span. A `Result` has
-no drop spelling, so an `owned` one is never released: the leak direction, and
-the stated boundary for a resource-bearing `T` or `E`, whose payload layout in
-`cell_value_t` is not designed. `let arc r: Result<Int, Int> = read()` is a loud
-C type error (a `cell_result_t` does not initialize a `cell_arc_t`), the same
-refusal as other unboxable `arc` shapes.
+Constructors are `Ok(e)` and `Err(e)`. Patterns are `Ok(x)` and `Err(x)` (or
+`_`). Payloads this slice admits are the scalar primitives for `T`; `E` is an
+`Int32` code or a payload-free enum. `Ok`/`Err` need a declared Result slot
+(`let r: Result<Int, E> = Ok(1)`); LLVM and MLIR refuse constructors and
+patterns together with `cannot lower`. The C backend lowers the type to
+`cell_result_t`. A `Result` has no drop spelling, so an `owned` one is never
+released: the leak direction, and the stated boundary for a resource-bearing
+`T` or `E`, whose payload layout in `cell_value_t` is not designed.
+`let arc r: Result<Int, Int> = read()` is a loud C type error (a
+`cell_result_t` does not initialize a `cell_arc_t`), the same refusal as other
+unboxable `arc` shapes.
 
 The runtime defines the target layout:
 
@@ -1659,6 +1657,10 @@ match value {
 structured `Pattern` and a body expression. The scrutinee is parsed with the
 struct-literal restriction on (section 6.7), so `match c { ... }` works.
 
+Wrap patterns `Some(x)`, `Some(_)`, `None`, `Ok(x)`, `Err(x)` inspect an
+optional or Result scrutinee. The inner pattern is a binding or `_`; nested
+patterns are a parse error.
+
 ### 9.0 Match guards
 
 **Status: implemented, except on a binding pattern.**
@@ -2020,11 +2022,11 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Additional integer widths (`Int8`, `UInt32`, ...) | designed, not implemented |
 | `T?` optional syntax | parsed, not enforced |
 | Optional lowering to the tagged struct | designed, not implemented |
-| Optional construction and unwrapping | designed, not implemented |
+| Optional construction and unwrapping | implemented (scalar payloads, C backend; LLVM/MLIR refuse) |
 | `[T]?` | designed, not implemented |
 | `[T]` list syntax | parsed, not enforced |
 | List lowering to `cell_slice_t` | designed, not implemented |
-| `Result<T, E>` | type parses, checks and lowers to C (pass-through only); construction and inspection designed-not-implemented; LLVM/MLIR refuse |
+| `Result<T, E>` | implemented (scalar payloads, C backend; LLVM/MLIR refuse) |
 | Generic types | designed, not implemented |
 | Unit type `()` in type position | designed, not implemented |
 | Implicit unit from an omitted `->` | implemented |

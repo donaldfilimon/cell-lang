@@ -636,6 +636,15 @@ static void test_result(void) {
     cell_result_t s = cell_ok_str(cell_str_from_cstr("payload"));
     CHECK(s.ok);
     CHECK(cell_str_eq(s.value.str, cell_str_from_cstr("payload")));
+
+    cell_result_t e = cell_err(7);
+    CHECK(!e.ok);
+    CHECK(e.error_code == 7);
+    CHECK(e.value.i64 == 0);
+    cell_result_t i32 = cell_ok_i32(-5);
+    CHECK(i32.ok);
+    CHECK(i32.error_code == 0);
+    CHECK((int32_t)i32.value.i64 == -5);
 }
 
 /* ------------------------------------------------------------------------ */

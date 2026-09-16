@@ -275,6 +275,11 @@ pub const CType = struct {
     /// leading `const ` and a trailing ` *`) would work today and break the
     /// first time a spelling changes; carrying it is exact.
     pointee: ?*const CType = null,
+    /// For `optional`: the `T` of `T?`. For `result`: the ok payload. Null
+    /// elsewhere. Preserved by `applyOwnership` and `pointerTo` like `elem`.
+    payload: ?*const CType = null,
+    /// For `result`: the `E`. Null elsewhere.
+    err_payload: ?*const CType = null,
 
     pub const unknown: CType = .{ .text = "void*", .shape = .unknown };
     pub const void_type: CType = .{ .text = "void", .shape = .unit };
@@ -1375,6 +1380,9 @@ pub const Generator = struct {
             return;
         }
         const want = self.current_ret_ty;
+        if (unwrapAnnotated(v).kind == .wrap) {
+            return try self.emitWrap(unwrapAnnotated(v).kind.wrap, want, indent);
+        }
         const have = try self.inferExpr(v);
         // THE GUARD IS ON `have` ALONE, and it is the unbox refusal below
         // written as one condition rather than as a pair naming `want`. The
@@ -1756,6 +1764,32 @@ pub const Generator = struct {
                 try self.writer.print("(void){s};\n", .{name});
             }
         }
+        if (arm.pattern.kind == .wrap_pattern) {
+            const wp = arm.pattern.kind.wrap_pattern;
+            if (wp.binding) |name| {
+                const ty: CType = switch (wp.ctor) {
+                    .some, .none => if (scrut_ty.payload) |p| p.* else CType.unknown,
+                    .ok => if (scrut_ty.payload) |p| p.* else CType.unknown,
+                    .err => if (scrut_ty.err_payload) |p| p.* else CType.unknown,
+                };
+                try self.writeIndent(indent);
+                try self.writeDecl(ty, name);
+                switch (wp.ctor) {
+                    .some, .none => try self.writer.print(" = {s}.value;\n", .{temp}),
+                    .ok => {
+                        const rf = resultField(ty);
+                        try self.writer.print(" = {s}{s}.value.{s};\n", .{ rf.cast, temp, rf.field });
+                    },
+                    .err => try self.writer.print(" = ({s}){s}.error_code;\n", .{ ty.text, temp }),
+                }
+                // A scalar copy: never droppable, `copy` like borrowck says.
+                try self.pushLocal(name, ty, .copy, false);
+                if (!exprUses(arm.body, name)) {
+                    try self.writeIndent(indent);
+                    try self.writer.print("(void){s};\n", .{name});
+                }
+            }
+        }
 
         if (dest) |d| {
             try self.emitValueInto(arm.body, d, indent);
@@ -1843,11 +1877,12 @@ pub const Generator = struct {
                     try out.print("{s} == cell_{s}_{s}", .{ temp, enum_name, ev.variant });
                 }
             },
-            // Stub: Task 7 gives this a real test. Never taken today because
-            // nothing lowers a `wrap` scrutinee into a match this backend
-            // reaches; `false` keeps the emitted C compilable in the
-            // meantime.
-            .wrap_pattern => try out.writeAll("false"),
+            .wrap_pattern => |wp| switch (wp.ctor) {
+                .some => try out.print("{s}.has_value", .{temp}),
+                .none => try out.print("!{s}.has_value", .{temp}),
+                .ok => try out.print("{s}.ok", .{temp}),
+                .err => try out.print("!{s}.ok", .{temp}),
+            },
         }
     }
 
@@ -2030,6 +2065,11 @@ pub const Generator = struct {
             else => {
                 try self.writeIndent(indent);
                 try out.print("{s} = ", .{dest.name});
+                if (unwrapAnnotated(e).kind == .wrap) {
+                    try self.emitWrap(unwrapAnnotated(e).kind.wrap, dest.ty, indent);
+                    try out.writeAll(";\n");
+                    return;
+                }
                 const have = try self.inferExpr(e);
                 if (dest.ty.shape == .slice and !dest.ty.pointer and dest.ty.elem != null) {
                     // The other end of `emitArgLike`'s slice routing: the
@@ -2123,13 +2163,55 @@ pub const Generator = struct {
             .list_lit => |items| try self.emitListLit(items, null, indent),
             .block, .if_expr, .match_expr => try self.emitValueExpr(e, null, indent),
             .annotated => |a| try self.emitExpr(a.value, indent),
-            // Stub: Task 7 gives `wrap` a real C representation. `EmitError`
-            // has no member for "unsupported construct" (it is exactly
-            // `Io.Writer.Error || Allocator.Error`), so this borrows
-            // `WriteFailed` as the least-wrong existing member rather than
-            // adding a new one; unreachable today since nothing before
-            // codegen rejects a `wrap` expression on the C backend.
-            .wrap => return error.WriteFailed,
+            .wrap => |w| try self.emitWrap(w, null, indent),
+        }
+    }
+
+    /// `Some(e)`, `None`, `Ok(e)`, `Err(e)`. `want` is the destination's
+    /// declared type when the position has one (a `let` with a written
+    /// type, a return, a call argument, a field); it decides the optional
+    /// instance and the Result payload field. Without it the operand's own
+    /// type decides, and `None` cannot be emitted at all, which the checker
+    /// already refuses.
+    fn emitWrap(self: *Generator, w: anytype, want: ?CType, indent: usize) EmitError!void {
+        const out = self.writer;
+        switch (w.ctor) {
+            .none => {
+                const dest = want orelse return error.WriteFailed;
+                try out.print("{s}_none()", .{optBase(dest)});
+            },
+            .some => {
+                const operand = w.operand.?;
+                const dest: ?CType = if (want) |d| (if (d.shape == .optional) d else null) else null;
+                if (dest) |d| {
+                    try out.print("{s}_some(", .{optBase(d)});
+                    try self.emitArgLike(operand, d.payload.?.*, indent);
+                    try out.writeAll(")");
+                } else {
+                    const inner = try self.inferExpr(operand);
+                    const base = optBaseForPayload(inner) orelse return error.WriteFailed;
+                    try out.print("{s}_some(", .{base});
+                    try self.emitExpr(operand, indent);
+                    try out.writeAll(")");
+                }
+            },
+            .ok => {
+                const operand = w.operand.?;
+                const payload: CType = if (want) |d| (if (d.shape == .result and d.payload != null) d.payload.?.* else try self.inferExpr(operand)) else try self.inferExpr(operand);
+                const rf = resultField(payload);
+                try out.print("{s}(", .{rf.ctor});
+                if (rf.cast.len != 0) {
+                    // Widen Byte to u64 and Float32 to double explicitly.
+                    try out.writeAll(if (std.mem.eql(u8, payload.text, "uint8_t")) "(uint64_t)" else if (std.mem.eql(u8, payload.text, "float")) "(double)" else "");
+                }
+                try self.emitExpr(operand, indent);
+                try out.writeAll(")");
+            },
+            .err => {
+                try out.writeAll("cell_err((int32_t)");
+                try self.emitExpr(w.operand.?, indent);
+                try out.writeAll(")");
+            },
         }
     }
 
@@ -2694,6 +2776,9 @@ pub const Generator = struct {
     fn emitArgLike(self: *Generator, arg: *const ast.Expr, want: CType, indent: usize) EmitError!void {
         const out = self.writer;
         const have = try self.inferExpr(arg);
+        if (unwrapAnnotated(arg).kind == .wrap) {
+            return try self.emitWrap(unwrapAnnotated(arg).kind.wrap, want, indent);
+        }
 
         // The declared-type conversions are answered FIRST, before any of the
         // address-of and dereference rules below. An arc handle is a struct
@@ -2902,12 +2987,21 @@ pub const Generator = struct {
             },
             .optional => |inner| blk: {
                 const inst = try self.optionalInstance(inner);
+                const p = try self.arena.create(CType);
+                p.* = try self.lowerType(inner, .copy);
                 break :blk .{
                     .text = try std.fmt.allocPrint(self.arena, "{s}_t", .{inst.base}),
                     .shape = .optional,
+                    .payload = p,
                 };
             },
-            .result => CType.result,
+            .result => |r| blk: {
+                const ok = try self.arena.create(CType);
+                ok.* = try self.lowerType(r.ok, .copy);
+                const err = try self.arena.create(CType);
+                err.* = try self.lowerType(r.err, .copy);
+                break :blk .{ .text = CType.result.text, .shape = .result, .payload = ok, .err_payload = err };
+            },
             .ref => |r| try self.lowerType(r.inner, r.ownership),
         };
     }
@@ -2940,6 +3034,8 @@ pub const Generator = struct {
             .name = base.name,
             .elem = base.elem,
             .pointee = pointee,
+            .payload = base.payload,
+            .err_payload = base.err_payload,
         };
     }
 
@@ -3105,11 +3201,32 @@ pub const Generator = struct {
                         try self.inferExpr(m.scrutinee),
                         .owned,
                     );
+                } else if (m.arms[0].pattern.kind == .wrap_pattern) {
+                    const wp = m.arms[0].pattern.kind.wrap_pattern;
+                    if (wp.binding) |name| {
+                        const scrut = try self.inferExpr(m.scrutinee);
+                        const payload: CType = switch (wp.ctor) {
+                            .some, .ok => if (scrut.payload) |p| p.* else CType.unknown,
+                            .err => if (scrut.err_payload) |p| p.* else CType.unknown,
+                            .none => CType.unknown,
+                        };
+                        try self.pushScratchLocal(name, payload, .copy);
+                    }
                 }
                 return try self.inferExpr(m.arms[0].body);
             },
             .annotated => |a| return try self.inferExpr(a.value),
-            .wrap => return CType.unknown,
+            .wrap => |w| switch (w.ctor) {
+                .some => {
+                    const inner = try self.inferExpr(w.operand.?);
+                    const p = try self.arena.create(CType);
+                    p.* = inner;
+                    const base = optBaseForPayload(inner) orelse return CType.unknown;
+                    return .{ .text = try std.fmt.allocPrint(self.arena, "{s}_t", .{base}), .shape = .optional, .payload = p };
+                },
+                .none => return CType.unknown,
+                .ok, .err => return CType.result,
+            },
         }
     }
 
@@ -3343,6 +3460,38 @@ fn isDefaultPattern(p: ast.Pattern) bool {
 /// Strip every `.annotated` wrapper. A written ownership prefix is kept on
 /// the AST as one of these (see the module doc comment's rule 3), so
 /// `observe(arc label)` reaches here as a wrapper around the identifier.
+/// `cell_opt_i64_t` -> `cell_opt_i64`, the constructor prefix.
+fn optBase(ty: CType) []const u8 {
+    std.debug.assert(ty.shape == .optional);
+    return ty.text[0 .. ty.text.len - "_t".len];
+}
+
+/// The predefined `cell_opt_*` instance for a scalar C type, by spelling.
+fn optBaseForPayload(t: CType) ?[]const u8 {
+    const map = .{
+        .{ "int64_t", "cell_opt_i64" }, .{ "uint64_t", "cell_opt_u64" },
+        .{ "int32_t", "cell_opt_i32" }, .{ "double", "cell_opt_f64" },
+        .{ "bool", "cell_opt_bool" },   .{ "uint8_t", "cell_opt_byte" },
+        .{ "float", "cell_opt_Float32" },
+    };
+    inline for (map) |row| if (std.mem.eql(u8, t.text, row[0])) return row[1];
+    return null;
+}
+
+/// Which `cell_value_t` field an ok payload of this C type rides in, and
+/// the runtime constructor that writes it.
+fn resultField(t: CType) struct { field: []const u8, ctor: []const u8, cast: []const u8 } {
+    if (std.mem.eql(u8, t.text, "int64_t")) return .{ .field = "i64", .ctor = "cell_ok_i64", .cast = "" };
+    if (std.mem.eql(u8, t.text, "int32_t")) return .{ .field = "i64", .ctor = "cell_ok_i32", .cast = "(int32_t)" };
+    if (std.mem.eql(u8, t.text, "uint64_t")) return .{ .field = "u64", .ctor = "cell_ok_u64", .cast = "" };
+    if (std.mem.eql(u8, t.text, "uint8_t")) return .{ .field = "u64", .ctor = "cell_ok_u64", .cast = "(uint8_t)" };
+    if (std.mem.eql(u8, t.text, "double")) return .{ .field = "f64", .ctor = "cell_ok_f64", .cast = "" };
+    if (std.mem.eql(u8, t.text, "float")) return .{ .field = "f64", .ctor = "cell_ok_f64", .cast = "(float)" };
+    if (std.mem.eql(u8, t.text, "bool")) return .{ .field = "b", .ctor = "cell_ok_bool", .cast = "" };
+    // Unknown payloads are refused by the checker; keep the C loud.
+    return .{ .field = "i64", .ctor = "cell_ok_i64", .cast = "" };
+}
+
 fn unwrapAnnotated(e: *const ast.Expr) *const ast.Expr {
     var current = e;
     while (true) {
@@ -7833,4 +7982,50 @@ test "a list element is a ninth position, and it inherits the conversion by rout
     try expectContains(e.text, "= cell_string_from_str(cell_str_from_parts(\"bb\", 2));");
     try expectContains(e.text, "cell_slice_alloc(sizeof(cell_string_t), 2)");
     try expectOccurrences(e.text, "cell_slice_free(&xs);", 1);
+}
+
+test "Some/None/Ok/Err lower onto the runtime constructors" {
+    var e = try emitSource(
+        \\pub enum E { A, B }
+        \\pub fn f() -> Int {
+        \\  let a: Int? = Some(1)
+        \\  let b: Int? = None
+        \\  let c: Int32? = Some(2)
+        \\  let d: Result<Int, E> = Ok(3)
+        \\  let g: Result<Int, E> = Err(E.B)
+        \\  let h: Result<Byte, Int32> = Ok(4)
+        \\  let i = Some(5)
+        \\  return 0
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectContains(f, "cell_opt_i64_t a = cell_opt_i64_some(1);");
+    try expectContains(f, "cell_opt_i64_t b = cell_opt_i64_none();");
+    try expectContains(f, "cell_opt_i32_t c = cell_opt_i32_some(2);");
+    try expectContains(f, "cell_result_t d = cell_ok_i64(3);");
+    try expectContains(f, "cell_result_t g = cell_err((int32_t)cell_E_B);");
+    try expectContains(f, "cell_result_t h = cell_ok_u64((uint64_t)4);");
+    try expectContains(f, "cell_opt_i64_t i = cell_opt_i64_some(5);");
+    try expectCompiles(e.text);
+}
+
+test "wrap patterns test the tag and bind the payload" {
+    var e = try emitSource(
+        \\pub enum E { A, B }
+        \\pub fn f(copy o: Int?, copy r: Result<Byte, E>) -> Int {
+        \\  let copy a = match o { Some(x) => x, None => 0 }
+        \\  let copy b = match r { Ok(v) => 1, Err(code) => 2 }
+        \\  return a + b
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectContains(f, "if (_cell_t1.has_value) {");
+    try expectContains(f, "int64_t x = _cell_t1.value;");
+    try expectContains(f, "} else if (!_cell_t1.has_value) {");
+    try expectContains(f, "if (_cell_t3.ok) {");
+    try expectContains(f, "uint8_t v = (uint8_t)_cell_t3.value.u64;");
+    try expectContains(f, "cell_E code = (cell_E)_cell_t3.error_code;");
+    try expectCompiles(e.text);
 }

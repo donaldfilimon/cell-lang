@@ -208,9 +208,8 @@ pub fn bytes_clear(exclusive xs: [Byte]);
 pub fn bytes_empty() -> owned [Byte];
 pub fn bytes_with_capacity(copy cap: Int) -> owned [Byte];
 
-// `bytes_pop` returns `Byte?` and there is no way to test or unwrap an
-// optional (SPEC section 3.2), so this signature is currently unusable even if
-// it were implemented.
+// `bytes_pop` returns `Byte?`. Since 2026-09-16 a `Byte?` is matched with
+// `Some`/`None` (SPEC section 3.2).
 
 // -- Reference counting ----------------------------------------------------
 //

@@ -212,6 +212,19 @@ pub const Checker = struct {
             .let => |*l| {
                 const annotated: ?Type = if (l.ty) |t| try self.resolveType(&t) else null;
                 var bound: Type = annotated orelse types.t_unknown;
+                if (annotated == null) {
+                    if (l.value) |*v| {
+                        if (v.kind == .wrap and v.kind.wrap.ctor != .some) {
+                            const word = switch (v.kind.wrap.ctor) {
+                                .none => "'None' needs a declared optional type here",
+                                .ok => "'Ok' needs a declared Result type here",
+                                .err => "'Err' needs a declared Result type here",
+                                .some => unreachable,
+                            };
+                            try self.errf(v.span, "{s}", .{word});
+                        }
+                    }
+                }
                 if (l.value) |*v| {
                     const actual = try self.checkExpr(v);
                     if (annotated) |want| {
@@ -429,6 +442,39 @@ pub const Checker = struct {
                             .mutable = false,
                             .ty = scrutinee,
                         }),
+                        .wrap_pattern => |wp| {
+                            const payload: ?Type = switch (wp.ctor) {
+                                .some, .none => switch (scrutinee) {
+                                    .optional => |inner| inner.*,
+                                    .unknown => types.t_unknown,
+                                    else => blk: {
+                                        try self.errf(arm.pattern.span, "pattern '{s}' needs an optional scrutinee, found {s}", .{
+                                            if (wp.ctor == .some) "Some" else "None",
+                                            try self.typeName(scrutinee),
+                                        });
+                                        break :blk null;
+                                    },
+                                },
+                                .ok, .err => switch (scrutinee) {
+                                    .result => |r| if (wp.ctor == .ok) r.ok.* else r.err.*,
+                                    .unknown => types.t_unknown,
+                                    else => blk: {
+                                        try self.errf(arm.pattern.span, "pattern '{s}' needs a Result scrutinee, found {s}", .{
+                                            if (wp.ctor == .ok) "Ok" else "Err",
+                                            try self.typeName(scrutinee),
+                                        });
+                                        break :blk null;
+                                    },
+                                },
+                            };
+                            if (wp.binding) |name| {
+                                try self.declare(arm.pattern.span, name, .{
+                                    .ownership = .copy,
+                                    .mutable = false,
+                                    .ty = payload orelse types.t_unknown,
+                                });
+                            }
+                        },
                         else => {},
                     }
                     if (arm.guard) |g| {
@@ -437,7 +483,9 @@ pub const Checker = struct {
                         // declares that name inside the arm rather than before
                         // the if-chain, so the guard could not see it. Rejected
                         // explicitly rather than emitted wrongly.
-                        if (arm.pattern.kind == .binding) {
+                        const binds = arm.pattern.kind == .binding or
+                            (arm.pattern.kind == .wrap_pattern and arm.pattern.kind.wrap_pattern.binding != null);
+                        if (binds) {
                             try self.errf(
                                 g.span,
                                 "a guard on a binding pattern is not implemented yet",
@@ -472,8 +520,29 @@ pub const Checker = struct {
             .annotated => |a| return try self.checkExpr(a.value),
 
             .wrap => |w| {
-                if (w.operand) |o| _ = try self.checkExpr(o);
-                return types.t_unknown;
+                const payload: Type = if (w.operand) |o| try self.checkExpr(o) else types.t_unknown;
+                switch (w.ctor) {
+                    .some => {
+                        if (!isScalarPayload(payload)) {
+                            try self.errf(expr.span, "optional/Result payloads other than scalar primitives are not implemented", .{});
+                            return try self.optionalOf(types.t_unknown);
+                        }
+                        return try self.optionalOf(payload);
+                    },
+                    .none => return try self.optionalOf(types.t_unknown),
+                    .ok => {
+                        if (!isScalarPayload(payload)) {
+                            try self.errf(expr.span, "optional/Result payloads other than scalar primitives are not implemented", .{});
+                            return try self.resultOf(types.t_unknown, types.t_unknown);
+                        }
+                        return try self.resultOf(payload, types.t_unknown);
+                    },
+                    .err => {
+                        // `Err("x")` is left typed as written so the declared
+                        // slot reports the mismatch with both types named.
+                        return try self.resultOf(types.t_unknown, payload);
+                    },
+                }
             },
         }
     }
@@ -661,6 +730,28 @@ pub const Checker = struct {
         return .{ .list = p };
     }
 
+    fn optionalOf(self: *Checker, inner: Type) CheckError!Type {
+        const p = try self.arena().create(Type);
+        p.* = inner;
+        return .{ .optional = p };
+    }
+
+    fn resultOf(self: *Checker, ok: Type, err: Type) CheckError!Type {
+        const o = try self.arena().create(Type);
+        o.* = ok;
+        const e = try self.arena().create(Type);
+        e.* = err;
+        return .{ .result = .{ .ok = o, .err = e } };
+    }
+
+    /// The payloads this slice admits (spec B.2): the scalar primitives.
+    fn isScalarPayload(t: Type) bool {
+        return switch (t) {
+            .unknown, .int, .int32, .uint, .float, .float32, .boolean, .byte => true,
+            else => false,
+        };
+    }
+
     // -- scopes -------------------------------------------------------------
 
     fn pushScope(self: *Checker) void {
@@ -816,6 +907,24 @@ fn literalFits(expected: Type, value: *const ast.Expr) bool {
         },
         .unary => |u| u.op == .neg and literalFits(expected, u.operand),
         .annotated => |a| literalFits(expected, a.value),
+        // `Some(3)` as `Byte?` (and `Ok(3)` as `Result<Byte, E>`) is the same
+        // untyped-literal widening as a bare `3` as `Byte`: the constructor
+        // wraps the literal, it does not change its width.
+        .wrap => |w| switch (w.ctor) {
+            .some => switch (expected) {
+                .optional => |inner| if (w.operand) |o| literalFits(inner.*, o) else false,
+                else => false,
+            },
+            .ok => switch (expected) {
+                .result => |r| if (w.operand) |o| literalFits(r.ok.*, o) else false,
+                else => false,
+            },
+            .err => switch (expected) {
+                .result => |r| if (w.operand) |o| literalFits(r.err.*, o) else false,
+                else => false,
+            },
+            .none => false,
+        },
         else => false,
     };
 }
@@ -908,6 +1017,66 @@ const TestModule = struct {
         try self.expectCount(0);
     }
 };
+
+test "Some carries its operand's type and None needs a declared slot" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f() -> Int? {
+        \\    let a: Int? = Some(1)
+        \\    let b: Int? = None
+        \\    let c = None
+        \\    return a
+        \\}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 4, 13, "'None' needs a declared optional type here");
+}
+
+test "Ok and Err are checked against the declared Result" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub enum IoError { Missing, Denied }
+        \\pub fn f() -> Result<Int, IoError> {
+        \\    let r: Result<Int, IoError> = Ok(1)
+        \\    let e: Result<Int, IoError> = Err(IoError.Denied)
+        \\    let bad: Result<Int, Int32> = Err("x")
+        \\    let untyped = Ok(1)
+        \\    return r
+        \\}
+    );
+    try t.expectCount(2);
+    try t.expectDiag(0, .err, 5, 35, "cannot initialize a binding of type Result<Int, Int32> with a value of type Result<<unknown>, String>");
+    try t.expectDiag(1, .err, 6, 19, "'Ok' needs a declared Result type here");
+}
+
+test "scalar payloads only" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f(owned s: String) -> String? {
+        \\    return Some(s)
+        \\}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 2, 12, "optional/Result payloads other than scalar primitives are not implemented");
+}
+
+test "wrap patterns bind the payload and need the matching scrutinee" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f(copy o: Int?, copy r: Result<Int, Int32>, copy n: Int) -> Int {
+        \\    let a = match o { Some(x) => x, None => 0 }
+        \\    let b = match r { Ok(v) => v, Err(code) => 0 }
+        \\    let c = match n { Some(x) => x, _ => 0 }
+        \\    return a + b + c
+        \\}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 4, 23, "pattern 'Some' needs an optional scrutinee, found Int");
+}
 
 test "an unresolved name is reported at its own span" {
     var t: TestModule = .init();

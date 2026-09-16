@@ -103,6 +103,10 @@ symbol for LLVM IR or MLIR to call, so both refuse with `cannot lower`. They
 refuse TOGETHER, which is why the agreement contract below still holds while
 the three backends disagree about the program.
 
+`optionals.cell` (prints 43) and `results.cell` (prints 9) are C only by the
+same contract: LLVM and MLIR refuse `Some`/`None`/`Ok`/`Err` together with
+`cannot lower`. Scalar payloads only.
+
 ## What `cell check` covers
 
 `cell check` parses, typechecks, and borrow-checks. A file in `examples/`

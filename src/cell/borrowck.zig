@@ -2055,6 +2055,23 @@ pub const Checker = struct {
                     .arm_scrutinee_binding = if (scrutinee_place) |p| p.binding else null,
                 });
             }
+            if (arm.pattern.kind == .wrap_pattern) {
+                if (arm.pattern.kind.wrap_pattern.binding) |name| {
+                    // The payload is a scalar copied out of the scrutinee
+                    // (spec B.2), so it aliases nothing and owns nothing.
+                    _ = try self.declare(.{
+                        .id = 0,
+                        .name = name,
+                        .ownership = .copy,
+                        .mutable = false,
+                        .struct_name = null,
+                        .decl_span = arm.pattern.span,
+                        .arm_origin = .temp,
+                        .arm_scrutinee = null,
+                        .arm_scrutinee_binding = null,
+                    });
+                }
+            }
             try self.checkExpr(arm.body);
             self.popScope();
 
@@ -2679,6 +2696,10 @@ pub const Checker = struct {
             .match_expr => |m| blk: {
                 var acc: ArcSource = .not_arc;
                 for (m.arms) |arm| {
+                    if (wrapPayloadBody(arm)) {
+                        acc = ArcSource.join(acc, .not_arc);
+                        continue;
+                    }
                     acc = ArcSource.join(acc, try self.arcUniqueSource(arm.body));
                 }
                 break :blk acc;
@@ -2835,6 +2856,19 @@ pub const Checker = struct {
     /// `ownedMoveSource` in a BRANCH position, where a place is not movable.
     /// See `OwnedMove`'s comment for why the promotion is the fix and a move
     /// is not.
+    /// True when this arm's body is the wrap-pattern payload itself. That
+    /// payload is a scalar copy (spec B.2), so it owns nothing and is not
+    /// `arc`. Asked during `ownedMoveSource`/`arcUniqueSource` of a match,
+    /// which run BEFORE `checkMatch` declares the binding; a lookup of the
+    /// name would otherwise fail closed as "unresolved".
+    fn wrapPayloadBody(arm: ast.MatchArm) bool {
+        if (arm.pattern.kind != .wrap_pattern) return false;
+        const name = arm.pattern.kind.wrap_pattern.binding orelse return false;
+        var body: *const ast.Expr = arm.body;
+        while (body.kind == .annotated) body = body.kind.annotated.value;
+        return body.kind == .ident and std.mem.eql(u8, body.kind.ident, name);
+    }
+
     fn ownedMoveBranch(self: *Checker, e: *const ast.Expr) Error!OwnedMove {
         return switch (try self.ownedMoveSource(e)) {
             .no_owned_place => .no_owned_place,
@@ -2955,6 +2989,10 @@ pub const Checker = struct {
             .match_expr => |m| blk: {
                 var acc: OwnedMove = .no_owned_place;
                 for (m.arms) |arm| {
+                    if (wrapPayloadBody(arm)) {
+                        acc = OwnedMove.join(acc, .no_owned_place);
+                        continue;
+                    }
                     acc = OwnedMove.join(acc, try self.ownedMoveBranch(arm.body));
                 }
                 break :blk acc;
@@ -8665,6 +8703,32 @@ test "moved_paths: a partial move is still ACCEPTED, with no diagnostic" {
         \\  let owned p: Pair = Pair { a: "x", b: "y" }
         \\  let owned m: String = p.a
         \\  return view(shared p.b)
+        \\}
+    );
+}
+
+test "Some reads its operand and a wrap-pattern binding is a copy" {
+    try expectAccepted(
+        \\pub fn view(copy n: Int) -> Int;
+        \\pub fn f(copy n: Int) -> Int {
+        \\    let o: Int? = Some(n)
+        \\    let m = view(n)
+        \\    let copy a = match o { Some(x) => x + m, None => m }
+        \\    return a
+        \\}
+    );
+    try expectRejectedWith(
+        \\pub fn f(copy o: Int?) -> Int {
+        \\    let copy a = match o {
+        \\        Some(x) => { x = 1 x },
+        \\        None => 0,
+        \\    }
+        \\    return a
+        \\}
+    , "cannot assign to immutable binding 'x'");
+    try expectAccepted(
+        \\pub fn f(copy o: Int?) -> Int {
+        \\    return match o { Some(x) => x, None => 0 }
         \\}
     );
 }

@@ -1,0 +1,34 @@
+// Optional values: construction with Some/None and inspection in match.
+//
+// Status: parses, passes `cell check`, and the emitted C compiles, links and
+// runs, printing 43 (see EXPECT-OUTPUT). C backend only: LLVM and MLIR refuse
+// the constructors and patterns together with `cannot lower`, so the
+// agreement contract holds. Payloads are scalar primitives (SPEC 3.2).
+// EXPECT-OUTPUT: 43
+
+pub fn print_int(copy value: Int);
+
+pub fn first_positive(copy a: Int, copy b: Int) -> Int? {
+    if a > 0 {
+        return Some(a)
+    }
+    if b > 0 {
+        return Some(b)
+    }
+    return None
+}
+
+pub fn or_zero(copy o: Int?) -> Int {
+    return match o {
+        Some(x) => x,
+        None => 0,
+    }
+}
+
+pub fn main() {
+    let copy a = or_zero(first_positive(-1, 40))
+    let copy b = or_zero(first_positive(-1, -1))
+    let copy c: Byte? = Some(3)
+    let copy d = match c { Some(v) => 3, None => 0 }
+    print_int(a + b + d)
+}

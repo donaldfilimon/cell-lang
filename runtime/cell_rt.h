@@ -315,6 +315,13 @@ static inline cell_result_t cell_ok_i64(int64_t v) {
     return r;
 }
 
+/** An Int32 payload rides in the i64 slot; readers narrow with a cast. */
+static inline cell_result_t cell_ok_i32(int32_t v) {
+    cell_result_t r = cell_ok_unit();
+    r.value.i64 = v;
+    return r;
+}
+
 static inline cell_result_t cell_ok_u64(uint64_t v) {
     cell_result_t r = cell_ok_unit();
     r.value.u64 = v;
