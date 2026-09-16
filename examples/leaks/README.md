@@ -36,3 +36,17 @@ there is nothing for `leaks` to measure and no fixture for it here.
 Run them all, with the pinned expected counts, via `tools/check.sh`'s `leaks`
 stage. That stage SKIPS loudly (not silently) when the macOS `leaks` tool is
 unavailable.
+
+Three `.c` files sit beside the fixtures and are part of how they are
+measured, not fixtures themselves. `leak_host.c` is the real `main` for every
+fixture: the emitted C is compiled with `-Dmain=cell_program_main`, and the
+host runs it and then overwrites the stack before returning, because
+`leaks -atExit` is a conservative scanner and used to find the last
+iteration's three boxes through a stale stack slot, reporting 2997 for a
+program that leaks 3000. `malloc_counter.h` and `malloc_counter.c` are the
+independent witness: `-include`d into the emitted C and the runtime (never
+into `malloc_counter.c` itself), they count every block obtained and never
+freed and print `MALLOC_COUNTER ALLOC= FREE= LIVE=` to stderr at exit. The
+stage requires the `leaks` count and LIVE to both equal the pin, so a pin can
+never again move on one witness. The trap note on the leaks stage in
+`tools/check.sh` carries the measurements that proved the under-count.

@@ -159,6 +159,18 @@
 #     that allocates a different amount per iteration will be off by that
 #     amount instead.
 #
+#     SINCE 2026-09-15 THE STAGE NO LONGER SEES THIS ARTIFACT, and it no longer
+#     trusts `leaks` alone. Every fixture is linked behind
+#     examples/leaks/leak_host.c (the real `main`, which runs the program and
+#     then overwrites the stack before exit; the emitted C is compiled with
+#     `-Dmain=cell_program_main` as its own object so the rename cannot touch
+#     the host) and built with examples/leaks/malloc_counter.{h,c} injected
+#     (`-include`, one shared definition across every translation unit). Each
+#     fixture therefore yields TWO numbers, the `leaks` count and the counter's
+#     LIVE, and the stage requires BOTH to equal the pin. The history below is
+#     kept because it is the reason those two files exist and the reason a
+#     one-witness stage must never come back.
+#
 #     PROVEN 2026-09-08, by two measurements rather than by argument, and the
 #     first one falsified the competing explanation that used to live in
 #     examples/leaks/block_scoped_local.cell (that the last iteration's box was
@@ -182,20 +194,25 @@
 #     which is precisely the group the other three still hold a stale reference
 #     to.
 #
-#     THE HAZARD THIS CREATES, and it is the reason all of the above is written
-#     down: the artifact is STACK-LAYOUT-SENSITIVE. A codegen change that adds
-#     or removes a local in the emitted C can flip a constant 2997 -> 3000 or
-#     3000 -> 2997 without changing what the program leaks. This stage would
-#     then report a RISE ("regression") or a DROP ("good, re-pin"), and the
-#     second is the honesty hazard, because someone re-pins believing a leak
-#     closed. RULE: a delta of exactly one iteration's allocations is this
-#     artifact and must be confirmed with the malloc counter before any
-#     re-pinning. Any other delta is semantic and should be chased.
+#     THE HAZARD THIS CREATED, and it is the reason all of the above is written
+#     down: the artifact is STACK-LAYOUT-SENSITIVE. Before the host existed, a
+#     codegen change that added or removed a local in the emitted C could flip
+#     a constant 2997 -> 3000 or 3000 -> 2997 without changing what the program
+#     leaks, and the stage would have reported a RISE ("regression") or a DROP
+#     ("good, re-pin"); the second is the honesty hazard, because someone
+#     re-pins believing a leak closed. The stack clobber removes the artifact
+#     and the counter is the witness that it is gone: if the two numbers ever
+#     disagree, the stage fails and names which one moved. RULE, unchanged in
+#     spirit: never re-pin on one witness. A `leaks` reading that the counter
+#     does not reproduce is a measurement problem, not a closed leak.
 #
-#     The counts pinned below were re-measured 8 times each and were IDENTICAL
-#     every time, so they are stable-but-undercounting numbers, not flaky ones;
-#     if a future re-measurement is not reproducible run to run, say so in the
-#     report rather than pinning whichever number came up first.
+#     The 2997s were re-measured 8 times each and were IDENTICAL every time,
+#     so they were stable-but-undercounting numbers, not flaky ones. The 3000s
+#     pinned below were measured 3 times each through the host and counter
+#     (leaks and LIVE agreed on every run; the two controls, row 3 at 0 and
+#     row 5 at 3000 with ALLOC=3003 FREE=3, held). If a future re-measurement
+#     is not reproducible run to run, say so in the report rather than pinning
+#     whichever number came up first.
 
 set -u
 
@@ -208,28 +225,35 @@ TMP=$(mktemp -d) || exit 2
 trap 'rm -rf "$TMP"' EXIT
 
 # ---- docs/OWNERSHIP.md R11 disclosed-leak constants, pinned by commit -----
-# Each number is the exact `leaks -atExit` count this fixture produced when
-# it was measured, over 1000 loop iterations, on THIS commit. Not the number
-# quoted in docs/OWNERSHIP.md's prose (that prose predates these fixtures and
-# used a different string literal in one case, which changes byte totals but
-# not leak counts): re-measured fresh so the constant and the fixture that
-# produces it live in the same place. Re-measured 8 times each and identical
-# every time; see this script's header trap note on `leaks -atExit`
-# under-counting by ONE ITERATION'S ALLOCATIONS via a stale stack/register
-# reference, which is why three of these read 2997 rather than the 3000 that
-# 1000 iterations at three allocations each actually leak. All four fixtures
-# leak exactly 3000; only visibility differs. Do NOT re-pin a constant that
-# moved by exactly 3 without confirming with the malloc counter that header
-# note describes: that delta is the measurement artifact, not a closed leak.
+# Each number is the count this fixture produced when it was measured, over
+# 1000 loop iterations, on THIS commit, read from BOTH witnesses the stage
+# uses: the `leaks -atExit` count of the binary linked behind
+# examples/leaks/leak_host.c, and the LIVE figure from
+# examples/leaks/malloc_counter.c injected into the same binary. The stage
+# fails unless both equal the pin. Not the number quoted in
+# docs/OWNERSHIP.md's prose (that prose predates these fixtures and used a
+# different string literal in one case, which changes byte totals but not
+# leak counts): re-measured fresh so the constant and the fixture that
+# produces it live in the same place.
+#
+# HISTORY, because the numbers moved once without any leak closing: from
+# 2026-09-08 (35003ca) to 2026-09-15 three of these were pinned at 2997,
+# measured at 78eadb22 with `leaks` alone, because the tool's conservative
+# scan could still see the last iteration's three boxes through a stale stack
+# slot. The header trap note on this stage carries the proof. Adding the host
+# and the counter made the true 3000 visible and confirmable, and the pins
+# moved 2997 -> 3000 on 2026-09-15 with NO change under src/: the codegen
+# measured is still 178599028cf2aabf3e815947cae0f9926b601c81's, which is why
+# that is the commit cited rather than the one that changed the method.
 #
 # When one of these changes because a gap in docs/OWNERSHIP.md R11 closed:
 # update the constant AND that document's row, and cite the new commit here.
-LEAKS_MEASURED_AT=78eadb22dd0e943f6f3ed15d8914d58a54e1ed11
+LEAKS_MEASURED_AT=178599028cf2aabf3e815947cae0f9926b601c81
 
 # R11 row 1: a Cell body never releases its own `arc` parameter.
-LEAK_PARAM_NEVER_RELEASED=2997
+LEAK_PARAM_NEVER_RELEASED=3000
 # R11 row 2: a struct holding an `arc` field is never dropped.
-LEAK_STRUCT_ARC_FIELD=2997
+LEAK_STRUCT_ARC_FIELD=3000
 # R11 row 3: an `arc` value unboxed for a `shared` parameter without ever
 # being bound (`inspect(shared fresh())`) drops its handle on the floor.
 # This is the one row whose count matches docs/OWNERSHIP.md's own prose
@@ -242,7 +266,7 @@ LEAK_STRUCT_ARC_FIELD=2997
 LEAK_UNBOUND_SHARED_TEMP=0
 # R11 row 4: an `arc` local declared inside a block is never released
 # (function-scoped release, block-scoped binding); the "block form" row.
-LEAK_BLOCK_SCOPED_LOCAL=2997
+LEAK_BLOCK_SCOPED_LOCAL=3000
 # R11 row 5: reassigning an `arc` `var` leaks the previous box.
 LEAK_REASSIGNED_VAR=3000
 
@@ -657,27 +681,65 @@ else
     # boundary in a hand-written C file" reasoning documented on run_c_host
     # applies (examples/leaks/unbound_shared_temp.cell reuses
     # examples/arc_host.c's existing `cell_inspect` rather than duplicating it).
+    #
+    # Two things differ from run_c_host, both forced by the header trap note
+    # on `leaks -atExit` under-counting:
+    #   * The emitted C is compiled as its OWN object with
+    #     `-Dmain=cell_program_main`, and examples/leaks/leak_host.c supplies
+    #     the real `main`, which runs the program and then clobbers the stack
+    #     so the conservative scan cannot find a stale pointer to the last
+    #     iteration's boxes. One `cc` line over every source would rename the
+    #     host's `main` too and leave no entry point, hence the separate steps.
+    #   * examples/leaks/malloc_counter.h is `-include`d into the emitted C,
+    #     the runtime, and any host, and malloc_counter.c (compiled WITHOUT
+    #     the header, see its comment) prints ALLOC/FREE/LIVE to stderr at
+    #     exit. LIVE is a count of blocks never freed that owes nothing to a
+    #     stack scan, and the fixture passes only when `leaks` AND LIVE both
+    #     equal the pin, so a re-pin can never again rest on one witness.
+    # The shared objects are built once, before the first fixture.
+    LEAKCC="cc -I runtime -I examples/leaks"
+    leak_shared_ok=1
+    $LEAKCC -c examples/leaks/malloc_counter.c -o "$TMP/leak_counter.o" 2>/dev/null \
+        || { fail "leaks: C compile examples/leaks/malloc_counter.c"; leak_shared_ok=0; }
+    $LEAKCC -c examples/leaks/leak_host.c -o "$TMP/leak_host.o" 2>/dev/null \
+        || { fail "leaks: C compile examples/leaks/leak_host.c"; leak_shared_ok=0; }
+    $LEAKCC -include examples/leaks/malloc_counter.h -c runtime/cell_rt.c -o "$TMP/leak_rt.o" 2>/dev/null \
+        || { fail "leaks: C compile runtime/cell_rt.c with the malloc counter"; leak_shared_ok=0; }
     run_c_leaks() {
         ex=$1; host=$2; want=$3; note=$4
+        [ "$leak_shared_ok" -eq 1 ] || { fail "leaks $ex: shared objects did not build"; return; }
         $CELL emit "examples/leaks/$ex.cell" > "$TMP/leak_$ex.c" 2>/dev/null \
             || { fail "leaks: C emit $ex"; return; }
+        $LEAKCC -include examples/leaks/malloc_counter.h -Dmain=cell_program_main \
+            -c "$TMP/leak_$ex.c" -o "$TMP/leak_$ex.o" 2>/dev/null \
+            || { fail "leaks: C compile $ex"; return; }
+        host_obj=""
         if [ -n "$host" ]; then
-            cc -I runtime "$TMP/leak_$ex.c" "$host" runtime/cell_rt.c -o "$TMP/leak_$ex" 2>/dev/null \
-                || { fail "leaks: C compile $ex"; return; }
-        else
-            cc -I runtime "$TMP/leak_$ex.c" runtime/cell_rt.c -o "$TMP/leak_$ex" 2>/dev/null \
-                || { fail "leaks: C compile $ex"; return; }
+            host_obj="$TMP/leak_${ex}_host.o"
+            $LEAKCC -include examples/leaks/malloc_counter.h -c "$host" -o "$host_obj" 2>/dev/null \
+                || { fail "leaks: C compile $host for $ex"; return; }
         fi
-        got=$(leaks -atExit -- "$TMP/leak_$ex" 2>/dev/null \
+        # $host_obj is deliberately unquoted: empty means no extra object.
+        cc "$TMP/leak_$ex.o" "$TMP/leak_host.o" "$TMP/leak_rt.o" "$TMP/leak_counter.o" $host_obj \
+            -o "$TMP/leak_$ex" 2>/dev/null \
+            || { fail "leaks: C link $ex"; return; }
+        got=$(leaks -atExit -- "$TMP/leak_$ex" 2>"$TMP/leak_$ex.stderr" \
             | sed -n 's/^Process [0-9][0-9]*: \([0-9][0-9]*\) leaks for .*/\1/p' | tail -1)
+        live=$(sed -n 's/^MALLOC_COUNTER ALLOC=[0-9]* FREE=[0-9]* LIVE=\([0-9][0-9]*\)$/\1/p' "$TMP/leak_$ex.stderr" | tail -1)
         if [ -z "$got" ]; then
             fail "leaks $ex: could not parse a leak count from 'leaks -atExit' output"
             return
         fi
-        if [ "$got" -eq "$want" ]; then
-            pass "leaks $ex -> $got leaks (pinned, $note)"
+        if [ -z "$live" ]; then
+            fail "leaks $ex: the malloc counter printed no MALLOC_COUNTER line (was examples/leaks/malloc_counter.c linked and its atexit handler reached?)"
+            return
+        fi
+        if [ "$got" -eq "$want" ] && [ "$live" -eq "$want" ]; then
+            pass "leaks $ex -> $got leaks, counter LIVE=$live (pinned, $note)"
+        elif [ "$got" -ne "$live" ]; then
+            fail "leaks $ex -> leaks=$got but counter LIVE=$live, want $want for both (the two witnesses DISAGREE: that is a measurement problem in examples/leaks/leak_host.c or malloc_counter.c, not a codegen change; do not re-pin)"
         else
-            fail "leaks $ex -> $got leaks, want $want (pinned $note; a DROP means the R11 gap closed and the constant plus docs/OWNERSHIP.md need updating; a RISE, or any leak in a previously clean fixture, means codegen regressed)"
+            fail "leaks $ex -> $got leaks, counter LIVE=$live, want $want (pinned $note; both witnesses agree, so this is real: a DROP means the R11 gap closed and the constant plus docs/OWNERSHIP.md need updating; a RISE, or any leak in a previously clean fixture, means codegen regressed)"
         fi
     }
 

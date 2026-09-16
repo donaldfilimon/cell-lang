@@ -11,11 +11,14 @@
 // is FALSE: this program emits ZERO release calls of any kind (`cell emit ...
 // | grep -c cell_arc_drop` is 0), so nothing is ever freed. An interposed
 // malloc counter reports ALLOC=3000 FREE=0 LIVE=3000 for 1000 iterations at
-// three allocations each. The `leaks -atExit` reading of 2997 is a
-// conservative-scan artifact, not a release: the last iteration's
-// allocations are still reachable from a stale stack/register slot when the
-// scan runs. tools/check.sh's leak stage documents the mechanism and both
-// recipes that prove it.
+// three allocations each. The `leaks -atExit` reading of 2997 that the gate
+// pinned until 2026-09-15 was a conservative-scan artifact, not a release:
+// the last iteration's allocations were still reachable from a stale
+// stack/register slot when the scan ran. Since 2026-09-15 the gate links
+// every fixture behind examples/leaks/leak_host.c, which clobbers the stack
+// before exit, and injects examples/leaks/malloc_counter.{h,c} as a second
+// witness; both now read 3000 and the pin is 3000. tools/check.sh's leak
+// stage documents the mechanism and both recipes that prove it.
 //
 // This fixture ISOLATES that gap alone: `a` is boxed straight from a string
 // literal (BOX, R11 retain rule 1), never touches a struct or a `shared`
