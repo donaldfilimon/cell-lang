@@ -3339,6 +3339,31 @@ pub const Checker = struct {
                 const t = self.placeTypeOf(b, place.path) orelse return null;
                 return t.ty;
             },
+            // An arm body that IS the arm's binding pattern hands back the
+            // scrutinee, so the `let` has the scrutinee's type. Resolved by
+            // shape rather than by declaring the pattern name, because that
+            // name is not in scope at this point and `declare` here would
+            // disturb the binding ids that `codegen.zig` agrees with.
+            //
+            // Narrow on purpose. It exists because codegen's own inference
+            // had the same hole: `match s { x => x }` inferred nothing, the
+            // temporary fell back to `int64_t`, and `cc` rejected the module.
+            // Fixing only that side would have been worse than leaving both
+            // broken -- the `cc` error was the sole thing stopping
+            // `let copy c = match s { x => x }` over a `String`, and once the
+            // C compiled, R12 would have waved through exactly the two
+            // headers over one buffer it exists to refuse. Both sides move
+            // together or neither does.
+            .match_expr => |m| {
+                if (m.arms.len == 0) return null;
+                const arm = m.arms[0];
+                if (arm.pattern.kind == .binding and arm.body.kind == .ident and
+                    std.mem.eql(u8, arm.body.kind.ident, arm.pattern.kind.binding))
+                {
+                    return try self.inferBindingType(m.scrutinee);
+                }
+                return try self.inferBindingType(arm.body);
+            },
             else => return null,
         }
     }
@@ -3355,9 +3380,22 @@ pub const Checker = struct {
     /// drop glue is exactly what turns each of them into a double free, so the
     /// refusal lands ahead of it rather than after.
     ///
-    /// A null type is PERMITTED, not refused: `let copy c = s` over a bare
-    /// `String` binding declared without a type still resolves nothing here
-    /// and is disclosed in `docs/OWNERSHIP.md` R12 instead.
+    /// A null type is still PERMITTED rather than refused, and that policy is
+    /// unchanged; what changed is how rarely it is reached. The example this
+    /// comment used to give, `let copy c = s` over a bare `String` binding
+    /// declared without a type, is REFUSED today and was already refused when
+    /// this was written: `inferBindingType` resolves a call initializer from
+    /// the signature table and an ident from the source binding, so `s` has a
+    /// type and so does `c`. Measured 2026-09-16 across four shapes, all
+    /// refused: call initializer, binding-to-binding with and without an
+    /// annotation, `copy` of a `shared` parameter, and a struct field.
+    ///
+    /// The route that really was open was a match: `let copy c = match s { x
+    /// => x }` resolved nothing, because there was no `.match_expr` arm at
+    /// all. There is one now, deliberately narrow. Whatever remains null is
+    /// permitted and disclosed in `docs/OWNERSHIP.md` R12; do not read that
+    /// as "nothing downstream will catch it", because for the match route
+    /// nothing did.
     fn refuseResourceCopy(
         self: *Checker,
         at: Span,
@@ -6130,6 +6168,40 @@ test "R12 refuses a copy place whose type owns resources, by all three routes" {
         \\t.cell:3:5: error: cannot declare copy binding 's': its type may own resources and copying its header would create two owners
         \\t.cell:3:5: note: use an 'owned' or 'arc' place, or take a 'shared' borrow; resource-bearing copy places are unsupported
         \\
+    );
+}
+
+test "R12 refuses a copy binding whose type comes back through a match arm" {
+    // The fourth route, and the one that was open after the other three were
+    // closed: `inferBindingType` had no `.match_expr` arm, so the binding's
+    // type resolved to null and `refuseResourceCopy` returned without a
+    // verdict. Nothing caught it downstream either -- codegen's own inference
+    // had the same hole, the temporary fell back to `int64_t`, and `cc`
+    // rejected the module. That C type error was the ONLY thing standing
+    // between this program and two `cell_string_t` headers over one buffer.
+    try expectDiagnostics(
+        \\pub fn make() -> String {
+        \\    return "hello"
+        \\}
+        \\pub fn main() -> Int {
+        \\    let owned s = make()
+        \\    let copy c = match s { x => x }
+        \\    return 0
+        \\}
+    ,
+        \\t.cell:6:5: error: cannot declare copy binding 'c': its type may own resources and copying its header would create two owners
+        \\t.cell:6:5: note: use an 'owned' or 'arc' place, or take a 'shared' borrow; resource-bearing copy places are unsupported
+        \\
+    );
+    // The inference is by SHAPE and stays narrow: an arm body that is not the
+    // arm's own binding still resolves through the body, so a scalar match
+    // keeps being accepted rather than being swept up by the new arm.
+    try expectAccepted(
+        \\pub fn main() -> Int {
+        \\    let copy n = 7
+        \\    let copy c = match n { x => x }
+        \\    return c
+        \\}
     );
 }
 

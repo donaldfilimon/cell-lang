@@ -2899,6 +2899,29 @@ pub const Generator = struct {
             .if_expr => |i| return try self.inferExpr(i.then_body),
             .match_expr => |m| {
                 if (m.arms.len == 0) return CType.void_type;
+                // A binding pattern names the scrutinee inside the arm, and
+                // `emitArmBody` declares it with the SCRUTINEE's type. This
+                // inference has to agree or the two disagree silently:
+                // `match s { x => x }` inferred `unknown` from `x` (no local
+                // of that name exists here), `emitValueExpr` fell back to
+                // `CType.int64`, and `cc` then rejected the whole module with
+                // `assigning to 'int64_t' from incompatible type
+                // 'cell_string_t'` -- `cell check` accepting a program the
+                // backend cannot compile, the same class as the struct
+                // typedef-order gap. Measured on `let shared c = match s { x
+                // => x }` over an owned `String`; it reached `shared` and
+                // `copy` alike, so it was never only an ownership-rule gap.
+                // `.owned` and the scratch push mirror `emitArmBody`, whose
+                // comment explains why this binding is never droppable.
+                const mark = self.locals.items.len;
+                defer self.locals.shrinkRetainingCapacity(mark);
+                if (m.arms[0].pattern.kind == .binding) {
+                    try self.pushScratchLocal(
+                        m.arms[0].pattern.kind.binding,
+                        try self.inferExpr(m.scrutinee),
+                        .owned,
+                    );
+                }
                 return try self.inferExpr(m.arms[0].body);
             },
             .annotated => |a| return try self.inferExpr(a.value),
@@ -3733,6 +3756,59 @@ test "an enum a struct field names is emitted before the struct" {
     );
     defer e.deinit();
     try expectBefore(e.text, "typedef int32_t cell_Color;", "typedef struct cell_Tagged {");
+}
+
+test "a match arm's binding pattern carries the scrutinee's type into inference" {
+    // `match s { x => x }` used to infer nothing from `x`, so `emitValueExpr`
+    // fell back to `CType.int64` and `cc` rejected the module with
+    // `assigning to 'int64_t' from incompatible type 'cell_string_t'`.
+    // Asserting the DECLARED TYPE of the destination rather than merely that
+    // a match was emitted: the wrong type is what compiled, not a missing
+    // statement, so a presence-only test would pass on the broken output.
+    var e = try emitSource(
+        \\pub fn make() -> String {
+        \\    return "hello"
+        \\}
+        \\pub fn demo() -> Int {
+        \\    let owned s = make()
+        \\    let shared c = match s { x => x }
+        \\    return 0
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_string_t c = ({");
+    try expectAbsent(e.text, "int64_t c = ({");
+}
+
+test "a scalar scrutinee is not over-typed by that inference" {
+    // The other direction of the same change: the arm binding must take the
+    // scrutinee's type, not a resource type by default.
+    var e = try emitSource(
+        \\pub fn demo() -> Int {
+        \\    let copy n = 7
+        \\    let copy c = match n { x => x }
+        \\    return c
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "int64_t c = ({");
+}
+
+test "an arm body that is not the binding still infers from the body" {
+    // Pins that the fix did not reroute every match through the scrutinee:
+    // a literal arm body keeps its own type, which is what already worked.
+    var e = try emitSource(
+        \\pub fn make() -> String {
+        \\    return "hello"
+        \\}
+        \\pub fn demo() -> Int {
+        \\    let owned s = make()
+        \\    let shared c = match s { x => "lit" }
+        \\    return 0
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_str_t c = ({");
 }
 
 test "a zero-parameter function is prototyped with void" {

@@ -1619,9 +1619,31 @@ The negative answers are pinned by their own tests: a scalar-only record is
 still copyable although it has a struct name, every `copy` in `examples/` is
 untouched, and an `arc` binding of the same resource-bearing type is still
 accepted, because an `arc` place retains rather than duplicating. A binding
-whose type resolves to nothing at all is PERMITTED rather than refused, which
-is the stated residual here: `let copy c = s` over a `String` binding declared
-with neither an annotation nor a resolvable initializer reaches no verdict.
+whose type resolves to nothing at all is PERMITTED rather than refused, and
+that policy still stands; the example given here for it was wrong. `let copy c
+= s` over a `String` binding with no annotation is **refused**, and was already
+refused when this paragraph was written: `inferBindingType` resolves a call
+initializer through the signature table and an ident through its source
+binding. Measured 2026-09-16 across four shapes, every one refused: call
+initializer, binding-to-binding with and without an annotation, `copy` of a
+`shared` parameter, and a struct field.
+
+**The route that really was open was a match, and it is CLOSED as of
+2026-09-16.** `let copy c = match s { x => x }` over an owned `String` reached
+no verdict, because `inferBindingType` had no `.match_expr` arm. The reason it
+is worth writing down is what was underneath: codegen's own inference had the
+identical hole, so the emitted temporary fell back to `int64_t` and `cc`
+rejected the module with `assigning to 'int64_t' from incompatible type
+'cell_string_t'`. That C type error was the only thing standing between the
+program and two `cell_string_t` headers over one buffer, and it was invisible
+as a safety property because it looked like an unrelated backend bug. Fixing
+the backend alone would have made the language strictly less safe, so both
+sides moved in one commit: codegen binds the arm's pattern name to the
+scrutinee's type during inference, and `inferBindingType` resolves an arm body
+that IS the arm's binding to the scrutinee's type. Both are narrow, by shape,
+and a scalar match stays accepted. The lesson generalises past this rule: when
+a front-end gap is masked by a back-end error, closing the back end first
+removes the only guard.
 
 One named over-refusal, in the safe direction. `let copy text = &mut name`
 over a `String` is refused, because the binding's type resolves through the
