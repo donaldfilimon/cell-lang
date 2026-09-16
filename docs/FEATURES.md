@@ -4,7 +4,7 @@ This is the current-status entry point. SPEC.md defines intended semantics;
 OWNERSHIP.md defines ownership rules and retains historical defect evidence.
 Their dated snapshot tables are not current qualification results.
 
-Source inspected: compiler revision `a26f8b8`, 2026-09-16. This matrix records
+Source inspected: compiler revision `d3cf2ae`, 2026-09-16. This matrix records
 static source and fixture evidence, not freshly qualified execution. No row is
 release-qualified on macOS, Linux or Windows. Gate reports qualify particular
 revisions and cases, not every possible program using a feature.
