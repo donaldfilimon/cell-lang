@@ -927,12 +927,16 @@ use-after-frees three and four**, where an earlier search covered
 return-position PLACES and not VALUE positions. Enumerating four *positions* and
 asserting a property of every *consumption* is that mistake one layer up.
 
-`if` and a block tail are covered too, although neither can reach a typed
-`owned` position through `cell check` today: typecheck gives both the type `()`
-and refuses the argument first. That is an accident of the type checker, not
-enforcement of this rule, and this document objects elsewhere to a rule whose
-enforcement depends on a coincidence of two types. Borrowck runs independently
-of typecheck, so its own tests pin both forms on their own merits.
+`if` and a block tail are covered too. Until 2026-09-15 neither could reach a
+typed `owned` position through `cell check`, because typecheck gave both the
+type `()` and refused the argument first; that was an accident of the type
+checker, not enforcement of this rule, and this document objects elsewhere to
+a rule whose enforcement depends on a coincidence of two types. Typecheck now
+types a block as its tail and an `if` with an `else` as its branches (SPEC
+6.10), so both forms reach borrowck typed, and borrowck's own tests pin them
+on their own merits: an `arc` place through an `if` is still refused here, and
+an `arc` block-local tail is refused at the `let` by name (see the R11 row 4
+closure below for how a block tail is resolved at all).
 
 **THE SECOND AXIS, the arc SOURCE: a CALL RESULT whose return type is `arc`.
 This one was a LIVE double free, not a masked one, and it is now CLOSED.**
@@ -1185,11 +1189,25 @@ in `moved` (which outlives the scope, for a future value-position drop pass),
 an `&t` tail is R18, an `arc` tail is R10 naming it, and a nested block
 recurses. A block is ONE path, which is why moving through it is sound where
 moving through an `if` or `match` is not: `let owned s2 = { s1 }` now moves
-`s1`, and a later use of `s1` is a use-after-move. Measured: the emitted C
+`s1`, and a later use of `s1` is a use-after-move. One path with an early exit
+inside it is still one path: `let owned s = { if c { return } \n x }` marks
+`x` moved for the whole function, so on the `return` path nothing frees `x`
+(`pendingDrops` skips a moved binding and `s` does not exist yet). Probed at
+`b608d59`: accepted, compiles under `-Werror`, and the outcome on that path is
+a LEAK of `x`, never a double free, which is the direction this document
+chooses everywhere a drop is uncertain. A second consequence of acceptance:
+`checkLet`'s struct-name inference, whose stated residual (a `match` or a block
+yielding a struct in an UNANNOTATED `let` leaves `struct_name` null, so a later
+`owned` consumption of `s.field` is refused) had no accepted program to apply
+to while every block tail was refused, now has one; write the type and it
+resolves, as that comment says. Measured: the emitted C
 runs under AddressSanitizer with the malloc counter at ALLOC=1 FREE=1 LIVE=0,
 so the move is balanced and `t` needs no drop of its own. **Residual, stated:**
-the other five R2.b consumption sites (assignment, call argument, struct
-field, list element, the unary/return site) still refuse a block-local tail,
+the other five R2.b consumption sites (an assignment into an `owned` place, a
+call argument, a `return`, an `owned` struct field, a list-literal element; the
+`ownedMoveSource` callers in `checkAssign`, `checkCall`, `checkStmt`'s return
+arm and the struct-literal and list-literal arms of `checkExpr`) still refuse a
+block-local tail,
 now with a message that says so ("the block-local binding 't' (only a 'let'
 resolves a block's value today)") instead of blaming ownership.
 
