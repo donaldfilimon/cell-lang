@@ -307,7 +307,9 @@ LEAK_REASSIGNED_VAR=3000
 # paragraph under that table carries it.
 # CLOSED 2026-09-15 (evening): `emitValueBlockDrops` releases a value block's
 # own locals after its tail is lowered into the destination, skipping any
-# local the tail still uses (a borrowed view is copied OUTSIDE the braces)
+# local the tail can still reach, transitively through the block's own lets
+# and assignments (a borrowed view is copied OUTSIDE the braces, and an
+# alias of it names the local nowhere in the tail: 85570d6 missed that)
 # and dropping the tail itself only in the one case the lowering cloned it
 # (an `arc` local into an `arc` destination, which this fixture is). The
 # gate went red on the old pin first ("both witnesses agree ... 0"), then

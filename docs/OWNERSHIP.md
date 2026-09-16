@@ -1172,13 +1172,24 @@ a }`) was not released at that block's exit: `examples/leaks/value_block_local.c
 read **3000 leaks over 1000 iterations** on both witnesses and the gate
 pinned it. `emitValueBlockDrops` now releases a value block's own locals
 after its tail is lowered into the destination, with ONE exclusion and ONE
-exception. The exclusion: any local the tail still USES is left alone,
+exception. The exclusion: any local the tail can still REACH is left alone,
 because the conversion into the declared type happens outside the statement
 expression (`return { let owned t = make() \n &t }` copies the view with
 `cell_string_from_str` around the braces; a read tail at a list element is
 `_cell_t0 = t` with no copy), so freeing inside would hand the copy freed
-memory; that over-refuses a tail like `f(&t)` returning a scalar, stated
-rather than optimised. The exception, which is what closes this fixture: a
+memory. Reach is TRANSITIVE through the block's own `let`s and assignments,
+to a fixpoint, and it has to be: the first version (`85570d6`) asked only
+whether the tail NAMES the local, and `let shared s = { let owned t = make()
+\n let shared v = &t \n v }` then freed `t` inside the braces and handed
+`s` a dangling view (the emitted C showed the free before the value left;
+the malloc counter read 1/1/0 and ASan stayed silent because the probe's
+callee never touched the bytes, which is why the emitted C is the witness).
+Caught and fixed the same night; a codegen test pins the alias shape and a
+two-alias-plus-assignment shape. The over-approximation (a tail like
+`f(&t)` returning a scalar keeps `t` alive for nothing) is stated rather
+than optimised: its cost is a leak, the other direction's is a use-after-free.
+At the `owned` sites a borrow alias as the tail is refused outright by
+borrowck ("cannot move out of 'v': it is a shared borrow"), pinned. The exception, which is what closes this fixture: a
 tail that is a bare identifier naming a block-local `arc` binding lowered
 into an `arc` destination was CLONED (`_cell_t0 = cell_arc_clone(a)`), so
 dropping `a` after it is 1 -> 2 -> 1; no other destination shape gets that,
@@ -1268,8 +1279,8 @@ t }` and `return { s1 }` both ALLOC=1 FREE=1 LIVE=0, equal to `return s1`;
 })` and `eat(owned { s1 })` both ALLOC=1 FREE=0 LIVE=1, equal to `eat(owned
 s1)` (row 1, the parameter); no ASan report anywhere, all compiled under
 `-Wall -Wextra -Werror`. **Residual, stated:** an unmoved local a value-position
-block's tail still uses is not released (the exclusion in the row 4 closure
-above; `[{ let owned t = make() \n t }]` leaks `t` rather than dangling the
+block's tail can still reach is not released (the exclusion in the row 4
+closure above; `[{ let owned t = make() \n t }]` leaks `t` rather than dangling the
 element), and the list element and struct field keep the transfer gaps they
 already had.
 
@@ -1654,9 +1665,10 @@ ways, and each is a real, documented gap rather than an oversight:
   `break`/`continue` drop everything declared since the enclosing loop
   opened, so this row of the list is closed for statement position, and
   `emitValueBlockDrops` closes it for value position the same evening. What
-  remains of it: a local a value block's TAIL still uses (a borrowed view,
-  a place read into a list element) is left unreleased, because the
-  conversion into the destination type runs outside the braces.
+  remains of it: a local a value block's TAIL can still reach (a borrowed
+  view, also through an alias; a place read into a list element) is left
+  unreleased, because the conversion into the destination type runs outside
+  the braces.
 - **Conservative on moves, in the leak-safe direction.** Borrowck's move
   tracking merges branches conservatively (a move in one arm of an `if`
   marks the place moved for everything after it, whether or not that arm

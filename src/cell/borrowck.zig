@@ -6164,6 +6164,24 @@ test "a valueless block at a call argument is walked exactly once" {
     );
 }
 
+test "a block tail that is a borrow alias of the block's own local cannot leave through an owned position" {
+    // The value-position release in codegen keeps a local the tail can
+    // reach alive; this is the other half, at the owned sites, where a
+    // borrow alias is refused outright rather than copied.
+    try expectDiagnostics(block_prelude ++
+        \\pub fn mk() -> String {
+        \\    return {
+        \\        let owned t = make()
+        \\        let shared v = &t
+        \\        v
+        \\    }
+        \\}
+    ,
+        \\t.cell:7:9: error: cannot move out of 'v': it is a shared borrow, not an owner
+        \\
+    );
+}
+
 test "R2.a does not fire for a place declared inside the loop body" {
     // A binding created fresh each iteration is not moved across the back
     // edge, so there is nothing to catch. Getting this wrong would reject

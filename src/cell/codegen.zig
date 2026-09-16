@@ -1514,9 +1514,21 @@ pub const Generator = struct {
     /// `cell_string_from_str(...)` around: free `t` inside and the view is
     /// copied from freed memory. A read tail at a list element is the same
     /// shape without the copy (`_cell_t0 = t`, and slice elements are never
-    /// released). So the rule is: every local the tail USES is skipped,
-    /// which is over-conservative for a tail like `f(&t)` that returns a
-    /// scalar, and that is stated rather than optimised away.
+    /// released). So the rule is: every local the tail can REACH is skipped.
+    /// Reach is transitive through the block's own statements, and it has to
+    /// be: `let shared v = &t \n v` names `t` nowhere in the tail, yet the
+    /// tail's value is a view of `t`. The first version of this function
+    /// (85570d6) asked `exprUses(tail, name)` alone and freed `t` under
+    /// exactly that program, leaving `let shared s = { ... v }` a dangling
+    /// view; caught the same night, the emitted C showed
+    /// `cell_string_free(&t)` before `_cell_t0` left the braces. `tailReach`
+    /// starts from the names the tail uses and adds, to a fixpoint, what
+    /// every block-level `let` of a reached name and every assignment into
+    /// a reached name uses, descending into nested statement lists. It is
+    /// syntactic and over-approximates (a tail like `f(&t)` returning a
+    /// scalar keeps `t` alive for nothing), and that is stated rather than
+    /// optimised away: the cost of the over-approximation is a leak, the
+    /// cost of an under-approximation is a use-after-free.
     ///
     /// ONE exception closes `examples/leaks/value_block_local.cell`: a tail
     /// that is a bare identifier naming a block-local `arc` binding, lowered
@@ -1527,12 +1539,13 @@ pub const Generator = struct {
     /// the handle uncloned, so no scalar-destination shortcut is taken.
     /// A moved local (`wasMoved`) is already excluded by `pendingDropsSince`,
     /// which is how an `owned` tail moved out of the block needs no drop.
-    fn emitValueBlockDrops(self: *Generator, mark: usize, tail: *const ast.Expr, dest: Dest, indent: usize) EmitError!void {
+    fn emitValueBlockDrops(self: *Generator, mark: usize, stmts: []const ast.Stmt, tail: *const ast.Expr, dest: Dest, indent: usize) EmitError!void {
         const tail_ident: ?[]const u8 = blk: {
             var t = tail;
             while (t.kind == .annotated) t = t.kind.annotated.value;
             break :blk if (t.kind == .ident) t.kind.ident else null;
         };
+        const reach = try self.tailReach(stmts, tail);
         for (try self.pendingDropsSince(mark)) |local| {
             if (tail_ident) |n| {
                 if (eq(n, local.name) and local.ownership == .arc and dest.ty.shape == .arc) {
@@ -1540,9 +1553,21 @@ pub const Generator = struct {
                     continue;
                 }
             }
-            if (exprUses(tail, local.name)) continue;
+            if (nameIn(reach.items, local.name)) continue;
             try self.emitDropFor(indent, local);
         }
+    }
+
+    /// The names a value block's tail can still reach once its value has
+    /// left the braces: every identifier the tail uses, plus, to a fixpoint,
+    /// every identifier used by a `let` that declares a reached name or by
+    /// an assignment into one, at any nesting depth inside the block. See
+    /// `emitValueBlockDrops` for why this is transitive.
+    fn tailReach(self: *Generator, stmts: []const ast.Stmt, tail: *const ast.Expr) Alloc!std.ArrayList([]const u8) {
+        var set: std.ArrayList([]const u8) = .empty;
+        _ = try collectIdents(self.arena, tail, &set);
+        while (try reachFromStmts(self.arena, stmts, &set)) {}
+        return set;
     }
 
     /// Emit `e` as statements that leave its value in `dest`.
@@ -1592,7 +1617,7 @@ pub const Generator = struct {
                     switch (last.kind) {
                         .expr => |le| {
                             try self.emitValueInto(&le, dest, indent + 1);
-                            try self.emitValueBlockDrops(mark, &le, dest, indent + 1);
+                            try self.emitValueBlockDrops(mark, stmts, &le, dest, indent + 1);
                         },
                         else => {
                             try self.emitStmt(last, &.{}, indent + 1);
@@ -3021,6 +3046,159 @@ fn exprUses(e: *const ast.Expr, name: []const u8) bool {
             break :blk false;
         },
         .annotated => |a| exprUses(a.value, name),
+    };
+}
+
+fn nameIn(set: []const []const u8, name: []const u8) bool {
+    for (set) |n| if (eq(n, name)) return true;
+    return false;
+}
+
+/// Adds every identifier `e` mentions to `set`; true when something new was
+/// added. Nested statement lists are walked in full.
+fn collectIdents(arena: std.mem.Allocator, e: *const ast.Expr, set: *std.ArrayList([]const u8)) Alloc!bool {
+    var added = false;
+    switch (e.kind) {
+        .ident => |n| if (!nameIn(set.items, n)) {
+            try set.append(arena, n);
+            added = true;
+        },
+        .int, .float, .string, .bool => {},
+        .call => |c| {
+            if (try collectIdents(arena, c.callee, set)) added = true;
+            for (c.args, 0..) |_, i| if (try collectIdents(arena, &c.args[i], set)) {
+                added = true;
+            };
+        },
+        .binary => |b| {
+            if (try collectIdents(arena, b.left, set)) added = true;
+            if (try collectIdents(arena, b.right, set)) added = true;
+        },
+        .unary => |u| if (try collectIdents(arena, u.operand, set)) {
+            added = true;
+        },
+        .field => |f| if (try collectIdents(arena, f.base, set)) {
+            added = true;
+        },
+        .struct_lit => |sl| for (sl.fields, 0..) |_, i| if (try collectIdents(arena, &sl.fields[i].value, set)) {
+            added = true;
+        },
+        .list_lit => |items| for (items, 0..) |_, i| if (try collectIdents(arena, &items[i], set)) {
+            added = true;
+        },
+        .block => |stmts| if (try collectIdentsStmts(arena, stmts, set)) {
+            added = true;
+        },
+        .if_expr => |i| {
+            if (try collectIdents(arena, i.cond, set)) added = true;
+            if (try collectIdents(arena, i.then_body, set)) added = true;
+            if (i.else_body) |eb| if (try collectIdents(arena, eb, set)) {
+                added = true;
+            };
+        },
+        .match_expr => |m| {
+            if (try collectIdents(arena, m.scrutinee, set)) added = true;
+            for (m.arms) |arm| if (try collectIdents(arena, arm.body, set)) {
+                added = true;
+            };
+        },
+        .annotated => |a| if (try collectIdents(arena, a.value, set)) {
+            added = true;
+        },
+    }
+    return added;
+}
+
+fn collectIdentsStmts(arena: std.mem.Allocator, stmts: []const ast.Stmt, set: *std.ArrayList([]const u8)) Alloc!bool {
+    var added = false;
+    for (stmts, 0..) |_, i| {
+        const st = &stmts[i];
+        switch (st.kind) {
+            .let => |l| if (l.value) |*v| if (try collectIdents(arena, v, set)) {
+                added = true;
+            },
+            .expr => |*e| if (try collectIdents(arena, e, set)) {
+                added = true;
+            },
+            .return_stmt => |*opt| if (opt.*) |*v| if (try collectIdents(arena, v, set)) {
+                added = true;
+            },
+            .assign => |*a| {
+                if (try collectIdents(arena, &a.target, set)) added = true;
+                if (try collectIdents(arena, &a.value, set)) added = true;
+            },
+            .while_stmt => |*w| {
+                if (try collectIdents(arena, &w.cond, set)) added = true;
+                if (try collectIdentsStmts(arena, w.body, set)) added = true;
+            },
+            .break_stmt, .continue_stmt => {},
+        }
+    }
+    return added;
+}
+
+/// One round of `tailReach`'s fixpoint over a statement list: a `let` whose
+/// name is reached feeds its initializer's identifiers in; an assignment
+/// whose target root is reached feeds its value's in; nested statement
+/// lists (a bare block, `if`/`match` bodies, a `while` body) are walked for
+/// the same two shapes. True when the round added a name.
+fn reachFromStmts(arena: std.mem.Allocator, stmts: []const ast.Stmt, set: *std.ArrayList([]const u8)) Alloc!bool {
+    var added = false;
+    for (stmts, 0..) |_, i| {
+        const st = &stmts[i];
+        switch (st.kind) {
+            .let => |l| if (nameIn(set.items, l.name)) {
+                if (l.value) |*v| if (try collectIdents(arena, v, set)) {
+                    added = true;
+                };
+            },
+            .assign => |*a| if (rootIdent(&a.target)) |root| {
+                if (nameIn(set.items, root)) {
+                    if (try collectIdents(arena, &a.value, set)) added = true;
+                }
+            },
+            .expr => |*e| if (try reachFromExpr(arena, e, set)) {
+                added = true;
+            },
+            .while_stmt => |*w| if (try reachFromStmts(arena, w.body, set)) {
+                added = true;
+            },
+            .return_stmt, .break_stmt, .continue_stmt => {},
+        }
+    }
+    return added;
+}
+
+fn reachFromExpr(arena: std.mem.Allocator, e: *const ast.Expr, set: *std.ArrayList([]const u8)) Alloc!bool {
+    return switch (e.kind) {
+        .block => |stmts| try reachFromStmts(arena, stmts, set),
+        .if_expr => |i| blk: {
+            var added = try reachFromExpr(arena, i.then_body, set);
+            if (i.else_body) |eb| if (try reachFromExpr(arena, eb, set)) {
+                added = true;
+            };
+            break :blk added;
+        },
+        .match_expr => |m| blk: {
+            var added = false;
+            for (m.arms) |arm| if (try reachFromExpr(arena, arm.body, set)) {
+                added = true;
+            };
+            break :blk added;
+        },
+        .annotated => |a| try reachFromExpr(arena, a.value, set),
+        else => false,
+    };
+}
+
+/// The binding an assignment target is rooted at (`x`, `x.f`, `owned x`).
+fn rootIdent(e: *const ast.Expr) ?[]const u8 {
+    return switch (e.kind) {
+        .ident => |n| n,
+        .field => |f| rootIdent(f.base),
+        .annotated => |a| rootIdent(a.value),
+        .unary => |u| rootIdent(u.operand),
+        else => null,
     };
 }
 
@@ -4874,6 +5052,51 @@ test "a call argument block whose tail is the block's own owned local frees noth
     try expectContains(e.text, "cell_eat(({");
     try expectContains(e.text, "_cell_t0 = t;");
     try expectAbsent(e.text, "cell_string_free(&t);");
+}
+
+test "a local a VALUE-position block's tail reaches through a borrow alias is not released" {
+    // 85570d6 freed `t` here: the tail names `v`, not `t`, and a by-name
+    // use scan cannot see that `v` is a view of `t`. `let shared s = { ... }`
+    // then held a dangling view (the emitted C had `cell_string_free(&t)`
+    // before `_cell_t0` left the braces). `tailReach` follows the block's
+    // own `let`s to a fixpoint, so `t` is reached and kept. The leak of `t`
+    // is the exclusion's stated cost.
+    var e = try emitSource(
+        \\pub fn make() -> String { return "abc" }
+        \\pub fn inspect(shared s: String) -> Int { return 1 }
+        \\pub fn f() {
+        \\  let shared s = {
+        \\    let owned t = make()
+        \\    let shared v = &t
+        \\    v
+        \\  }
+        \\  inspect(s)
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "_cell_t0 = v;");
+    try expectAbsent(e.text, "cell_string_free(&t);");
+}
+
+test "tail reach is transitive through two aliases and an assignment, and unrelated locals still drop" {
+    var e = try emitSource(
+        \\pub fn make() -> String { return "abc" }
+        \\pub fn inspect(shared s: String) -> Int { return 1 }
+        \\pub fn f() {
+        \\  let shared s = {
+        \\    let owned junk = make()
+        \\    let owned t = make()
+        \\    let shared v = &t
+        \\    var shared w = v
+        \\    w = v
+        \\    w
+        \\  }
+        \\  inspect(s)
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "cell_string_free(&t);");
+    try expectLineBefore(e.text, "cell_string_free(&junk);", "_cell_t0 = w;");
 }
 
 test "a value-position block's tail resolves through a nested block, and later bindings keep their ids" {
