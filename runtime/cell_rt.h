@@ -22,12 +22,17 @@
  * ---------------------------------------------------------------------------
  *   Cell            C type      note
  *   Int, Int64      int64_t
+ *   Int8            int8_t
+ *   Int16           int16_t
  *   Int32           int32_t
  *   UInt, UInt64    uint64_t
+ *   UInt8           uint8_t     distinct from Byte
+ *   UInt16          uint16_t
+ *   UInt32          uint32_t
  *   Float, Float64  double
  *   Float32         float
  *   Bool            bool        C11 stdbool, 1 byte
- *   Byte            uint8_t
+ *   Byte            uint8_t     distinct from UInt8
  *   Unit            void        only as a return type
  *
  * Primitives are always passed and returned by value, in every ownership mode.
@@ -266,7 +271,12 @@ void cell_slice_free(cell_slice_t *s);
 
 CELL_DEFINE_OPTIONAL(cell_opt_i64, int64_t)
 CELL_DEFINE_OPTIONAL(cell_opt_u64, uint64_t)
+CELL_DEFINE_OPTIONAL(cell_opt_i8, int8_t)
+CELL_DEFINE_OPTIONAL(cell_opt_i16, int16_t)
 CELL_DEFINE_OPTIONAL(cell_opt_i32, int32_t)
+CELL_DEFINE_OPTIONAL(cell_opt_u8, uint8_t)
+CELL_DEFINE_OPTIONAL(cell_opt_u16, uint16_t)
+CELL_DEFINE_OPTIONAL(cell_opt_u32, uint32_t)
 CELL_DEFINE_OPTIONAL(cell_opt_f64, double)
 CELL_DEFINE_OPTIONAL(cell_opt_bool, bool)
 CELL_DEFINE_OPTIONAL(cell_opt_byte, uint8_t)

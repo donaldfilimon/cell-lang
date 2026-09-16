@@ -955,7 +955,7 @@ const Emitter = struct {
         if (right.isNone()) return right;
 
         const float = isFloat(left.ty);
-        const unsigned = left_e.ty.tag() == .uint or left_e.ty.tag() == .byte;
+        const unsigned = left_e.ty.isUnsigned();
 
         const s = try self.nextSsa();
         switch (op) {
@@ -1576,11 +1576,12 @@ const Emitter = struct {
         if (ty.tag() == .struct_type) return self.structType(ty.struct_type);
         return switch (ty) {
             .int, .uint => "i64",
-            .int32 => "i32",
+            .int8, .uint8, .byte => "i8",
+            .int16, .uint16 => "i16",
+            .int32, .uint32 => "i32",
             .float => "f64",
             .float32 => "f32",
             .boolean => "i1",
-            .byte => "i8",
             .enum_type => "i32",
             // `unit` has no MLIR type: a func with no result simply omits it,
             // which the callers handle by testing for null.
@@ -1671,7 +1672,7 @@ const Emitter = struct {
 
     fn unsupportedReturnOwnership(ty: hir.Ty, ownership: hir.Ownership) ?[]const u8 {
         const nonprimitive = switch (ty) {
-            .unit, .int, .int32, .uint, .float, .float32, .boolean, .byte, .enum_type => false,
+            .unit, .int, .int8, .int16, .int32, .uint, .uint8, .uint16, .uint32, .float, .float32, .boolean, .byte, .enum_type => false,
             .unknown, .string, .optional, .list, .result, .struct_type, .func => true,
         };
         if (!nonprimitive) return null;
@@ -1878,6 +1879,16 @@ test "a bodyless declaration becomes a private func.func" {
     );
     defer e.deinit();
     try expectContains(e.text, "func.func private @cell_print_int(i64)");
+}
+
+test "a UInt32 parameter lowers to i32" {
+    var e = try emitSource(
+        \\pub fn take(copy v: UInt32) -> UInt32;
+        \\pub fn take8(copy v: Int8) -> Int8;
+    );
+    defer e.deinit();
+    try expectContains(e.text, "func.func private @cell_take(i32) -> i32");
+    try expectContains(e.text, "func.func private @cell_take8(i8) -> i8");
 }
 
 test "control flow uses the cf dialect, not scf" {

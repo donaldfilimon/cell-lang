@@ -27,8 +27,8 @@ pub struct Point {
     copy y: Float64
 }
 
-// A struct used in type position falls through to void*, because mapPrimitive
-// only knows the eleven primitive names. See SPEC 3.1 and 3.6.
+// A struct used in type position is a declared user type, not a primitive.
+// See SPEC 3.1 and 3.6.
 pub fn distance_squared(shared p: Point, shared q: Point) -> Float64;
 
 // Enum variants carry no data. `Some(Int)` is a parse error, and EnumDef

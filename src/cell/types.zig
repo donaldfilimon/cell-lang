@@ -9,8 +9,10 @@
 //!
 //! Type aliases are folded at construction: `Int` and `Int64` are one tag,
 //! `UInt` and `UInt64` are one tag, `Float` and `Float64` are one tag. That
-//! matches `codegen.mapPrimitive`, which maps each pair to a single C type, and
-//! it is what lets a `1.0` literal initialize a `Float64` field.
+//! matches `codegen.namedType`, which maps each pair to a single C type, and
+//! it is what lets a `1.0` literal initialize a `Float64` field. `Int8`,
+//! `Int16`, `UInt8`, `UInt16`, and `UInt32` are their own tags: they do not
+//! fold into `Int`/`Int32`/`UInt`/`Byte`.
 //!
 //! Ownership is deliberately NOT part of a type. `ast.Param` and `ast.Field`
 //! carry ownership beside the type, so a `shared Int` parameter and an `Int`
@@ -38,9 +40,16 @@ pub const Type = union(enum) {
     unit,
     /// `Int` and `Int64`.
     int,
+    int8,
+    int16,
     int32,
     /// `UInt` and `UInt64`.
     uint,
+    /// Distinct from `Byte`. They share a C type (`uint8_t`) and are not
+    /// `compatible`.
+    uint8,
+    uint16,
+    uint32,
     /// `Float` and `Float64`.
     float,
     float32,
@@ -66,7 +75,16 @@ pub const Type = union(enum) {
 
     pub fn isNumeric(self: Type) bool {
         return switch (self) {
-            .int, .int32, .uint, .float, .float32, .byte => true,
+            .int, .int8, .int16, .int32, .uint, .uint8, .uint16, .uint32, .float, .float32, .byte => true,
+            else => false,
+        };
+    }
+
+    /// Unsigned integer tags, including `Byte`. Used by the LLVM and MLIR
+    /// backends to pick `udiv` / unsigned icmp rather than the signed forms.
+    pub fn isUnsigned(self: Type) bool {
+        return switch (self) {
+            .uint, .uint8, .uint16, .uint32, .byte => true,
             else => false,
         };
     }
@@ -78,23 +96,34 @@ pub const Type = union(enum) {
 pub const t_unknown: Type = .unknown;
 pub const t_unit: Type = .unit;
 pub const t_int: Type = .int;
+pub const t_int8: Type = .int8;
+pub const t_int16: Type = .int16;
 pub const t_int32: Type = .int32;
 pub const t_uint: Type = .uint;
+pub const t_uint8: Type = .uint8;
+pub const t_uint16: Type = .uint16;
+pub const t_uint32: Type = .uint32;
 pub const t_float: Type = .float;
 pub const t_float32: Type = .float32;
 pub const t_bool: Type = .boolean;
 pub const t_string: Type = .string;
 pub const t_byte: Type = .byte;
 
-/// The eleven primitive names `codegen.mapPrimitive` recognizes, and nothing
-/// else. A name that is not here is a user type or unresolved.
+/// The sixteen primitive names `codegen.namedType` recognizes, and nothing
+/// else. A name that is not here is a user type or unresolved. `Char` is
+/// not among them.
 pub fn fromPrimitiveName(text: []const u8) ?Type {
     const table = .{
         .{ "Int", t_int },
         .{ "Int64", t_int },
+        .{ "Int8", t_int8 },
+        .{ "Int16", t_int16 },
         .{ "Int32", t_int32 },
         .{ "UInt", t_uint },
         .{ "UInt64", t_uint },
+        .{ "UInt8", t_uint8 },
+        .{ "UInt16", t_uint16 },
+        .{ "UInt32", t_uint32 },
         .{ "Float", t_float },
         .{ "Float64", t_float },
         .{ "Float32", t_float32 },
@@ -115,7 +144,7 @@ pub fn compatible(a: Type, b: Type) bool {
     if (a.isUnknown() or b.isUnknown()) return true;
     return switch (a) {
         .unknown => true,
-        .unit, .int, .int32, .uint, .float, .float32, .boolean, .string, .byte => a.tag() == b.tag(),
+        .unit, .int, .int8, .int16, .int32, .uint, .uint8, .uint16, .uint32, .float, .float32, .boolean, .string, .byte => a.tag() == b.tag(),
         .optional => |ai| switch (b) {
             .optional => |bi| compatible(ai.*, bi.*),
             else => false,
@@ -156,8 +185,13 @@ pub fn write(ty: Type, w: *Io.Writer) Io.Writer.Error!void {
         .unknown => try w.writeAll("<unknown>"),
         .unit => try w.writeAll("()"),
         .int => try w.writeAll("Int"),
+        .int8 => try w.writeAll("Int8"),
+        .int16 => try w.writeAll("Int16"),
         .int32 => try w.writeAll("Int32"),
         .uint => try w.writeAll("UInt"),
+        .uint8 => try w.writeAll("UInt8"),
+        .uint16 => try w.writeAll("UInt16"),
+        .uint32 => try w.writeAll("UInt32"),
         .float => try w.writeAll("Float"),
         .float32 => try w.writeAll("Float32"),
         .boolean => try w.writeAll("Bool"),
@@ -277,8 +311,13 @@ test "type names render in Cell source syntax" {
 
 test "isNumeric covers every integer and float tag and nothing else" {
     try std.testing.expect(Type.isNumeric(.int));
+    try std.testing.expect(Type.isNumeric(.int8));
+    try std.testing.expect(Type.isNumeric(.int16));
     try std.testing.expect(Type.isNumeric(.int32));
     try std.testing.expect(Type.isNumeric(.uint));
+    try std.testing.expect(Type.isNumeric(.uint8));
+    try std.testing.expect(Type.isNumeric(.uint16));
+    try std.testing.expect(Type.isNumeric(.uint32));
     try std.testing.expect(Type.isNumeric(.float));
     try std.testing.expect(Type.isNumeric(.float32));
     try std.testing.expect(Type.isNumeric(.byte));
@@ -286,4 +325,28 @@ test "isNumeric covers every integer and float tag and nothing else" {
     try std.testing.expect(!Type.isNumeric(.string));
     try std.testing.expect(!Type.isNumeric(.unit));
     try std.testing.expect(!Type.isNumeric(.unknown));
+}
+
+test "Int8 Int16 UInt8 UInt16 UInt32 are primitives and not aliases" {
+    try std.testing.expect(fromPrimitiveName("Int8").?.tag() == .int8);
+    try std.testing.expect(fromPrimitiveName("Int16").?.tag() == .int16);
+    try std.testing.expect(fromPrimitiveName("UInt8").?.tag() == .uint8);
+    try std.testing.expect(fromPrimitiveName("UInt16").?.tag() == .uint16);
+    try std.testing.expect(fromPrimitiveName("UInt32").?.tag() == .uint32);
+
+    try std.testing.expect(!compatible(fromPrimitiveName("Int8").?, fromPrimitiveName("Int").?));
+    try std.testing.expect(!compatible(fromPrimitiveName("Int8").?, fromPrimitiveName("Int32").?));
+    try std.testing.expect(!compatible(fromPrimitiveName("Int16").?, fromPrimitiveName("Int").?));
+    try std.testing.expect(!compatible(fromPrimitiveName("Int16").?, fromPrimitiveName("Int32").?));
+    try std.testing.expect(!compatible(fromPrimitiveName("UInt32").?, fromPrimitiveName("UInt").?));
+    try std.testing.expect(!compatible(fromPrimitiveName("UInt32").?, fromPrimitiveName("Int32").?));
+    try std.testing.expect(!compatible(fromPrimitiveName("UInt8").?, fromPrimitiveName("Byte").?));
+    try std.testing.expect(!compatible(fromPrimitiveName("UInt8").?, fromPrimitiveName("UInt").?));
+    try std.testing.expect(!compatible(fromPrimitiveName("UInt16").?, fromPrimitiveName("UInt").?));
+
+    try std.testing.expect(fromPrimitiveName("Char") == null);
+    try std.testing.expect(fromPrimitiveName("Int128") == null);
+    try std.testing.expect(Type.isUnsigned(.uint8));
+    try std.testing.expect(Type.isUnsigned(.byte));
+    try std.testing.expect(!Type.isUnsigned(.int8));
 }

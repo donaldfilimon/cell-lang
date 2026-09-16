@@ -1,0 +1,50 @@
+// Additional integer widths from SPEC 3.1: Int8, Int16, UInt8, UInt16, UInt32.
+// Scalar only. UInt8 is not Byte: they share a C type and are not compatible.
+//
+// Status: parses, passes `cell check`, and the C backend compiles, links and
+// runs, printing 16. Untyped integer literals take the declared width
+// (typecheck already did this for Byte/Int32). LLVM and MLIR lower a UInt32
+// parameter to i32, but refuse a body that stores an untyped Int literal into
+// a narrower slot, because HIR still types a bare `7` as Int. That is the
+// existing literal-width gap, not a new conversion rule.
+// EXPECT-OUTPUT: 16
+
+pub fn print_int(copy value: Int);
+
+pub fn add8(copy a: Int8, copy b: Int8) -> Int8 {
+    return a + b
+}
+
+pub fn add16(copy a: Int16, copy b: Int16) -> Int16 {
+    return a + b
+}
+
+pub fn addu8(copy a: UInt8, copy b: UInt8) -> UInt8 {
+    return a + b
+}
+
+pub fn addu16(copy a: UInt16, copy b: UInt16) -> UInt16 {
+    return a + b
+}
+
+pub fn addu32(copy a: UInt32, copy b: UInt32) -> UInt32 {
+    return a + b
+}
+
+pub fn main() {
+    let copy a: Int8 = add8(copy 1, copy 2)
+    let copy b: Int16 = add16(copy 3, copy 4)
+    let copy c: UInt8 = addu8(copy 1, copy 1)
+    let copy d: UInt16 = addu16(copy 2, copy 2)
+    let copy e: UInt32 = addu32(copy 7, copy 9)
+    let copy want_a: Int8 = 3
+    let copy want_b: Int16 = 7
+    let copy want_c: UInt8 = 2
+    let copy want_d: UInt16 = 4
+    let copy want_e: UInt32 = 16
+    if a == want_a && b == want_b && c == want_c && d == want_d && e == want_e {
+        print_int(16)
+    } else {
+        print_int(0)
+    }
+}

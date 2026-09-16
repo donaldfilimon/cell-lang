@@ -4,7 +4,7 @@
 // Closed 2026-09-16 (TYPE-02). Typecheck refuses a name that is not a
 // primitive, a declared struct, a declared enum, or a constructed type
 // already implemented (`T?`, `Result<T, E>`, `[T]`). `Strng` is a misspelling,
-// `UInt32` is a width Cell does not have, and `Widget` does not exist; all
+// `Int128` is a width Cell does not have, and `Widget` does not exist; all
 // three are `unknown type`, not an ownership rule.
 //
 // `no_such_width` is spelled `shared`, not `copy`, so a regression that
@@ -12,5 +12,5 @@
 // refuses a `copy` place whose resource shape cannot be resolved.
 
 pub fn misspelled(shared s: Strng) -> Int;
-pub fn no_such_width(shared v: UInt32) -> Int;
+pub fn no_such_width(shared v: Int128) -> Int;
 pub fn entirely_invented(shared v: Widget) -> Int;

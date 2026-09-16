@@ -774,7 +774,7 @@ pub const Checker = struct {
     /// The payloads this slice admits (spec B.2): the scalar primitives.
     fn isScalarPayload(t: Type) bool {
         return switch (t) {
-            .unknown, .int, .int32, .uint, .float, .float32, .boolean, .byte => true,
+            .unknown, .int, .int8, .int16, .int32, .uint, .uint8, .uint16, .uint32, .float, .float32, .boolean, .byte => true,
             else => false,
         };
     }
@@ -940,7 +940,7 @@ pub const Checker = struct {
 
 /// `expected` accepts `actual`, with one widening rule: an untyped numeric
 /// literal takes the expected width. Cell has no cast operator, so without this
-/// no `Byte`, `Int32`, `UInt`, or `Float32` binding could ever be initialized.
+/// no `Byte`, `Int32`, `UInt32`, or `Float32` binding could ever be initialized.
 /// The rule applies only where an expected type exists (initializer, argument,
 /// assignment, return); a literal inside a larger arithmetic expression still
 /// types as `Int` or `Float`.
@@ -952,7 +952,7 @@ fn accepts(expected: Type, actual: Type, value: *const ast.Expr) bool {
 fn literalFits(expected: Type, value: *const ast.Expr) bool {
     return switch (value.kind) {
         .int => switch (expected) {
-            .int, .int32, .uint, .byte => true,
+            .int, .int8, .int16, .int32, .uint, .uint8, .uint16, .uint32, .byte => true,
             else => false,
         },
         .float => switch (expected) {
@@ -1633,9 +1633,32 @@ test "an untyped integer literal takes the width it is assigned to" {
         \\    let copy b: Byte = 7
         \\    let copy small: Int32 = -3
         \\    let copy f32: Float32 = 1.5
+        \\    let copy i8: Int8 = -1
+        \\    let copy u32: UInt32 = 7
         \\}
     );
     try t.expectClean();
+}
+
+test "UInt32 typechecks and UInt8 is not Byte" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn take_u32(copy v: UInt32) -> UInt32 {
+        \\    return v
+        \\}
+        \\pub fn take_u8(copy v: UInt8) -> UInt8 {
+        \\    return v
+        \\}
+        \\pub fn take_byte(copy v: Byte) -> Byte {
+        \\    return v
+        \\}
+        \\pub fn mix(copy a: UInt8) -> Byte {
+        \\    return a
+        \\}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 11, 12, "return type mismatch: expected Byte, found UInt8");
 }
 
 test "one unresolved name does not cascade into its uses" {
@@ -1722,11 +1745,11 @@ test "unknown type names are still refused" {
         \\    return
         \\}
         \\pub fn misspelled(shared s: Strng) -> ();
-        \\pub fn no_such_width(shared v: UInt32) -> Int;
+        \\pub fn no_such_width(shared v: Int128) -> Int;
     );
     try t.expectCount(2);
     try t.expectDiag(0, .err, 4, 1, "unknown type 'Strng'");
-    try t.expectDiag(1, .err, 5, 1, "unknown type 'UInt32'");
+    try t.expectDiag(1, .err, 5, 1, "unknown type 'Int128'");
 }
 
 test "unknown type names are refused and a declared struct name is accepted" {
@@ -1734,7 +1757,7 @@ test "unknown type names are refused and a declared struct name is accepted" {
     defer t.deinit();
     try t.check(
         \\pub fn misspelled(shared s: Strng) -> Int;
-        \\pub fn no_such_width(shared v: UInt32) -> Int;
+        \\pub fn no_such_width(shared v: Int128) -> Int;
         \\pub fn entirely_invented(shared v: Widget) -> Int;
         \\pub struct Point {
         \\    copy x: Int
@@ -1745,7 +1768,7 @@ test "unknown type names are refused and a declared struct name is accepted" {
     );
     try t.expectCount(3);
     try t.expectDiag(0, .err, 1, 1, "unknown type 'Strng'");
-    try t.expectDiag(1, .err, 2, 1, "unknown type 'UInt32'");
+    try t.expectDiag(1, .err, 2, 1, "unknown type 'Int128'");
     try t.expectDiag(2, .err, 3, 1, "unknown type 'Widget'");
     try std.testing.expect(t.checker.diagnostics.hasErrors());
 }
@@ -1755,7 +1778,7 @@ test "an unknown name is refused inside T?, Result, a list, and a let" {
     defer t.deinit();
     try t.check(
         \\pub fn opt(copy v: Strng?) -> Int;
-        \\pub fn res(copy v: Result<UInt32, Int>) -> Int;
+        \\pub fn res(copy v: Result<Int128, Int>) -> Int;
         \\pub fn list(shared v: [Widget]) -> Int;
         \\pub fn local() {
         \\    let copy x: Missing = 1
@@ -1763,7 +1786,7 @@ test "an unknown name is refused inside T?, Result, a list, and a let" {
     );
     try t.expectCount(4);
     try t.expectDiag(0, .err, 1, 1, "unknown type 'Strng'");
-    try t.expectDiag(1, .err, 2, 1, "unknown type 'UInt32'");
+    try t.expectDiag(1, .err, 2, 1, "unknown type 'Int128'");
     try t.expectDiag(2, .err, 3, 1, "unknown type 'Widget'");
     try t.expectDiag(3, .err, 5, 5, "unknown type 'Missing'");
 }

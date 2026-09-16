@@ -184,7 +184,8 @@ are not.
 | File | What it demonstrates |
 |---|---|
 | `hello.cell` | the flagship: struct, enum, a function, a call |
-| `primitives.cell` | all eleven primitives and their exact C mapping |
+| `primitives.cell` | all sixteen primitives and their exact C mapping |
+| `widths.cell` | Int8/Int16/UInt8/UInt16/UInt32 arithmetic; prints 16 through C |
 | `expressions.cell` | operator precedence and left associativity |
 | `bindings.cell` | `let`, `var`, `let mut`, the optional type annotation |
 | `control_flow.cell` | `if` / `else` / `else if`, and block expressions |
@@ -289,14 +290,16 @@ fail for opposite reasons, so keep both:
   are rejected structurally at declaration time for the same two-owner hazard.
 
 Two other files are not ownership bugs at all. One is currently-rejected for
-the wrong reason (unknown identifier); the other, `unknown_type.cell`, is still
-accepted:
+the wrong reason (unknown identifier); the other, `unknown_type.cell`, is
+currently-rejected for TYPE-02:
 
 - `silent_literals.cell`: currently-rejected. `0x1F`, `1_000`, and `1e9` each
   lex as two tokens. Today the checker reports `unknown identifier 'x1F'`;
   the lexer still splits the literal.
-- `unknown_type.cell`: currently-accepted. Any type name outside the eleven
-  primitives silently becomes `void*`.
+- `unknown_type.cell`: currently-rejected. A name that is not a primitive, a
+  declared struct, a declared enum, or an implemented constructed type is
+  `unknown type`. `Int128` stands in for a width Cell still does not have;
+  `UInt32` is a real primitive as of the additional-widths landing.
 
 A third file used to live here for the same reason: `while_is_not_a_loop.cell`,
 rejected as `unknown identifier 'while'` because `while` was not yet a

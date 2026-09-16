@@ -652,27 +652,34 @@ printed by the CLI; see section 11.
 
 **Status: implemented.**
 
-`Generator.mapPrimitive` in `src/cell/codegen.zig` fixes these names. This
+`Generator.namedType` in `src/cell/codegen.zig` fixes these names. This
 table is normative and exhaustive:
 
 | Cell | C emitted today | Notes |
 |---|---|---|
 | `Int` | `int64_t` | the default integer |
 | `Int64` | `int64_t` | same C type as `Int` |
+| `Int8` | `int8_t` | |
+| `Int16` | `int16_t` | |
 | `Int32` | `int32_t` | |
 | `UInt` | `uint64_t` | |
 | `UInt64` | `uint64_t` | same C type as `UInt` |
+| `UInt8` | `uint8_t` | distinct from `Byte`; they share a C type and are not compatible |
+| `UInt16` | `uint16_t` | |
+| `UInt32` | `uint32_t` | |
 | `Float` | `double` | the default float |
 | `Float64` | `double` | same C type as `Float` |
 | `Float32` | `float` | |
 | `Bool` | `bool` | `<stdbool.h>` |
 | `String` | `cell_str_t` | length-prefixed view; see section 10.3 |
-| `Byte` | `uint8_t` | |
+| `Byte` | `uint8_t` | distinct from `UInt8` |
 
-There are exactly eleven primitive names. `Int` and `Int64` are
+There are exactly sixteen primitive names. `Int` and `Int64` are
 indistinguishable at the ABI, as are `UInt`/`UInt64` and `Float`/`Float64`;
 whether they are distinct *types* in the source language is **designed, not
 implemented**, because there is no type representation to distinguish them in.
+`Int8`, `Int16`, `UInt8`, `UInt16`, and `UInt32` are their own tags: `Int` is
+not `Int32`, and `UInt8` is not `Byte`.
 
 `String` is a length-prefixed `cell_str_t`, matching `runtime/cell_rt.h`.
 Section 10.3 is the ABI table. A literal bound as `arc` is now boxed
@@ -685,7 +692,7 @@ inline` runtime helper, so the three backends disagree here by design rather
 than by accident.
 
 **Any other type name is refused at typecheck** with `unknown type 'Strng'`.
-A name is a type iff it is one of the eleven primitives, a declared struct,
+A name is a type iff it is one of the sixteen primitives, a declared struct,
 a declared enum, or a constructed type already implemented (`T?`,
 `Result<T, E>`, `[T]`). Closed 2026-09-16 (TYPE-02);
 `examples/rejected/unknown_type.cell` is `currently-rejected`. Codegen still
@@ -695,8 +702,8 @@ from the CLI. Specified:
 
 > `error: unknown type 'Strng'`
 
-`Int8`, `Int16`, `UInt8`, `UInt16`, `UInt32`, and `Char` are **designed, not
-implemented**.
+`Char` is **designed, not implemented**. There is no C mapping in this
+section, so the name stays unknown.
 
 ### 3.2 Optional types
 
@@ -711,8 +718,9 @@ String?
 on a type name.
 
 Constructors are `Some(e)` and `None`. Patterns are `Some(x)`, `Some(_)`, and
-`None`. Payloads this slice admits are the scalar primitives (`Int`, `Int32`,
-`UInt`, `Float`, `Float32`, `Bool`, `Byte`); anything else is refused.
+`None`. Payloads this slice admits are the scalar primitives (`Int`, `Int8`,
+`Int16`, `Int32`, `UInt`, `UInt8`, `UInt16`, `UInt32`, `Float`, `Float32`,
+`Bool`, `Byte`); anything else is refused.
 `None` needs a declared optional slot (`let a: Int? = None`); `Some(e)` is
 complete from its operand. LLVM and MLIR refuse constructors and patterns
 together with `cannot lower`.
@@ -832,11 +840,8 @@ still a parenthesized expression, so `return ()` does not parse. A bare
 
 **Status: implemented (layout emission). Field types: not checked.**
 
-See section 8.2. A struct name used in type position falls through
-`mapPrimitive` to `void*` (section 3.1), so a struct parameter is currently an
-opaque pointer and any field access on it produces invalid C. Measured on
-`examples/ownership.cell`: `member reference base type 'void *' is not a
-structure or union`.
+See section 8.2. A struct name used in type position is a declared user type,
+not a primitive. Field types are still not checked independently of use.
 
 ### 3.7 Enum types
 
@@ -2038,9 +2043,10 @@ point and separates checking, backend lowering, cleanup and release evidence.
 
 | Construct | Status |
 |---|---|
-| The 11 primitives and their C mapping | implemented |
+| The 16 primitives and their C mapping | implemented |
 | Unknown type name rejection | implemented |
-| Additional integer widths (`Int8`, `UInt32`, ...) | designed, not implemented |
+| Additional integer widths (`Int8`, `Int16`, `UInt8`, `UInt16`, `UInt32`) | implemented |
+| `Char` | designed, not implemented |
 | `T?` optional syntax | implemented (scalar payloads typechecked; `[T]?` and `T??` still do not parse) |
 | Optional lowering to the tagged struct | implemented (scalar payloads, C backend; LLVM/MLIR refuse constructors and patterns) |
 | Optional construction and unwrapping | implemented (scalar payloads, C backend; LLVM/MLIR refuse) |

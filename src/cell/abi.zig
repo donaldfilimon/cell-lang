@@ -29,11 +29,12 @@ pub const Layout = struct {
 pub fn layoutOf(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) ?Layout {
     return switch (ty) {
         .int, .uint, .float => .{ .size = 8, .alignment = 8 },
-        .int32, .float32 => .{ .size = 4, .alignment = 4 },
+        .int16, .uint16 => .{ .size = 2, .alignment = 2 },
+        .int32, .uint32, .float32 => .{ .size = 4, .alignment = 4 },
         // An enum is an int32_t typedef in the C ABI (SPEC 10.3), so both
         // backends agree on its width.
         .enum_type => .{ .size = 4, .alignment = 4 },
-        .boolean, .byte => .{ .size = 1, .alignment = 1 },
+        .boolean, .byte, .int8, .uint8 => .{ .size = 1, .alignment = 1 },
         .unit => .{ .size = 0, .alignment = 1 },
         .struct_type => |name| structLayout(m, name),
         // String is the one type whose SIZE depends on ownership, which is why
@@ -85,8 +86,13 @@ pub fn layoutOf(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) ?Layout {
 pub fn optionalBase(elem: hir.Ty) ?[]const u8 {
     return switch (elem) {
         .int => "cell_opt_i64",
-        .uint => "cell_opt_u64",
+        .int8 => "cell_opt_i8",
+        .int16 => "cell_opt_i16",
         .int32 => "cell_opt_i32",
+        .uint => "cell_opt_u64",
+        .uint8 => "cell_opt_u8",
+        .uint16 => "cell_opt_u16",
+        .uint32 => "cell_opt_u32",
         .float => "cell_opt_f64",
         .boolean => "cell_opt_bool",
         .byte => "cell_opt_byte",
@@ -249,11 +255,12 @@ pub const Class = union(enum) {
 fn scalarSpelling(ty: hir.Ty) ?[]const u8 {
     return switch (ty) {
         .int, .uint => "i64",
-        .int32 => "i32",
+        .int8, .uint8, .byte => "i8",
+        .int16, .uint16 => "i16",
+        .int32, .uint32 => "i32",
         .float => "double",
         .float32 => "float",
         .boolean => "i1",
-        .byte => "i8",
         .enum_type => "i32",
         .unit => "void",
         else => null,
@@ -438,11 +445,20 @@ fn emptyModule() hir.Module {
 test "scalar layouts match the C ABI in cell_rt.h" {
     const m = emptyModule();
     try std.testing.expectEqual(@as(u32, 8), layoutOf(&m, types.t_int, .copy).?.size);
+    try std.testing.expectEqual(@as(u32, 1), layoutOf(&m, types.t_int8, .copy).?.size);
+    try std.testing.expectEqual(@as(u32, 2), layoutOf(&m, types.t_int16, .copy).?.size);
     try std.testing.expectEqual(@as(u32, 4), layoutOf(&m, types.t_int32, .copy).?.size);
+    try std.testing.expectEqual(@as(u32, 1), layoutOf(&m, types.t_uint8, .copy).?.size);
+    try std.testing.expectEqual(@as(u32, 2), layoutOf(&m, types.t_uint16, .copy).?.size);
+    try std.testing.expectEqual(@as(u32, 4), layoutOf(&m, types.t_uint32, .copy).?.size);
     try std.testing.expectEqual(@as(u32, 8), layoutOf(&m, types.t_float, .copy).?.size);
     try std.testing.expectEqual(@as(u32, 4), layoutOf(&m, types.t_float32, .copy).?.size);
     try std.testing.expectEqual(@as(u32, 1), layoutOf(&m, types.t_bool, .copy).?.size);
     try std.testing.expectEqual(@as(u32, 1), layoutOf(&m, types.t_byte, .copy).?.size);
+    try std.testing.expectEqualStrings("i32", scalarSpelling(types.t_uint32).?);
+    try std.testing.expectEqualStrings("i8", scalarSpelling(types.t_int8).?);
+    try std.testing.expectEqualStrings("i8", scalarSpelling(types.t_uint8).?);
+    try std.testing.expectEqualStrings("i8", scalarSpelling(types.t_byte).?);
     // An enum is an int32_t typedef in the C ABI, SPEC 10.3.
     try std.testing.expectEqual(@as(u32, 4), layoutOf(&m, .{ .enum_type = "Color" }, .copy).?.size);
 }

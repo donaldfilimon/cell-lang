@@ -3327,8 +3327,13 @@ pub const Generator = struct {
 
     fn namedType(self: *Generator, n: []const u8) Alloc!CType {
         if (eq(n, "Int") or eq(n, "Int64")) return CType.int64;
+        if (eq(n, "Int8")) return .{ .text = "int8_t", .shape = .integer };
+        if (eq(n, "Int16")) return .{ .text = "int16_t", .shape = .integer };
         if (eq(n, "Int32")) return .{ .text = "int32_t", .shape = .integer };
         if (eq(n, "UInt") or eq(n, "UInt64")) return .{ .text = "uint64_t", .shape = .integer };
+        if (eq(n, "UInt8")) return .{ .text = "uint8_t", .shape = .integer };
+        if (eq(n, "UInt16")) return .{ .text = "uint16_t", .shape = .integer };
+        if (eq(n, "UInt32")) return .{ .text = "uint32_t", .shape = .integer };
         if (eq(n, "Float") or eq(n, "Float64")) return CType.float64;
         if (eq(n, "Float32")) return .{ .text = "float", .shape = .floating };
         if (eq(n, "Bool")) return CType.boolean;
@@ -3354,13 +3359,19 @@ pub const Generator = struct {
     }
 
     /// Which `CELL_DEFINE_OPTIONAL` instance covers `T?`. cell_rt.h predefines
-    /// eight; anything else is instantiated at the top of the module.
+    /// the scalar instances; anything else is instantiated at the top of the
+    /// module. `UInt8?` is `cell_opt_u8`, not `cell_opt_byte`.
     fn optionalInstance(self: *Generator, inner: *const ast.TypeExpr) Alloc!OptionalInst {
         switch (inner.*) {
             .name => |n| {
                 if (eq(n, "Int") or eq(n, "Int64")) return .{ .base = "cell_opt_i64", .elem = "int64_t", .generated = false };
-                if (eq(n, "UInt") or eq(n, "UInt64")) return .{ .base = "cell_opt_u64", .elem = "uint64_t", .generated = false };
+                if (eq(n, "Int8")) return .{ .base = "cell_opt_i8", .elem = "int8_t", .generated = false };
+                if (eq(n, "Int16")) return .{ .base = "cell_opt_i16", .elem = "int16_t", .generated = false };
                 if (eq(n, "Int32")) return .{ .base = "cell_opt_i32", .elem = "int32_t", .generated = false };
+                if (eq(n, "UInt") or eq(n, "UInt64")) return .{ .base = "cell_opt_u64", .elem = "uint64_t", .generated = false };
+                if (eq(n, "UInt8")) return .{ .base = "cell_opt_u8", .elem = "uint8_t", .generated = false };
+                if (eq(n, "UInt16")) return .{ .base = "cell_opt_u16", .elem = "uint16_t", .generated = false };
+                if (eq(n, "UInt32")) return .{ .base = "cell_opt_u32", .elem = "uint32_t", .generated = false };
                 if (eq(n, "Float") or eq(n, "Float64")) return .{ .base = "cell_opt_f64", .elem = "double", .generated = false };
                 if (eq(n, "Bool")) return .{ .base = "cell_opt_bool", .elem = "bool", .generated = false };
                 if (eq(n, "Byte")) return .{ .base = "cell_opt_byte", .elem = "uint8_t", .generated = false };
@@ -3756,7 +3767,9 @@ fn optBase(ty: CType) []const u8 {
 fn optBaseForPayload(t: CType) ?[]const u8 {
     const map = .{
         .{ "int64_t", "cell_opt_i64" },   .{ "uint64_t", "cell_opt_u64" },
-        .{ "int32_t", "cell_opt_i32" },   .{ "double", "cell_opt_f64" },
+        .{ "int8_t", "cell_opt_i8" },     .{ "int16_t", "cell_opt_i16" },
+        .{ "int32_t", "cell_opt_i32" },   .{ "uint16_t", "cell_opt_u16" },
+        .{ "uint32_t", "cell_opt_u32" },  .{ "double", "cell_opt_f64" },
         .{ "bool", "cell_opt_bool" },     .{ "uint8_t", "cell_opt_byte" },
         .{ "float", "cell_opt_Float32" },
     };
@@ -3768,9 +3781,13 @@ fn optBaseForPayload(t: CType) ?[]const u8 {
 /// the runtime constructor that writes it.
 fn resultField(t: CType) struct { field: []const u8, ctor: []const u8, cast: []const u8 } {
     if (std.mem.eql(u8, t.text, "int64_t")) return .{ .field = "i64", .ctor = "cell_ok_i64", .cast = "" };
+    if (std.mem.eql(u8, t.text, "int8_t")) return .{ .field = "i64", .ctor = "cell_ok_i64", .cast = "(int8_t)" };
+    if (std.mem.eql(u8, t.text, "int16_t")) return .{ .field = "i64", .ctor = "cell_ok_i64", .cast = "(int16_t)" };
     if (std.mem.eql(u8, t.text, "int32_t")) return .{ .field = "i64", .ctor = "cell_ok_i32", .cast = "(int32_t)" };
     if (std.mem.eql(u8, t.text, "uint64_t")) return .{ .field = "u64", .ctor = "cell_ok_u64", .cast = "" };
     if (std.mem.eql(u8, t.text, "uint8_t")) return .{ .field = "u64", .ctor = "cell_ok_u64", .cast = "(uint8_t)" };
+    if (std.mem.eql(u8, t.text, "uint16_t")) return .{ .field = "u64", .ctor = "cell_ok_u64", .cast = "(uint16_t)" };
+    if (std.mem.eql(u8, t.text, "uint32_t")) return .{ .field = "u64", .ctor = "cell_ok_u64", .cast = "(uint32_t)" };
     if (std.mem.eql(u8, t.text, "double")) return .{ .field = "f64", .ctor = "cell_ok_f64", .cast = "" };
     if (std.mem.eql(u8, t.text, "float")) return .{ .field = "f64", .ctor = "cell_ok_f64", .cast = "(float)" };
     if (std.mem.eql(u8, t.text, "bool")) return .{ .field = "b", .ctor = "cell_ok_bool", .cast = "" };
@@ -4305,6 +4322,28 @@ test "every module includes the runtime header" {
     var e = try emitSource("pub fn f(copy v: Int) -> Int;");
     defer e.deinit();
     try expectContains(e.text, "#include \"cell_rt.h\"");
+}
+
+test "Int8 Int16 UInt8 UInt16 UInt32 lower to their C types" {
+    var e = try emitSource(
+        \\pub fn take_int8(copy v: Int8) -> Int8;
+        \\pub fn take_int16(copy v: Int16) -> Int16;
+        \\pub fn take_uint8(copy v: UInt8) -> UInt8;
+        \\pub fn take_uint16(copy v: UInt16) -> UInt16;
+        \\pub fn take_uint32(copy v: UInt32) -> UInt32;
+        \\pub fn maybe_u32(copy v: UInt32?) -> Bool;
+        \\pub fn maybe_u8(copy v: UInt8?) -> Bool;
+        \\pub fn maybe_byte(copy v: Byte?) -> Bool;
+    );
+    defer e.deinit();
+    try expectContains(e.text, "int8_t cell_take_int8(int8_t v);");
+    try expectContains(e.text, "int16_t cell_take_int16(int16_t v);");
+    try expectContains(e.text, "uint8_t cell_take_uint8(uint8_t v);");
+    try expectContains(e.text, "uint16_t cell_take_uint16(uint16_t v);");
+    try expectContains(e.text, "uint32_t cell_take_uint32(uint32_t v);");
+    try expectContains(e.text, "bool cell_maybe_u32(cell_opt_u32_t v);");
+    try expectContains(e.text, "bool cell_maybe_u8(cell_opt_u8_t v);");
+    try expectContains(e.text, "bool cell_maybe_byte(cell_opt_byte_t v);");
 }
 
 test "ownership selects the parameter type for each mode" {
