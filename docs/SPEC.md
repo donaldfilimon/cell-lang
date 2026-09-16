@@ -239,12 +239,36 @@ ownership model and the C ABI are not up for negotiation. What has landed:
 | `const Foo = struct { }` | A second item grammar for a meaning the existing one already expresses. The genuinely missing feature underneath it, a top-level `const` value binding, is worth having on its own and is not this. |
 | macros | The other implementation states outright that its expander is not hygienic. A construct that can invisibly introduce a binding can silently change which place a move kills, and the diagnostic would point into expanded source. That is not deferrable in a language whose claim is that ownership is checkable. |
 | `.bod` as a package manifest | Section 1.2 is normative: `.bod` is a body file. See below. |
+| error unions, `!T` and `E!T` | A second spelling of `Result<T, E>` (section 3.4). The other implementation lowers an error union to a tagged `{ok, code, value}` struct; `runtime/cell_rt.h` already defines `cell_result_t { bool ok; int32_t error_code; cell_value_t value; }` for `Result`, the same three fields and the same choice to narrow the error to an integer code. Admitting both is a pure synonym, refused on the `i32`/`f64` grounds above. The real gap is that `Result<T, E>` does not parse yet (FEATURES TYPE-06). |
+| postfix `?` on an expression, for error propagation | Postfix `?` already means optional in a type (section 3.2, `T?`). Different positions, so a parser could tell them apart, but one glyph would carry two unrelated meanings. Whether Cell wants propagation at all is a separate question, and it cannot be asked usefully until `Result` parses. |
 
 **The `.bod` collision, stated normatively.** Another implementation reads
 `.bod` as a package manifest. This specification does not, and a conforming
 implementation MUST treat `.bod` and `.body` as body files paired to a
 `.cell`/`.cel` module by filename stem, per section 1.2. The other reading is
 recorded here only so the conflict is visible rather than discovered.
+
+**Deferred, with the reason, ruled 2026-09-16.** Two further constructs from
+the other implementation are neither admitted nor refused yet:
+
+- **`error_scope` / `handle` / `raise` / `propagate`: deferred, leaning
+  refuse.** In the other tree `raise` transfers to the immediately enclosing
+  `handle` and `propagate` passes the error to the caller, so this is local
+  control flow over an error value, not unwinding. It is still sugar over
+  `match` on a `Result`, whose base does not exist yet; its `handle` arms use
+  `|e|` captures, which the `switch` row above already refused; and its
+  `raise` edge is a new CFG edge that the drop pass and borrowck would have to
+  model, which this delta admits only on evidence. `match` on a `Result`
+  expresses the same program.
+- **A package manifest under any name: deferred until section 8.4 resolves
+  modules.** A manifest describes dependencies to resolve, and nothing
+  resolves modules today, which is the reason `@import("std")` was refused.
+  One clause is decided now: when a manifest is admitted it MUST NOT use the
+  `.bod` or `.body` extensions, per section 1.2.
+
+Every item in this ruling either depends on `Result<T, E>` or is moot without
+it, so parsing `Result<T, E>` (TYPE-06) is the next implementation slice here,
+and the only one that is not a decision.
 
 **Union stage 4 landed too, and it is the one that changed the language rather
 than its surface: Cell has loops.** `while`, `break` and `continue` are
