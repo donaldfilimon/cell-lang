@@ -1,9 +1,11 @@
-// R11 gap 4 (docs/OWNERSHIP.md, "Still broken" table, row 4): an `arc` local
-// declared inside a block is never released, because the drop pass is
-// function-scoped rather than block-scoped, so nothing schedules a release
-// for a binding a nested block (here, a `while` body) pops before the
-// function returns. Re-executing the block reassigns the same C-local
-// variable to a fresh box each time, so the loop leaks every iteration.
+// R11 gap 4 (docs/OWNERSHIP.md, formerly "Still broken" row 4, CLOSED
+// 2026-09-15): an `arc` local declared inside a block used to be never
+// released, because the drop pass was function-scoped rather than
+// block-scoped, so nothing scheduled a release for a binding a nested block
+// (here, a `while` body) popped before the function returned. `emitStmts`
+// now releases a block's own locals at its closing brace, so this loop frees
+// every iteration's box and the gate pins this fixture at 0. It stays in the
+// gate BECAUSE it is closed: any nonzero reading re-opens the gap.
 //
 // MEASURED 2026-09-08, and it corrects what this comment used to claim. The
 // old text said the last iteration's box is released by a function-scoped

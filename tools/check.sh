@@ -260,7 +260,14 @@ trap 'rm -rf "$TMP"' EXIT
 #
 # When one of these changes because a gap in docs/OWNERSHIP.md R11 closed:
 # update the constant AND that document's row, and cite the new commit here.
-LEAKS_MEASURED_AT=178599028cf2aabf3e815947cae0f9926b601c81
+#
+# 2026-09-15, second move: the block-scoped release that closed row 4 is a
+# codegen change, so the tree the surviving 3000s describe is no longer
+# 1785990's. They were re-measured (3 runs, both witnesses) on the tree that
+# the closing commit changed, whose parent is 82f222e; a commit cannot cite
+# its own hash, so the hash below is that parent and the codegen it names is
+# "82f222e plus the row-4 commit that follows it".
+LEAKS_MEASURED_AT=82f222e903afdd01cdc9a384a000ffc2a8df70cc
 
 # R11 row 1: a Cell body never releases its own `arc` parameter.
 LEAK_PARAM_NEVER_RELEASED=3000
@@ -276,9 +283,16 @@ LEAK_STRUCT_ARC_FIELD=3000
 # in the gate BECAUSE it is closed: pinned at 0, any nonzero reading here is a
 # regression that re-opens R11 row 3.
 LEAK_UNBOUND_SHARED_TEMP=0
-# R11 row 4: an `arc` local declared inside a block is never released
+# R11 row 4: an `arc` local declared inside a block used to be never released
 # (function-scoped release, block-scoped binding); the "block form" row.
-LEAK_BLOCK_SCOPED_LOCAL=3000
+# CLOSED 2026-09-15: `emitStmts` is now a block-scope drop point and `break`/
+# `continue` drop the loop's scopes, so this fixture releases every
+# iteration's box and measures 0 on both witnesses (it was 3000 on both the
+# same evening, through the same host and counter). It stays in the gate
+# BECAUSE it is closed: pinned at 0, any nonzero reading here re-opens row 4.
+# The codegen tests that pin the drop start at "an arc local declared in a
+# while body is released at the end of every iteration" in src/cell/codegen.zig.
+LEAK_BLOCK_SCOPED_LOCAL=0
 # R11 row 5: reassigning an `arc` `var` leaks the previous box.
 LEAK_REASSIGNED_VAR=3000
 
@@ -758,7 +772,7 @@ else
     run_c_leaks param_never_released "" "$LEAK_PARAM_NEVER_RELEASED" "R11 row 1 @ ${LEAKS_MEASURED_AT}"
     run_c_leaks struct_arc_field "" "$LEAK_STRUCT_ARC_FIELD" "R11 row 2 @ ${LEAKS_MEASURED_AT}"
     run_c_leaks unbound_shared_temp examples/arc_host.c "$LEAK_UNBOUND_SHARED_TEMP" "R11 row 3, CLOSED @ 460b9a3"
-    run_c_leaks block_scoped_local "" "$LEAK_BLOCK_SCOPED_LOCAL" "R11 row 4 @ ${LEAKS_MEASURED_AT}"
+    run_c_leaks block_scoped_local "" "$LEAK_BLOCK_SCOPED_LOCAL" "R11 row 4, CLOSED 2026-09-15"
     run_c_leaks reassigned_var "" "$LEAK_REASSIGNED_VAR" "R11 row 5 @ ${LEAKS_MEASURED_AT}"
 fi
 

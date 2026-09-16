@@ -1136,7 +1136,6 @@ section carries that count and is the authority for it.
 |---|---|
 | A Cell body never releases its own `arc` parameter (no parameter is dropped), so every call-site retain into one leaks a reference | by construction; `examples/arc_host.c` is the ABI-correct contrast, and `examples/arc.cell` reports 0 leaks because of it |
 | A struct holding an `arc` field is never dropped, so rule 4's retain leaks | `record` shapes are excluded from `hasDropCall` |
-| An `arc` local declared inside a block OR A MATCH ARM is never released, because release is function-scoped and both are popped before the drop pass runs; inside a `while` body that is unbounded | `leaks`: **3000 leaks / 80000 bytes** over 1000 iterations for the block form, confirmed by the malloc counter's LIVE=3000 (an earlier reading of 2997 / 63936 was `leaks -atExit` under-counting one iteration through a stale stack slot; `examples/leaks/leak_host.c` and `tools/check.sh`'s leaks stage record why) |
 | Reassigning an `arc` `var` leaks the previous box (`var arc v = "one"` then `v = "two"`), the same class as the R3a-revival leak R16 documents for `owned` | `leaks`: **3 leaks / 64 bytes** for a single reassignment |
 | An `owned` String or list PLACE bound as `arc` (**the reverse direction**; `arc` into `owned` is refused outright by R10 above) is not boxed at all, and is left as a C type error rather than a silent double free | see retain rule 1 above. Re-measured: `let arc b = a` with an `owned` String `a` still emits `cell_arc_t b = a;` and `cc` rejects it, `initializing 'cell_arc_t' with an expression of incompatible type 'cell_string_t'` |
 
@@ -1147,6 +1146,25 @@ measured at 2998 leaks over 1000 iterations. `460b9a3` fixed it: the emitted C
 now hoists the handle into the statement expression and releases it before the
 result is yielded. Measured at **0 leaks**, with `examples/arc.cell` still
 printing 13 at 0 leaks, so nothing regressed to buy it.
+
+**ALSO CLOSED, 2026-09-15, same convention.** An `arc` (or `owned`) local
+declared inside a statement-position block, a `while` body, an `if` branch, or a
+`match` arm body used to be never released, because release was
+function-scoped and the binding was popped before the drop pass ran; in a
+`while` body that was unbounded, measured at **3000 leaks / 80000 bytes** over
+1000 iterations once `leaks -atExit`'s under-count was corrected. `emitStmts`
+in `codegen.zig` is now a block-scope drop point, and `break`/`continue` drop
+everything declared since the enclosing loop opened. Measured at **0** on both
+the `leaks` count and the malloc counter's LIVE, with the other four fixtures
+unchanged. Safe against a loop body that moves an OUTER place because R2.a
+already refuses that program (the back edge would use it dead); an outer `arc`
+place is cloned into the body's local and the per-iteration drop releases that
+clone. **Residual, stated:** a local declared inside a VALUE-position block
+(`let r = { let arc a = ...; a }`) is still not released at that block's exit,
+and the same program is separately defective: `cell check` accepts it while
+typing the block as `()`, and the emitted C declares `int64_t r` and assigns
+the arc into it, which `cc` refuses. Both are pinned by tests in `codegen.zig`
+rather than left as prose.
 
 **A SIXTH gap existed and was never in this table. It is closed by REFUSAL, so
 it gets no fixture and changes no constant in the gate.** `let owned ys: [Int] =

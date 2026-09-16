@@ -33,8 +33,11 @@
 //! to do conservatively: an unmoved `owned`/`arc` `let`/`var` local gets
 //! `cell_string_free(&x)`, `cell_slice_free(&x)`, or `cell_arc_drop(x)` (the
 //! only three symbols in `runtime/cell_rt.h` that are real functions rather
-//! than `static inline`) at the end of its function's body and before every
-//! `return`. "Unmoved" is answered by `borrowck.zig`, not re-derived here:
+//! than `static inline`) at the end of the statement-position scope that
+//! declared it (the function body, or since 2026-09-15 a `while` body, a
+//! bare block, an `if` branch, or a `match` arm body), before every `return`,
+//! and before every `break`/`continue` for the loop's scopes. "Unmoved" is
+//! answered by `borrowck.zig`, not re-derived here:
 //! `emitModule` runs one `borrowck.Checker` over the whole module before
 //! emitting anything, and every `Local` records the id `Checker.declare`
 //! assigned to the SAME source declaration, so `Checker.wasMoved` can be
@@ -53,10 +56,17 @@
 //! place that might already be gone is a double free. This backend always
 //! picks the leak. Known gaps left on purpose: a value moved on only one
 //! path still leaks on every path that did not move it; a struct with
-//! owning fields is never destroyed at all; and `wasMoved` answers "moved
+//! owning fields is never destroyed at all; `wasMoved` answers "moved
 //! ANYWHERE in the function", so a `var` that is moved and later reassigned
 //! (R3a revival) is never dropped either, even though it holds a fresh,
-//! unmoved value at the function's end -- the revived value leaks too.
+//! unmoved value at the function's end -- the revived value leaks too; and
+//! a local declared inside a VALUE-position block (`emitValueInto`) is not
+//! released at that block's exit, because it may be the value flowing out.
+//! Why block-scoped release is safe for a local whose initializer moves an
+//! OUTER place inside a loop: borrowck's R2.a refuses that program outright
+//! (the back edge would use the place dead), so no accepted loop body
+//! re-moves a freed buffer; an outer `arc` place is cloned into the local
+//! instead, and the per-iteration drop releases exactly that clone.
 //!
 //! THE ID-NUMBERING AGREEMENT THIS RELIES ON. Codegen does not reuse
 //! borrowck's `Binding`s; it keeps its own `next_binding_id` counter and
@@ -342,6 +352,12 @@ pub const Generator = struct {
     arena: std.mem.Allocator = undefined,
     module: *const ast.Module = undefined,
     locals: std.ArrayList(Local) = .empty,
+    /// `self.locals.items.len` at the entry of every `while` body currently
+    /// being emitted, innermost last. A `break` or `continue` leaves every
+    /// scope between itself and the loop at once, so it must drop every
+    /// local declared since the LOOP's mark, not since the innermost
+    /// block's: `emitLoopExitDrops` reads the top of this stack.
+    loop_marks: std.ArrayList(usize) = .empty,
     temp_counter: usize = 0,
     /// Name of the function being emitted, used in panic messages.
     current_fn: []const u8 = "",
@@ -625,12 +641,28 @@ pub const Generator = struct {
 
     // ── statements ──────────────────────────────────────────────────────
 
+    /// A statement-position block: a `while` body, a bare `{ }`, an `if`
+    /// branch, or a `match` arm body reached through `emitEffect`. This is
+    /// the BLOCK-SCOPE drop point (OWNERSHIP.md R11 row 4, closed
+    /// 2026-09-15): on normal exit, every droppable local declared since
+    /// `mark` is released here, in reverse order, at this block's own
+    /// indent. A block that ends in a jump emits nothing, because the jump
+    /// already did it: a `return` drops everything visible through
+    /// `pendingDrops`, and a `break`/`continue` drops the loop's scopes
+    /// through `emitLoopExitDrops`.
+    ///
+    /// Value-position blocks are NOT this function: `emitValueInto` owns
+    /// them with its own mark and does not release their locals, because a
+    /// block-local place can flow out as the block's value and the
+    /// conversion into the destination is what decides whether that flow
+    /// retains. That residual is pinned by a test rather than described.
     fn emitStmts(self: *Generator, stmts: []const ast.Stmt, indent: usize) EmitError!void {
         const mark = self.locals.items.len;
         defer self.locals.shrinkRetainingCapacity(mark);
         for (stmts, 0..) |_, i| {
             try self.emitStmt(&stmts[i], stmts[i + 1 ..], indent);
         }
+        if (!endsInJump(stmts)) try self.emitDropsSince(mark, indent);
     }
 
     fn emitStmt(self: *Generator, stmt: *const ast.Stmt, rest: []const ast.Stmt, indent: usize) EmitError!void {
@@ -641,15 +673,19 @@ pub const Generator = struct {
                 try out.writeAll("while (");
                 try self.emitExpr(&w.cond, indent);
                 try out.writeAll(") {\n");
+                try self.loop_marks.append(self.arena, self.locals.items.len);
                 try self.emitStmts(w.body, indent + 4);
+                _ = self.loop_marks.pop();
                 try self.writeIndent(indent);
                 try out.writeAll("}\n");
             },
             .break_stmt => {
+                try self.emitLoopExitDrops(indent);
                 try self.writeIndent(indent);
                 try out.writeAll("break;\n");
             },
             .continue_stmt => {
+                try self.emitLoopExitDrops(indent);
                 try self.writeIndent(indent);
                 try out.writeAll("continue;\n");
             },
@@ -779,10 +815,19 @@ pub const Generator = struct {
     /// (`record` shape) is excluded by `hasDropCall`, not by an ownership
     /// check, because a struct can be `owned` too.
     fn pendingDrops(self: *Generator) Alloc![]const Local {
+        return self.pendingDropsSince(0);
+    }
+
+    /// `pendingDrops` restricted to the locals at index `mark` and above:
+    /// the ones a block that started at `mark` owns. The same three checks
+    /// gate each one in, and `isShadowedAt` still looks at EVERY later
+    /// binding, so a block-local shadowed by a later block-local is
+    /// suppressed exactly as at function scope.
+    fn pendingDropsSince(self: *Generator, mark: usize) Alloc![]const Local {
         const checker = self.checker orelse return &.{};
         var out: std.ArrayList(Local) = .empty;
         var i = self.locals.items.len;
-        while (i > 0) {
+        while (i > mark) {
             i -= 1;
             const local = self.locals.items[i];
             if (self.isShadowedAt(i)) continue;
@@ -828,11 +873,28 @@ pub const Generator = struct {
         return false;
     }
 
-    /// The end-of-function-body drop point. Nested block/if/match/while
-    /// exits do NOT call this: the brief's design is function-scoped, not
-    /// block-scoped (see the module doc comment's "known gaps").
+    /// The end-of-function-body drop point: every visible local. Nested
+    /// statement-position scopes release their own locals through
+    /// `emitDropsSince` at the end of `emitStmts`, so by the time this runs
+    /// the function's top-level `let`s are the only ones still visible.
     fn emitScopeDrops(self: *Generator, indent: usize) EmitError!void {
         for (try self.pendingDrops()) |local| try self.emitDropFor(indent, local);
+    }
+
+    /// The block-scope drop point: the locals declared since `mark`.
+    fn emitDropsSince(self: *Generator, mark: usize, indent: usize) EmitError!void {
+        for (try self.pendingDropsSince(mark)) |local| try self.emitDropFor(indent, local);
+    }
+
+    /// The `break`/`continue` drop point: everything declared since the
+    /// innermost enclosing `while` body opened, which includes the locals of
+    /// any block, `if` branch, or arm body the jump sits inside. Outside any
+    /// loop there is nothing to do; the parser does not produce a bare
+    /// `break`, so the empty case is defensive rather than reachable.
+    fn emitLoopExitDrops(self: *Generator, indent: usize) EmitError!void {
+        if (self.loop_marks.items.len == 0) return;
+        const mark = self.loop_marks.items[self.loop_marks.items.len - 1];
+        try self.emitDropsSince(mark, indent);
     }
 
     /// The other drop point: before every `return`. When nothing needs
@@ -2814,6 +2876,18 @@ fn endsInReturn(body: []const ast.Stmt) bool {
     };
 }
 
+/// True when the block's last statement leaves it by a jump that has
+/// already emitted the block's drops (`return` via `pendingDrops`, `break`
+/// and `continue` via `emitLoopExitDrops`), so `emitStmts` must not emit
+/// them a second time after unreachable code.
+fn endsInJump(body: []const ast.Stmt) bool {
+    if (body.len == 0) return false;
+    return switch (body[body.len - 1].kind) {
+        .return_stmt, .break_stmt, .continue_stmt => true,
+        else => false,
+    };
+}
+
 // ── use analysis, for the (void) casts that keep -Wextra quiet ───────────
 
 fn exprUses(e: *const ast.Expr, name: []const u8) bool {
@@ -2948,6 +3022,24 @@ fn expectAbsent(haystack: []const u8, needle: []const u8) !void {
 /// answer and two is a double free. `expectContains` cannot tell those apart,
 /// and a drop test that only asks "is the free there" passes just as happily
 /// when it is there twice.
+/// The trimmed line immediately before the first `jump` must be `prev`:
+/// how a drop-before-jump test asks its question without hardcoding the
+/// indentation of a `while` body nested in an `if`.
+fn expectLineBefore(haystack: []const u8, jump: []const u8, prev: []const u8) !void {
+    const at = std.mem.indexOf(u8, haystack, jump) orelse {
+        std.debug.print("\nexpected to find:\n{s}\nin:\n{s}\n", .{ jump, haystack });
+        return error.NotFound;
+    };
+    const line_start = if (std.mem.lastIndexOfScalar(u8, haystack[0..at], '\n')) |i| i + 1 else 0;
+    const prev_end = if (line_start > 0) line_start - 1 else 0;
+    const prev_start = if (std.mem.lastIndexOfScalar(u8, haystack[0..prev_end], '\n')) |i| i + 1 else 0;
+    const got = std.mem.trim(u8, haystack[prev_start..prev_end], " ");
+    if (!std.mem.eql(u8, got, prev)) {
+        std.debug.print("\nexpected the line before:\n{s}\nto be:\n{s}\nbut it was:\n{s}\nin:\n{s}\n", .{ jump, prev, got, haystack });
+        return error.WrongLineBefore;
+    }
+}
+
 fn expectOccurrences(haystack: []const u8, needle: []const u8, want: usize) !void {
     const got = std.mem.count(u8, haystack, needle);
     if (got != want) {
@@ -4463,6 +4555,148 @@ test "drops run in reverse declaration order" {
         \\  cell_string_free(&b);
         \\  cell_string_free(&a);
     );
+}
+
+// ── block-scoped release, OWNERSHIP.md R11 row 4 (closed 2026-09-15) ────
+
+test "an arc local declared in a while body is released at the end of every iteration" {
+    // The exact shape of examples/leaks/block_scoped_local.cell, which
+    // measured 3000 leaks over 1000 iterations before this drop existed.
+    var e = try emitSource(
+        \\pub fn f() {
+        \\  var i = 0
+        \\  while i < 1000 {
+        \\    let arc a = "leaked-block-local"
+        \\    i = i + 1
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    // Once, inside the loop, after the body's last statement.
+    try expectOccurrences(e.text, "cell_arc_drop(a);", 1);
+    try expectContains(e.text,
+        \\          i = (i + 1);
+        \\          cell_arc_drop(a);
+        \\  }
+    );
+}
+
+test "an owned local declared in a bare block is freed at that block's closing brace" {
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  {
+        \\    let owned s = make()
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectOccurrences(e.text, "cell_string_free(&s);", 1);
+    try expectContains(e.text,
+        \\    cell_string_free(&s);
+        \\  }
+        \\}
+    );
+}
+
+test "a break drops the loop body's locals before jumping, and the normal exit drops them too" {
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f(shared k: Int) {
+        \\  var i = 0
+        \\  while i < 10 {
+        \\    let owned s = make()
+        \\    if (i == k) {
+        \\      break
+        \\    }
+        \\    i = i + 1
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    // The `break` sits inside an `if` branch inside the body: it must drop
+    // since the LOOP's mark, not the branch's, so `s` is released there.
+    try expectLineBefore(e.text, "break;", "cell_string_free(&s);");
+    // And the `if` branch itself ends in a jump, so it emits no second drop.
+    try expectOccurrences(e.text, "cell_string_free(&s);", 2);
+}
+
+test "a continue drops the loop body's locals before jumping" {
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f(shared k: Int) {
+        \\  var i = 0
+        \\  while i < 10 {
+        \\    i = i + 1
+        \\    let owned s = make()
+        \\    if (i == k) {
+        \\      continue
+        \\    }
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectLineBefore(e.text, "continue;", "cell_string_free(&s);");
+    try expectOccurrences(e.text, "cell_string_free(&s);", 2);
+}
+
+test "a loop-body local moved into an owned parameter is not dropped at the body's end" {
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn take(owned s: String);
+        \\pub fn f() {
+        \\  var i = 0
+        \\  while i < 10 {
+        \\    let owned s = make()
+        \\    take(s)
+        \\    i = i + 1
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "cell_string_free(&s)");
+}
+
+test "an arc local declared in a statement-position match arm body is released at the arm's end" {
+    // OWNERSHIP.md row 4 named the match-arm form beside the block form.
+    var e = try emitSource(
+        \\pub fn f(shared k: Int) {
+        \\  match k {
+        \\    1 => {
+        \\      let arc a = "arm-local"
+        \\    },
+        \\    _ => 0,
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectOccurrences(e.text, "cell_arc_drop(a);", 1);
+}
+
+test "a local declared in a VALUE-position block is still not released: pinned residual" {
+    // `emitValueInto` owns value-position blocks and does not release
+    // their locals, because the block's value may be that very place. When
+    // block-scoped release reaches value position, this test should flip to
+    // expecting the drop, not be deleted.
+    //
+    // Found while writing it, and NOT fixed here: this program passes
+    // `cell check` (the typechecker gives a block expression the type `()`,
+    // so the untyped `let` accepts it) and the emitted C declares
+    // `int64_t r` and assigns `cell_arc_t a` into it, which `cc` refuses. A
+    // block's tail expression is not typed as the block's value anywhere. A
+    // `cell check`-accepted program whose C does not compile is the class
+    // tools/sweep-backends.sh hunts, and its probes contain no value-position
+    // block, which is why it never reported this one.
+    var e = try emitSource(
+        \\pub fn f() {
+        \\  let arc r = {
+        \\    let arc a = "inner"
+        \\    a
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(e.text, "cell_arc_drop(a);");
 }
 
 test "a shared or copy local is never dropped" {
