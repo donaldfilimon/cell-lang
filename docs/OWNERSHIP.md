@@ -1169,18 +1169,29 @@ That program became expressible on 2026-09-15 itself: until then the
 typechecker typed every block as `()` (so the typed form was refused) and
 codegen's inference could not see the block's own `let`, so the untyped form
 emitted `int64_t r` and did not compile; both are fixed the same day and pinned
-by tests in `codegen.zig` and `typecheck.zig`. Only `arc` reaches this gap:
-the `owned` form, `let owned s = { let owned t = make() \n t }`, is refused
-("cannot bind the unresolved name 't' to 'owned' binding 's'"). Read off
-`borrowck.zig` rather than guessed: the ownership-source walks that R10 and
-R2.b run over an initializer, `arcUniqueSource` and `ownedMoveSource`, both
-descend straight to a block's trailing expression WITHOUT entering the block's
-scope or declaring its `let`s, so a tail that names a block-local reaches
-their `.ident` arm with `lookup` failed and is reported as unresolved. The
-refusal is safe (it is R2.b's "refuse what cannot be resolved", not a wrong
-move), but the message blames ownership for what is a scoping gap in those
-two walks, and fixing it means declaring the block's bindings in a pushed
-scope before asking about the tail.
+by tests in `codegen.zig` and `typecheck.zig`. The `owned` form,
+`let owned s = { let owned t = make() \n t }`, was refused until later on
+2026-09-15 ("cannot bind the unresolved name 't'"), because the
+ownership-source walks R10 and R2.b run over an initializer, `arcUniqueSource`
+and `ownedMoveSource`, descend to a block's trailing expression without the
+block's scope. **Resolved at the `let` position the same day**, and at the
+consumption site rather than inside those walks (they run back to back over
+one initializer, and `checkExpr` may walk it a third time, so declaring inside
+them would advance the binding-id counter once per walk and break the id
+lockstep with codegen): `checkOwnedLetFromBlock` checks the block's statements
+in a scope it keeps open, then treats the tail as the `let`'s own initializer,
+so a block-local tail resolves through `lookup`, `movePlace` records the move
+in `moved` (which outlives the scope, for a future value-position drop pass),
+an `&t` tail is R18, an `arc` tail is R10 naming it, and a nested block
+recurses. A block is ONE path, which is why moving through it is sound where
+moving through an `if` or `match` is not: `let owned s2 = { s1 }` now moves
+`s1`, and a later use of `s1` is a use-after-move. Measured: the emitted C
+runs under AddressSanitizer with the malloc counter at ALLOC=1 FREE=1 LIVE=0,
+so the move is balanced and `t` needs no drop of its own. **Residual, stated:**
+the other five R2.b consumption sites (assignment, call argument, struct
+field, list element, the unary/return site) still refuse a block-local tail,
+now with a message that says so ("the block-local binding 't' (only a 'let'
+resolves a block's value today)") instead of blaming ownership.
 
 **A SIXTH gap existed and was never in this table. It is closed by REFUSAL, so
 it gets no fixture and changes no constant in the gate.** `let owned ys: [Int] =

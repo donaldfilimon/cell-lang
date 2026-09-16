@@ -778,6 +778,18 @@ pub const Checker = struct {
         l: *const @FieldType(ast.Stmt.Kind, "let"),
         v: *const ast.Expr,
     ) Error!void {
+        // A BLOCK in an `owned` position is one path, not a branch: its tail
+        // always evaluates, so consuming the tail is a real move that this
+        // checker can record, unlike an `if` or `match` whose taken arm it
+        // cannot know. It is handled here, at the consumption site, and not
+        // inside `arcUniqueSource`/`ownedMoveSource`, because those two walks
+        // run back to back over the same initializer and `checkExpr` may
+        // walk it a third time: declaring the block's `let`s inside a walk
+        // would advance `next_binding_id` once per walk and break the id
+        // lockstep with codegen. See `checkOwnedLetFromBlock`.
+        if (l.ownership == .owned and v.kind == .block) {
+            return self.checkOwnedLetFromBlock(l, v.kind.block);
+        }
         // R18, the `let` position, and the ONE question asked about the
         // initializer's borrow-ness anywhere in this function.
         //
@@ -910,6 +922,48 @@ pub const Checker = struct {
         // `copy` and `arc` bindings duplicate or retain rather than move
         // (R12, R10), so a bare place initializer is only read.
         try self.checkExpr(v);
+    }
+
+    /// `let owned s = { ...; tail }`: the block's statements are checked in
+    /// a scope that stays OPEN while the tail is treated as the `let`'s own
+    /// initializer, so a tail naming a block-local resolves through `lookup`
+    /// to the real binding and `movePlace` records the move in `moved`, which
+    /// outlives the scope (a future value-position drop pass reads
+    /// `wasMoved` for it). Every other tail shape gets the same answer it
+    /// would get as a bare initializer: `&t` is R18, an `arc` local is R10
+    /// naming it, a nested block recurses, a call falls to `checkExpr`.
+    ///
+    /// The scope and the `open_blocks` entry are pushed exactly as
+    /// `checkBlockStmts` does, because a loan created inside the block
+    /// records `block_index`/`stmt_index` and is truncated by depth on the
+    /// way out. Each statement is checked exactly once here and the generic
+    /// `checkExpr(v)` never sees this block, so the block's `let`s are
+    /// declared once, in codegen's order (statements, then the tail).
+    ///
+    /// Until 2026-09-15 this program was refused with "cannot bind the
+    /// unresolved name 't'": the ownership-source walks descended to the tail
+    /// without the block's scope. The other five R2.b consumption sites still
+    /// refuse a block-local tail (with an accurate message now); only the
+    /// `let` position resolves a block's value today.
+    fn checkOwnedLetFromBlock(
+        self: *Checker,
+        l: *const @FieldType(ast.Stmt.Kind, "let"),
+        stmts: []const ast.Stmt,
+    ) Error!void {
+        if (stmts.len == 0 or stmts[stmts.len - 1].kind != .expr) {
+            // No value flows out; typecheck reports the unit mismatch.
+            return self.checkBlockStmts(stmts);
+        }
+        try self.pushScope();
+        defer self.popScope();
+        try self.open_blocks.append(self.allocator, .{ .stmts = stmts, .index = 0 });
+        defer _ = self.open_blocks.pop();
+        for (stmts[0 .. stmts.len - 1], 0..) |*st, i| {
+            self.open_blocks.items[self.open_blocks.items.len - 1].index = i;
+            try self.checkStmt(st);
+        }
+        self.open_blocks.items[self.open_blocks.items.len - 1].index = stmts.len - 1;
+        try self.checkLetInit(l, &stmts[stmts.len - 1].kind.expr);
     }
 
     fn checkAssign(self: *Checker, a: *const @FieldType(ast.Stmt.Kind, "assign")) Error!void {
@@ -1999,10 +2053,20 @@ pub const Checker = struct {
             },
             // A block's value is its trailing expression statement. A block
             // that ends in anything else (or in nothing) yields unit.
+            //
+            // A tail naming one of the block's OWN `let`s cannot resolve
+            // here: this walk runs without the block's scope, on purpose (see
+            // `checkLetInit`'s dispatch). The `let` position resolves it
+            // through `checkOwnedLetFromBlock` before ever reaching this arm;
+            // every other consumption site refuses, and says why.
             .block => |stmts| blk: {
                 if (stmts.len == 0) break :blk .not_arc;
                 const last = &stmts[stmts.len - 1];
                 if (last.kind != .expr) break :blk .not_arc;
+                if (blockLocalTail(stmts)) |name| break :blk .{ .unknown = .{
+                    .display = try self.msg("the block-local binding '{s}' (only a 'let' resolves a block's value today)", .{name}),
+                    .span = last.kind.expr.span,
+                } };
                 break :blk try self.arcUniqueSource(&last.kind.expr);
             },
         };
@@ -2261,11 +2325,18 @@ pub const Checker = struct {
                 break :blk acc;
             },
             // A block's value is its trailing expression statement. A block
-            // that ends in anything else, or in nothing, yields unit.
+            // that ends in anything else, or in nothing, yields unit. A tail
+            // naming one of the block's own `let`s is unresolvable here, as
+            // `arcUniqueSource`'s arm explains; the `let` position never
+            // reaches this arm (`checkOwnedLetFromBlock`).
             .block => |stmts| blk: {
                 if (stmts.len == 0) break :blk .no_owned_place;
                 const last = &stmts[stmts.len - 1];
                 if (last.kind != .expr) break :blk .no_owned_place;
+                if (blockLocalTail(stmts)) |name| break :blk .{ .unknown = .{
+                    .display = try self.msg("the block-local binding '{s}' (only a 'let' resolves a block's value today)", .{name}),
+                    .span = last.kind.expr.span,
+                } };
                 break :blk try self.ownedMoveBranch(&last.kind.expr);
             },
         };
@@ -3982,6 +4053,21 @@ fn expectAccepted(src: []const u8) !void {
 /// A `Buffer` with one `owned` field and one `copy` field, plus the four
 /// helpers the rules' examples call. Kept on one line each so a test's own
 /// statements start at a predictable line.
+/// The name of a block's tail when that tail is a bare identifier declared
+/// by one of the block's own `let` statements; null otherwise. Purely
+/// syntactic, so the ownership-source walks can name what they cannot
+/// resolve without declaring anything.
+fn blockLocalTail(stmts: []const ast.Stmt) ?[]const u8 {
+    if (stmts.len == 0) return null;
+    const last = &stmts[stmts.len - 1];
+    if (last.kind != .expr or last.kind.expr.kind != .ident) return null;
+    const name = last.kind.expr.kind.ident;
+    for (stmts[0 .. stmts.len - 1]) |st| {
+        if (st.kind == .let and std.mem.eql(u8, st.kind.let.name, name)) return name;
+    }
+    return null;
+}
+
 const prelude =
     \\pub struct Buffer {
     \\    owned data: [Byte]
@@ -5450,16 +5536,18 @@ test "R2.b covers an if branch and a block tail, which typecheck alone would hid
         \\t.cell:5:32: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
         \\
     );
-    try expectDiagnostics(
+    // CHANGED 2026-09-15: the block half is no longer refused. A block is
+    // ONE path, so its tail always evaluates and `s1` is moved through it
+    // (`checkOwnedLetFromBlock`); the branch reasoning above is for `if`
+    // and `match`, whose taken arm is unknown. The test "a block tail naming
+    // an OUTER owned place moves it" proves the move is recorded, by using
+    // `x` afterwards and getting a use-after-move.
+    try expectAccepted(
         \\pub fn mk() -> String;
         \\pub fn main() {
         \\    let owned s1 = mk()
         \\    let owned s2 = { s1 }
         \\}
-    ,
-        \\t.cell:4:22: error: cannot bind the place 's1' reached through a branch to 'owned' binding 's2': which owned place it gives up cannot be resolved here
-        \\t.cell:4:22: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
-        \\
     );
     // An `owned` keyword in front of the value does not get around it.
     // `placeOf` already peels `.annotated`, so this arm adds no move that
@@ -5665,6 +5753,116 @@ test "R2.a: reassigning before the body ends revives the place and the loop is l
         \\        i = i + 1
         \\    }
         \\}
+    );
+}
+
+// ── a block in an `owned` let position (2026-09-15) ────────────────────────
+
+const block_prelude =
+    \\pub fn make() -> String;
+    \\pub fn eat(owned s: String) { }
+    \\
+;
+// block_prelude occupies lines 1 through 3 (its trailing empty line counts), so a
+// test body's first line is 4.
+
+test "an owned let takes a block whose tail is the block's own owned local" {
+    try expectAccepted(block_prelude ++
+        \\pub fn main() {
+        \\    let owned s = {
+        \\        let owned t = make()
+        \\        t
+        \\    }
+        \\}
+    );
+}
+
+test "the block's statements are checked in a live scope: a tail moved earlier is a use after move" {
+    try expectDiagnostics(block_prelude ++
+        \\pub fn main() {
+        \\    let owned s = {
+        \\        let owned t = make()
+        \\        eat(owned t)
+        \\        t
+        \\    }
+        \\}
+    ,
+        \\t.cell:7:9: error: use of 't' after it was moved
+        \\t.cell:6:19: note: 't' was moved here by the call to 'eat'
+        \\
+    );
+}
+
+test "a block tail naming an OUTER owned place moves it, because a block is one path" {
+    try expectDiagnostics(block_prelude ++
+        \\pub fn main() {
+        \\    let owned x = make()
+        \\    let owned s = { x }
+        \\    eat(owned x)
+        \\}
+    ,
+        \\t.cell:6:15: error: use of 'x' after it was moved
+        \\t.cell:5:21: note: 'x' was moved here by binding it to 's'
+        \\
+    );
+}
+
+test "a nested block tail resolves through both scopes" {
+    try expectAccepted(block_prelude ++
+        \\pub fn main() {
+        \\    let owned s = {
+        \\        let owned t = make()
+        \\        {
+        \\            let owned u = t
+        \\            u
+        \\        }
+        \\    }
+        \\}
+    );
+}
+
+test "a block tail that is the block's own arc local is R10, naming the local" {
+    try expectDiagnostics(block_prelude ++
+        \\pub fn main() {
+        \\    let owned s = {
+        \\        let arc t = "a"
+        \\        t
+        \\    }
+        \\}
+    ,
+        \\t.cell:6:9: error: cannot bind 'arc' value 't' to 'owned' binding 's': ownership is shared and cannot be made unique
+        \\t.cell:6:9: note: an 'owned' holder frees the value, and the 'arc' box would free it again
+        \\
+    );
+}
+
+test "a block tail that borrows the block's own local is R18" {
+    try expectDiagnostics(block_prelude ++
+        \\pub fn main() {
+        \\    let owned s = {
+        \\        let owned t = make()
+        \\        &t
+        \\    }
+        \\}
+    ,
+        \\t.cell:6:9: error: cannot bind a borrow of 't' to the 'owned' binding 's': a borrow does not confer ownership
+        \\t.cell:6:9: note: R18: an 'owned' binding is destroyed at the end of its scope (R16), so binding one to a borrow frees the lender's value twice; write 'let shared s' or 'let exclusive s' to hold the borrow
+        \\
+    );
+}
+
+test "a block-local tail at a call argument is still refused, and the message says why" {
+    try expectDiagnostics(block_prelude ++
+        \\pub fn main() {
+        \\    eat(owned {
+        \\        let owned t = make()
+        \\        t
+        \\    })
+        \\}
+    ,
+        \\t.cell:6:9: error: cannot pass the block-local binding 't' (only a 'let' resolves a block's value today) to 'owned' parameter 's': its ownership cannot be resolved here
+        \\t.cell:6:9: note: R10 refuses what it cannot prove is not 'arc': an 'arc' value made unique is freed twice
+        \\
     );
 }
 

@@ -4762,6 +4762,30 @@ test "a value-position block's tail resolves through a nested block, and later b
     try expectContains(e.text, "cell_arc_drop(r);");
 }
 
+test "an owned block tail is moved into the let, and bindings after the block keep their ids" {
+    // borrowck checks the block's statements inside `checkOwnedLetFromBlock`
+    // and never through `checkExpr(v)`, so `t` must be declared exactly once
+    // on its side, in the order codegen declares it. If borrowck declared it
+    // twice, `z`'s id would no longer match its name, `pushLocal`'s Debug
+    // assert would fire under `zig build test`, and in release `droppable`
+    // would clear and `z`'s drop would vanish.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f() {
+        \\  let owned s = {
+        \\    let owned t = make()
+        \\    t
+        \\  }
+        \\  let arc z = "after"
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_string_t s = ({");
+    try expectOccurrences(e.text, "cell_string_free(&s);", 1);
+    try expectAbsent(e.text, "cell_string_free(&t)");
+    try expectContains(e.text, "cell_arc_drop(z);");
+}
+
 test "a shared or copy local is never dropped" {
     var e = try emitSource(
         \\pub fn make() -> String;
