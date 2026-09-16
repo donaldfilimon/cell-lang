@@ -10,8 +10,9 @@
 // change. AFTER: 0. It stays in the gate BECAUSE it is closed: pinned at
 // 0, any nonzero reading re-opens it.
 //
-// What this fixture does NOT cover: a field moved on only one branch of
-// an `if` (still leaked by design; needs drop flags, not recursion).
+// What this fixture does NOT cover: a field written again after its move
+// (R16 revival at field granularity). A field moved on only one branch
+// of an `if` closed the same day (`branch_field.cell`).
 //
 // Status: parses, passes `cell check`. LLVM and MLIR refuse it (`String`
 // crossing the C boundary is scalar-first-refused there); lives under

@@ -1,10 +1,10 @@
 # `examples/leaks/`
 
-Sixteen fixtures: R11's measurable gaps and their CLOSED pins (seven,
+Seventeen fixtures: R11's measurable gaps and their CLOSED pins (seven,
 including the value-block residual and the `owned` twin of row 5); R16's
-revival leak (`revived_var.cell`, closed 2026-09-16) and six closed
+revival leak (`revived_var.cell`, closed 2026-09-16) and seven closed
 residuals (`branch_move`, `loop_jump_revival`, `value_block_revival`,
-`revived_record`, `loop_cross`, `partial_nested_field`); the partial-move pin; and one regression pin for an
+`revived_record`, `loop_cross`, `partial_nested_field`, `branch_field`); the partial-move pin; and one regression pin for an
 implemented feature (`arc_box_move.cell`, below). Each isolates exactly one
 disclosed retain/release shape and loops it 1000 times so a leak is a
 stable count, not noise.
@@ -34,16 +34,17 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `block_scoped_local.cell` | 4: a block-scoped `arc` local is never released; **CLOSED 2026-09-15**, kept and pinned at 0 |
 | `reassigned_var.cell` | 5: reassigning an `arc` `var` leaked the previous box; **CLOSED 2026-09-15** by the reassignment pre-drop in `emitAssign`, kept and pinned at 0 |
 | `reassigned_owned_var.cell` | not an R11 row: row 5's `owned` twin. Reassigning an `owned` String or list var leaked the old value (4000 before on both witnesses, including two stores whose var is moved only afterwards); **CLOSED 2026-09-16** by extending `emitAssign`'s pre-drop, decided per store from borrowck's `assign_liveness`, pinned at 0. A store whose target was already moved (R3a revival), or that sits in a `while` body moving it, keeps its leak by design and is not measured here |
-| `revived_var.cell` | not an R11 row: OWNERSHIP.md R16's revival leak. A var moved and then revived (R3a) was never released at scope end (5000 before on both witnesses, one per drop point: body end, `return`, nested block end, `owned` parameter, list); **CLOSED 2026-09-16** by borrowck's per-exit liveness (`exit_liveness`), pinned at 0. What still leaks, by design and not measured here: a field moved on only one branch |
+| `revived_var.cell` | not an R11 row: OWNERSHIP.md R16's revival leak. A var moved and then revived (R3a) was never released at scope end (5000 before on both witnesses, one per drop point: body end, `return`, nested block end, `owned` parameter, list); **CLOSED 2026-09-16** by borrowck's per-exit liveness (`exit_liveness`), pinned at 0 |
 | `value_block_local.cell` | the residual of row 4's closure: an `arc` local declared in a VALUE-position block was not released at that block's exit (measurable since 2026-09-15, when a block began to type as its tail); **CLOSED 2026-09-15** the same evening by `emitValueBlockDrops`, kept and pinned at 0 |
 | `arc_box_move.cell` | not a gap: R10 move-into-`arc` at `let`, at a direct `-> arc` return, by assignment into a whole `var arc`, as an argument to an `arc` parameter and into a struct literal's `arc` field, all IMPLEMENTED 2026-09-16; pinned at 0 as a regression guard (a drift between borrowck's move and codegen's box is a double free or a leak). A move on one branch only leaks by design and is not measured |
-| `partial_move_field.cell` | not a numbered row: a record with one owning field moved out was skipped whole, leaking its other owning field; **CLOSED 2026-09-16** by field-path move records in borrowck and `emitPartialRecordDrop` in codegen, kept and pinned at 0. A field moved on only one branch still leaks by design and is not measured here |
-| `partial_nested_field.cell` | R16 residual: a nested field whose sibling was moved (`p.inner.a` moved, `p.inner.b` leaked because the whole `inner` field was skipped); **CLOSED 2026-09-16** by recursing `emitPartialRecordDrop`, 1000 -> 0. A field moved on only one branch still leaks by design and is not measured here |
+| `partial_move_field.cell` | not a numbered row: a record with one owning field moved out was skipped whole, leaking its other owning field; **CLOSED 2026-09-16** by field-path move records in borrowck and `emitPartialRecordDrop` in codegen, kept and pinned at 0 |
+| `partial_nested_field.cell` | R16 residual: a nested field whose sibling was moved (`p.inner.a` moved, `p.inner.b` leaked because the whole `inner` field was skipped); **CLOSED 2026-09-16** by recursing `emitPartialRecordDrop`, 1000 -> 0 |
 | `branch_move.cell` | R16 residual 1: a var moved on one branch; **CLOSED 2026-09-16** by branch-end releases, 501 -> 0 |
 | `loop_jump_revival.cell` | R16 residual 2: a revived loop-local at continue; **CLOSED 2026-09-16** by jump releases, 1000 -> 0 |
 | `value_block_revival.cell` | R16 residual 3: a revived var in a value block; **CLOSED 2026-09-16** by value-block-end releases, 1000 -> 0 |
 | `revived_record.cell` | R16 residual 4: a record revived after a whole move; **CLOSED 2026-09-16** by record-revival admission, 1000 -> 0 |
 | `loop_cross.cell` | R16 residual: a var moved inside a `while` it was declared outside of; **CLOSED 2026-09-16** by after_loop releases, 1000 -> 0 |
+| `branch_field.cell` | R16 residual 1 at field granularity: a field moved on only one branch of an `if` leaked on the other; **CLOSED 2026-09-16** by branch-end field releases (live here, dead after the merge), 1000 -> 0 |
 
 R11's sixth disclosed gap (an `owned` String or list place bound as `arc`) was
 never a runtime leak: it was a C type error, then a borrowck refusal, and since

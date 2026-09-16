@@ -280,6 +280,17 @@ const ExitLiveness = struct {
     live: bool,
 };
 
+/// See `Checker.exit_field_liveness`. Whole-binding liveness stays on
+/// `ExitLiveness`; a field path is a sibling record, never a `liveAtExit`
+/// overload. Missing or `live = false` keeps the leak.
+const ExitFieldLiveness = struct {
+    kind: ExitKind,
+    key: usize,
+    binding: u32,
+    path: []const u8,
+    live: bool,
+};
+
 /// A place whose value has been moved out (R2).
 const Dead = struct {
     binding: u32,
@@ -457,6 +468,14 @@ pub const Checker = struct {
     /// is walked) or at any exit after it (`loop_moved`). Bindings declared inside the loop body are
     /// fresh on every iteration, so the back edge carries none of their moves.
     exit_liveness: std.ArrayListUnmanaged(ExitLiveness) = .empty,
+    /// Per-field sibling of `exit_liveness`. One entry per (exit, visible
+    /// binding, path in `moved_paths`): whether that field still held a
+    /// value on the path being walked. Filled from `dead` at `recordExit`
+    /// (so a `branch_end` sees the pre-merge snapshot). Codegen frees a
+    /// field at a branch end only when it is live here and dead after the
+    /// merge; a missing record keeps the leak. Whole-binding `liveAtExit`
+    /// is unchanged: any dead field path still makes `live = false`.
+    exit_field_liveness: std.ArrayListUnmanaged(ExitFieldLiveness) = .empty,
     /// Every binding declared outside a `while` and moved inside it. Permanent,
     /// like `moved`, and safe to keep across functions for the same reason.
     /// See `exit_liveness`.
@@ -527,6 +546,7 @@ pub const Checker = struct {
         self.moved_paths.deinit(self.allocator);
         self.assign_liveness.deinit(self.allocator);
         self.exit_liveness.deinit(self.allocator);
+        self.exit_field_liveness.deinit(self.allocator);
         self.loop_moved.deinit(self.allocator);
         self.names.deinit(self.allocator);
         self.block_loans.deinit(self.allocator);
@@ -728,6 +748,47 @@ pub const Checker = struct {
         return found;
     }
 
+    /// True only when EVERY record for this field path at the exit found it
+    /// holding a value. False for a missing record, so a drop point the
+    /// checker did not vouch for keeps the leak. Exact path: `"a"` is not
+    /// `"inner.a"`. See `exit_field_liveness`.
+    pub fn fieldLiveAtExit(
+        self: *const Checker,
+        kind: ExitKind,
+        key: usize,
+        binding: u32,
+        path: []const u8,
+    ) bool {
+        var found = false;
+        for (self.exit_field_liveness.items) |entry| {
+            if (entry.kind != kind or entry.key != key or entry.binding != binding) continue;
+            if (!std.mem.eql(u8, entry.path, path)) continue;
+            if (!entry.live) return false;
+            found = true;
+        }
+        return found;
+    }
+
+    /// True only when EVERY record for this field path at the exit found it
+    /// dead. False for a missing record (the other half of the leak). The
+    /// branch-end rule needs both: live here AND dead after the merge.
+    pub fn fieldDeadAtExit(
+        self: *const Checker,
+        kind: ExitKind,
+        key: usize,
+        binding: u32,
+        path: []const u8,
+    ) bool {
+        var found = false;
+        for (self.exit_field_liveness.items) |entry| {
+            if (entry.kind != kind or entry.key != key or entry.binding != binding) continue;
+            if (!std.mem.eql(u8, entry.path, path)) continue;
+            if (entry.live) return false;
+            found = true;
+        }
+        return found;
+    }
+
     /// Record every visible binding's liveness at one scope exit.
     fn recordExit(self: *Checker, kind: ExitKind, key: usize) Error!void {
         for (self.bindings.items) |b| {
@@ -746,6 +807,33 @@ pub const Checker = struct {
                 .binding = b.id,
                 .live = live,
             });
+            // Per-field sibling: every path `moved_paths` recorded under
+            // this binding, including paths moved on a different branch.
+            // Iterating `dead` alone would omit the keeping path (nothing
+            // dead there) and the else-path drop would miss its record.
+            // `live` is filled from THIS path's `dead` (pre-merge at a
+            // `branch_end`). Overlap matches `findDead`: a whole-binding
+            // dead or a descendant still marks the field dead.
+            for (self.moved_paths.items) |m| {
+                if (m.binding != b.id or m.path.len == 0) continue;
+                var field_live = !self.loop_moved.contains(b.id);
+                if (field_live) {
+                    for (self.dead.items) |d| {
+                        if (d.binding != b.id) continue;
+                        if (pathPrefix(d.path, m.path) or pathPrefix(m.path, d.path)) {
+                            field_live = false;
+                            break;
+                        }
+                    }
+                }
+                try self.exit_field_liveness.append(self.allocator, .{
+                    .kind = kind,
+                    .key = key,
+                    .binding = b.id,
+                    .path = m.path,
+                    .live = field_live,
+                });
+            }
         }
     }
 
@@ -5246,6 +5334,13 @@ const LiveHarness = struct {
             unreachable;
         };
     }
+
+    fn firstIf(self: *const LiveHarness, name: []const u8) *const ast.Expr {
+        return firstIfIn(self.fnBody(name)) orelse {
+            std.debug.print("\nno if in {s}\n", .{name});
+            unreachable;
+        };
+    }
 };
 
 fn firstWhileIn(stmts: []const ast.Stmt) ?usize {
@@ -5268,6 +5363,17 @@ fn firstWhileInExpr(e: *const ast.Expr) ?usize {
         .if_expr => |i| firstWhileInExpr(i.then_body) orelse if (i.else_body) |eb| firstWhileInExpr(eb) else null,
         else => null,
     };
+}
+
+fn firstIfIn(stmts: []const ast.Stmt) ?*const ast.Expr {
+    for (stmts) |*s| {
+        switch (s.kind) {
+            .expr => if (s.kind.expr.kind == .if_expr) return &s.kind.expr,
+            .while_stmt => if (firstIfIn(s.kind.while_stmt.body)) |inner| return inner,
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn firstJumpIn(stmts: []const ast.Stmt) ?usize {
@@ -8112,6 +8218,43 @@ test "after_loop is live for a revival then break, and the jump itself stays dea
     const key = h.firstWhile("f");
     try std.testing.expect(h.checker.liveAtExit(.after_loop, key, v));
     try std.testing.expect(!h.checker.liveAtExit(.jump, h.firstJump("f"), v));
+}
+
+test "R16 field live at the non-moving branch_end and dead after the merge" {
+    // Residual 1 at field granularity: `take(owned p.a)` inside `if c`
+    // marks `p.a` moved for the whole function, so whole-binding
+    // `liveAtExit` is false on every path (any dead field path). The
+    // sibling field records keep the else path live and the merge dead.
+    var h: LiveHarness = try .init(
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(shared c: Bool) {
+        \\    let owned p: Pair = Pair { a: "x", b: "y" }
+        \\    if (c) {
+        \\        take(owned p.a)
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    const p = h.binding("p");
+    const if_expr = h.firstIf("f");
+    const then_key = Checker.branchKeyOf(if_expr.kind.if_expr.then_body);
+    const else_key = @intFromPtr(if_expr);
+    const end_key = h.fnBodyKey("f");
+    try std.testing.expect(!h.checker.fieldLiveAtExit(.branch_end, then_key, p, "a"));
+    try std.testing.expect(h.checker.fieldLiveAtExit(.branch_end, else_key, p, "a"));
+    try std.testing.expect(h.checker.fieldDeadAtExit(.block_end, end_key, p, "a"));
+    try std.testing.expect(!h.checker.fieldDeadAtExit(.branch_end, else_key, p, "a"));
+    // `b` was never moved, so there is no field record: missing => leak.
+    try std.testing.expect(!h.checker.fieldLiveAtExit(.branch_end, else_key, p, "b"));
+    try std.testing.expect(!h.checker.fieldDeadAtExit(.block_end, end_key, p, "b"));
+    // Whole-binding `liveAtExit` is true on the keeping path (no field is
+    // dead there) and false after the merge (any dead field path folds in).
+    try std.testing.expect(h.checker.liveAtExit(.branch_end, else_key, p));
+    try std.testing.expect(!h.checker.liveAtExit(.block_end, end_key, p));
 }
 
 // ── R9: `arc` grants shared access only ─────────────────────────────────

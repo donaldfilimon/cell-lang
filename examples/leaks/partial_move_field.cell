@@ -19,12 +19,9 @@
 // What this fixture does NOT cover, stated so nobody reads it as a proof:
 // a field written again after its move (`p.a = "c"`), whose NEW value still
 // leaks because the move record is never revived (R16 at field granularity,
-// measured and described in docs/OWNERSHIP.md), and a CONDITIONAL partial
-// move. Borrowck records a move made on one branch of
-// an `if` as if it happened on every path, so the moved field is left
-// unreleased on the path that did not move it. That is a leak by design
-// (the fail-toward-leak asymmetry codegen.zig's header commits to), not a
-// double free, and closing it needs runtime drop flags.
+// measured and described in docs/OWNERSHIP.md). A CONDITIONAL partial
+// move (`take(p.a)` on only one branch of an `if`) closed the same day
+// (`branch_field.cell`): branch-end field releases, not drop flags.
 //
 // Status: parses, passes `cell check`. LLVM and MLIR refuse it (`String`
 // crossing the C boundary is scalar-first-refused there); lives under

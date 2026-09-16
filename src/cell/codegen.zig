@@ -74,9 +74,12 @@
 //! outside of is released after that while when borrowck recorded
 //! `after_loop` live (2026-09-16); a nested field whose sibling was moved
 //! is released by recursing `emitPartialRecordDrop` (2026-09-16); a field
-//! moved on only one branch still leaks; and a local declared inside a
-//! VALUE-position block (`emitValueInto`) is not released at that block's
-//! exit, because it may be the value flowing out.
+//! moved on only one branch of an `if` is released on the keeping path
+//! (2026-09-16) from per-field exit liveness, live here and dead after
+//! the merge, never by dropping the whole record (that double-frees the
+//! unmoved sibling with the later partial drop); and a local declared
+//! inside a VALUE-position block (`emitValueInto`) is not released at
+//! that block's exit, because it may be the value flowing out.
 //! Why block-scoped release is safe for a local whose initializer moves an
 //! OUTER place inside a loop: borrowck's R2.a refuses that program outright
 //! (the back edge would use the place dead), so no accepted loop body
@@ -1773,6 +1776,10 @@ pub const Generator = struct {
     /// OUTSIDE the branch (index below `mark`) that borrowck recorded live
     /// at this branch's end AND not live at `after` is released here.
     /// Both conditions read recorded entries; a missing record keeps the leak.
+    /// A record that was not wholly moved still drops the owning fields that
+    /// are live here and dead after the merge; the whole record is never
+    /// freed on this path (that double-frees the unmoved sibling with the
+    /// later partial drop).
     fn emitBranchEndDrops(self: *Generator, key: usize, mark: usize, after: ?Exit, indent: usize) EmitError!void {
         const checker = self.checker orelse return;
         const here: Exit = .{ .kind = .branch_end, .key = key };
@@ -1784,23 +1791,27 @@ pub const Generator = struct {
             if (local.ownership != .owned and local.ownership != .arc) continue;
             if (!try self.needsDrop(local.ty)) continue;
             if (local.ty.shape == .record) {
-                if (!checker.wasWhollyMoved(local.id)) continue;
-                if (!checker.recordLiveAtExit(here.kind, here.key, local.id)) continue;
-                if (after) |a| {
-                    if (checker.recordLiveAtExit(a.kind, a.key, local.id)) continue;
+                if (checker.wasWhollyMoved(local.id)) {
+                    if (!checker.recordLiveAtExit(here.kind, here.key, local.id)) continue;
+                    if (after) |a| {
+                        if (checker.recordLiveAtExit(a.kind, a.key, local.id)) continue;
+                    }
+                    try self.emitDropFor(indent, local);
+                } else {
+                    try self.emitBranchEndFieldDrops(indent, local, here, after);
                 }
-            } else {
-                if (!checker.wasMoved(local.id)) continue;
-                if (!checker.liveAtExit(here.kind, here.key, local.id)) continue;
-                if (after) |a| {
-                    if (checker.liveAtExit(a.kind, a.key, local.id)) continue;
-                }
+                continue;
+            }
+            if (!checker.wasMoved(local.id)) continue;
+            if (!checker.liveAtExit(here.kind, here.key, local.id)) continue;
+            if (after) |a| {
+                if (checker.liveAtExit(a.kind, a.key, local.id)) continue;
             }
             try self.emitDropFor(indent, local);
         }
     }
 
-    fn branchNeedsSynthesizedElse(self: *Generator, key: usize, mark: usize, after: ?Exit) Alloc!bool {
+    fn branchNeedsSynthesizedElse(self: *Generator, key: usize, mark: usize, after: ?Exit) EmitError!bool {
         const checker = self.checker orelse return false;
         const here: Exit = .{ .kind = .branch_end, .key = key };
         var i = mark;
@@ -1811,21 +1822,117 @@ pub const Generator = struct {
             if (local.ownership != .owned and local.ownership != .arc) continue;
             if (!try self.needsDrop(local.ty)) continue;
             if (local.ty.shape == .record) {
-                if (!checker.wasWhollyMoved(local.id)) continue;
-                if (!checker.recordLiveAtExit(here.kind, here.key, local.id)) continue;
-                if (after) |a| {
-                    if (checker.recordLiveAtExit(a.kind, a.key, local.id)) continue;
+                if (checker.wasWhollyMoved(local.id)) {
+                    if (!checker.recordLiveAtExit(here.kind, here.key, local.id)) continue;
+                    if (after) |a| {
+                        if (checker.recordLiveAtExit(a.kind, a.key, local.id)) continue;
+                    }
+                    return true;
                 }
-            } else {
-                if (!checker.wasMoved(local.id)) continue;
-                if (!checker.liveAtExit(here.kind, here.key, local.id)) continue;
-                if (after) |a| {
-                    if (checker.liveAtExit(a.kind, a.key, local.id)) continue;
-                }
+                if (try self.branchEndKeepsField(local, here, after)) return true;
+                continue;
+            }
+            if (!checker.wasMoved(local.id)) continue;
+            if (!checker.liveAtExit(here.kind, here.key, local.id)) continue;
+            if (after) |a| {
+                if (checker.liveAtExit(a.kind, a.key, local.id)) continue;
             }
             return true;
         }
         return false;
+    }
+
+    /// Live here and dead after the merge. Missing either record keeps the leak.
+    fn fieldKeptOnBranch(
+        checker: *const borrowck.Checker,
+        here: Exit,
+        after: ?Exit,
+        binding: u32,
+        path: []const u8,
+    ) bool {
+        if (!checker.fieldLiveAtExit(here.kind, here.key, binding, path)) return false;
+        const a = after orelse return false;
+        return checker.fieldDeadAtExit(a.kind, a.key, binding, path);
+    }
+
+    fn emitBranchEndFieldDrops(
+        self: *Generator,
+        indent: usize,
+        local: Local,
+        here: Exit,
+        after: ?Exit,
+    ) EmitError!void {
+        _ = try self.walkBranchEndFields(indent, local.id, local.name, local.ty.name, "", here, after, 0, true);
+    }
+
+    fn branchEndKeepsField(self: *Generator, local: Local, here: Exit, after: ?Exit) EmitError!bool {
+        return self.walkBranchEndFields(0, local.id, local.name, local.ty.name, "", here, after, 0, false);
+    }
+
+    /// Walk owning fields under `path_prefix`. A field live here and dead
+    /// after the merge is released whole (or counted, when `emit` is false).
+    /// A nested record with only a descendant moved recurses; a whole-field
+    /// move on this branch is skipped. Same reverse-declaration order as
+    /// `emitPartialFields`. Depth 16 matches `recordNeedsDrop`.
+    fn walkBranchEndFields(
+        self: *Generator,
+        indent: usize,
+        binding: u32,
+        c_base: []const u8,
+        struct_name: []const u8,
+        path_prefix: []const u8,
+        here: Exit,
+        after: ?Exit,
+        depth: usize,
+        emit: bool,
+    ) EmitError!bool {
+        if (depth > 16) return false;
+        const checker = self.checker orelse return false;
+        const def = self.findStruct(struct_name) orelse return false;
+        var any = false;
+        var i = def.fields.len;
+        while (i > 0) {
+            i -= 1;
+            const f = def.fields[i];
+            if (f.ownership != .owned and f.ownership != .arc) continue;
+            const field_path: []const u8 = if (path_prefix.len == 0) f.name else try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ path_prefix, f.name });
+            const fty = try self.lowerType(&f.ty, f.ownership);
+            if (fieldKeptOnBranch(checker, here, after, binding, field_path)) {
+                if (emit) try self.emitOneFieldDrop(indent, c_base, f.name, fty);
+                any = true;
+                continue;
+            }
+            if (fty.shape == .record and checker.fieldWasMoved(binding, field_path) and !checker.fieldWasMovedWhole(binding, field_path)) {
+                const nested_c = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ c_base, f.name });
+                if (try self.walkBranchEndFields(indent, binding, nested_c, fty.name, field_path, here, after, depth + 1, emit)) {
+                    any = true;
+                }
+            }
+        }
+        return any;
+    }
+
+    fn emitOneFieldDrop(self: *Generator, indent: usize, c_base: []const u8, name: []const u8, fty: CType) EmitError!void {
+        const out = self.writer;
+        switch (fty.shape) {
+            .string => {
+                try self.writeIndent(indent);
+                try out.print("cell_string_free(&{s}.{s});\n", .{ c_base, name });
+            },
+            .slice => {
+                try self.writeIndent(indent);
+                try out.print("cell_slice_free(&{s}.{s});\n", .{ c_base, name });
+            },
+            .arc => {
+                try self.writeIndent(indent);
+                try out.print("cell_arc_drop({s}.{s});\n", .{ c_base, name });
+            },
+            .record => if (try self.recordNeedsDrop(fty.name, 1)) {
+                try self.writeIndent(indent);
+                try out.print("cell_drop_{s}(&{s}.{s});\n", .{ fty.name, c_base, name });
+            },
+            else => {},
+        }
     }
 
     fn emitMatchStmt(self: *Generator, m: anytype, indent: usize) EmitError!void {
@@ -5200,12 +5307,15 @@ test "a record whose only owning field was moved out releases nothing of its own
     try expectOccurrences(e.text, "cell_string_free(&m);", 1);
 }
 
-test "a field moved on only one branch of an if is left unreleased, the other field is released" {
-    // Borrowck records a move made inside a branch as if it happened on
-    // every path. For a drop that is the leak direction: `p.a` may still be
-    // live on the path that skipped the `if`, and leaving it unreleased is
-    // what keeps the path that DID move it from a double free. `p.b` was
-    // never touched and is released either way.
+test "a field moved on only one branch of an if is released on the other" {
+    // Residual 1 at field granularity. The merge still records `p.a` moved,
+    // so the scope-end partial drop skips it. The non-moving branch now
+    // releases it at its own end. `p.b` was never moved and is released
+    // once at scope end. The whole record is never dropped on the else
+    // path: that would double-free `p.b` with the later partial drop.
+    // Falsified 2026-09-16: freeing `cell_drop_Pair(&p)` on the else path,
+    // freeing `p.a` at scope end as well as else, or freeing `p.a` on the
+    // then path, each AddressSanitizer double free at exit 134. Restored.
     var e = try emitSource(
         \\pub struct Pair {
         \\    owned a: String
@@ -5220,9 +5330,11 @@ test "a field moved on only one branch of an if is left unreleased, the other fi
         \\}
     );
     defer e.deinit();
-    try expectOccurrences(e.text, "cell_string_free(&p.b);", 1);
-    try expectAbsent(e.text, "cell_string_free(&p.a);");
-    try expectAbsent(e.text, "cell_drop_Pair(&p);");
+    const f = try fnDef(e.text, "f");
+    try expectOccurrences(f, "cell_string_free(&p.a);", 1);
+    try expectContains(f, "} else {\n    cell_string_free(&p.a);\n  }");
+    try expectOccurrences(f, "cell_string_free(&p.b);", 1);
+    try expectAbsent(f, "cell_drop_Pair(&p);");
 }
 
 test "a record moved as a whole after nothing else is still not dropped at all" {

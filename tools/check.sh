@@ -408,8 +408,7 @@ LEAK_VALUE_BLOCK_LOCAL=0
 # (`emitPartialRecordDrop`); after, `leaks` 0 and ALLOC=2000 FREE=2000 LIVE=0.
 # ASan clean on the straight-line, single-owning-field, conditional and
 # read-after-partial-move shapes. Stays pinned at 0: any nonzero reading
-# re-opens it. A CONDITIONAL partial move still leaks the moved field on the
-# path that did not move it, by design; that is not measured here.
+# re-opens it. A CONDITIONAL partial move is `branch_field.cell`.
 LEAK_PARTIAL_MOVE_FIELD=0
 # R10 move-into-`arc` at its five IMPLEMENTED positions (`let arc` since
 # f9441cb; a direct `return` from `-> arc T`, an assignment into a whole
@@ -445,9 +444,13 @@ LEAK_LOOP_CROSS=0
 # moved, and `fieldWasMoved` used to skip the whole `inner` field, so
 # `p.inner.b` leaked. Measured 1000 before (2026-09-16, ALLOC=3000
 # FREE=2000 LIVE=1000); CLOSED the same day by recursing
-# `emitPartialRecordDrop`, 1000 -> 0. A field moved on only one branch
-# still leaks by design and is not measured here.
+# `emitPartialRecordDrop`, 1000 -> 0.
 LEAK_PARTIAL_NESTED_FIELD=0
+# R16 residual 1 at field granularity: a field moved on only one branch of
+# an `if` leaked on the other (`p.a` skipped at scope end because the merge
+# records it dead). Measured 1000 before (2026-09-16, ALLOC=4000 FREE=3000
+# LIVE=1000); CLOSED the same day by branch-end field releases, 1000 -> 0.
+LEAK_BRANCH_FIELD=0
 
 # ---- stage 10 disclosed signature disagreements, pinned by defect ---------
 # Each line is `<example key>:<function>:<leg>` naming a place where the C
@@ -938,6 +941,7 @@ else
     run_c_leaks revived_record "" "$LEAK_REVIVED_RECORD" "R16 residual 4, CLOSED 2026-09-16 by record-revival admission; 1000 -> 0"
     run_c_leaks loop_cross "" "$LEAK_LOOP_CROSS" "R16 residual outer-while-var, CLOSED 2026-09-16 by after_loop releases; 1000 -> 0"
     run_c_leaks partial_nested_field "" "$LEAK_PARTIAL_NESTED_FIELD" "R16 residual nested partial field, CLOSED 2026-09-16 by recursive emitPartialRecordDrop; 1000 -> 0"
+    run_c_leaks branch_field "" "$LEAK_BRANCH_FIELD" "R16 residual 1 at field granularity, CLOSED 2026-09-16 by branch-end field releases; 1000 -> 0"
 fi
 
 # ------------------------------------------- 8. cross-backend answer agreement --

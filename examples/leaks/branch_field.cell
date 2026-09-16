@@ -1,0 +1,39 @@
+// R16 residual 1 at field granularity: a field moved on only one branch of
+// an `if` leaked on the other. `take(p.a)` runs when c > 0; when it does
+// not, `p.a` is still owned at the merge, but the merge records it dead
+// (a branch move is recorded as a move), so the scope-end partial drop
+// skips it. `p.b` was already released either way. Each iteration calls
+// both the moving branch and the keeping branch, so a leak of `p.a` is
+// 1000, not half.
+//
+// BEFORE: 1000. AFTER: 0. CLOSED 2026-09-16 by branch-end field releases
+// (live here, dead after the merge). Drop flags are not required.
+//
+// Status: parses, passes `cell check`; C only; lives under examples/leaks/.
+
+pub struct Pair {
+    owned a: String
+    owned b: String
+}
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn one_branch(copy c: Int) {
+    let owned p: Pair = Pair { a: "aaaaaaaa", b: "bbbbbbbb" }
+    if c > 0 {
+        take(p.a)
+    }
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        one_branch(1)
+        one_branch(0)
+        i = i + 1
+    }
+    print_int(i)
+}

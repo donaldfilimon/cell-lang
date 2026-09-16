@@ -1411,13 +1411,21 @@ moved (still releases nothing of its own), a read of `p.b` after moving `p.a`
 (released after the read), and a move on one branch of an `if` whose callee
 really frees its argument.
 
-Two limits, all in the leak direction and all deliberate. A field moved on
-only ONE branch of an `if` is recorded as moved on every path, exactly as
-`moved` always was, so on the path that did not move it that field leaks;
-closing it needs runtime drop flags. And a field that is written again after
-being moved out (`let owned m = p.a` then `p.a = "c"`) keeps its moved
-record, because `moved_paths` is permanent like `moved` and never revived, so
-the NEW value leaks: this is R16's revival leak at field granularity.
+**CLOSED 2026-09-16: a field moved on only one branch of an if.** The merge
+still records `p.a` moved, so the scope-end partial drop skips it; codegen
+now releases that field at the keeping branch's end when borrowck recorded
+it live there and dead after the merge (`exit_field_liveness`, a sibling of
+whole-binding `liveAtExit`). Missing either record keeps the leak. The whole
+record is never freed on the else path (that double-frees `p.b` with the
+later partial drop). Drop flags are not required.
+`examples/leaks/branch_field.cell` measured 1000 before on both witnesses
+and 0 after, pinned in the gate.
+
+One limit remains, in the leak direction and deliberate: a field that is
+written again after being moved out (`let owned m = p.a` then `p.a = "c"`)
+keeps its moved record, because `moved_paths` is permanent like `moved` and
+never revived, so the NEW value leaks. This is R16's revival leak at field
+granularity.
 Measured over 1000 iterations with an owned local: `leaks` 2000 and LIVE=2000
 on the tree before (the whole record skipped, both fields leaking), `leaks`
 1000 and LIVE=1000 after (only the revived value leaking), ASan clean both
@@ -1436,7 +1444,7 @@ measured 1000 before on both witnesses (`leaks` 1000, counter ALLOC=3000
 FREE=2000 LIVE=1000) and 0 after, pinned in the gate. Emitting
 `cell_drop_Inner(&p.inner)` or `cell_string_free(&p.inner.a)` on that
 program was an AddressSanitizer double free of `m` at exit 134; restored.
-A field moved on only one branch still leaks.
+A field moved on only one branch is closed below, with `branch_field.cell`.
 
 **What had to land first, and why it is part of this closure.** Dropping a
 record turns every bitwise alias of its fields that outlives it from a leak
@@ -2186,14 +2194,24 @@ ways, and each is a real, documented gap rather than an oversight:
   `.jump` still holding a value. Codegen releases that binding after the
   closing `}`, moved-only. `examples/leaks/loop_cross.cell` measured 1000
   on both witnesses before and 0 after, pinned in the gate; ASan clean.
-  What still leaks, by design: a skip-revival `break`/`continue`, a
-  `return` inside the loop, and a field moved on only one branch.
+  What still leaks, by design: a skip-revival `break`/`continue`, and a
+  `return` inside the loop.
   **CLOSED 2026-09-16: a nested field whose sibling was moved.**
   `emitPartialRecordDrop` recurses into a partly moved record field
   (skip `inner.a`, free `inner.b`); `examples/leaks/partial_nested_field.cell`
   measured 1000 before and 0 after, pinned in the gate.
+  **CLOSED 2026-09-16: a field moved on only one branch of an `if`.**
+  Per-field exit liveness (`exit_field_liveness`) records whether each
+  moved path still holds a value at a `branch_end` (pre-merge) and at the
+  enclosing exit. Codegen frees an owning field that is live here and
+  dead after the merge; missing either record keeps the leak. The whole
+  record is never dropped on the keeping path. `examples/leaks/branch_field.cell`
+  measured 1000 before and 0 after, pinned in the gate. Falsified: freeing
+  `cell_drop_Pair(&p)` on the else path, freeing `p.a` at scope end as well
+  as else, or freeing `p.a` on the then path, each AddressSanitizer double
+  free at exit 134; restored.
 
-Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released, and a nested field whose sibling was moved is released by recursing that same partial drop. What remains out of scope is a field moved on only one branch (it leaks on the other path, pending drop flags).
+Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released, and a nested field whose sibling was moved is released by recursing that same partial drop. A field moved on only one branch is closed the same day (`branch_field.cell`): it is released on the keeping path from per-field exit liveness, not by drop flags.
 
 ### R17. Double free is prevented by R2, not by a runtime check
 
