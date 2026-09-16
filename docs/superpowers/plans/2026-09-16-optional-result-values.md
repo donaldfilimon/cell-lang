@@ -1105,7 +1105,7 @@ Expected: `43` and `9`, exit 0. Then `./zig-out/bin/cell emit --target=llvm exam
 - `stdlib/prelude.cell`: the sentence "`bytes_pop` returns `Byte?` and there is no way to test or unwrap an optional ... currently unusable" becomes history ("since 2026-09-16 a `Byte?` is matched with `Some`/`None`").
 - `examples/README.md`: list the two files beside `owned_string.cell` as C-only by design.
 
-Run `grep -c '—'` on every edited file (expect 0) and `sh tools/check-rule-lists.sh` (expect `ok`).
+Run `grep -c ','` on every edited file (expect 0) and `sh tools/check-rule-lists.sh` (expect `ok`).
 
 - [ ] **Step 4: Gate and sweep**
 
