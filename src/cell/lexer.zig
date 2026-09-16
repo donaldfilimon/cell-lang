@@ -228,6 +228,9 @@ pub const Lexer = struct {
         return self.make(.invalid, start, line, column);
     }
 
+    /// Tokenize a string literal. A backslash skips the next byte so `\"`
+    /// does not end the token. Decode of `\n` and friends is the parser's
+    /// job (SPEC 2.8); this walk only keeps the lexeme intact.
     fn lexString(self: *Lexer, start: usize, line: u32, column: u32) Token {
         self.advance(); // opening "
         while (self.index < self.source.len and self.source[self.index] != '"') {
@@ -483,10 +486,10 @@ test "SPEC 2.5's reserved words lex as keywords, not identifiers" {
     // The whole reservation is worthless if one of them silently stays an
     // identifier, because that is exactly the failure mode it exists to stop.
     const reserved = [_][]const u8{
-        "while",  "for",    "loop",  "break", "continue", "in",
-        "impl",   "trait",  "where", "type",  "const",    "static",
-        "self",   "Self",   "as",    "is",    "defer",    "async",
-        "await",  "yield",  "import", "export", "extern", "unsafe",
+        "while", "for",   "loop",   "break",  "continue", "in",
+        "impl",  "trait", "where",  "type",   "const",    "static",
+        "self",  "Self",  "as",     "is",     "defer",    "async",
+        "await", "yield", "import", "export", "extern",   "unsafe",
     };
     for (reserved) |word| {
         var lex = Lexer.init(word, "t.cell");

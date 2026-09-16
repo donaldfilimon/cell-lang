@@ -199,6 +199,7 @@ are not.
 | `comparisons.cell` | `==` and `!=` as the whole condition of `if`, `else if` and `while`; prints 621 through all three backends, and is the corpus's only guard against the doubled `if ((a == 2))` that clang rejects under `-Werror` |
 | `while_is_now_a_loop.cell` | the same program that once passed and silently did nothing, now looping correctly; its header records all four meanings it has had |
 | `unit_type.cell` | explicit `()` in type position: `-> ()` is the same unit as an omitted `->`; a `let` of `()` is refused |
+| `escapes.cell` | SPEC 2.8 simple escapes: `"\n"` is one newline byte and `"\\"` is one backslash; prints 11 through all three backends |
 
 ## Running `arc.cell`, the one example with a C host
 

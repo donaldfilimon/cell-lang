@@ -20,7 +20,7 @@ operation on the named type. M1-M10 refer to the approved completion program.
 | ID / capability | Frontend | C | LLVM | MLIR | Ownership / cleanup boundary | Evidence | Milestone |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | LEX-01 ASCII names, spans, comments | checked | n/a | n/a | n/a | n/a | [lexer](../src/cell/lexer.zig) | M5 |
-| LEX-02 decimal literals and strings | partial | partial | partial | partial | Escape interpretation incomplete | [primitives](../examples/primitives.cell), [lexer](../src/cell/lexer.zig) | M5 |
+| LEX-02 decimal literals and strings | checked | lowered | lowered | lowered | Parser decodes `\n \t \r \\ \" \0`; no `\u{...}`, raw, interpolated, or multi-line (LEX-03) | [escapes](../examples/escapes.cell), [primitives](../examples/primitives.cell), [parser](../src/cell/parser.zig) | M5 |
 | LEX-03 radix/separator/exponent literals, Unicode names, advanced strings | absent | absent | absent | absent | n/a | [silent literals](../examples/rejected/silent_literals.cell) | M5 |
 | TYPE-01 primitive types and aliases | checked | lowered | lowered | lowered | Primitive modes pass by value | [types](../src/cell/types.zig), [primitives](../examples/primitives.cell) | M5 |
 | TYPE-02 unknown type rejection | checked | partial | refused | refused | Unresolved names refused at typecheck (`unknown type 'Strng'`). C codegen still maps an unchecked name to `void*` | [unknown type](../examples/rejected/unknown_type.cell) | M2 |

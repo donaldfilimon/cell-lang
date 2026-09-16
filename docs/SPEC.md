@@ -55,10 +55,10 @@ lowered (sections 3.2 and 3.3); `[T]?` still does not parse.
 
 | Status | Constructs |
 |---|---|
-| implemented | 108 |
+| implemented | 109 |
 | partially implemented | 2 |
 | parsed, not enforced | 3 |
-| designed, not implemented | 42 |
+| designed, not implemented | 41 |
 | **total** | **155** |
 
 Counted from the section 12 index on 2026-09-08, not estimated. Recounted
@@ -580,19 +580,22 @@ literals are parsed into `f64`.
 
 ### 2.8 String literals
 
-**Status: implemented (lexing). Escape processing: designed, not implemented.**
+**Status: implemented (lexing and the six simple escapes).** `\u{...}`,
+unterminated-string diagnostics, multi-line, raw, and interpolated strings
+are **designed, not implemented**.
 
 ```
 string_literal = '"' character* '"'
 ```
 
 The lexer skips the character after a backslash so that `\"` does not terminate
-the literal, and `stringValue` in the parser strips the surrounding quotes.
-**Nothing translates escapes.** The bytes `\` and `n` survive into the AST and
-are written verbatim into the emitted C, where the C compiler then interprets
-them. This works by coincidence for the escapes C shares with Cell, and it is
-specified as a defect: a conforming implementation processes `\n`, `\t`, `\r`,
-`\\`, `\"`, `\0`, and `\u{...}` itself and re-escapes on emission.
+the literal. The parser strips the surrounding quotes and decodes `\n`, `\t`,
+`\r`, `\\`, `\"`, and `\0` into the corresponding byte in the AST. An unknown
+escape is a parse error. Emitters re-escape those decoded bytes for the
+target (C string syntax, LLVM `c"..."` hex escapes). `"\n"` is one newline
+byte, not the two bytes backslash and n.
+
+`\u{...}` is **designed, not implemented**; `\u` is an unknown escape today.
 
 An unterminated string literal runs to end of file and produces **no
 diagnostic**. Specified as an error:
@@ -2023,7 +2026,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Decimal float literal | implemented |
 | Exponent float literal | designed, not implemented |
 | String literal lexing | implemented |
-| String escape processing | designed, not implemented |
+| String escape processing | implemented for `\n \t \r \\ \" \0`; `\u{...}` remains designed, not implemented |
 | Unterminated string diagnostic | designed, not implemented |
 | Multi-line / raw / interpolated strings | designed, not implemented |
 | Boolean literals | implemented |

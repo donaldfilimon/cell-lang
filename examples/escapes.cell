@@ -1,0 +1,20 @@
+// String escape decoding (SPEC 2.8, FEATURES LEX-02).
+//
+// Status: parses, passes `cell check`, and runs. `"\n"` is one newline byte
+// (length 1, not the two bytes backslash and n) and `"\\"` is one backslash
+// (length 1, not two backslashes). The printed number is
+// `str_len("\n") * 10 + str_len("\\")`, which is 11 only when both decode.
+// A frontend that still stored the source bytes would print 22.
+//
+// Scalar only: string literals and `str_len` on a borrowed view. All three
+// backends already lower that shape (see examples/backends.cell and the LLVM
+// `cell_str` materialization tests). No `\u{...}`, raw, interpolated, or
+// multi-line strings; those are LEX-03.
+// EXPECT-OUTPUT: 11
+
+pub fn print_int(copy value: Int);
+pub fn str_len(shared s: String) -> Int;
+
+pub fn main() {
+    print_int(str_len("\n") * 10 + str_len("\\"))
+}

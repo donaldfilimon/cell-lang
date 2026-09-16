@@ -372,7 +372,7 @@ pub const Parser = struct {
             return self.expr(.{ .float = v }, start);
         }
         if (self.match(.string)) {
-            return self.expr(.{ .string = stringValue(self.prev().lexeme) }, start);
+            return self.expr(.{ .string = try self.stringValue(self.prev().lexeme) }, start);
         }
         if (self.match(.kw_true)) return self.expr(.{ .bool = true }, start);
         if (self.match(.kw_false)) return self.expr(.{ .bool = false }, start);
@@ -566,7 +566,7 @@ pub const Parser = struct {
             return self.patternNode(.{ .float = v }, start);
         }
         if (self.match(.string)) {
-            return self.patternNode(.{ .string = stringValue(self.prev().lexeme) }, start);
+            return self.patternNode(.{ .string = try self.stringValue(self.prev().lexeme) }, start);
         }
         if (self.match(.kw_true)) return self.patternNode(.{ .bool = true }, start);
         if (self.match(.kw_false)) return self.patternNode(.{ .bool = false }, start);
@@ -806,21 +806,53 @@ pub const Parser = struct {
         return self.fail("expected identifier");
     }
 
+    /// Strip the surrounding quotes from a string token and decode SPEC 2.8
+    /// escapes into the parser arena. Decode shrinks the byte count (`"\n"`
+    /// is one byte, not two), so the result is never a slice of the lexeme.
+    /// Supported: `\n \t \r \\ \" \0`. Anything else, including a trailing
+    /// backslash, is a parse error.
+    fn stringValue(self: *Parser, raw: []const u8) ParseError![]const u8 {
+        const inner = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw[0..0];
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        var i: usize = 0;
+        while (i < inner.len) {
+            if (inner[i] != '\\') {
+                try buf.append(self.allocator, inner[i]);
+                i += 1;
+                continue;
+            }
+            if (i + 1 >= inner.len) {
+                return self.failSpan(tokenSpan(self.prev()), "unknown string escape");
+            }
+            const decoded: u8 = switch (inner[i + 1]) {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                '\\' => '\\',
+                '"' => '"',
+                '0' => 0,
+                else => return self.failSpan(tokenSpan(self.prev()), "unknown string escape"),
+            };
+            try buf.append(self.allocator, decoded);
+            i += 2;
+        }
+        return try buf.toOwnedSlice(self.allocator);
+    }
+
     /// Record where and why the parse failed, then return the error. Only the
     /// first failure is kept: later ones are consequences of it.
-    fn fail(self: *Parser, msg: []const u8) ParseError {
+    fn failSpan(self: *Parser, span: Span, msg: []const u8) ParseError {
         if (self.last_error == null) {
-            self.last_error = .{ .span = tokenSpan(self.current()), .message = msg };
+            self.last_error = .{ .span = span, .message = msg };
         }
         return error.UnexpectedToken;
     }
-};
 
-/// Strip the surrounding quotes from a string token's lexeme.
-fn stringValue(raw: []const u8) []const u8 {
-    if (raw.len >= 2) return raw[1 .. raw.len - 1];
-    return "";
-}
+    fn fail(self: *Parser, msg: []const u8) ParseError {
+        return self.failSpan(tokenSpan(self.current()), msg);
+    }
+};
 
 // ── tests ───────────────────────────────────────────────────────────────
 
@@ -1315,4 +1347,53 @@ test "a trailing semicolon after an item is accepted and ignored" {
     const module = try p.parseModule();
     // Four items, and the lone stray `;` on its own line contributes none.
     try std.testing.expectEqual(@as(usize, 4), module.items.len);
+}
+
+test "string literals unescape supported escapes" {
+    var tp = try parseForTest(
+        \\pub fn main() {
+        \\  print("\n\t\r\\\"\0")
+        \\  print("a\"b")
+        \\  print("hello")
+        \\}
+    );
+    defer tp.deinit();
+    const body = tp.module.items[0].kind.fn_def.body.?;
+    const six = body[0].kind.expr.kind.call.args[0].kind.string;
+    try std.testing.expectEqual(@as(usize, 6), six.len);
+    try std.testing.expectEqual(@as(u8, '\n'), six[0]);
+    try std.testing.expectEqual(@as(u8, '\t'), six[1]);
+    try std.testing.expectEqual(@as(u8, '\r'), six[2]);
+    try std.testing.expectEqual(@as(u8, '\\'), six[3]);
+    try std.testing.expectEqual(@as(u8, '"'), six[4]);
+    try std.testing.expectEqual(@as(u8, 0), six[5]);
+    try std.testing.expectEqualStrings("a\"b", body[1].kind.expr.kind.call.args[0].kind.string);
+    try std.testing.expectEqualStrings("hello", body[2].kind.expr.kind.call.args[0].kind.string);
+
+    var pat = try parseForTest(
+        \\pub fn f(shared s: String) -> Int {
+        \\  return match s {
+        \\    "\n" => 1,
+        \\    _ => 0,
+        \\  }
+        \\}
+    );
+    defer pat.deinit();
+    const m = onlyStmt(pat.module).kind.return_stmt.?.kind.match_expr;
+    try std.testing.expectEqualStrings("\n", m.arms[0].pattern.kind.string);
+}
+
+test "an unknown string escape is a parse error" {
+    try std.testing.expectEqualStrings(
+        "unknown string escape",
+        try parseErrorFor(
+            \\pub fn main() { print("\x") }
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "unknown string escape",
+        try parseErrorFor(
+            \\pub fn main() { print("\u{0}") }
+        ),
+    );
 }

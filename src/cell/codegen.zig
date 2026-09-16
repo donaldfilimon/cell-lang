@@ -3087,9 +3087,9 @@ pub const Generator = struct {
     }
 
     /// A Cell string is a length-prefixed view, not a C string (cell_rt.h
-    /// section 2). The parser strips the quotes without unescaping, so the
-    /// bytes are re-escaped here exactly as they are and the length is the
-    /// count of those bytes.
+    /// section 2). The parser has already decoded SPEC 2.8 escapes, so `s`
+    /// is the payload bytes. They are re-escaped here for a C string
+    /// literal and the length is the decoded byte count.
     fn emitStringLiteral(self: *Generator, s: []const u8) EmitError!void {
         const out = self.writer;
         try out.writeAll("cell_str_from_parts(\"");
@@ -4446,16 +4446,31 @@ test "a defined function is never renamed onto a runtime symbol" {
     try expectAbsent(e.text, "cell_assert_msg");
 }
 
-test "a string literal becomes a length-prefixed view with escapes preserved" {
-    var e = try emitSource(
+test "a string literal decodes escapes then re-escapes them for C" {
+    var quote = try emitSource(
         \\pub fn main() {
         \\  print("a\"b")
         \\}
     );
-    defer e.deinit();
-    // The parser does not unescape, so the value holds a backslash and the
-    // emitted literal must reproduce it exactly.
-    try expectContains(e.text, "cell_str_from_parts(\"a\\\\\\\"b\", 4)");
+    defer quote.deinit();
+    // `"a\"b"` is three bytes a"b. The C literal re-escapes the quote.
+    try expectContains(quote.text, "cell_str_from_parts(\"a\\\"b\", 3)");
+
+    var nl = try emitSource(
+        \\pub fn main() {
+        \\  print("\n")
+        \\}
+    );
+    defer nl.deinit();
+    try expectContains(nl.text, "cell_str_from_parts(\"\\n\", 1)");
+
+    var bs = try emitSource(
+        \\pub fn main() {
+        \\  print("\\")
+        \\}
+    );
+    defer bs.deinit();
+    try expectContains(bs.text, "cell_str_from_parts(\"\\\\\", 1)");
 }
 
 test "a shared borrow of a primitive drops the ampersand" {
