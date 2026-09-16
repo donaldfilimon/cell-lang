@@ -1843,6 +1843,11 @@ pub const Generator = struct {
                     try out.print("{s} == cell_{s}_{s}", .{ temp, enum_name, ev.variant });
                 }
             },
+            // Stub: Task 7 gives this a real test. Never taken today because
+            // nothing lowers a `wrap` scrutinee into a match this backend
+            // reaches; `false` keeps the emitted C compilable in the
+            // meantime.
+            .wrap_pattern => try out.writeAll("false"),
         }
     }
 
@@ -2118,6 +2123,13 @@ pub const Generator = struct {
             .list_lit => |items| try self.emitListLit(items, null, indent),
             .block, .if_expr, .match_expr => try self.emitValueExpr(e, null, indent),
             .annotated => |a| try self.emitExpr(a.value, indent),
+            // Stub: Task 7 gives `wrap` a real C representation. `EmitError`
+            // has no member for "unsupported construct" (it is exactly
+            // `Io.Writer.Error || Allocator.Error`), so this borrows
+            // `WriteFailed` as the least-wrong existing member rather than
+            // adding a new one; unreachable today since nothing before
+            // codegen rejects a `wrap` expression on the C backend.
+            .wrap => return error.WriteFailed,
         }
     }
 
@@ -3097,6 +3109,7 @@ pub const Generator = struct {
                 return try self.inferExpr(m.arms[0].body);
             },
             .annotated => |a| return try self.inferExpr(a.value),
+            .wrap => return CType.unknown,
         }
     }
 
@@ -3517,6 +3530,7 @@ fn exprUses(e: *const ast.Expr, name: []const u8) bool {
             break :blk false;
         },
         .annotated => |a| exprUses(a.value, name),
+        .wrap => |w| if (w.operand) |o| exprUses(o, name) else false,
     };
 }
 
@@ -3575,6 +3589,9 @@ fn collectIdents(arena: std.mem.Allocator, e: *const ast.Expr, set: *std.ArrayLi
         },
         .annotated => |a| if (try collectIdents(arena, a.value, set)) {
             added = true;
+        },
+        .wrap => |w| if (w.operand) |o| {
+            if (try collectIdents(arena, o, set)) added = true;
         },
     }
     return added;

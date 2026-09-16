@@ -776,6 +776,12 @@ const Lowerer = struct {
                     .kind = .{ .match_expr = .{ .scrutinee = scrutinee, .arms = arms } },
                 };
             },
+
+            .wrap => |w| {
+                _ = w;
+                try self.cannotLower(e.span, "optional and Result values are not lowered by the IR backends");
+                return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
+            },
         }
     }
 
@@ -877,6 +883,10 @@ const Lowerer = struct {
                 });
                 try self.scope.append(self.arena, .{ .name = name, .slot = slot, .depth = self.depth });
                 return .{ .kind = .{ .binding = slot }, .span = p.span };
+            },
+            .wrap_pattern => {
+                try self.cannotLower(p.span, "optional and Result patterns are not lowered by the IR backends");
+                return .{ .kind = .wildcard, .span = p.span };
             },
         }
     }

@@ -470,6 +470,11 @@ pub const Checker = struct {
             },
 
             .annotated => |a| return try self.checkExpr(a.value),
+
+            .wrap => |w| {
+                if (w.operand) |o| _ = try self.checkExpr(o);
+                return types.t_unknown;
+            },
         }
     }
 

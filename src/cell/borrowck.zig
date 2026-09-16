@@ -1932,6 +1932,7 @@ pub const Checker = struct {
             .if_expr => |*i| try self.checkIf(i),
             .match_expr => |*m| try self.checkMatch(m),
             .annotated => |a| try self.checkExpr(a.value),
+            .wrap => |w| if (w.operand) |o| try self.checkExpr(o),
         }
     }
 
@@ -2701,6 +2702,8 @@ pub const Checker = struct {
                 } };
                 break :blk try self.arcUniqueSource(&last.kind.expr);
             },
+            // A fresh value with no handle behind it, like a literal.
+            .wrap => .not_arc,
         };
     }
 
@@ -2972,6 +2975,8 @@ pub const Checker = struct {
                 } };
                 break :blk try self.ownedMoveBranch(&last.kind.expr);
             },
+            // A fresh value with no place behind it.
+            .wrap => .no_owned_place,
         };
     }
 
@@ -3615,6 +3620,8 @@ pub const Checker = struct {
                 if (last.kind != .expr) break :blk .not_borrow;
                 break :blk try self.borrowSource(&last.kind.expr);
             },
+            // A fresh value, never a place, never a borrow.
+            .wrap => .not_borrow,
         };
     }
 
@@ -4491,6 +4498,7 @@ fn exprUsesName(e: *const ast.Expr, name: []const u8) bool {
             break :blk false;
         },
         .annotated => |a| exprUsesName(a.value, name),
+        .wrap => |w| if (w.operand) |o| exprUsesName(o, name) else false,
     };
 }
 
@@ -4595,6 +4603,7 @@ fn exprPropagatesName(e: *const ast.Expr, name: []const u8) bool {
             break :blk false;
         },
         .annotated => |a| exprPropagatesName(a.value, name),
+        .wrap => |w| if (w.operand) |o| exprPropagatesName(o, name) else false,
     };
 }
 
@@ -4708,6 +4717,7 @@ fn oracleDeclCountExpr(e: *const ast.Expr, name: []const u8) usize {
             }
             break :blk n;
         },
+        .wrap => |w| if (w.operand) |o| oracleDeclCountExpr(o, name) else 0,
     };
 }
 
@@ -4799,6 +4809,7 @@ fn oracleTaintExpr(
                 try oracleTaintExpr(gpa, arm.body, names, changed);
             }
         },
+        .wrap => |w| if (w.operand) |o| try oracleTaintExpr(gpa, o, names, changed),
     }
 }
 
@@ -4918,6 +4929,10 @@ fn oracleFindExpr(
             }
             break :blk null;
         },
+        .wrap => |w| if (w.operand) |o|
+            oracleFindExpr(o, names, .other, min_start, strict_from)
+        else
+            null,
     };
 }
 

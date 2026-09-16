@@ -376,6 +376,21 @@ pub const Parser = struct {
         }
         if (self.match(.kw_true)) return self.expr(.{ .bool = true }, start);
         if (self.match(.kw_false)) return self.expr(.{ .bool = false }, start);
+        if (self.match(.kw_none)) {
+            if (self.check(.l_paren)) return self.fail("'None' takes no operand");
+            return self.expr(.{ .wrap = .{ .ctor = .none, .operand = null } }, start);
+        }
+        if (self.matchCtor()) |ctor| {
+            try self.expect(.l_paren);
+            const saved = self.no_struct_lit;
+            self.no_struct_lit = false;
+            const inner = try self.parseExpr();
+            self.no_struct_lit = saved;
+            try self.expect(.r_paren);
+            const p = try self.allocator.create(ast.Expr);
+            p.* = inner;
+            return self.expr(.{ .wrap = .{ .ctor = ctor, .operand = p } }, start);
+        }
         if (self.match(.ident)) {
             const name = self.prev().lexeme;
             if (!self.no_struct_lit and self.check(.l_brace)) {
@@ -555,6 +570,17 @@ pub const Parser = struct {
         }
         if (self.match(.kw_true)) return self.patternNode(.{ .bool = true }, start);
         if (self.match(.kw_false)) return self.patternNode(.{ .bool = false }, start);
+        if (self.match(.kw_none)) {
+            return self.patternNode(.{ .wrap_pattern = .{ .ctor = .none, .binding = null } }, start);
+        }
+        if (self.matchCtor()) |ctor| {
+            try self.expect(.l_paren);
+            if (!self.match(.ident)) return self.fail("expected a binding or '_' inside the pattern");
+            const name = self.prev().lexeme;
+            const binding: ?[]const u8 = if (std.mem.eql(u8, name, "_")) null else name;
+            try self.expect(.r_paren);
+            return self.patternNode(.{ .wrap_pattern = .{ .ctor = ctor, .binding = binding } }, start);
+        }
         if (self.match(.ident)) {
             const name = self.prev().lexeme;
             // `_` lexes as an identifier, so the wildcard is a lexeme test.
@@ -638,6 +664,14 @@ pub const Parser = struct {
         if (self.match(.kw_exclusive)) return .exclusive;
         if (self.match(.kw_arc)) return .arc;
         if (self.match(.kw_copy)) return .copy;
+        return null;
+    }
+
+    /// `Some`, `Ok` or `Err` (the three constructors that take an operand).
+    fn matchCtor(self: *Parser) ?ast.Ctor {
+        if (self.match(.kw_some)) return .some;
+        if (self.match(.kw_ok)) return .ok;
+        if (self.match(.kw_err)) return .err;
         return null;
     }
 
@@ -996,6 +1030,70 @@ test "each match pattern form parses" {
     // Arm patterns carry their own spans: `Color.Red` is line 3, column 5.
     try std.testing.expectEqual(@as(u32, 3), m.arms[0].pattern.span.line);
     try std.testing.expectEqual(@as(u32, 5), m.arms[0].pattern.span.column);
+}
+
+test "Some/None/Ok/Err parse as wrap expressions" {
+    var tp = try parseForTest(
+        \\pub fn f() -> Int {
+        \\  let a: Int? = Some(1)
+        \\  let b: Int? = None
+        \\  let c: Result<Int, Int32> = Ok(2)
+        \\  let d: Result<Int, Int32> = Err(3)
+        \\  return 0
+        \\}
+    );
+    defer tp.deinit();
+    const body = tp.module.items[0].kind.fn_def.body.?;
+    const a = body[0].kind.let.value.?.kind.wrap;
+    try std.testing.expectEqual(ast.Ctor.some, a.ctor);
+    try std.testing.expectEqual(@as(i64, 1), a.operand.?.kind.int);
+    const b = body[1].kind.let.value.?.kind.wrap;
+    try std.testing.expectEqual(ast.Ctor.none, b.ctor);
+    try std.testing.expect(b.operand == null);
+    try std.testing.expectEqual(ast.Ctor.ok, body[2].kind.let.value.?.kind.wrap.ctor);
+    try std.testing.expectEqual(ast.Ctor.err, body[3].kind.let.value.?.kind.wrap.ctor);
+}
+
+test "Some/None/Ok/Err parse as wrap patterns with a binding or a wildcard" {
+    var tp = try parseForTest(
+        \\pub fn f(copy o: Int?) -> Int {
+        \\  return match o {
+        \\    Some(x) => x,
+        \\    Some(_) => 1,
+        \\    None => 0,
+        \\  }
+        \\}
+    );
+    defer tp.deinit();
+    const m = onlyStmt(tp.module).kind.return_stmt.?.kind.match_expr;
+    const p0 = m.arms[0].pattern.kind.wrap_pattern;
+    try std.testing.expectEqual(ast.Ctor.some, p0.ctor);
+    try std.testing.expectEqualStrings("x", p0.binding.?);
+    const p1 = m.arms[1].pattern.kind.wrap_pattern;
+    try std.testing.expect(p1.binding == null);
+    const p2 = m.arms[2].pattern.kind.wrap_pattern;
+    try std.testing.expectEqual(ast.Ctor.none, p2.ctor);
+    try std.testing.expect(p2.binding == null);
+}
+
+test "malformed wrap forms are parse errors" {
+    // `Some` needs parentheses; `Ok()` needs an operand; a nested
+    // constructor inside a pattern is refused; `None(x)` is refused.
+    const bad = [_][]const u8{
+        "pub fn f() -> Int? { return Some }",
+        "pub fn f() -> Result<Int, Int32> { return Ok() }",
+        "pub fn f(copy o: Int?) -> Int { return match o { Some(Some(x)) => 1, _ => 0 } }",
+        "pub fn f() -> Int? { return None(1) }",
+    };
+    for (bad) |src| {
+        var lex = lexer.Lexer.init(src, "t.cell");
+        var tokens = try lex.tokenizeAll(std.testing.allocator);
+        defer tokens.deinit(std.testing.allocator);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var p = Parser.init(arena.allocator(), tokens.items, "t.cell");
+        try std.testing.expectError(error.UnexpectedToken, p.parseModule());
+    }
 }
 
 test "a brace after a bare match scrutinee opens the body, not a struct literal" {

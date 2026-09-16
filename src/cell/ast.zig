@@ -64,6 +64,9 @@ pub const FieldInit = struct {
     span: Span,
 };
 
+/// The four value constructors for `T?` and `Result<T, E>` (SPEC 3.2, 3.4).
+pub const Ctor = enum { some, none, ok, err };
+
 pub const Expr = struct {
     kind: Kind,
     span: Span,
@@ -88,11 +91,15 @@ pub const Expr = struct {
         block: []Stmt,
         if_expr: struct { cond: *Expr, then_body: *Expr, else_body: ?*Expr },
         match_expr: struct { scrutinee: *Expr, arms: []MatchArm },
+        /// `Some(e)`, `None`, `Ok(e)`, `Err(e)`. `operand` is null exactly
+        /// for `None`.
+        wrap: struct { ctor: Ctor, operand: ?*Expr },
     };
 };
 
 /// A structured match pattern. Enum variants carry no payload in this
-/// grammar, so there are no subpatterns to nest.
+/// grammar, so there are no subpatterns to nest. A wrap pattern carries at
+/// most one binding; nested patterns are refused by the parser.
 pub const Pattern = struct {
     kind: Kind,
     span: Span,
@@ -108,6 +115,9 @@ pub const Pattern = struct {
         float: f64,
         string: []const u8,
         bool: bool,
+        /// `Some(x)`, `Some(_)`, `None`, `Ok(x)`, `Err(x)`. `binding` is
+        /// null for `_` and for `None`.
+        wrap_pattern: struct { ctor: Ctor, binding: ?[]const u8 },
     };
 };
 
