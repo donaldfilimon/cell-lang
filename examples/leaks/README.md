@@ -37,6 +37,10 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `value_block_local.cell` | the residual of row 4's closure: an `arc` local declared in a VALUE-position block was not released at that block's exit (measurable since 2026-09-15, when a block began to type as its tail); **CLOSED 2026-09-15** the same evening by `emitValueBlockDrops`, kept and pinned at 0 |
 | `arc_box_move.cell` | not a gap: R10 move-into-`arc` at `let`, at a direct `-> arc` return, by assignment into a whole `var arc`, as an argument to an `arc` parameter and into a struct literal's `arc` field, all IMPLEMENTED 2026-09-16; pinned at 0 as a regression guard (a drift between borrowck's move and codegen's box is a double free or a leak). A move on one branch only leaks by design and is not measured |
 | `partial_move_field.cell` | not a numbered row: a record with one owning field moved out was skipped whole, leaking its other owning field; **CLOSED 2026-09-16** by field-path move records in borrowck and `emitPartialRecordDrop` in codegen, kept and pinned at 0. A field moved on only one branch still leaks by design and is not measured here |
+| `branch_move.cell` | R16 residual 1: a var moved on one branch; **CLOSED 2026-09-16** by branch-end releases, 501 -> 0 |
+| `loop_jump_revival.cell` | R16 residual 2: a revived loop-local at continue; **CLOSED 2026-09-16** by jump releases, 1000 -> 0 |
+| `value_block_revival.cell` | R16 residual 3: a revived var in a value block; **CLOSED 2026-09-16** by value-block-end releases, 1000 -> 0 |
+| `revived_record.cell` | R16 residual 4: a record revived after a whole move; **CLOSED 2026-09-16** by record-revival admission, 1000 -> 0 |
 
 R11's sixth disclosed gap (an `owned` String or list place bound as `arc`) was
 never a runtime leak: it was a C type error, then a borrowck refusal, and since

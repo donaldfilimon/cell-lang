@@ -1,0 +1,32 @@
+// R16 residual 2: a var declared inside a loop body, moved and then revived
+// before a `continue`, leaks at the jump: no exit is recorded there, so
+// `emitLoopExitDrops` releases only never-moved locals.
+//
+// BEFORE: 1000. AFTER: 0. CLOSED 2026-09-16 by jump releases.
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn body(copy n: Int) {
+    var i = 0
+    while i < n {
+        i = i + 1
+        var owned v: String = "a"
+        take(v)
+        v = "b"
+        if i > 0 {
+            continue
+        }
+    }
+}
+
+pub fn main() {
+    var i = 0
+    while i < 100 {
+        body(10)
+        i = i + 1
+    }
+    print_int(i)
+}

@@ -1,0 +1,29 @@
+// R16 residual 1: a var moved on one branch leaks on the other. `take(v)`
+// runs when c > 0; when it does not, v is still owned at the merge, but the
+// merge records it dead (a branch move is recorded as a move), so the scope
+// end never releases it. Half the calls take the moving branch.
+//
+// BEFORE: 501. AFTER: 0. CLOSED 2026-09-16 by branch-end releases.
+//
+// Status: parses, passes `cell check`; C only; lives under examples/leaks/.
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn one_branch(copy c: Int) {
+    var owned v: String = "branch"
+    if c > 0 {
+        take(v)
+    }
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        one_branch(i - 500)
+        i = i + 1
+    }
+    print_int(i)
+}

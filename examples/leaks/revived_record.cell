@@ -1,0 +1,29 @@
+// R16 residual 4: a record moved whole and then reassigned whole is never
+// released, because the scope-end admission reads `moved_paths`, which is
+// permanent.
+//
+// BEFORE: 1000. AFTER: 0. CLOSED 2026-09-16 by record-revival admission.
+
+pub struct Box {
+    owned s: String
+}
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned b: Box) {
+}
+
+pub fn revive_record() {
+    var owned b = Box { s: "one" }
+    take(b)
+    b = Box { s: "two" }
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        revive_record()
+        i = i + 1
+    }
+    print_int(i)
+}

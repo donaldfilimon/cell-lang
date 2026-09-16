@@ -255,6 +255,16 @@ pub const ExitKind = enum {
     block_end,
     /// A `return` statement, keyed by the statement's address.
     return_stmt,
+    /// The end of one `if` branch or `match` arm body, keyed like a
+    /// block end (the body's statement slice) or, for a non-block branch,
+    /// by the branch expression's address. Recorded BEFORE the merge.
+    /// A missing else is keyed by the `if` expression's address.
+    branch_end,
+    /// A `break` or `continue`, keyed by the statement's address.
+    jump,
+    /// The end of a value-position block, keyed by its statement slice,
+    /// recorded after the tail is checked.
+    value_block_end,
 };
 
 /// See `Checker.exit_liveness`.
@@ -691,6 +701,14 @@ pub const Checker = struct {
         return found;
     }
 
+    /// A record binding is released whole at an exit when it holds a value
+    /// there (revived after any move) and no field path of it is dead on
+    /// this path. Same records as `liveAtExit`; `recordExit` already folds
+    /// any dead field path into `live = false`.
+    pub fn recordLiveAtExit(self: *const Checker, kind: ExitKind, key: usize, binding: u32) bool {
+        return self.liveAtExit(kind, key, binding);
+    }
+
     /// True only when EVERY record for `binding` at the exit (`kind`, `key`)
     /// found it holding a value that no loop could have moved. False for an
     /// exit the checker did not record, so a drop point it did not vouch for
@@ -770,7 +788,13 @@ pub const Checker = struct {
         }
         // An empty block declares nothing, so no drop point asks about it,
         // and its slice pointer is not a meaningful key.
-        if (stmts.len > 0) try self.recordExit(.block_end, @intFromPtr(stmts.ptr));
+        if (stmts.len > 0) {
+            try self.recordExit(.block_end, @intFromPtr(stmts.ptr));
+            // Expression-position blocks go through checkBlockStmts too
+            // (`let copy n = { ... }`); codegen's value-block drop asks this
+            // kind. Same key, same liveness as the statement-position end.
+            try self.recordExit(.value_block_end, @intFromPtr(stmts.ptr));
+        }
     }
 
     // ── statements ──────────────────────────────────────────────────────
@@ -884,7 +908,7 @@ pub const Checker = struct {
             // A `break` or `continue` moves nothing and borrows nothing. It
             // does change which paths reach the end of the body, which R2.a
             // below deliberately ignores; see the note there.
-            .break_stmt, .continue_stmt => {},
+            .break_stmt, .continue_stmt => try self.recordExit(.jump, @intFromPtr(stmt)),
             .let => |*l| try self.checkLet(l, stmt.span),
             .expr => |*e| try self.checkExpr(e),
             .return_stmt => |*opt| {
@@ -1346,9 +1370,26 @@ pub const Checker = struct {
     fn closeBlockTail(self: *Checker, depth: usize) void {
         var i: usize = 0;
         while (i < depth) : (i += 1) {
+            const blk = self.open_blocks.items[self.open_blocks.items.len - 1];
+            if (blk.stmts.len > 0) {
+                // After the tail is consumed, before the block's lets leave
+                // scope: the value-block drop point. OOM here keeps the leak
+                // rather than aborting a successful check.
+                self.recordExit(.value_block_end, @intFromPtr(blk.stmts.ptr)) catch {};
+            }
             _ = self.open_blocks.pop();
             self.popScope();
         }
+    }
+
+    /// The key codegen uses for a branch body: the block's statement slice
+    /// when the branch is a block, else the expression itself. Mirrored by
+    /// `codegen.branchKey`.
+    fn branchKeyOf(e: *const ast.Expr) usize {
+        return switch (e.kind) {
+            .block => |stmts| if (stmts.len > 0) @intFromPtr(stmts.ptr) else @intFromPtr(e),
+            else => @intFromPtr(e),
+        };
     }
 
     fn checkAssign(self: *Checker, a: *const @FieldType(ast.Stmt.Kind, "assign")) Error!void {
@@ -1929,7 +1970,7 @@ pub const Checker = struct {
                 }
             },
             .block => |stmts| try self.checkBlockStmts(stmts),
-            .if_expr => |*i| try self.checkIf(i),
+            .if_expr => try self.checkIf(e),
             .match_expr => |*m| try self.checkMatch(m),
             .annotated => |a| try self.checkExpr(a.value),
             .wrap => |w| if (w.operand) |o| try self.checkExpr(o),
@@ -1942,7 +1983,8 @@ pub const Checker = struct {
     /// Branches are merged conservatively: a place moved in any branch is dead
     /// afterwards, and a place revived in only one branch stays dead. That is
     /// the sound answer without a control-flow graph.
-    fn checkIf(self: *Checker, i: *const @FieldType(ast.Expr.Kind, "if_expr")) Error!void {
+    fn checkIf(self: *Checker, expr: *const ast.Expr) Error!void {
+        const i = expr.kind.if_expr;
         const region = self.temp_loans.items.len;
         defer self.temp_loans.shrinkRetainingCapacity(region);
 
@@ -1952,6 +1994,7 @@ pub const Checker = struct {
         defer entry.deinit(self.allocator);
 
         try self.checkExpr(i.then_body);
+        try self.recordExit(.branch_end, branchKeyOf(i.then_body));
         var then_dead = try self.dead.clone(self.allocator);
         defer then_dead.deinit(self.allocator);
 
@@ -1959,6 +2002,11 @@ pub const Checker = struct {
         try self.dead.appendSlice(self.allocator, entry.items);
         if (i.else_body) |else_body| {
             try self.checkExpr(else_body);
+            try self.recordExit(.branch_end, branchKeyOf(else_body));
+        } else {
+            // Missing else: live iff not moved before the if. Keyed by the
+            // if expression, matching codegen's synthesized-else drops.
+            try self.recordExit(.branch_end, @intFromPtr(expr));
         }
         try self.unionDead(then_dead.items);
     }
@@ -2073,6 +2121,7 @@ pub const Checker = struct {
                 }
             }
             try self.checkExpr(arm.body);
+            try self.recordExit(.branch_end, branchKeyOf(arm.body));
             self.popScope();
 
             for (self.dead.items) |d| {

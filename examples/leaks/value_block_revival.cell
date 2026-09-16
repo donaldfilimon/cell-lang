@@ -1,0 +1,29 @@
+// R16 residual 3: a var revived inside a VALUE-position block is not
+// released at the block's end, because that exit is not recorded and
+// `emitValueBlockDrops` only skips what the tail can reach.
+//
+// BEFORE: 1000. AFTER: 0. CLOSED 2026-09-16 by value-block-end releases.
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn in_value_block() -> Int {
+    let copy n = {
+        var owned v: String = "a"
+        take(v)
+        v = "b"
+        3
+    }
+    return n
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        let copy r = in_value_block()
+        i = i + 1
+    }
+    print_int(i)
+}

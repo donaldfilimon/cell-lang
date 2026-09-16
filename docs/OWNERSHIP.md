@@ -2161,9 +2161,14 @@ ways, and each is a real, documented gap rather than an oversight:
   Removing either guard was measured as an AddressSanitizer double free
   (exit 134). `examples/leaks/revived_var.cell` (body end, `return`, nested
   block, `owned` parameter, list) measured 5000 on both witnesses before
-  and 0 after, pinned in the gate. What still leaks, by design: a var moved
-  inside a `while` it was declared outside of, a `break` or `continue` exit
-  and a value block's tail (neither is recorded), and a revived record.
+  and 0 after, pinned in the gate. **CLOSED 2026-09-16, the four residuals
+  that sentence named:** a var kept on the non-moving branch (501 -> 0,
+  `branch_move.cell`), a revival then `continue` (1000 -> 0,
+  `loop_jump_revival.cell`), a revival inside a value-position block (1000
+  -> 0, `value_block_revival.cell`), and a record revived after a whole
+  move (1000 -> 0, `revived_record.cell`). What still leaks, by design: a
+  var moved inside a `while` it was declared outside of, and the per-field
+  record case (a field moved on only one branch, a partly moved field).
 
 Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released. What remains out of scope is a field moved on only one branch (it leaks on the other path, pending drop flags) and a partly moved field (the whole field is left unreleased).
 

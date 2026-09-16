@@ -69,9 +69,9 @@
 //! Both halves are closed for the cases borrowck vouches for (2026-09-16):
 //! `emitAssign` releases an `owned` var's old value on a store from
 //! `assign_liveness`, and `pendingDropsSince` releases a revived var at a
-//! block end or `return` from `exit_liveness`; a `break`/`continue` exit, a
-//! value block's tail, a var moved inside a `while` and a revived record
-//! still leak; and
+//! block end, `return`, `break`/`continue`, value-block end, and a revived
+//! record from `exit_liveness`; a var moved inside a `while` it was declared
+//! outside of, and a field moved on only one branch, still leak; and
 //! a local declared inside a VALUE-position block (`emitValueInto`) is not
 //! released at that block's exit, because it may be the value flowing out.
 //! Why block-scoped release is safe for a local whose initializer moves an
@@ -376,6 +376,9 @@ pub const Generator = struct {
     /// local declared since the LOOP's mark, not since the innermost
     /// block's: `emitLoopExitDrops` reads the top of this stack.
     loop_marks: std.ArrayList(usize) = .empty,
+    /// The enclosing statement list's block-end exit, for branch-end drops
+    /// that ask "live here, dead after the merge".
+    current_after: ?Exit = null,
     temp_counter: usize = 0,
     /// Name of the function being emitted, used in panic messages.
     current_fn: []const u8 = "",
@@ -707,6 +710,7 @@ pub const Generator = struct {
         // `emitScopeDrops` ever got to look at them. Inlined here so the
         // drop pass runs while they are still visible; `self.locals` is
         // cleared in full below regardless, so no scope actually leaks.
+        self.current_after = blockExit(body);
         for (body, 0..) |_, i| {
             try self.emitStmt(&body[i], body[i + 1 ..], 1);
         }
@@ -765,6 +769,9 @@ pub const Generator = struct {
     fn emitStmts(self: *Generator, stmts: []const ast.Stmt, indent: usize) EmitError!void {
         const mark = self.locals.items.len;
         defer self.locals.shrinkRetainingCapacity(mark);
+        const saved = self.current_after;
+        self.current_after = blockExit(stmts);
+        defer self.current_after = saved;
         for (stmts, 0..) |_, i| {
             try self.emitStmt(&stmts[i], stmts[i + 1 ..], indent);
         }
@@ -786,12 +793,12 @@ pub const Generator = struct {
                 try out.writeAll("}\n");
             },
             .break_stmt => {
-                try self.emitLoopExitDrops(indent);
+                try self.emitLoopExitDrops(.{ .kind = .jump, .key = @intFromPtr(stmt) }, indent);
                 try self.writeIndent(indent);
                 try out.writeAll("break;\n");
             },
             .continue_stmt => {
-                try self.emitLoopExitDrops(indent);
+                try self.emitLoopExitDrops(.{ .kind = .jump, .key = @intFromPtr(stmt) }, indent);
                 try self.writeIndent(indent);
                 try out.writeAll("continue;\n");
             },
@@ -822,8 +829,8 @@ pub const Generator = struct {
                 }
             },
             .return_stmt => |opt| try self.emitReturnStmt(opt, .{ .kind = .return_stmt, .key = @intFromPtr(stmt) }, indent),
-            .expr => |e| switch (e.kind) {
-                .if_expr => |i| try self.emitIfStmt(i, indent),
+            .expr => |*e| switch (e.kind) {
+                .if_expr => try self.emitIfStmt(e, indent),
                 .match_expr => |m| try self.emitMatchStmt(m, indent),
                 .block => |b| {
                     try self.writeIndent(indent);
@@ -833,7 +840,7 @@ pub const Generator = struct {
                     try out.writeAll("}\n");
                 },
                 .annotated => |a| try self.emitEffect(a.value, indent),
-                else => try self.emitDiscarded(&e, indent),
+                else => try self.emitDiscarded(e, indent),
             },
             .assign => |a| try self.emitAssign(a, indent),
         }
@@ -1088,6 +1095,15 @@ pub const Generator = struct {
             // R11 row 2: through the generated glue, by pointer like the two
             // `_free` calls. `needsDrop` admitted this local, so glue exists.
             .record => {
+                if (self.checker) |c| {
+                    if (c.wasWhollyMoved(local.id)) {
+                        // Revived after a whole move: pendingDropsSince already
+                        // required recordLiveAtExit, so the glue frees the
+                        // live value.
+                        try self.writer.print("cell_drop_{s}(&{s});\n", .{ local.ty.name, local.name });
+                        return;
+                    }
+                }
                 const partial = if (self.checker) |c| c.wasMoved(local.id) else false;
                 if (partial) {
                     try self.emitPartialRecordDrop(indent, local);
@@ -1199,9 +1215,12 @@ pub const Generator = struct {
             if (local.ty.shape == .record) {
                 // A record with only FIELDS moved out is still partly live,
                 // and `emitDropFor` releases exactly its unmoved owning
-                // fields. A revived record is not handled: `moved_paths` is
-                // permanent and the glue would not know which value is live.
-                if (checker.wasWhollyMoved(local.id)) continue;
+                // fields. A wholly moved record that holds a fresh value at
+                // this exit (revived) is released whole.
+                if (checker.wasWhollyMoved(local.id)) {
+                    const e = exit orelse continue;
+                    if (!checker.recordLiveAtExit(e.kind, e.key, local.id)) continue;
+                }
             } else if (checker.wasMoved(local.id)) {
                 // Any other shape has no field path a move can take (a `copy`
                 // sub-place like `buf.len` never reaches `movePlace`'s
@@ -1266,12 +1285,10 @@ pub const Generator = struct {
     /// any block, `if` branch, or arm body the jump sits inside. Outside any
     /// loop there is nothing to do; the parser does not produce a bare
     /// `break`, so the empty case is defensive rather than reachable.
-    fn emitLoopExitDrops(self: *Generator, indent: usize) EmitError!void {
+    fn emitLoopExitDrops(self: *Generator, key: Exit, indent: usize) EmitError!void {
         if (self.loop_marks.items.len == 0) return;
         const mark = self.loop_marks.items[self.loop_marks.items.len - 1];
-        // No exit key: borrowck's `exit_liveness` records no jump, so a
-        // revived var is not released here and leaks, as before.
-        try self.emitDropsSince(mark, indent, null);
+        try self.emitDropsSince(mark, indent, key);
     }
 
     /// The other drop point: before every `return`. When nothing needs
@@ -1604,28 +1621,37 @@ pub const Generator = struct {
         return CType.int64;
     }
 
-    fn emitIfStmt(self: *Generator, i: anytype, indent: usize) EmitError!void {
+    fn emitIfStmt(self: *Generator, e: *const ast.Expr, indent: usize) EmitError!void {
+        const i = e.kind.if_expr;
+        const after = self.current_after;
+        const mark = self.locals.items.len;
         const out = self.writer;
         try self.writeIndent(indent);
         try out.writeAll("if (");
         try self.emitCond(i.cond, indent);
         try out.writeAll(") ");
-        try self.emitBranchStmt(i.then_body, indent);
+        try self.emitBranchStmt(i.then_body, mark, after, indent);
         if (i.else_body) |eb| {
             try out.writeAll(" else ");
-            try self.emitBranchStmt(eb, indent);
+            try self.emitBranchStmt(eb, mark, after, indent);
+        } else if (try self.branchNeedsSynthesizedElse(@intFromPtr(e), mark, after)) {
+            try out.writeAll(" else {\n");
+            try self.emitBranchEndDrops(@intFromPtr(e), mark, after, indent + 1);
+            try self.writeIndent(indent);
+            try out.writeAll("}");
         }
         try out.writeAll("\n");
     }
 
     /// One branch of a statement-position `if`. A nested `if` becomes
     /// `else if` rather than a braced block.
-    fn emitBranchStmt(self: *Generator, e: *const ast.Expr, indent: usize) EmitError!void {
+    fn emitBranchStmt(self: *Generator, e: *const ast.Expr, mark: usize, after: ?Exit, indent: usize) EmitError!void {
         const out = self.writer;
         switch (e.kind) {
             .block => |stmts| {
                 try out.writeAll("{\n");
                 try self.emitStmts(stmts, indent + 1);
+                try self.emitBranchEndDrops(branchKey(e), mark, after, indent + 1);
                 try self.writeIndent(indent);
                 try out.writeAll("}");
             },
@@ -1633,22 +1659,87 @@ pub const Generator = struct {
                 try out.writeAll("if (");
                 try self.emitCond(i.cond, indent);
                 try out.writeAll(") ");
-                try self.emitBranchStmt(i.then_body, indent);
+                try self.emitBranchStmt(i.then_body, mark, after, indent);
                 if (i.else_body) |eb| {
                     try out.writeAll(" else ");
-                    try self.emitBranchStmt(eb, indent);
+                    try self.emitBranchStmt(eb, mark, after, indent);
+                } else if (try self.branchNeedsSynthesizedElse(@intFromPtr(e), mark, after)) {
+                    try out.writeAll(" else {\n");
+                    try self.emitBranchEndDrops(@intFromPtr(e), mark, after, indent + 1);
+                    try self.writeIndent(indent);
+                    try out.writeAll("}");
                 }
             },
-            .annotated => |a| try self.emitBranchStmt(a.value, indent),
+            .annotated => |a| try self.emitBranchStmt(a.value, mark, after, indent),
             else => {
                 try out.writeAll("{\n");
                 try self.writeIndent(indent + 1);
                 try self.emitExpr(e, indent + 1);
                 try out.writeAll(";\n");
+                try self.emitBranchEndDrops(branchKey(e), mark, after, indent + 1);
                 try self.writeIndent(indent);
                 try out.writeAll("}");
             },
         }
+    }
+
+    /// D.2's two-condition rule at the end of one branch: a local declared
+    /// OUTSIDE the branch (index below `mark`) that borrowck recorded live
+    /// at this branch's end AND not live at `after` is released here.
+    /// Both conditions read recorded entries; a missing record keeps the leak.
+    fn emitBranchEndDrops(self: *Generator, key: usize, mark: usize, after: ?Exit, indent: usize) EmitError!void {
+        const checker = self.checker orelse return;
+        const here: Exit = .{ .kind = .branch_end, .key = key };
+        var i = mark;
+        while (i > 0) {
+            i -= 1;
+            const local = self.locals.items[i];
+            if (!local.droppable) continue;
+            if (local.ownership != .owned and local.ownership != .arc) continue;
+            if (!try self.needsDrop(local.ty)) continue;
+            if (local.ty.shape == .record) {
+                if (!checker.wasWhollyMoved(local.id)) continue;
+                if (!checker.recordLiveAtExit(here.kind, here.key, local.id)) continue;
+                if (after) |a| {
+                    if (checker.recordLiveAtExit(a.kind, a.key, local.id)) continue;
+                }
+            } else {
+                if (!checker.wasMoved(local.id)) continue;
+                if (!checker.liveAtExit(here.kind, here.key, local.id)) continue;
+                if (after) |a| {
+                    if (checker.liveAtExit(a.kind, a.key, local.id)) continue;
+                }
+            }
+            try self.emitDropFor(indent, local);
+        }
+    }
+
+    fn branchNeedsSynthesizedElse(self: *Generator, key: usize, mark: usize, after: ?Exit) Alloc!bool {
+        const checker = self.checker orelse return false;
+        const here: Exit = .{ .kind = .branch_end, .key = key };
+        var i = mark;
+        while (i > 0) {
+            i -= 1;
+            const local = self.locals.items[i];
+            if (!local.droppable) continue;
+            if (local.ownership != .owned and local.ownership != .arc) continue;
+            if (!try self.needsDrop(local.ty)) continue;
+            if (local.ty.shape == .record) {
+                if (!checker.wasWhollyMoved(local.id)) continue;
+                if (!checker.recordLiveAtExit(here.kind, here.key, local.id)) continue;
+                if (after) |a| {
+                    if (checker.recordLiveAtExit(a.kind, a.key, local.id)) continue;
+                }
+            } else {
+                if (!checker.wasMoved(local.id)) continue;
+                if (!checker.liveAtExit(here.kind, here.key, local.id)) continue;
+                if (after) |a| {
+                    if (checker.liveAtExit(a.kind, a.key, local.id)) continue;
+                }
+            }
+            return true;
+        }
+        return false;
     }
 
     fn emitMatchStmt(self: *Generator, m: anytype, indent: usize) EmitError!void {
@@ -1802,7 +1893,7 @@ pub const Generator = struct {
     fn emitEffect(self: *Generator, e: *const ast.Expr, indent: usize) EmitError!void {
         switch (e.kind) {
             .block => |stmts| try self.emitStmts(stmts, indent),
-            .if_expr => |i| try self.emitIfStmt(i, indent),
+            .if_expr => try self.emitIfStmt(e, indent),
             .match_expr => |m| try self.emitMatchStmt(m, indent),
             .annotated => |a| try self.emitEffect(a.value, indent),
             else => try self.emitDiscarded(e, indent),
@@ -1962,9 +2053,8 @@ pub const Generator = struct {
             break :blk if (t.kind == .ident) t.kind.ident else null;
         };
         const reach = try self.tailReach(stmts, tail);
-        // No exit key: the tail can move or read a local after the block's
-        // statements, which is not the state borrowck recorded at its end.
-        for (try self.pendingDropsSince(mark, null)) |local| {
+        const exit: ?Exit = if (stmts.len > 0) .{ .kind = .value_block_end, .key = @intFromPtr(stmts.ptr) } else null;
+        for (try self.pendingDropsSince(mark, exit)) |local| {
             if (tail_ident) |n| {
                 if (eq(n, local.name) and local.ownership == .arc and dest.ty.shape == .arc) {
                     try self.emitDropFor(indent, local);
@@ -2028,6 +2118,9 @@ pub const Generator = struct {
                 const mark = self.locals.items.len;
                 defer self.locals.shrinkRetainingCapacity(mark);
                 if (stmts.len > 0) {
+                    const saved_after = self.current_after;
+                    self.current_after = blockExit(stmts);
+                    defer self.current_after = saved_after;
                     for (stmts[0 .. stmts.len - 1], 0..) |_, i| {
                         try self.emitStmt(&stmts[i], stmts[i + 1 ..], indent + 1);
                     }
@@ -3636,6 +3729,15 @@ fn blockExit(body: []const ast.Stmt) ?Exit {
     return .{ .kind = .block_end, .key = @intFromPtr(body.ptr) };
 }
 
+/// Mirrors `borrowck.branchKeyOf`: a block body's statement slice, else
+/// the expression itself.
+fn branchKey(e: *const ast.Expr) usize {
+    return switch (e.kind) {
+        .block => |stmts| if (stmts.len > 0) @intFromPtr(stmts.ptr) else @intFromPtr(e),
+        else => @intFromPtr(e),
+    };
+}
+
 // ── use analysis, for the (void) casts that keep -Wextra quiet ───────────
 
 fn exprUses(e: *const ast.Expr, name: []const u8) bool {
@@ -4886,13 +4988,9 @@ test "a moved value is not dropped" {
     try expectAbsent(try fnDef(e.text, "f"), "cell_string_free");
 }
 
-test "a value moved in one branch of an if is not dropped" {
-    // The conservative case: borrowck marks `s` moved for the rest of the
-    // function once ANY branch moves it (see borrowck.zig's module doc
-    // comment and the `moved` field), even though the `if` here has no
-    // `else` and the move might not have happened. Not dropping is the
-    // safe direction: a real move here would make dropping a double free,
-    // so this must also stay free of `cell_string_free`.
+test "a value moved in one branch of an if is released on the other" {
+    // R16 residual 1: the merge still records `s` moved, so the scope-end
+    // drop skips it. The non-moving branch now releases it at its own end.
     var e = try emitSource(
         \\pub fn make() -> String;
         \\pub fn take(owned s: String) { }
@@ -4904,7 +5002,9 @@ test "a value moved in one branch of an if is not dropped" {
         \\}
     );
     defer e.deinit();
-    try expectAbsent(try fnDef(e.text, "f"), "cell_string_free");
+    const f = try fnDef(e.text, "f");
+    try expectOccurrences(f, "cell_string_free(&s);", 1);
+    try expectContains(f, "} else {\n    cell_string_free(&s);\n  }");
 }
 
 test "a value moved by being returned is not dropped" {
@@ -6453,7 +6553,10 @@ test "a revived var stays unreleased where the path may not hold a value" {
         \\}
     );
     defer e.deinit();
-    for ([_][]const u8{ "one_branch", "moved_again", "break_after", "back_edge" }) |name| {
+    // one_branch: revival on the then path is released at that branch's end.
+    const one = try fnDef(e.text, "one_branch");
+    try expectOccurrences(one, "cell_string_free(&v);", 1);
+    for ([_][]const u8{ "moved_again", "break_after", "back_edge" }) |name| {
         const body = try fnDef(e.text, name);
         try expectAbsent(body, "cell_string_free(&v);");
     }
@@ -8027,5 +8130,110 @@ test "wrap patterns test the tag and bind the payload" {
     try expectContains(f, "if (_cell_t3.ok) {");
     try expectContains(f, "uint8_t v = (uint8_t)_cell_t3.value.u64;");
     try expectContains(f, "cell_E code = (cell_E)_cell_t3.error_code;");
+    try expectCompiles(e.text);
+}
+
+test "a var moved on one branch is released at the end of the other" {
+    var e = try emitSource(
+        \\pub fn take(owned s: String);
+        \\pub fn f(copy c: Int) {
+        \\  var owned v: String = "a"
+        \\  if c > 0 {
+        \\    take(v)
+        \\  } else {
+        \\    c = c + 1
+        \\  }
+        \\}
+        \\pub fn g(copy c: Int) {
+        \\  var owned v: String = "a"
+        \\  if c > 0 {
+        \\    take(v)
+        \\  }
+        \\}
+        \\pub fn both(copy c: Int) {
+        \\  var owned v: String = "a"
+        \\  if c > 0 {
+        \\    take(v)
+        \\  } else {
+        \\    take(v)
+        \\  }
+        \\}
+        \\pub fn neither(copy c: Int) {
+        \\  var owned v: String = "a"
+        \\  if c > 0 {
+        \\    c = c + 1
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectOccurrences(f, "cell_string_free(&v);", 1);
+    try expectLineBefore(f, "cell_string_free(&v);", "c = (c + 1);");
+    const g = try fnDef(e.text, "g");
+    try expectOccurrences(g, "cell_string_free(&v);", 1);
+    try expectContains(g, "} else {\n    cell_string_free(&v);\n  }");
+    const both = try fnDef(e.text, "both");
+    try expectAbsent(both, "cell_string_free(&v);");
+    const neither = try fnDef(e.text, "neither");
+    try expectOccurrences(neither, "cell_string_free(&v);", 1);
+    try expectCompiles(e.text);
+}
+
+test "a revived loop-local is released at a continue" {
+    var e = try emitSource(
+        \\pub fn take(owned s: String);
+        \\pub fn f(copy n: Int) {
+        \\  var i = 0
+        \\  while i < n {
+        \\    i = i + 1
+        \\    var owned v: String = "a"
+        \\    take(v)
+        \\    v = "b"
+        \\    if i > 0 {
+        \\      continue
+        \\    }
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectOccurrences(f, "cell_string_free(&v);", 2);
+    try expectContains(f, "cell_string_free(&v);\n            continue;");
+    try expectCompiles(e.text);
+}
+
+test "a var revived in a value block is released after the tail" {
+    var e = try emitSource(
+        \\pub fn take(owned s: String);
+        \\pub fn f() -> Int {
+        \\  let copy n = {
+        \\    var owned v: String = "a"
+        \\    take(v)
+        \\    v = "b"
+        \\    3
+        \\  }
+        \\  return n
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectOccurrences(f, "cell_string_free(&v);", 1);
+    try expectBefore(f, "= 3;", "cell_string_free(&v);");
+    try expectCompiles(e.text);
+}
+
+test "a revived record is released whole at scope end" {
+    var e = try emitSource(
+        \\pub struct Box { owned s: String }
+        \\pub fn take(owned b: Box);
+        \\pub fn f() {
+        \\  var owned b = Box { s: "one" }
+        \\  take(b)
+        \\  b = Box { s: "two" }
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectOccurrences(f, "cell_drop_Box(&b);", 1);
     try expectCompiles(e.text);
 }
