@@ -1,0 +1,33 @@
+// R16 residual: a field revived after it was moved leaked the new value.
+// `take(p.a)` marks `a` moved; `p.a = "cccccccc"` revives it (R3a). The
+// partial drop still skipped `p.a` because `moved_paths` was never
+// retracted, so the new String was left unreleased. `p.b` was already
+// released. Each iteration is a fresh record so a leak of the revived
+// field is 1000, not one.
+//
+// BEFORE: 1000. AFTER: 0. CLOSED 2026-09-16 by retracting the revived
+// field path from `fieldWasMoved`. A skip-revival `break`/`continue`
+// and a `return` inside a loop still leak.
+//
+// Status: parses, passes `cell check`; C only; lives under examples/leaks/.
+
+pub struct Pair {
+    owned a: String
+    owned b: String
+}
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        var owned p: Pair = Pair { a: "aaaaaaaa", b: "bbbbbbbb" }
+        take(p.a)
+        p.a = "cccccccc"
+        i = i + 1
+    }
+    print_int(i)
+}

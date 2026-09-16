@@ -451,6 +451,12 @@ LEAK_PARTIAL_NESTED_FIELD=0
 # records it dead). Measured 1000 before (2026-09-16, ALLOC=4000 FREE=3000
 # LIVE=1000); CLOSED the same day by branch-end field releases, 1000 -> 0.
 LEAK_BRANCH_FIELD=0
+# R16 residual: a field revived after it was moved (`take(p.a)` then
+# `p.a = "c"`) leaked the new value because `moved_paths` was never
+# retracted. Measured 1000 before (2026-09-16, ALLOC=3000 FREE=2000
+# LIVE=1000); CLOSED the same day by R3a retracting the revived field
+# path from `fieldWasMoved`, 1000 -> 0.
+LEAK_FIELD_REVIVAL=0
 
 # ---- stage 10 disclosed signature disagreements, pinned by defect ---------
 # Each line is `<example key>:<function>:<leg>` naming a place where the C
@@ -942,6 +948,7 @@ else
     run_c_leaks loop_cross "" "$LEAK_LOOP_CROSS" "R16 residual outer-while-var, CLOSED 2026-09-16 by after_loop releases; 1000 -> 0"
     run_c_leaks partial_nested_field "" "$LEAK_PARTIAL_NESTED_FIELD" "R16 residual nested partial field, CLOSED 2026-09-16 by recursive emitPartialRecordDrop; 1000 -> 0"
     run_c_leaks branch_field "" "$LEAK_BRANCH_FIELD" "R16 residual 1 at field granularity, CLOSED 2026-09-16 by branch-end field releases; 1000 -> 0"
+    run_c_leaks field_revival "" "$LEAK_FIELD_REVIVAL" "R16 residual field revival, CLOSED 2026-09-16 by retracting the revived path from fieldWasMoved; 1000 -> 0"
 fi
 
 # ------------------------------------------- 8. cross-backend answer agreement --

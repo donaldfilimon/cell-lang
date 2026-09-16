@@ -1,10 +1,10 @@
 # `examples/leaks/`
 
-Seventeen fixtures: R11's measurable gaps and their CLOSED pins (seven,
+Eighteen fixtures: R11's measurable gaps and their CLOSED pins (seven,
 including the value-block residual and the `owned` twin of row 5); R16's
-revival leak (`revived_var.cell`, closed 2026-09-16) and seven closed
+revival leak (`revived_var.cell`, closed 2026-09-16) and eight closed
 residuals (`branch_move`, `loop_jump_revival`, `value_block_revival`,
-`revived_record`, `loop_cross`, `partial_nested_field`, `branch_field`); the partial-move pin; and one regression pin for an
+`revived_record`, `loop_cross`, `partial_nested_field`, `branch_field`, `field_revival`); the partial-move pin; and one regression pin for an
 implemented feature (`arc_box_move.cell`, below). Each isolates exactly one
 disclosed retain/release shape and loops it 1000 times so a leak is a
 stable count, not noise.
@@ -45,6 +45,7 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `revived_record.cell` | R16 residual 4: a record revived after a whole move; **CLOSED 2026-09-16** by record-revival admission, 1000 -> 0 |
 | `loop_cross.cell` | R16 residual: a var moved inside a `while` it was declared outside of; **CLOSED 2026-09-16** by after_loop releases, 1000 -> 0 |
 | `branch_field.cell` | R16 residual 1 at field granularity: a field moved on only one branch of an `if` leaked on the other; **CLOSED 2026-09-16** by branch-end field releases (live here, dead after the merge), 1000 -> 0 |
+| `field_revival.cell` | R16 residual: a field revived after it was moved leaked the new value; **CLOSED 2026-09-16** by retracting the revived path from `fieldWasMoved`, 1000 -> 0 |
 
 R11's sixth disclosed gap (an `owned` String or list place bound as `arc`) was
 never a runtime leak: it was a C type error, then a borrowck refusal, and since

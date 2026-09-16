@@ -235,6 +235,11 @@ const MovedPath = struct {
     binding: u32,
     /// `""` when the binding itself moved, a dotted field path otherwise.
     path: []const u8,
+    /// Set by R3a field revival. `fieldWasMoved` skips a revived path so
+    /// the new value is released; the slot stays so `loop_moved`'s length
+    /// snapshots still see the binding. A whole-binding `path == ""` is
+    /// never marked: assigning a field must not look like a whole move.
+    revived: bool = false,
 };
 
 /// See `Checker.assign_liveness`.
@@ -414,7 +419,7 @@ pub const Checker = struct {
     /// and a query by id can never cross a function boundary by accident.
     moved: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// The same moves as `moved`, WITH the field path each one took, and
-    /// permanent for the same reason. `moved` answers "was anything under
+    /// append-only for the same reason. `moved` answers "was anything under
     /// this binding moved", which is everything a scalar, a buffer or a
     /// handle needs. A record needs to know WHICH fields went: before this
     /// existed, `let owned m = p.a` made codegen skip `p` entirely, so a
@@ -424,7 +429,11 @@ pub const Checker = struct {
     /// inherits `moved`'s conservatism exactly, since both are written at
     /// the same point: a move on one branch of an `if` is recorded as if it
     /// happened on every path, which for a DROP decision fails toward a
-    /// leak and never toward a double free.
+    /// leak and never toward a double free. R3a field revival marks a
+    /// matching field path `revived` rather than deleting the slot, so
+    /// `fieldWasMoved` can release the new value without shrinking the log
+    /// `loop_moved` snapshots by length. A whole-binding `path == ""` is
+    /// never marked.
     moved_paths: std.ArrayListUnmanaged(MovedPath) = .empty,
     /// One entry per whole-binding reassignment `v = ...` the checker
     /// accepted, recording whether `v` still held a live value at that store
@@ -855,6 +864,7 @@ pub const Checker = struct {
     pub fn fieldWasMovedWhole(self: *const Checker, binding: u32, path: []const u8) bool {
         for (self.moved_paths.items) |m| {
             if (m.binding != binding or m.path.len == 0) continue;
+            if (m.revived and !self.loop_moved.contains(binding)) continue;
             if (std.mem.eql(u8, m.path, path)) return true;
         }
         return false;
@@ -866,10 +876,14 @@ pub const Checker = struct {
     /// rather than being freed while something else may own a piece of it.
     /// A whole-binding move is deliberately NOT reported here: callers
     /// check `wasWhollyMoved` first. `path` is a dotted field path, so
-    /// `"inner"` and `"inner.a"` are both valid.
+    /// `"inner"` and `"inner.a"` are both valid. A path R3a revived is
+    /// skipped unless the binding is `loop_moved`: a skip-revival
+    /// `continue` can leave an outer field taken, and releasing it at
+    /// function end is a double free.
     pub fn fieldWasMoved(self: *const Checker, binding: u32, field: []const u8) bool {
         for (self.moved_paths.items) |m| {
             if (m.binding != binding or m.path.len == 0) continue;
+            if (m.revived and !self.loop_moved.contains(binding)) continue;
             if (std.mem.eql(u8, m.path, field)) return true;
             if (m.path.len > field.len and std.mem.startsWith(u8, m.path, field) and m.path[field.len] == '.') return true;
         }
@@ -2707,15 +2721,28 @@ pub const Checker = struct {
     }
 
     /// R3a: assigning to a place revives it and everything under it.
+    /// A field revival also retracts matching `moved_paths` entries from
+    /// drop queries (`pathPrefix`, same as `dead`), so `fieldWasMoved`
+    /// returns false and the new value is released. A whole-binding
+    /// `path == ""` is left in place: assigning `p.a` must not look like
+    /// a whole move of `p` (that double-frees after `let owned q = p`).
+    /// A sibling path is not a prefix and is left in place.
     fn revive(self: *Checker, place: Place) void {
+        var revived_dead = false;
         var i: usize = 0;
         while (i < self.dead.items.len) {
             const d = self.dead.items[i];
             if (d.binding == place.binding and pathPrefix(place.path, d.path)) {
                 _ = self.dead.swapRemove(i);
+                revived_dead = true;
                 continue;
             }
             i += 1;
+        }
+        if (!revived_dead) return;
+        for (self.moved_paths.items) |*m| {
+            if (m.binding != place.binding or m.path.len == 0) continue;
+            if (pathPrefix(place.path, m.path)) m.revived = true;
         }
     }
 
@@ -9249,6 +9276,77 @@ test "moved_paths: a partial move is still ACCEPTED, with no diagnostic" {
         \\  return view(shared p.b)
         \\}
     );
+}
+
+test "moved_paths: a field revived after it was moved is no longer fieldWasMoved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var checker = try checkedFor(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn take(owned s: String) { }
+        \\pub fn f() {
+        \\  var owned p: Pair = Pair { a: "x", b: "y" }
+        \\  take(owned p.a)
+        \\  p.a = "c"
+        \\}
+    );
+    defer checker.deinit();
+    try std.testing.expect(!checker.hasErrors());
+    const p = try idNamed(&checker, "p");
+    try std.testing.expect(checker.wasMoved(p));
+    try std.testing.expect(!checker.wasWhollyMoved(p));
+    try std.testing.expect(!checker.fieldWasMoved(p, "a"));
+    try std.testing.expect(!checker.fieldWasMovedWhole(p, "a"));
+    try std.testing.expect(!checker.fieldWasMoved(p, "b"));
+}
+
+test "moved_paths: a field moved and never revived stays fieldWasMoved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var checker = try checkedFor(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn take(owned s: String) { }
+        \\pub fn f() {
+        \\  let owned p: Pair = Pair { a: "x", b: "y" }
+        \\  take(owned p.a)
+        \\}
+    );
+    defer checker.deinit();
+    try std.testing.expect(!checker.hasErrors());
+    const p = try idNamed(&checker, "p");
+    try std.testing.expect(checker.fieldWasMoved(p, "a"));
+    try std.testing.expect(checker.fieldWasMovedWhole(p, "a"));
+    try std.testing.expect(!checker.fieldWasMoved(p, "b"));
+}
+
+test "moved_paths: reviving one field does not clear a moved sibling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var checker = try checkedFor(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn take(owned s: String) { }
+        \\pub fn f() {
+        \\  var owned p: Pair = Pair { a: "x", b: "y" }
+        \\  take(owned p.a)
+        \\  take(owned p.b)
+        \\  p.a = "c"
+        \\}
+    );
+    defer checker.deinit();
+    try std.testing.expect(!checker.hasErrors());
+    const p = try idNamed(&checker, "p");
+    try std.testing.expect(!checker.fieldWasMoved(p, "a"));
+    try std.testing.expect(checker.fieldWasMoved(p, "b"));
+    try std.testing.expect(!checker.wasWhollyMoved(p));
 }
 
 test "Some reads its operand and a wrap-pattern binding is a copy" {

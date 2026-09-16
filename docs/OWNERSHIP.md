@@ -1421,16 +1421,24 @@ later partial drop). Drop flags are not required.
 `examples/leaks/branch_field.cell` measured 1000 before on both witnesses
 and 0 after, pinned in the gate.
 
-One limit remains, in the leak direction and deliberate: a field that is
-written again after being moved out (`let owned m = p.a` then `p.a = "c"`)
-keeps its moved record, because `moved_paths` is permanent like `moved` and
-never revived, so the NEW value leaks. This is R16's revival leak at field
-granularity.
-Measured over 1000 iterations with an owned local: `leaks` 2000 and LIVE=2000
-on the tree before (the whole record skipped, both fields leaking), `leaks`
-1000 and LIVE=1000 after (only the revived value leaking), ASan clean both
-ways. Releasing the revived value would need the revival to clear the
-record, which is exactly the part R16 leaves undone.
+**CLOSED 2026-09-16: a field revived after it was moved.** It read: a field
+written again after being moved out (`take(owned p.a)` then `p.a = "c"`)
+kept its moved record, because `moved_paths` was permanent like `moved` and
+never revived, so the NEW value leaked. R3a revival now retracts matching
+field paths from drop queries (the same `pathPrefix` rule `revive` already
+uses on `dead`). A whole-binding `path == ""` is not retracted when only a
+field is assigned (that would drop a wholly moved record after
+`let owned q = p`). A sibling `p.b` is not retracted. `fieldWasMoved`
+then returns false for `a`, so `emitPartialRecordDrop` frees the revived
+value; the moved-and-never-revived case still skips. An outer field whose
+binding is `loop_moved` stays skipped, so a skip-revival `continue` does
+not become a double free.
+`examples/leaks/field_revival.cell` measured 1000 before on both witnesses
+and 0 after, pinned in the gate. Falsified: retracting `path == ""` on a
+field store then dropping the whole record after `let owned q = p`;
+freeing `p.a` at scope end when it was moved and not revived; retracting
+sibling `p.b` when reviving `p.a`. Each AddressSanitizer double free at
+exit 134; restored.
 
 **The partly-moved nested field is CLOSED (2026-09-16).** It read: a move of
 part of a field (`p.inner.a`) left the whole top-level field `p.inner`
@@ -2210,8 +2218,14 @@ ways, and each is a real, documented gap rather than an oversight:
   `cell_drop_Pair(&p)` on the else path, freeing `p.a` at scope end as well
   as else, or freeing `p.a` on the then path, each AddressSanitizer double
   free at exit 134; restored.
+  **CLOSED 2026-09-16: a field revived after it was moved.** R3a retracts
+  matching field paths from `moved_paths` drop queries; `fieldWasMoved`
+  is false for the revived field so the new value is released at scope
+  end. `examples/leaks/field_revival.cell` measured 1000 before and 0
+  after, pinned in the gate. A skip-revival `break`/`continue` and a
+  `return` inside a loop still leak.
 
-Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released, and a nested field whose sibling was moved is released by recursing that same partial drop. A field moved on only one branch is closed the same day (`branch_field.cell`): it is released on the keeping path from per-field exit liveness, not by drop flags.
+Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released, and a nested field whose sibling was moved is released by recursing that same partial drop. A field moved on only one branch is closed the same day (`branch_field.cell`): it is released on the keeping path from per-field exit liveness, not by drop flags. A field revived after it was moved is closed the same day (`field_revival.cell`): R3a retracts that path from `fieldWasMoved`.
 
 ### R17. Double free is prevented by R2, not by a runtime check
 

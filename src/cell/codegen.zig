@@ -77,7 +77,10 @@
 //! moved on only one branch of an `if` is released on the keeping path
 //! (2026-09-16) from per-field exit liveness, live here and dead after
 //! the merge, never by dropping the whole record (that double-frees the
-//! unmoved sibling with the later partial drop); and a local declared
+//! unmoved sibling with the later partial drop); a field revived after it
+//! was moved is released at scope end (2026-09-16) because R3a retracts
+//! that path from `fieldWasMoved`; a skip-revival `break`/`continue` and
+//! a `return` inside a loop still leak; and a local declared
 //! inside a VALUE-position block (`emitValueInto`) is not released at
 //! that block's exit, because it may be the value flowing out.
 //! Why block-scoped release is safe for a local whose initializer moves an
@@ -385,6 +388,10 @@ pub const Generator = struct {
     /// The enclosing statement list's block-end exit, for branch-end drops
     /// that ask "live here, dead after the merge".
     current_after: ?Exit = null,
+    /// The drop point currently being emitted. A jump after a move and
+    /// before a later revival must not free the taken field; missing or
+    /// not-dead keeps the leak.
+    drop_exit: ?Exit = null,
     temp_counter: usize = 0,
     /// Name of the function being emitted, used in panic messages.
     current_fn: []const u8 = "",
@@ -1183,6 +1190,9 @@ pub const Generator = struct {
             if (f.ownership != .owned and f.ownership != .arc) continue;
             const field_path: []const u8 = if (path_prefix.len == 0) f.name else try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ path_prefix, f.name });
             if (checker.fieldWasMovedWhole(binding, field_path)) continue;
+            if (self.drop_exit) |ex| {
+                if (checker.fieldDeadAtExit(ex.kind, ex.key, binding, field_path)) continue;
+            }
             const fty = try self.lowerType(&f.ty, f.ownership);
             if (checker.fieldWasMoved(binding, field_path)) {
                 // Proper prefix only: whole was already skipped. Recurse
@@ -1332,6 +1342,9 @@ pub const Generator = struct {
     fn emitLoopExitDrops(self: *Generator, key: Exit, indent: usize) EmitError!void {
         if (self.loop_marks.items.len == 0) return;
         const mark = self.loop_marks.items[self.loop_marks.items.len - 1];
+        const saved = self.drop_exit;
+        self.drop_exit = key;
+        defer self.drop_exit = saved;
         try self.emitDropsSince(mark, indent, key);
     }
 
@@ -1398,6 +1411,9 @@ pub const Generator = struct {
     /// after a `return` never executes.
     fn emitReturnStmt(self: *Generator, opt: ?ast.Expr, exit: Exit, indent: usize) EmitError!void {
         const out = self.writer;
+        const saved = self.drop_exit;
+        self.drop_exit = exit;
+        defer self.drop_exit = saved;
         const to_drop = try self.pendingDrops(exit);
         const retain = if (opt) |v| try self.returnedArcNeedsRetain(&v) else false;
         if (to_drop.len == 0) {
@@ -5459,6 +5475,57 @@ test "a record with nothing moved still goes through its drop glue" {
     defer e.deinit();
     try expectOccurrences(e.text, "cell_drop_Pair(&p);", 1);
     try expectAbsent(e.text, "fields moved out");
+}
+
+test "a skip-revival continue does not free a field taken before the jump" {
+    // The walk still sees `p.a = "c"` after `continue`, which retracts
+    // `fieldWasMoved`. Freeing `p.a` at the jump would double-free with
+    // `take`. Dead at this jump => skip; `p.b` is still released.
+    var e = try emitSource(
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn take(owned s: String) { }
+        \\pub fn f() {
+        \\  var i = 0
+        \\  while i < 1 {
+        \\    var owned p: Pair = Pair { a: "x", b: "y" }
+        \\    take(owned p.a)
+        \\    if i < 1 { continue }
+        \\    p.a = "c"
+        \\    i = i + 1
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectContains(f, "cell_string_free(&p.b);");
+    try expectLineBefore(f, "continue;", "cell_string_free(&p.b);");
+}
+
+test "a field revived after it was moved is released at scope end" {
+    // R16 field revival. `take(owned p.a)` marks `a` moved; `p.a = "c"`
+    // revives it. Before, `moved_paths` stayed set, so the partial drop
+    // skipped the new value. `p.b` was never moved. Still partial: no
+    // whole-record glue (that would double-free if `a` had not revived).
+    var e = try emitSource(
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn take(owned s: String) { }
+        \\pub fn f() {
+        \\  var owned p: Pair = Pair { a: "x", b: "y" }
+        \\  take(owned p.a)
+        \\  p.a = "c"
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectOccurrences(f, "cell_string_free(&p.a);", 1);
+    try expectOccurrences(f, "cell_string_free(&p.b);", 1);
+    try expectAbsent(f, "cell_drop_Pair(&p);");
 }
 
 test "a moved field of a nested record releases the sibling, not the moved field" {
