@@ -521,6 +521,18 @@ fn buildOrRun(init: std.process.Init, cwd: Io.Dir, command: Command, inv: Invoca
     return 0;
 }
 
+/// Env var `cell run`/`cell test` set on the compiled child so the runtime
+/// can null Darwin crash exception ports before abort(). abort() still
+/// raises SIGABRT; the parent still sees a signal death (shell 134).
+/// Measured 2026-09-16: CRASHREPORTER_DISABLE=1 does not suppress
+/// DiagnosticReports on this Mac; task_set_exception_ports does.
+const no_crash_reporter_env = "CELL_NO_CRASH_REPORTER";
+
+fn childEnvForCellProgram(map: *std.process.Environ.Map) !*const std.process.Environ.Map {
+    try map.put(no_crash_reporter_env, "1");
+    return map;
+}
+
 fn exitCodeOf(term: std.process.Child.Term, err_w: *Io.Writer) u8 {
     return switch (term) {
         .exited => |code| code,
@@ -613,8 +625,9 @@ fn runProgram(
         return .compile_failed;
     }
 
+    const child_env = try childEnvForCellProgram(init.environ_map);
     if (!capture) {
-        var child = std.process.spawn(io, .{ .argv = &.{out} }) catch |err| {
+        var child = std.process.spawn(io, .{ .argv = &.{out}, .environ_map = child_env }) catch |err| {
             try err_w.print("error: cannot execute '{s}': {s}\n", .{ out, @errorName(err) });
             try err_w.flush();
             return .compile_failed;
@@ -622,7 +635,7 @@ fn runProgram(
         const term = try child.wait(io);
         return .{ .ran = .{ .term = term, .stdout = "" } };
     }
-    const result = std.process.run(init.gpa, io, .{ .argv = &.{out} }) catch |err| {
+    const result = std.process.run(init.gpa, io, .{ .argv = &.{out}, .environ_map = child_env }) catch |err| {
         try err_w.print("error: cannot execute '{s}': {s}\n", .{ out, @errorName(err) });
         try err_w.flush();
         return .compile_failed;
@@ -822,6 +835,18 @@ test "reportLine formats every outcome" {
     try std.testing.expectEqualStrings("FAIL  o.cell (exit 134: program terminated by signal SIGABRT)", reportLine(&buf, "o.cell", .{ .failed_signal = .{ .name = "SIGABRT", .signo = 6 } }));
     try std.testing.expectEqualStrings("FAIL  p.cell (expected output '42', got '41')", reportLine(&buf, "p.cell", .{ .failed_output = .{ .want = "42", .got = "41" } }));
     try std.testing.expectEqualStrings("FAIL  q.cell (did not compile)", reportLine(&buf, "q.cell", .failed_compile));
+}
+
+test "cell run/test children receive CELL_NO_CRASH_REPORTER without dropping the rest of the env" {
+    // The runtime keys off this var to null Darwin crash exception ports
+    // before abort(). Passing environ_map replaces the child environment,
+    // so the helper must keep existing keys.
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("PATH", "/usr/bin");
+    const got = try childEnvForCellProgram(&map);
+    try std.testing.expectEqualStrings("1", got.get(no_crash_reporter_env).?);
+    try std.testing.expectEqualStrings("/usr/bin", got.get("PATH").?);
 }
 
 test "parseArgs: the path, --target=, and -o are order-independent, and a second path is refused" {

@@ -6,6 +6,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/exception.h>
+#ifndef EXC_MASK_CORPSE_NOTIFY
+#define EXC_MASK_CORPSE_NOTIFY 0
+#endif
+#endif
+
 /*
  * Implementation of the Cell C ABI value model. The authoritative description
  * of every type below lives in the comment block at the top of cell_rt.h.
@@ -271,6 +279,47 @@ void cell_print_int(int64_t value) {
     printf("%lld\n", (long long)value);
 }
 
+/*
+ * `cell run` / `cell test` set CELL_NO_CRASH_REPORTER=1 on the child so an
+ * aborting program does not pop macOS Crash Reporter. abort() still raises
+ * SIGABRT; the parent still sees WIFSIGNALED (shell 134). Measured 2026-09-16
+ * on this Mac: CRASHREPORTER_DISABLE=1 does not suppress DiagnosticReports;
+ * task_set_exception_ports with EXC_MASK_CRASH|RESOURCE|GUARD|CORPSE_NOTIFY
+ * and MACH_PORT_NULL does, and wait-status stays 134. A binary built with
+ * `cell build` does not get the env var, so abort() is unchanged there.
+ */
+static const char cell_no_crash_reporter_env[] = "CELL_NO_CRASH_REPORTER";
+
+static int cell_should_suppress_crash_reporter(void) {
+    const char *v = getenv(cell_no_crash_reporter_env);
+    return v != NULL && v[0] != '\0';
+}
+
+static void cell_disable_crash_reporter(void) {
+#if defined(__APPLE__)
+    exception_mask_t mask = EXC_MASK_CRASH | EXC_MASK_RESOURCE | EXC_MASK_GUARD | EXC_MASK_CORPSE_NOTIFY;
+    (void)task_set_exception_ports(
+        mach_task_self(),
+        mask,
+        MACH_PORT_NULL,
+        EXCEPTION_DEFAULT,
+        THREAD_STATE_NONE);
+#endif
+}
+
+#if defined(__APPLE__)
+__attribute__((constructor))
+static void cell_maybe_disable_crash_reporter(void) {
+    if (cell_should_suppress_crash_reporter()) cell_disable_crash_reporter();
+}
+#endif
+
+__attribute__((noreturn))
+static void cell_abort(void) {
+    if (cell_should_suppress_crash_reporter()) cell_disable_crash_reporter();
+    abort();
+}
+
 void cell_assert(bool cond) {
     if (!cond) cell_panic(cell_str_from_cstr("assertion failed"));
 }
@@ -280,7 +329,7 @@ void cell_assert_msg(bool cond, cell_str_t msg) {
     fputs("cell panic: assertion failed: ", stderr);
     if (msg.ptr != NULL && msg.len > 0) fwrite(msg.ptr, 1, msg.len, stderr);
     fputc('\n', stderr);
-    abort();
+    cell_abort();
 }
 
 __attribute__((noreturn))
@@ -288,7 +337,7 @@ void cell_panic(cell_str_t msg) {
     fputs("cell panic: ", stderr);
     if (msg.ptr != NULL && msg.len > 0) fwrite(msg.ptr, 1, msg.len, stderr);
     fputc('\n', stderr);
-    abort();
+    cell_abort();
 }
 
 bool cell_str_eq(cell_str_t a, cell_str_t b) {
