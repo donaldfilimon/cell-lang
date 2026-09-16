@@ -1891,6 +1891,34 @@ test "a UInt32 parameter lowers to i32" {
     try expectContains(e.text, "func.func private @cell_take8(i8) -> i8");
 }
 
+test "an untyped integer literal in an Int8 slot lowers as i8" {
+    var e = try emitSource(
+        \\pub fn f() {
+        \\    let copy a: Int8 = 3
+        \\    let copy b: UInt32 = 7
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "arith.constant 3 : i8");
+    try expectContains(e.text, "arith.constant 7 : i32");
+}
+
+test "an untyped integer literal as a UInt32 argument lowers as i32" {
+    var e = try emitSource(
+        \\pub fn take(copy v: UInt32) -> UInt32;
+        \\pub fn take8(copy v: Int8) -> Int8;
+        \\pub fn f() -> UInt32 {
+        \\    let copy a: Int8 = take8(copy 1)
+        \\    return take(copy 7)
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "arith.constant 1 : i8");
+    try expectContains(e.text, "arith.constant 7 : i32");
+}
+
 test "control flow uses the cf dialect, not scf" {
     // scf.if cannot contain a `return`, and Cell has early return. This test
     // pins the choice so nobody "tidies" it back to scf.

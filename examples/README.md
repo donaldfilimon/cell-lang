@@ -185,7 +185,7 @@ are not.
 |---|---|
 | `hello.cell` | the flagship: struct, enum, a function, a call |
 | `primitives.cell` | all sixteen primitives and their exact C mapping |
-| `widths.cell` | Int8/Int16/UInt8/UInt16/UInt32 arithmetic; prints 16 through C |
+| `widths.cell` | Int8/Int16/UInt8/UInt16/UInt32 arithmetic; prints 16 through C, LLVM and MLIR |
 | `expressions.cell` | operator precedence and left associativity |
 | `bindings.cell` | `let`, `var`, `let mut`, the optional type annotation |
 | `control_flow.cell` | `if` / `else` / `else if`, and block expressions |

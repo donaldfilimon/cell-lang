@@ -1,12 +1,11 @@
 // Additional integer widths from SPEC 3.1: Int8, Int16, UInt8, UInt16, UInt32.
 // Scalar only. UInt8 is not Byte: they share a C type and are not compatible.
 //
-// Status: parses, passes `cell check`, and the C backend compiles, links and
-// runs, printing 16. Untyped integer literals take the declared width
-// (typecheck already did this for Byte/Int32). LLVM and MLIR lower a UInt32
-// parameter to i32, but refuse a body that stores an untyped Int literal into
-// a narrower slot, because HIR still types a bare `7` as Int. That is the
-// existing literal-width gap, not a new conversion rule.
+// Status: parses, passes `cell check`, and C, LLVM and MLIR compile, link and
+// run, printing 16. Untyped integer literals take the declared width at a
+// `let` and at a call argument (the two positions this file uses). A literal
+// in return position, a match arm, an assignment, or a struct field is still
+// typed Int and the IR backends refuse the width mismatch rather than convert.
 // EXPECT-OUTPUT: 16
 
 pub fn print_int(copy value: Int);

@@ -483,10 +483,12 @@ const Lowerer = struct {
                 // The initializer is lowered BEFORE the binding enters scope,
                 // so `let x = x` reads the outer `x`. That matches
                 // typecheck.zig, which declares after checking the value.
-                var value: ?Expr = null;
-                if (l.value) |v| value = try self.lowerExpr(&v);
-
+                // The declared type, when present, is the destination for an
+                // untyped integer literal: `let copy a: Int8 = 3` is i8, not
+                // Int. No other construct is inferred from it.
                 const declared: ?Ty = if (l.ty) |*t| self.resolve(t) else null;
+                var value: ?Expr = null;
+                if (l.value) |v| value = try self.lowerExprIn(&v, declared);
                 const ty = declared orelse if (value) |v| v.ty else types.t_unknown;
 
                 const slot: u32 = @intCast(self.bindings.items.len);
@@ -592,8 +594,18 @@ const Lowerer = struct {
     }
 
     fn lowerExpr(self: *Lowerer, e: *const ast.Expr) LowerError!Expr {
+        return self.lowerExprIn(e, null);
+    }
+
+    /// Lower `e`. `expected` is the type of the slot the expression fills, and
+    /// only `let` initializers and call arguments supply one. An untyped
+    /// integer literal then takes that width when the value fits; every other
+    /// form ignores it. That is not inference: it is the same destination rule
+    /// typecheck.zig already applies, so LLVM and MLIR see i8 rather than i64
+    /// for `let copy a: Int8 = 3`.
+    fn lowerExprIn(self: *Lowerer, e: *const ast.Expr, expected: ?Ty) LowerError!Expr {
         switch (e.kind) {
-            .int => |v| return self.lit(e.span, types.t_int, .{ .int_const = v }),
+            .int => |v| return self.lowerIntLiteral(e.span, v, expected),
             .float => |v| return self.lit(e.span, types.t_float, .{ .float_const = v }),
             .bool => |v| return self.lit(e.span, types.t_bool, .{ .bool_const = v }),
             .string => |v| return self.lit(e.span, types.t_string, .{ .string_const = v }),
@@ -619,8 +631,9 @@ const Lowerer = struct {
                 // The prefix is a checked assertion about a call argument
                 // (R15), not a value transformation. It has already been
                 // verified, and `modes` on the call carries it forward, so the
-                // wrapper does not survive into the IR.
-                return self.lowerExpr(an.value);
+                // wrapper does not survive into the IR. The destination does:
+                // `take(copy 7)` is still an untyped literal in a typed slot.
+                return self.lowerExprIn(an.value, expected);
             },
 
             .binary => |b| {
@@ -636,6 +649,11 @@ const Lowerer = struct {
             },
 
             .unary => |u| {
+                if (u.op == .neg) {
+                    if (try self.lowerNegatedIntLiteral(e.span, u.operand, expected)) |folded| {
+                        return folded;
+                    }
+                }
                 const operand = try self.box(try self.lowerExpr(u.operand));
                 const ty: Ty = switch (u.op) {
                     .not => types.t_bool,
@@ -815,7 +833,13 @@ const Lowerer = struct {
                 }
                 break :blk written orelse .owned;
             };
-            lowered_args[i] = try self.lowerExpr(&a);
+            const param_ty: ?Ty = blk: {
+                if (sig) |s| {
+                    if (i < s.params.len) break :blk self.resolve(&s.params[i].ty);
+                }
+                break :blk null;
+            };
+            lowered_args[i] = try self.lowerExprIn(&a, param_ty);
             modes[i] = .{ .param = param_mode, .written = written };
         }
 
@@ -993,4 +1017,183 @@ const Lowerer = struct {
             try std.fmt.allocPrint(self.arena, "cannot lower: {s}", .{message}),
         );
     }
+
+    fn lowerIntLiteral(self: *Lowerer, span: Span, v: i64, expected: ?Ty) LowerError!Expr {
+        const ty = intLiteralTy(v, expected) orelse {
+            try self.cannotLower(span, "integer literal does not fit the destination width");
+            return self.lit(span, types.t_unknown, .{ .int_const = v });
+        };
+        return self.lit(span, ty, .{ .int_const = v });
+    }
+
+    /// Fold `-N` into an `int_const` of the destination width when `expected`
+    /// is an integer slot. The operand `128` does not fit Int8, but `-128`
+    /// does, so the sign has to be applied before the range check; passing
+    /// the destination through to the operand would refuse a value that fits.
+    /// Without a destination the unary form is left alone.
+    fn lowerNegatedIntLiteral(
+        self: *Lowerer,
+        span: Span,
+        operand: *const ast.Expr,
+        expected: ?Ty,
+    ) LowerError!?Expr {
+        const dest = expected orelse return null;
+        if (!isIntegerWidth(dest)) return null;
+        const v = astIntLiteral(operand) orelse return null;
+        if (v == std.math.minInt(i64)) {
+            try self.cannotLower(span, "integer literal does not fit the destination width");
+            return self.lit(span, types.t_unknown, .{ .int_const = 0 });
+        }
+        return try self.lowerIntLiteral(span, -v, expected);
+    }
 };
+
+fn astIntLiteral(e: *const ast.Expr) ?i64 {
+    var cur = e;
+    while (true) {
+        switch (cur.kind) {
+            .int => |v| return v,
+            .annotated => |an| cur = an.value,
+            else => return null,
+        }
+    }
+}
+
+fn isIntegerWidth(ty: Ty) bool {
+    return switch (ty) {
+        .int, .int8, .int16, .int32, .uint, .uint8, .uint16, .uint32, .byte => true,
+        else => false,
+    };
+}
+
+fn intFitsWidth(v: i64, ty: Ty) bool {
+    return switch (ty) {
+        .int => true,
+        .int8 => v >= std.math.minInt(i8) and v <= std.math.maxInt(i8),
+        .int16 => v >= std.math.minInt(i16) and v <= std.math.maxInt(i16),
+        .int32 => v >= std.math.minInt(i32) and v <= std.math.maxInt(i32),
+        .uint => v >= 0,
+        .uint8, .byte => v >= 0 and v <= std.math.maxInt(u8),
+        .uint16 => v >= 0 and v <= std.math.maxInt(u16),
+        .uint32 => v >= 0 and v <= std.math.maxInt(u32),
+        else => false,
+    };
+}
+
+/// The type an untyped integer literal takes in `expected`, or null when
+/// `expected` is an integer width the value does not fit. Null is a refusal,
+/// not a cue to truncate.
+fn intLiteralTy(v: i64, expected: ?Ty) ?Ty {
+    const dest = expected orelse return types.t_int;
+    if (!isIntegerWidth(dest)) return types.t_int;
+    if (intFitsWidth(v, dest)) return dest;
+    return null;
+}
+
+const Lowered = struct {
+    arena: std.heap.ArenaAllocator,
+    diagnostics: diag.Bag,
+    module: Module,
+
+    fn deinit(self: *Lowered) void {
+        self.diagnostics.deinit(self.arena.allocator());
+        self.arena.deinit();
+    }
+};
+
+fn lowerSource(source: []const u8) !Lowered {
+    const lexer = @import("lexer.zig");
+    const parser = @import("parser.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    errdefer arena.deinit();
+    const allocator = arena.allocator();
+    var lex = lexer.Lexer.init(source, "t.cell");
+    const tokens = try lex.tokenizeAll(allocator);
+    var parser_state = parser.Parser.init(allocator, tokens.items, "t.cell");
+    var ast_module = try parser_state.parseModule();
+    var diagnostics: diag.Bag = .init("t.cell", source);
+    errdefer diagnostics.deinit(allocator);
+    const module = try lower(allocator, &ast_module, &diagnostics);
+    return .{ .arena = arena, .diagnostics = diagnostics, .module = module };
+}
+
+test "an untyped integer literal takes the destination width" {
+    var l = try lowerSource(
+        \\pub fn take8(copy v: Int8) -> Int8;
+        \\pub fn takeu32(copy v: UInt32) -> UInt32;
+        \\pub fn f() {
+        \\    let copy a: Int8 = 3
+        \\    let copy b: Int16 = -4
+        \\    let copy c: UInt8 = 1
+        \\    let copy d: UInt16 = 2
+        \\    let copy e: UInt32 = 7
+        \\    let copy small: Int32 = -3
+        \\    let copy g: Byte = 9
+        \\    let copy h = take8(copy 5)
+        \\    let copy i = takeu32(copy 16)
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const f = l.module.findFn("f").?;
+    const body = f.body.?;
+    try std.testing.expectEqual(.int8, body[0].kind.let.value.?.ty.tag());
+    try std.testing.expectEqual(@as(i64, 3), body[0].kind.let.value.?.kind.int_const);
+    try std.testing.expectEqual(.int16, body[1].kind.let.value.?.ty.tag());
+    try std.testing.expectEqual(@as(i64, -4), body[1].kind.let.value.?.kind.int_const);
+    try std.testing.expectEqual(.uint8, body[2].kind.let.value.?.ty.tag());
+    try std.testing.expectEqual(.uint16, body[3].kind.let.value.?.ty.tag());
+    try std.testing.expectEqual(.uint32, body[4].kind.let.value.?.ty.tag());
+    try std.testing.expectEqual(.int32, body[5].kind.let.value.?.ty.tag());
+    try std.testing.expectEqual(.byte, body[6].kind.let.value.?.ty.tag());
+    const take8_arg = body[7].kind.let.value.?.kind.call.args[0];
+    try std.testing.expectEqual(.int8, take8_arg.ty.tag());
+    try std.testing.expectEqual(@as(i64, 5), take8_arg.kind.int_const);
+    const takeu32_arg = body[8].kind.let.value.?.kind.call.args[0];
+    try std.testing.expectEqual(.uint32, takeu32_arg.ty.tag());
+    try std.testing.expectEqual(@as(i64, 16), takeu32_arg.kind.int_const);
+}
+
+test "an integer literal that does not fit the destination width is refused" {
+    var l = try lowerSource(
+        \\pub fn f() {
+        \\    let copy a: Int8 = 128
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(l.diagnostics.hasErrors());
+    var found = false;
+    for (l.diagnostics.list.items) |d| {
+        if (std.mem.indexOf(u8, d.message, "does not fit the destination width") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "a bare integer literal in return position stays Int" {
+    // Destination typing is let and call-arg only. `return 7` from `-> Int8`
+    // is still Int; LLVM/MLIR refuse the width mismatch rather than convert.
+    var l = try lowerSource(
+        \\pub fn f() -> Int8 {
+        \\    return 7
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const ret = l.module.findFn("f").?.body.?[0].kind.ret.?;
+    try std.testing.expectEqual(.int, ret.ty.tag());
+}
+
+test "UInt8 and Byte stay distinct destination widths" {
+    var l = try lowerSource(
+        \\pub fn f() {
+        \\    let copy a: UInt8 = 1
+        \\    let copy b: Byte = 1
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const body = l.module.findFn("f").?.body.?;
+    try std.testing.expectEqual(.uint8, body[0].kind.let.value.?.ty.tag());
+    try std.testing.expectEqual(.byte, body[1].kind.let.value.?.ty.tag());
+    try std.testing.expect(!types.compatible(body[0].kind.let.value.?.ty, body[1].kind.let.value.?.ty));
+}

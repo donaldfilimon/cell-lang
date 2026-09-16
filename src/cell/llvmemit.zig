@@ -1922,6 +1922,34 @@ test "a UInt32 parameter lowers to i32" {
     try expectContains(e.text, "declare i8 @cell_take8(i8)");
 }
 
+test "an untyped integer literal in an Int8 slot lowers as i8" {
+    var e = try emitSource(
+        \\pub fn f() {
+        \\    let copy a: Int8 = 3
+        \\    let copy b: UInt32 = 7
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "store i8 3, ptr");
+    try expectContains(e.text, "store i32 7, ptr");
+}
+
+test "an untyped integer literal as a UInt32 argument lowers as i32" {
+    var e = try emitSource(
+        \\pub fn take(copy v: UInt32) -> UInt32;
+        \\pub fn take8(copy v: Int8) -> Int8;
+        \\pub fn f() -> UInt32 {
+        \\    let copy a: Int8 = take8(copy 1)
+        \\    return take(copy 7)
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "call i8 @cell_take8(i8 1)");
+    try expectContains(e.text, "call i32 @cell_take(i32 7)");
+}
+
 test "arc is still refused with a diagnostic rather than emitted wrongly" {
     // [T] USED to be here and now lowers as a cell_slice_t, so this moved to
     // the type that is still genuinely unplaceable: `arc` has no retain and
