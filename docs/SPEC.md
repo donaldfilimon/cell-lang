@@ -490,10 +490,14 @@ fn      let     var     mut     struct   enum
 if      else    match   return  use      pub
 true    false
 owned   shared  exclusive  arc  copy
+Some    None    Ok      Err
 ```
 
 The five ownership words are full keywords, not contextual ones. `arc` cannot
 be a variable name.
+
+`Some`, `None`, `Ok` and `Err` are keywords since 2026-09-16 so that they can
+never collide with a user enum's variants (section 9).
 
 ### 2.5 Reserved for future use
 

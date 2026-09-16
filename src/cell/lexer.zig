@@ -51,6 +51,14 @@ pub const TokenKind = enum {
     kw_exclusive,
     kw_arc,
     kw_copy,
+    // Value constructors for `T?` and `Result<T, E>` (SPEC 3.2, 3.4).
+    // Keywords, so a user enum can never declare a variant with one of
+    // these names and the uppercase-is-a-variant pattern rule needs no
+    // special case.
+    kw_some,
+    kw_none,
+    kw_ok,
+    kw_err,
     // Reserved words (SPEC 2.5). These lex as keywords but have NO parser
     // rule yet, which is the point: a program using one as a name now fails
     // with "expected item" or "expected expression" instead of silently
@@ -282,6 +290,10 @@ pub const Lexer = struct {
             .{ "exclusive", .kw_exclusive },
             .{ "arc", .kw_arc },
             .{ "copy", .kw_copy },
+            .{ "Some", .kw_some },
+            .{ "None", .kw_none },
+            .{ "Ok", .kw_ok },
+            .{ "Err", .kw_err },
             // SPEC 2.5, reserved. Keep this list and the enum above in the
             // same order as the specification's block, so a reader can diff
             // them by eye.
@@ -495,4 +507,20 @@ test "Self and self are distinct, and case still matters elsewhere" {
     try std.testing.expectEqual(TokenKind.kw_Self, tokens.items[1].kind);
     // A word merely starting with a reserved one is still an identifier.
     try std.testing.expectEqual(TokenKind.ident, tokens.items[2].kind);
+}
+
+test "Some, None, Ok and Err lex as keywords, not identifiers" {
+    const words = [_][]const u8{ "Some", "None", "Ok", "Err" };
+    const kinds = [_]TokenKind{ .kw_some, .kw_none, .kw_ok, .kw_err };
+    for (words, kinds) |word, kind| {
+        var lex = Lexer.init(word, "t.cell");
+        var tokens = try lex.tokenizeAll(std.testing.allocator);
+        defer tokens.deinit(std.testing.allocator);
+        try std.testing.expectEqual(kind, tokens.items[0].kind);
+    }
+    // A user identifier that merely starts the same way is untouched.
+    var lex = Lexer.init("Something", "t.cell");
+    var tokens = try lex.tokenizeAll(std.testing.allocator);
+    defer tokens.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TokenKind.ident, tokens.items[0].kind);
 }
