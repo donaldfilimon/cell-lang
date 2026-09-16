@@ -310,8 +310,10 @@ pub const Parser = struct {
         return self.expr(.{ .unary = .{ .op = op, .operand = p } }, start);
     }
 
-    /// A primary expression followed by any number of `.field` and `(args)`
-    /// suffixes, so `a.b(c).d` becomes a chain instead of a flattened name.
+    /// A primary expression followed by any number of `.field`, `(args)`, and
+    /// `[index]` suffixes, so `a.b(c)[i].d` becomes a chain instead of a
+    /// flattened name. `[` after a primary is indexing; a list literal is
+    /// only a primary.
     fn parsePostfix(self: *Parser) ParseError!ast.Expr {
         const start = self.current();
         var e = try self.parsePrimary();
@@ -328,6 +330,19 @@ pub const Parser = struct {
                 const callee = try self.allocator.create(ast.Expr);
                 callee.* = e;
                 e = self.expr(.{ .call = .{ .callee = callee, .args = args } }, start);
+                continue;
+            }
+            if (self.match(.l_bracket)) {
+                const saved = self.no_struct_lit;
+                self.no_struct_lit = false;
+                const index = try self.parseExpr();
+                self.no_struct_lit = saved;
+                try self.expect(.r_bracket);
+                const base = try self.allocator.create(ast.Expr);
+                base.* = e;
+                const idx = try self.allocator.create(ast.Expr);
+                idx.* = index;
+                e = self.expr(.{ .index = .{ .base = base, .index = idx } }, start);
                 continue;
             }
             break;
@@ -1239,6 +1254,33 @@ test "if keeps both bodies" {
     try std.testing.expectEqualStrings("flag", i.cond.kind.ident);
     try std.testing.expectEqual(@as(usize, 1), i.then_body.kind.block.len);
     try std.testing.expectEqual(@as(usize, 1), i.else_body.?.kind.block.len);
+}
+
+test "postfix indexing parses as an index expression" {
+    var tp = try parseForTest(
+        \\pub fn main() {
+        \\  let copy b = s[0]
+        \\}
+    );
+    defer tp.deinit();
+
+    const value = onlyStmt(tp.module).kind.let.value.?;
+    try std.testing.expectEqualStrings("s", value.kind.index.base.kind.ident);
+    try std.testing.expectEqual(@as(i64, 0), value.kind.index.index.kind.int);
+}
+
+test "postfix indexing chains after a field and a call" {
+    var tp = try parseForTest(
+        \\pub fn main() {
+        \\  let copy b = xs.data[i]
+        \\}
+    );
+    defer tp.deinit();
+
+    const value = onlyStmt(tp.module).kind.let.value.?;
+    try std.testing.expectEqualStrings("data", value.kind.index.base.kind.field.name);
+    try std.testing.expectEqualStrings("xs", value.kind.index.base.kind.field.base.kind.ident);
+    try std.testing.expectEqualStrings("i", value.kind.index.index.kind.ident);
 }
 
 test "call on a field chain parses as a postfix chain" {

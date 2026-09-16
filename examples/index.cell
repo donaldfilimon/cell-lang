@@ -1,0 +1,47 @@
+// Postfix indexing a[i] for String and [Byte] returns Byte?.
+// Out of bounds, including a negative index, is None; never a panic.
+//
+// Status: parses, passes `cell check`, and the emitted C compiles, links and
+// runs, printing 125 (see EXPECT-OUTPUT). C backend only: LLVM and MLIR refuse
+// indexing together with `cannot lower`, so the agreement contract holds.
+// [Int] indexing and indexed assignment `a[i] = x` are not implemented.
+// EXPECT-OUTPUT: 125
+
+pub fn print_int(copy value: Int);
+
+pub fn present(copy o: Byte?) -> Int {
+    return match o {
+        Some(_) => 1,
+        None => 0,
+    }
+}
+
+pub fn main() {
+    let owned s = "Hi"
+    let copy H: Byte = 72
+    let copy i_byte: Byte = 105
+    let copy seven: Byte = 7
+    let copy nine: Byte = 9
+    let owned xs: [Byte] = [seven, nine]
+
+    let copy a = match s[0] {
+        Some(v) => if v == H { 1 } else { 0 },
+        None => 0,
+    }
+    let copy b = match s[1] {
+        Some(v) => if v == i_byte { 2 } else { 0 },
+        None => 0,
+    }
+    let copy c = match s[2] {
+        Some(_) => 0,
+        None => 4,
+    }
+    let copy d = match s[-1] {
+        Some(_) => 0,
+        None => 8,
+    }
+    let copy e = present(xs[0])
+    let copy f = present(xs[1])
+    let copy g = present(xs[2])
+    print_int(a + b + c + d + e * 100 + f * 10 + g)
+}

@@ -1898,6 +1898,12 @@ pub const Checker = struct {
             .ident, .field => {
                 if (try self.placeOf(e)) |place| try self.readPlace(place);
             },
+            // Indexing reads the base; it does not move it. `a[i]` after a
+            // move of `a` is use-after-move.
+            .index => |*ix| {
+                try self.checkExpr(ix.base);
+                try self.checkExpr(ix.index);
+            },
             .call => |*c| try self.checkCall(c, e.span),
             .binary => |*b| {
                 try self.checkExpr(b.left);
@@ -2913,6 +2919,8 @@ pub const Checker = struct {
                     .span = e.span,
                 } };
             },
+            // A Byte? copy of one element; not an arc handle.
+            .index => .not_arc,
             .if_expr => |i| blk: {
                 const then_v = try self.arcUniqueSource(i.then_body);
                 // A missing `else` yields unit on that path, which is not
@@ -3206,6 +3214,9 @@ pub const Checker = struct {
                     .span = e.span,
                 } };
             },
+            // Indexing copies a byte; it is not an owned place and does not
+            // move the base. The read is `checkExpr`'s.
+            .index => .no_owned_place,
             .if_expr => |i| blk: {
                 const then_v = try self.ownedMoveBranch(i.then_body);
                 // A missing `else` yields unit on that path, which owns
@@ -3890,6 +3901,7 @@ pub const Checker = struct {
             },
             // A fresh value, never a place, never a borrow.
             .wrap => .not_borrow,
+            .index => .not_borrow,
         };
     }
 
@@ -4722,6 +4734,7 @@ fn exprUsesName(e: *const ast.Expr, name: []const u8) bool {
         .binary => |b| exprUsesName(b.left, name) or exprUsesName(b.right, name),
         .unary => |u| exprUsesName(u.operand, name),
         .field => |f| exprUsesName(f.base, name),
+        .index => |ix| exprUsesName(ix.base, name) or exprUsesName(ix.index, name),
         .struct_lit => |sl| blk: {
             for (sl.fields) |*f| {
                 if (exprUsesName(&f.value, name)) break :blk true;
@@ -4834,6 +4847,7 @@ fn exprPropagatesName(e: *const ast.Expr, name: []const u8) bool {
         .binary => |b| exprPropagatesName(b.left, name) or exprPropagatesName(b.right, name),
         .unary => |u| exprPropagatesName(u.operand, name),
         .field => |f| exprPropagatesName(f.base, name),
+        .index => |ix| exprPropagatesName(ix.base, name) or exprPropagatesName(ix.index, name),
         .struct_lit => |sl| blk: {
             for (sl.fields) |*f| {
                 if (exprPropagatesName(&f.value, name)) break :blk true;
@@ -4958,6 +4972,7 @@ fn oracleDeclCountExpr(e: *const ast.Expr, name: []const u8) usize {
         .binary => |b| oracleDeclCountExpr(b.left, name) + oracleDeclCountExpr(b.right, name),
         .unary => |u| oracleDeclCountExpr(u.operand, name),
         .field => |f| oracleDeclCountExpr(f.base, name),
+        .index => |ix| oracleDeclCountExpr(ix.base, name) + oracleDeclCountExpr(ix.index, name),
         .annotated => |a| oracleDeclCountExpr(a.value, name),
         .struct_lit => |sl| blk: {
             var n: usize = 0;
@@ -5057,6 +5072,10 @@ fn oracleTaintExpr(
         },
         .unary => |u| try oracleTaintExpr(gpa, u.operand, names, changed),
         .field => |f| try oracleTaintExpr(gpa, f.base, names, changed),
+        .index => |ix| {
+            try oracleTaintExpr(gpa, ix.base, names, changed);
+            try oracleTaintExpr(gpa, ix.index, names, changed);
+        },
         .annotated => |a| try oracleTaintExpr(gpa, a.value, names, changed),
         .struct_lit => |sl| {
             for (sl.fields) |*f| try oracleTaintExpr(gpa, &f.value, names, changed);
@@ -5166,6 +5185,8 @@ fn oracleFindExpr(
         .binary => |b| oracleFindExpr(b.left, names, .other, min_start, strict_from) orelse
             oracleFindExpr(b.right, names, .other, min_start, strict_from),
         .field => |f| oracleFindExpr(f.base, names, .other, min_start, strict_from),
+        .index => |ix| oracleFindExpr(ix.base, names, .other, min_start, strict_from) orelse
+            oracleFindExpr(ix.index, names, .other, min_start, strict_from),
         .struct_lit => |sl| blk: {
             for (sl.fields) |*f| {
                 if (oracleFindExpr(&f.value, names, .other, min_start, strict_from)) |x| break :blk x;
@@ -5499,6 +5520,21 @@ test "R2: a return moves the returned place" {
     ,
         \\t.cell:11:12: error: use of 'b' after it was moved
         \\t.cell:10:10: note: 'b' was moved here by the call to 'take'
+        \\
+    );
+}
+
+test "indexing reads the base so a move then a[i] is use after move" {
+    try expectDiagnostics(
+        \\pub fn take(owned s: String) { }
+        \\pub fn main() {
+        \\    let owned s = "ab"
+        \\    take(s)
+        \\    let copy b = s[0]
+        \\}
+    ,
+        \\t.cell:5:18: error: use of 's' after it was moved
+        \\t.cell:4:10: note: 's' was moved here by the call to 'take'
         \\
     );
 }

@@ -1323,7 +1323,7 @@ literal really is wanted in a condition, parentheses restore it:
 `Expr.list_lit` carries the element expressions. An empty list emits
 `cell_slice_empty()`. A populated list lowers to a GNU statement expression
 that `cell_slice_alloc`s a buffer and `cell_slice_push`es each element.
-There is no indexing operator (section 6.11).
+Indexing `a[i]` is implemented for `String` and `[Byte]` only (section 6.11).
 
 ### 6.9 `if` expressions
 
@@ -1365,9 +1365,29 @@ loop-shaped program parses and does nothing.
 
 ### 6.11 Indexing
 
-**Status: designed, not implemented.** `a[0]` does not parse in expression
-position; `[` only begins a list literal, and `parsePostfix` has no bracket
-suffix.
+**Status: implemented for `String` and `[Byte]` in expression position
+(2026-09-16).** `parsePostfix` accepts `[ expr ]` after a primary, so `s[0]`
+and `xs[i]` parse as an index expression, not a list literal. `[` still
+begins a list literal when it is a primary.
+
+```cell
+let copy b: Byte? = s[0]
+let copy c: Byte? = xs[i]
+```
+
+- `String[i]` and `[Byte][i]` type as `Byte?`. The C backend calls
+  `cell_str_byte_at` and `cell_bytes_at`, which return `cell_opt_byte_t`:
+  absent on out-of-bounds, including a negative index. Never a panic, never
+  a truncation, never an unchecked `xs.ptr[i]`.
+- The index must be `Int`. Other integer widths are refused rather than
+  silently truncated.
+- `[Int][i]`, a struct `[i]`, and every other base type are refused with a
+  diagnostic that names the base type.
+- Indexing reads the base; it does not move it. A move of `a` then `a[i]`
+  is use-after-move.
+- Indexed assignment `a[i] = x` parses and is refused. General `[T]`
+  indexing is not implemented.
+- LLVM and MLIR refuse indexing together with `cannot lower` at the span.
 
 ---
 
@@ -2132,7 +2152,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Block expression parsing | implemented |
 | Block expression lowering | implemented |
 | Block expression typing (tail expression is the value; `if` branches must agree) | implemented 2026-09-15 |
-| Indexing `a[i]` | designed, not implemented |
+| Indexing `a[i]` | implemented for `String` and `[Byte]` as `Byte?` (C); LLVM/MLIR refuse; `[Int]` and indexed assignment refused |
 
 ### Statements
 

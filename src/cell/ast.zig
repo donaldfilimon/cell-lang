@@ -84,6 +84,8 @@ pub const Expr = struct {
         annotated: struct { ownership: Ownership, value: *Expr },
         /// `base.name`
         field: struct { base: *Expr, name: []const u8 },
+        /// `base[index]`. A value, not a place: indexed assignment is refused.
+        index: struct { base: *Expr, index: *Expr },
         /// `Name { a: 1, b: 2 }`
         struct_lit: struct { name: []const u8, fields: []FieldInit },
         /// `[a, b, c]` or `[]`

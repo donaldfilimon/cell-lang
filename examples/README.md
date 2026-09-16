@@ -110,6 +110,10 @@ the three backends disagree about the program.
 same contract: LLVM and MLIR refuse `Some`/`None`/`Ok`/`Err` together with
 `cannot lower`. Scalar payloads only.
 
+`index.cell` (prints 125) is C only by the same contract: postfix `a[i]` for
+`String` and `[Byte]` lowers through `cell_str_byte_at` / `cell_bytes_at`,
+and LLVM and MLIR refuse indexing together with `cannot lower`.
+
 `prelude.cell` (prints 123) is C only: it calls prelude functions that return
 optionals and owned Strings, which LLVM and MLIR refuse together.
 
@@ -204,6 +208,7 @@ are not.
 | `unit_type.cell` | explicit `()` in type position: `-> ()` is the same unit as an omitted `->`; a `let` of `()` is refused |
 | `escapes.cell` | SPEC 2.8 simple escapes: `"\n"` is one newline byte and `"\\"` is one backslash; prints 11 through all three backends |
 | `silent_literals.cell` | SPEC 2.6/2.7: `0x1F` is 31, `1_000` is 1000, `1e9` is a Float; prints 31 through all three backends |
+| `index.cell` | postfix `a[i]` for `String` and `[Byte]` as `Byte?`; prints 125 through C; LLVM and MLIR refuse together |
 
 ## Running `arc.cell`, the one example with a C host
 

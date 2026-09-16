@@ -2445,12 +2445,30 @@ pub const Generator = struct {
                     try out.print(".{s}", .{f.name});
                 }
             },
+            .index => |ix| try self.emitIndex(ix, indent),
             .struct_lit => |sl| try self.emitStructLit(sl, indent),
             .list_lit => |items| try self.emitListLit(items, null, indent),
             .block, .if_expr, .match_expr => try self.emitValueExpr(e, null, indent),
             .annotated => |a| try self.emitExpr(a.value, indent),
             .wrap => |w| try self.emitWrap(w, null, indent),
         }
+    }
+
+    /// `a[i]` for String and `[Byte]`. Bounds-checked runtime helpers return
+    /// `cell_opt_byte_t`; never an unchecked `xs.ptr[i]`.
+    fn emitIndex(self: *Generator, ix: anytype, indent: usize) EmitError!void {
+        const out = self.writer;
+        const base_ty = try self.inferExpr(ix.base);
+        if (base_ty.shape == .str or base_ty.shape == .string) {
+            try out.writeAll("cell_str_byte_at(");
+            try self.emitArgLike(ix.base, CType.str, indent);
+        } else {
+            try out.writeAll("cell_bytes_at(");
+            try self.emitArgLike(ix.base, CType.slice, indent);
+        }
+        try out.writeAll(", ");
+        try self.emitArgLike(ix.index, CType.int64, indent);
+        try out.writeAll(")");
     }
 
     /// `Some(e)`, `None`, `Ok(e)`, `Err(e)`. `want` is the destination's
@@ -3447,6 +3465,11 @@ pub const Generator = struct {
                 }
                 return CType.unknown;
             },
+            .index => {
+                const p = try self.arena.create(CType);
+                p.* = .{ .text = "uint8_t", .shape = .byte };
+                return .{ .text = "cell_opt_byte_t", .shape = .optional, .payload = p };
+            },
             .struct_lit => |sl| return try self.namedType(sl.name),
             .list_lit => return CType.slice,
             .block => |stmts| {
@@ -3964,6 +3987,7 @@ fn exprUses(e: *const ast.Expr, name: []const u8) bool {
         .binary => |b| exprUses(b.left, name) or exprUses(b.right, name),
         .unary => |u| exprUses(u.operand, name),
         .field => |f| exprUses(f.base, name),
+        .index => |ix| exprUses(ix.base, name) or exprUses(ix.index, name),
         .struct_lit => |sl| blk: {
             for (sl.fields, 0..) |_, i| {
                 if (exprUses(&sl.fields[i].value, name)) break :blk true;
@@ -4025,6 +4049,10 @@ fn collectIdents(arena: std.mem.Allocator, e: *const ast.Expr, set: *std.ArrayLi
         },
         .field => |f| if (try collectIdents(arena, f.base, set)) {
             added = true;
+        },
+        .index => |ix| {
+            if (try collectIdents(arena, ix.base, set)) added = true;
+            if (try collectIdents(arena, ix.index, set)) added = true;
         },
         .struct_lit => |sl| for (sl.fields, 0..) |_, i| if (try collectIdents(arena, &sl.fields[i].value, set)) {
             added = true;
@@ -4578,6 +4606,25 @@ test "a list parameter lowers to a slice, not void*" {
     defer e.deinit();
     try expectContains(e.text, "int64_t cell_count(cell_slice_t xs);");
     try expectAbsent(e.text, "void*");
+}
+
+test "postfix indexing of String and [Byte] calls the bounds-checked helpers" {
+    var e = try emitSource(
+        \\pub fn f(shared s: String, shared xs: [Byte], copy i: Int) -> Byte? {
+        \\  return s[i]
+        \\}
+        \\pub fn g(shared xs: [Byte]) -> Byte? {
+        \\  return xs[0]
+        \\}
+        \\pub fn h(owned s: String, copy i: Int) -> Byte? {
+        \\  return s[i]
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_str_byte_at(s, i)");
+    try expectContains(e.text, "cell_bytes_at(xs, 0)");
+    try expectContains(e.text, "cell_str_byte_at(cell_string_as_str(&s), i)");
+    try expectAbsent(e.text, ".ptr[");
 }
 
 test "calls are mangled and reach the runtime intrinsics" {

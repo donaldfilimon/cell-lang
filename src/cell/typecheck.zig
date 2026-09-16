@@ -26,6 +26,7 @@ const Type = types.Type;
 const CallExpr = @FieldType(ast.Expr.Kind, "call");
 const BinaryExpr = @FieldType(ast.Expr.Kind, "binary");
 const FieldExpr = @FieldType(ast.Expr.Kind, "field");
+const IndexExpr = @FieldType(ast.Expr.Kind, "index");
 const StructLitExpr = @FieldType(ast.Expr.Kind, "struct_lit");
 
 pub const Checker = struct {
@@ -293,6 +294,15 @@ pub const Checker = struct {
             },
 
             .assign => |*a| {
+                // Indexed assignment `a[i] = x` parses (the target is an
+                // expression) and is refused here. The runtime helpers return
+                // a Byte?; they do not write.
+                if (isIndexExpr(&a.target)) {
+                    try self.errf(a.target.span, "indexed assignment is not implemented", .{});
+                    _ = try self.checkExpr(&a.target);
+                    _ = try self.checkExpr(&a.value);
+                    return;
+                }
                 // R14 (immutable assignment) is borrowck's rule. Typecheck only
                 // checks that the value's type matches the target.
                 const target = try self.checkExpr(&a.target);
@@ -353,6 +363,7 @@ pub const Checker = struct {
             .call => |*c| return try self.checkCall(expr.span, c),
             .binary => |*b| return try self.checkBinary(expr.span, b),
             .field => |*f| return try self.checkField(expr.span, f),
+            .index => |*ix| return try self.checkIndex(expr.span, ix),
             .struct_lit => |*sl| return try self.checkStructLit(expr.span, sl),
 
             .unary => |*u| {
@@ -721,6 +732,33 @@ pub const Checker = struct {
         return types.t_unknown;
     }
 
+    /// `a[i]` in expression position. `String` and `[Byte]` type as `Byte?`
+    /// (the runtime helpers return `cell_opt_byte_t`: absent on OOB, never a
+    /// panic). The index is `Int`; other integer widths are refused rather
+    /// than truncated. Anything else names the base type and stays unknown.
+    fn checkIndex(self: *Checker, span: ast.Span, ix: *const IndexExpr) CheckError!Type {
+        const base = try self.checkExpr(ix.base);
+        const index = try self.checkExpr(ix.index);
+        if (!index.isUnknown() and index.tag() != .int) {
+            try self.errf(ix.index.span, "index must be Int, found {s}", .{
+                try self.typeName(index),
+            });
+        }
+        if (base.isUnknown()) return try self.optionalOf(types.t_byte);
+        const indexable = switch (base) {
+            .string => true,
+            .list => |elem| elem.tag() == .byte,
+            else => false,
+        };
+        if (!indexable) {
+            try self.errf(span, "cannot index a value of type {s}", .{
+                try self.typeName(base),
+            });
+            return types.t_unknown;
+        }
+        return try self.optionalOf(types.t_byte);
+    }
+
     fn checkStructLit(self: *Checker, span: ast.Span, sl: *const StructLitExpr) CheckError!Type {
         const def = self.structs.get(sl.name) orelse {
             for (sl.fields) |*fi| _ = try self.checkExpr(&fi.value);
@@ -947,6 +985,12 @@ pub const Checker = struct {
 fn accepts(expected: Type, actual: Type, value: *const ast.Expr) bool {
     if (types.compatible(expected, actual)) return true;
     return literalFits(expected, value);
+}
+
+fn isIndexExpr(e: *const ast.Expr) bool {
+    var cur = e;
+    while (cur.kind == .annotated) cur = cur.kind.annotated.value;
+    return cur.kind == .index;
 }
 
 fn literalFits(expected: Type, value: *const ast.Expr) bool {
@@ -1370,6 +1414,68 @@ test "reading a field a struct does not have is reported" {
     );
     try t.expectCount(1);
     try t.expectDiag(0, .err, 5, 12, "struct 'Point' has no field 'y'");
+}
+
+test "String and [Byte] index as Byte?" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f(shared s: String, shared xs: [Byte], copy i: Int) -> Byte? {
+        \\    let copy a: Byte? = s[i]
+        \\    let copy b: Byte? = xs[0]
+        \\    return a
+        \\}
+    );
+    try t.expectClean();
+}
+
+test "indexing [Int] names the base type" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f(shared xs: [Int]) -> Byte? {
+        \\    return xs[0]
+        \\}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 2, 12, "cannot index a value of type [Int]");
+}
+
+test "indexing a struct names the base type" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub struct Point { copy x: Int }
+        \\pub fn f(shared p: Point) -> Byte? {
+        \\    return p[0]
+        \\}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 3, 12, "cannot index a value of type Point");
+}
+
+test "an index that is not Int is refused rather than truncated" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f(shared s: String, copy i: UInt32) -> Byte? {
+        \\    return s[i]
+        \\}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 2, 14, "index must be Int, found UInt32");
+}
+
+test "indexed assignment is not implemented" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f(exclusive xs: [Byte], copy i: Int, copy v: Byte) {
+        \\    xs[i] = v
+        \\}
+    );
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 2, 5, "indexed assignment is not implemented");
 }
 
 test "a struct literal checks each field's name and type" {

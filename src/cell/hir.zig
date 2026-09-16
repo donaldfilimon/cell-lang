@@ -800,6 +800,11 @@ const Lowerer = struct {
                 try self.cannotLower(e.span, "optional and Result values are not lowered by the IR backends");
                 return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
             },
+
+            .index => {
+                try self.cannotLower(e.span, "indexing is not lowered by the IR backends");
+                return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "index" });
+            },
         }
     }
 
