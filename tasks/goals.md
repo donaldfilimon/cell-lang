@@ -2,6 +2,7 @@
 
 ## Project Grok bots follow Cell's gate
 status: done
+- Also: project `computer-control` skill (Grok Bot Agent Computer, not Claude/Orca); `reviewer` and `test-writer` overlays so those agents stop reviewing as Rust. `grok inspect` lists all three agents and both skills as project.
 - Project overlays under `.grok/{agents,personas,skills,rules}` shadow the bundled implementer `fmt`/`clippy` bar with `-Dswift=false`, `tools/check.sh`, the `--test-filter`/`refAllDecls` false-green trap, and the canonical-`main`/worktree rule.
 - `tools/check-grok-bots.sh` greps those live files and fails closed if a token or the implementer overlay is dropped; `tools/tests/test-grok-bots.sh` drives that script (eight cases). Wired as gate stage 15.
 - `grok inspect --json` lists `implementer` (agent) and `cell-lang` (skill) as `source.type=project`, twice identical. Inspect has no personas catalog; `.grok/personas/implementer.toml` is loaded by Grok but not listed there.

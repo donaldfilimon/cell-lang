@@ -13,6 +13,7 @@ Done bar (replaces "run fmt and clippy"):
 Operational traps:
 - `--test-filter` matching nothing still exits 0 because `src/root.zig` has an anonymous `test { refAllDecls(@This()); }` with no name to exclude. Confirm the named test appears in the output; the count is always one higher than the named matches.
 - Unique work must land on canonical `main` in this checkout. A worktree is unfinished until its work is merged back, the worktree directory is removed, and the branch label is deleted. Do not leave unique commits only in a worktree.
+- Computer control is Grok Bot's Agent Computer (cloud), not Claude Computer Use and not Orca. GUI clicks are not a substitute for `-Dswift=false` / `tools/check.sh`. Take over for passwords and 2FA; never paste secrets into chat.
 
 Rules:
 - Follow existing Zig (master idioms). Smallest change that solves the problem.
