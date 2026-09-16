@@ -364,12 +364,10 @@ pub const Parser = struct {
             return self.expr(.{ .annotated = .{ .ownership = own, .value = p } }, start);
         }
         if (self.match(.int)) {
-            const v = std.fmt.parseInt(i64, self.prev().lexeme, 10) catch return error.InvalidLiteral;
-            return self.expr(.{ .int = v }, start);
+            return self.expr(.{ .int = try self.intFromPrev() }, start);
         }
         if (self.match(.float)) {
-            const v = std.fmt.parseFloat(f64, self.prev().lexeme) catch return error.InvalidLiteral;
-            return self.expr(.{ .float = v }, start);
+            return self.expr(.{ .float = try self.floatFromPrev() }, start);
         }
         if (self.match(.string)) {
             return self.expr(.{ .string = try self.stringValue(self.prev().lexeme) }, start);
@@ -410,6 +408,7 @@ pub const Parser = struct {
         if (self.match(.l_brace)) return try self.parseBlockExpr(start);
         if (self.match(.kw_if)) return try self.parseIf(start);
         if (self.match(.kw_match)) return try self.parseMatch(start);
+        if (self.check(.invalid)) return self.failInvalid();
         return self.fail("expected expression");
     }
 
@@ -546,24 +545,23 @@ pub const Parser = struct {
 
     fn parsePattern(self: *Parser) ParseError!ast.Pattern {
         const start = self.current();
+        if (self.check(.invalid)) return self.failInvalid();
         if (self.match(.minus)) {
             if (self.match(.int)) {
-                const v = std.fmt.parseInt(i64, self.prev().lexeme, 10) catch return error.InvalidLiteral;
+                const v = try self.intFromPrev();
                 return self.patternNode(.{ .int = -v }, start);
             }
             if (self.match(.float)) {
-                const v = std.fmt.parseFloat(f64, self.prev().lexeme) catch return error.InvalidLiteral;
+                const v = try self.floatFromPrev();
                 return self.patternNode(.{ .float = -v }, start);
             }
             return self.fail("expected a number after '-' in pattern");
         }
         if (self.match(.int)) {
-            const v = std.fmt.parseInt(i64, self.prev().lexeme, 10) catch return error.InvalidLiteral;
-            return self.patternNode(.{ .int = v }, start);
+            return self.patternNode(.{ .int = try self.intFromPrev() }, start);
         }
         if (self.match(.float)) {
-            const v = std.fmt.parseFloat(f64, self.prev().lexeme) catch return error.InvalidLiteral;
-            return self.patternNode(.{ .float = v }, start);
+            return self.patternNode(.{ .float = try self.floatFromPrev() }, start);
         }
         if (self.match(.string)) {
             return self.patternNode(.{ .string = try self.stringValue(self.prev().lexeme) }, start);
@@ -852,7 +850,53 @@ pub const Parser = struct {
     fn fail(self: *Parser, msg: []const u8) ParseError {
         return self.failSpan(tokenSpan(self.current()), msg);
     }
+
+    fn failInvalid(self: *Parser) ParseError {
+        return self.fail(invalidTokenMessage(self.current().lexeme));
+    }
+
+    /// Base 0 so `0x`/`0b`/`0o` prefixes select the radix. Underscores in a
+    /// well-formed lexeme are ignored by `parseInt`.
+    fn intFromPrev(self: *Parser) ParseError!i64 {
+        return std.fmt.parseInt(i64, self.prev().lexeme, 0) catch {
+            return self.failSpan(tokenSpan(self.prev()), "invalid integer literal");
+        };
+    }
+
+    fn floatFromPrev(self: *Parser) ParseError!f64 {
+        return std.fmt.parseFloat(f64, self.prev().lexeme) catch {
+            return self.failSpan(tokenSpan(self.prev()), "invalid float literal");
+        };
+    }
 };
+
+fn hasHexPrefix(lexeme: []const u8) bool {
+    return lexeme.len >= 2 and lexeme[0] == '0' and (lexeme[1] == 'x' or lexeme[1] == 'X');
+}
+
+fn looksLikeNumberLexeme(lexeme: []const u8) bool {
+    if (lexeme.len == 0) return false;
+    return std.ascii.isDigit(lexeme[0]);
+}
+
+fn invalidTokenMessage(lexeme: []const u8) []const u8 {
+    if (lexeme.len > 0 and lexeme[0] == '"') return "unterminated string literal";
+    if (hasHexPrefix(lexeme)) {
+        if (std.mem.indexOfScalar(u8, lexeme, '.') != null) return "hexadecimal floats are not implemented";
+        for (lexeme[2..]) |c| {
+            if (c == 'p' or c == 'P') return "hexadecimal floats are not implemented";
+        }
+        return "invalid integer literal";
+    }
+    if (looksLikeNumberLexeme(lexeme)) {
+        if (std.mem.indexOfScalar(u8, lexeme, '.') != null) return "invalid float literal";
+        for (lexeme) |c| {
+            if (c == 'e' or c == 'E') return "invalid float literal";
+        }
+        return "invalid integer literal";
+    }
+    return "unexpected token";
+}
 
 // ── tests ───────────────────────────────────────────────────────────────
 
@@ -1395,5 +1439,74 @@ test "an unknown string escape is a parse error" {
         try parseErrorFor(
             \\pub fn main() { print("\u{0}") }
         ),
+    );
+}
+
+test "hex bin oct and separators parse as the integer value" {
+    var tp = try parseForTest(
+        \\pub fn main() {
+        \\  let copy a = 0x1F
+        \\  let copy b = 0X1F
+        \\  let copy c = 0b1010
+        \\  let copy d = 0B1010
+        \\  let copy e = 0o17
+        \\  let copy f = 0O17
+        \\  let copy g = 1_000
+        \\  let copy h = 0xFF_FF
+        \\}
+    );
+    defer tp.deinit();
+    const body = tp.module.items[0].kind.fn_def.body.?;
+    try std.testing.expectEqual(@as(i64, 31), body[0].kind.let.value.?.kind.int);
+    try std.testing.expectEqual(@as(i64, 31), body[1].kind.let.value.?.kind.int);
+    try std.testing.expectEqual(@as(i64, 10), body[2].kind.let.value.?.kind.int);
+    try std.testing.expectEqual(@as(i64, 10), body[3].kind.let.value.?.kind.int);
+    try std.testing.expectEqual(@as(i64, 15), body[4].kind.let.value.?.kind.int);
+    try std.testing.expectEqual(@as(i64, 15), body[5].kind.let.value.?.kind.int);
+    try std.testing.expectEqual(@as(i64, 1000), body[6].kind.let.value.?.kind.int);
+    try std.testing.expectEqual(@as(i64, 65535), body[7].kind.let.value.?.kind.int);
+}
+
+test "exponent floats parse as Float values" {
+    var tp = try parseForTest(
+        \\pub fn main() {
+        \\  let copy a = 1e9
+        \\  let copy b = 1E9
+        \\  let copy c = 1.5e-3
+        \\  let copy d = 1.5e+3
+        \\}
+    );
+    defer tp.deinit();
+    const body = tp.module.items[0].kind.fn_def.body.?;
+    try std.testing.expectEqual(@as(f64, 1e9), body[0].kind.let.value.?.kind.float);
+    try std.testing.expectEqual(@as(f64, 1e9), body[1].kind.let.value.?.kind.float);
+    try std.testing.expectEqual(@as(f64, 1.5e-3), body[2].kind.let.value.?.kind.float);
+    try std.testing.expectEqual(@as(f64, 1.5e3), body[3].kind.let.value.?.kind.float);
+}
+
+test "unterminated string is a parse error" {
+    try std.testing.expectEqualStrings(
+        "unterminated string literal",
+        try parseErrorFor(
+            \\pub fn main() { let copy s = "hello
+        ),
+    );
+}
+
+test "hexadecimal floats are refused as literals" {
+    try std.testing.expectEqualStrings(
+        "hexadecimal floats are not implemented",
+        try parseErrorFor("pub fn main() { let copy a = 0x1p1 }"),
+    );
+}
+
+test "adjacent and trailing underscores are refused as literals" {
+    try std.testing.expectEqualStrings(
+        "invalid integer literal",
+        try parseErrorFor("pub fn main() { let copy a = 1_ }"),
+    );
+    try std.testing.expectEqualStrings(
+        "invalid integer literal",
+        try parseErrorFor("pub fn main() { let copy a = 1__000 }"),
     );
 }

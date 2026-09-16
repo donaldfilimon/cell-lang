@@ -1,0 +1,10 @@
+// EXPECT: currently-rejected
+// Violates: docs/SPEC.md section 2.7 (hexadecimal floats are not implemented).
+//
+// `0x1p1` must not silently become the integer 0 or 1. The lexer keeps the
+// whole form as one token and the parser names it as a literal problem:
+//   error: hexadecimal floats are not implemented
+
+pub fn f() {
+    let copy a = 0x1p1
+}

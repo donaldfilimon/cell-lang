@@ -1,0 +1,27 @@
+// Hex, binary, octal, underscore separators, and exponent floats
+// (SPEC 2.6 and 2.7, FEATURES LEX-03).
+//
+// This file used to live in examples/rejected/ because `0x1F`, `1_000`, and
+// `1e9` each lexed as two tokens. `0x1F` was the integer 0 plus identifier
+// `x1F`, so `a` was 0. They are now one token each: `0x1F` is 31, `1_000`
+// is 1000, and `1e9` is a Float (it would not type-check as `Float` if it
+// were still an Int). Hexadecimal floats (`0x1p1`) stay refused.
+//
+// Scalar only, so all three backends carry it. The printed number is 31
+// only when the hex value, the separator value, and the exponent float
+// all match.
+// EXPECT-OUTPUT: 31
+
+pub fn print_int(copy value: Int);
+
+pub fn main() {
+    let copy hex = 0x1F
+    let copy sep = 1_000
+    let copy exp: Float = 1e9
+    let copy want_exp: Float = 1000000000.0
+    if hex == 31 && sep == 1000 && exp == want_exp {
+        print_int(31)
+    } else {
+        print_int(0)
+    }
+}

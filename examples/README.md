@@ -172,9 +172,11 @@ Run it rather than trusting a number here, including this paragraph's.
 comments.
 
 Still not implemented: loops other than `while`, generics, enum
-payloads, and hex / underscore / exponent literals. Scalar `Result<T, E>`
-constructs and matches in C; LLVM and MLIR refuse those programs. `arc`
-retain/release is implemented in the C backend, with the gaps
+payloads, Unicode identifiers, hexadecimal floats, and raw / interpolated /
+multi-line strings. Hex / binary / octal integers, underscore separators,
+and exponent floats are implemented; see `silent_literals.cell`. Scalar
+`Result<T, E>` constructs and matches in C; LLVM and MLIR refuse those
+programs. `arc` retain/release is implemented in the C backend, with the gaps
 `docs/OWNERSHIP.md` R11 names.
 Stem pairing and `while`/`break`/`continue` are implemented; `for` and `loop`
 are not.
@@ -201,6 +203,7 @@ are not.
 | `while_is_now_a_loop.cell` | the same program that once passed and silently did nothing, now looping correctly; its header records all four meanings it has had |
 | `unit_type.cell` | explicit `()` in type position: `-> ()` is the same unit as an omitted `->`; a `let` of `()` is refused |
 | `escapes.cell` | SPEC 2.8 simple escapes: `"\n"` is one newline byte and `"\\"` is one backslash; prints 11 through all three backends |
+| `silent_literals.cell` | SPEC 2.6/2.7: `0x1F` is 31, `1_000` is 1000, `1e9` is a Float; prints 31 through all three backends |
 
 ## Running `arc.cell`, the one example with a C host
 
@@ -289,17 +292,19 @@ fail for opposite reasons, so keep both:
   aggregate transfer and partial-move drop state exist. Copy String/list fields
   are rejected structurally at declaration time for the same two-owner hazard.
 
-Two other files are not ownership bugs at all. One is currently-rejected for
-the wrong reason (unknown identifier); the other, `unknown_type.cell`, is
-currently-rejected for TYPE-02:
+Two other files are not ownership bugs at all:
 
-- `silent_literals.cell`: currently-rejected. `0x1F`, `1_000`, and `1e9` each
-  lex as two tokens. Today the checker reports `unknown identifier 'x1F'`;
-  the lexer still splits the literal.
+- `hex_float.cell`: currently-rejected. Hexadecimal floats (`0x1p1`) are not
+  implemented; the diagnostic names that, rather than splitting the form into
+  `0` plus an identifier.
 - `unknown_type.cell`: currently-rejected. A name that is not a primitive, a
   declared struct, a declared enum, or an implemented constructed type is
   `unknown type`. `Int128` stands in for a width Cell still does not have;
   `UInt32` is a real primitive as of the additional-widths landing.
+
+`silent_literals.cell` used to live here, rejected as `unknown identifier
+'x1F'` because the lexer split `0x1F`. Hex, separators, and exponent floats
+now parse; the accepted successor is `examples/silent_literals.cell`.
 
 A third file used to live here for the same reason: `while_is_not_a_loop.cell`,
 rejected as `unknown identifier 'while'` because `while` was not yet a

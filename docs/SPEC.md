@@ -539,50 +539,67 @@ which records the history and current execution contract.
 
 ### 2.6 Integer literals
 
-**Status: implemented (decimal only).**
+**Status: implemented.** Decimal, hexadecimal, binary, octal, and underscore
+separators. There is no sign in the literal itself: `-1` is unary negation
+applied to `1` (section 6.5). One exception exists inside patterns, where `-`
+followed by a numeric literal is folded into a negative literal pattern
+(section 9), because a pattern is not an expression and cannot contain a unary
+operator.
 
 ```
-int_literal = ASCII digit+
+digit          = "0" ... "9"
+hex_digit      = digit | "a" ... "f" | "A" ... "F"
+bin_digit      = "0" | "1"
+oct_digit      = "0" ... "7"
+
+decimal        = digit (digit | "_")*
+hexadecimal    = "0" ("x" | "X") hex_digit (hex_digit | "_")*
+binary         = "0" ("b" | "B") bin_digit (bin_digit | "_")*
+octal          = "0" ("o" | "O") oct_digit (oct_digit | "_")*
+int_literal    = decimal | hexadecimal | binary | octal
 ```
 
-Decimal digits only. There is no sign in the literal itself: `-1` is unary
-negation applied to `1` (section 6.5). One exception exists inside patterns,
-where `-` followed by a numeric literal is folded into a negative literal
-pattern (section 9), because a pattern is not an expression and cannot contain
-a unary operator.
+Underscores separate digits. They cannot be leading, trailing, or adjacent,
+and they cannot sit next to a prefix. A malformed separator or a prefix with
+no digits is an invalid integer literal, not a number plus an identifier.
+`1_000` is 1000; `0xFF_FF` is 65535; `1_` and `1__000` are errors.
 
-**Hexadecimal (`0x1F`), binary (`0b1010`), octal (`0o17`), and underscore digit
-separators (`1_000`) are designed, not implemented, and they fail dangerously.**
-The lexer stops at the first non-digit, so `0x1F` lexes as the integer `0`
-followed by the identifier `x1F`, and `1_000` lexes as `1` followed by `_000`.
-Both are accepted by `cell check` with exit code 0. Measured: `let copy x =
-0x1F` emits `int64_t x = 0; x1F;`. A conforming implementation must either
-support these forms or reject them; silently producing a different number is
-not an option. See `examples/rejected/silent_literals.cell`.
+Integer literals are parsed into `i64` by `std.fmt.parseInt` with base 0, so
+the prefix selects the radix. A literal that does not fit is
+`error: invalid integer literal`. There is no arbitrary-precision literal
+type and no literal suffix.
 
-Integer literals are parsed into `i64` by `std.fmt.parseInt`. A literal that
-does not fit produces `error.InvalidLiteral`. There is no arbitrary-precision
-literal type and no literal suffix.
+See [`examples/silent_literals.cell`](../examples/silent_literals.cell).
 
 ### 2.7 Float literals
 
-**Status: implemented (simple decimal form only).**
+**Status: implemented (decimal, with optional exponent).** Hexadecimal floats
+are **designed, not implemented**.
 
 ```
-float_literal = ASCII digit+ "." ASCII digit+
+exponent       = ("e" | "E") ("+" | "-")? digit (digit | "_")*
+float_literal  = digit (digit | "_")* "." digit (digit | "_")* exponent?
+               | digit (digit | "_")* exponent
 ```
 
 A digit is required on both sides of the point. `1.` and `.5` are not float
 literals: `1.` lexes as `1` followed by `.`, and `.5` as `.` followed by `5`.
-Exponent notation (`1e9`, `1.5e-3`) and hexadecimal floats are **designed, not
-implemented**, and mis-lex in the same silent way as section 2.6. Float
-literals are parsed into `f64`.
+`1e9`, `1E9`, `1.5e-3`, and `1.5e+3` are floats. `1e9` is not an Int.
+
+Hexadecimal floats (`0x1p1`, `0x1.0p1`) are refused as literals:
+
+> `error: hexadecimal floats are not implemented`
+
+They must not silently become `0` or `1`. See
+[`examples/rejected/hex_float.cell`](../examples/rejected/hex_float.cell).
+
+Float literals are parsed into `f64`.
 
 ### 2.8 String literals
 
-**Status: implemented (lexing and the six simple escapes).** `\u{...}`,
-unterminated-string diagnostics, multi-line, raw, and interpolated strings
-are **designed, not implemented**.
+**Status: implemented (lexing, the six simple escapes, and the unterminated
+diagnostic).** `\u{...}`, multi-line, raw, and interpolated strings are
+**designed, not implemented**.
 
 ```
 string_literal = '"' character* '"'
@@ -597,8 +614,8 @@ byte, not the two bytes backslash and n.
 
 `\u{...}` is **designed, not implemented**; `\u` is an unknown escape today.
 
-An unterminated string literal runs to end of file and produces **no
-diagnostic**. Specified as an error:
+An unterminated string literal (EOF inside `"..."`) is an error at the opening
+quote:
 
 > `error: unterminated string literal`
 
@@ -2026,13 +2043,14 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Reserved words that are lexed and NOT implemented (`for`, `loop`, `async`, `await`, `defer`, `impl`, `trait`, ...) | designed, not implemented |
 | `while` | implemented: it was in this row as a reserved word long after loops landed |
 | Decimal integer literal | implemented |
-| Hex / binary / octal literal | designed, not implemented |
-| Underscore digit separator | designed, not implemented |
+| Hex / binary / octal literal | implemented |
+| Underscore digit separator | implemented |
 | Decimal float literal | implemented |
-| Exponent float literal | designed, not implemented |
+| Exponent float literal | implemented |
+| Hexadecimal float literal | designed, not implemented |
 | String literal lexing | implemented |
 | String escape processing | implemented for `\n \t \r \\ \" \0`; `\u{...}` remains designed, not implemented |
-| Unterminated string diagnostic | designed, not implemented |
+| Unterminated string diagnostic | implemented |
 | Multi-line / raw / interpolated strings | designed, not implemented |
 | Boolean literals | implemented |
 | Operator and punctuation set | implemented |

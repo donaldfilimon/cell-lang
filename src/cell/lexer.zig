@@ -230,7 +230,9 @@ pub const Lexer = struct {
 
     /// Tokenize a string literal. A backslash skips the next byte so `\"`
     /// does not end the token. Decode of `\n` and friends is the parser's
-    /// job (SPEC 2.8); this walk only keeps the lexeme intact.
+    /// job (SPEC 2.8); this walk only keeps the lexeme intact. EOF before a
+    /// closing quote is `.invalid` so the parser can name it as an
+    /// unterminated string rather than silently succeeding.
     fn lexString(self: *Lexer, start: usize, line: u32, column: u32) Token {
         self.advance(); // opening "
         while (self.index < self.source.len and self.source[self.index] != '"') {
@@ -243,25 +245,122 @@ pub const Lexer = struct {
             }
             self.advance();
         }
-        if (self.index < self.source.len) self.advance(); // closing "
+        if (self.index >= self.source.len) return self.make(.invalid, start, line, column);
+        self.advance(); // closing "
         return self.make(.string, start, line, column);
     }
 
+    /// Tokenize an integer or float. Hex (`0x1F`), binary (`0b1010`), octal
+    /// (`0o17`), underscore separators (`1_000`, `0xFF_FF`), and decimal
+    /// exponents (`1e9`, `1.5e-3`) are one token. A digit is required on both
+    /// sides of a decimal point, so `1.` and `.5` are not floats. Malformed
+    /// forms (trailing or adjacent underscores, a prefix with no digits,
+    /// leftover letters, hexadecimal floats) are a single `.invalid` token
+    /// rather than a number plus an identifier.
     fn lexNumber(self: *Lexer, start: usize, line: u32, column: u32) Token {
-        var is_float = false;
-        while (self.index < self.source.len and std.ascii.isDigit(self.source[self.index])) {
-            self.advance();
+        if (self.source[self.index] == '0' and self.index + 1 < self.source.len) {
+            switch (self.source[self.index + 1]) {
+                'x', 'X' => return self.lexPrefixedNumber(start, line, column, 16),
+                'b', 'B' => return self.lexPrefixedNumber(start, line, column, 2),
+                'o', 'O' => return self.lexPrefixedNumber(start, line, column, 8),
+                else => {},
+            }
         }
+
+        self.consumeNumberBody(10);
+
+        var is_float = false;
         if (self.index < self.source.len and self.source[self.index] == '.' and
             self.index + 1 < self.source.len and std.ascii.isDigit(self.source[self.index + 1]))
         {
             is_float = true;
             self.advance();
-            while (self.index < self.source.len and std.ascii.isDigit(self.source[self.index])) {
+            self.consumeNumberBody(10);
+        }
+        if (self.index < self.source.len and (self.source[self.index] == 'e' or self.source[self.index] == 'E')) {
+            is_float = true;
+            self.advance();
+            if (self.index < self.source.len and (self.source[self.index] == '+' or self.source[self.index] == '-')) {
                 self.advance();
             }
+            const exp_start = self.index;
+            self.consumeNumberBody(10);
+            if (self.index == exp_start) {
+                self.consumeIdentContinue();
+                return self.make(.invalid, start, line, column);
+            }
         }
+
+        if (self.index < self.source.len and isIdentContinue(self.source[self.index])) {
+            self.consumeIdentContinue();
+            return self.make(.invalid, start, line, column);
+        }
+
+        const lexeme = self.source[start..self.index];
+        if (!underscoresOk(lexeme)) return self.make(.invalid, start, line, column);
         return self.make(if (is_float) .float else .int, start, line, column);
+    }
+
+    fn lexPrefixedNumber(self: *Lexer, start: usize, line: u32, column: u32, radix: u8) Token {
+        self.advance(); // 0
+        self.advance(); // x/b/o
+        const digits_start = self.index;
+        self.consumeNumberBody(radix);
+
+        if (radix == 16 and self.looksLikeHexFloat()) {
+            self.consumeHexFloatRest();
+            self.consumeIdentContinue();
+            return self.make(.invalid, start, line, column);
+        }
+
+        if (self.index < self.source.len and isIdentContinue(self.source[self.index])) {
+            self.consumeIdentContinue();
+            return self.make(.invalid, start, line, column);
+        }
+
+        if (self.index == digits_start or !underscoresOk(self.source[start..self.index])) {
+            return self.make(.invalid, start, line, column);
+        }
+        return self.make(.int, start, line, column);
+    }
+
+    fn looksLikeHexFloat(self: *const Lexer) bool {
+        if (self.index >= self.source.len) return false;
+        const c = self.source[self.index];
+        if (c == 'p' or c == 'P') return true;
+        if (c == '.' and self.index + 1 < self.source.len) {
+            const n = self.source[self.index + 1];
+            return std.ascii.isHex(n) or n == 'p' or n == 'P' or n == '_';
+        }
+        return false;
+    }
+
+    fn consumeHexFloatRest(self: *Lexer) void {
+        if (self.index < self.source.len and self.source[self.index] == '.') {
+            self.advance();
+            self.consumeNumberBody(16);
+        }
+        if (self.index < self.source.len and (self.source[self.index] == 'p' or self.source[self.index] == 'P')) {
+            self.advance();
+            if (self.index < self.source.len and (self.source[self.index] == '+' or self.source[self.index] == '-')) {
+                self.advance();
+            }
+            self.consumeNumberBody(10);
+        }
+    }
+
+    fn consumeNumberBody(self: *Lexer, radix: u8) void {
+        while (self.index < self.source.len) {
+            const c = self.source[self.index];
+            if (c != '_' and !isDigitInRadix(c, radix)) break;
+            self.advance();
+        }
+    }
+
+    fn consumeIdentContinue(self: *Lexer) void {
+        while (self.index < self.source.len and isIdentContinue(self.source[self.index])) {
+            self.advance();
+        }
     }
 
     fn lexIdent(self: *Lexer, start: usize, line: u32, column: u32) Token {
@@ -407,6 +506,47 @@ fn isIdentContinue(c: u8) bool {
     return isIdentStart(c) or std.ascii.isDigit(c);
 }
 
+fn isDigitInRadix(c: u8, radix: u8) bool {
+    return switch (radix) {
+        2 => c == '0' or c == '1',
+        8 => c >= '0' and c <= '7',
+        10 => std.ascii.isDigit(c),
+        16 => std.ascii.isHex(c),
+        else => unreachable,
+    };
+}
+
+/// Underscores must sit between two digits of the literal's radix. Leading,
+/// trailing, or adjacent underscores, and an underscore next to a prefix,
+/// point, sign, or exponent marker, are not a number.
+fn underscoresOk(lexeme: []const u8) bool {
+    var i: usize = 0;
+    var radix: u8 = 10;
+    if (lexeme.len >= 2 and lexeme[0] == '0') {
+        switch (lexeme[1]) {
+            'x', 'X' => {
+                i = 2;
+                radix = 16;
+            },
+            'b', 'B' => {
+                i = 2;
+                radix = 2;
+            },
+            'o', 'O' => {
+                i = 2;
+                radix = 8;
+            },
+            else => {},
+        }
+    }
+    while (i < lexeme.len) : (i += 1) {
+        if (lexeme[i] != '_') continue;
+        if (i == 0 or i + 1 >= lexeme.len) return false;
+        if (!isDigitInRadix(lexeme[i - 1], radix) or !isDigitInRadix(lexeme[i + 1], radix)) return false;
+    }
+    return true;
+}
+
 test "lex hello" {
     const src =
         \\pub fn main() {
@@ -526,4 +666,72 @@ test "Some, None, Ok and Err lex as keywords, not identifiers" {
     var tokens = try lex.tokenizeAll(std.testing.allocator);
     defer tokens.deinit(std.testing.allocator);
     try std.testing.expectEqual(TokenKind.ident, tokens.items[0].kind);
+}
+
+fn firstToken(src: []const u8) Token {
+    var lex = Lexer.init(src, "t.cell");
+    return lex.next();
+}
+
+test "hex bin oct integers are one token" {
+    const cases = [_]struct { src: []const u8, lexeme: []const u8 }{
+        .{ .src = "0x1F", .lexeme = "0x1F" },
+        .{ .src = "0X1F", .lexeme = "0X1F" },
+        .{ .src = "0b1010", .lexeme = "0b1010" },
+        .{ .src = "0B1010", .lexeme = "0B1010" },
+        .{ .src = "0o17", .lexeme = "0o17" },
+        .{ .src = "0O17", .lexeme = "0O17" },
+    };
+    for (cases) |c| {
+        const t = firstToken(c.src);
+        try std.testing.expectEqual(TokenKind.int, t.kind);
+        try std.testing.expectEqualStrings(c.lexeme, t.lexeme);
+    }
+}
+
+test "underscore separators are one integer token" {
+    const t = firstToken("1_000");
+    try std.testing.expectEqual(TokenKind.int, t.kind);
+    try std.testing.expectEqualStrings("1_000", t.lexeme);
+
+    const hex = firstToken("0xFF_FF");
+    try std.testing.expectEqual(TokenKind.int, hex.kind);
+    try std.testing.expectEqualStrings("0xFF_FF", hex.lexeme);
+}
+
+test "exponent forms are float tokens" {
+    const cases = [_][]const u8{ "1e9", "1E9", "1.5e-3", "1.5e+3" };
+    for (cases) |src| {
+        const t = firstToken(src);
+        try std.testing.expectEqual(TokenKind.float, t.kind);
+        try std.testing.expectEqualStrings(src, t.lexeme);
+    }
+}
+
+test "1. and .5 are not float literals" {
+    var lex = Lexer.init("1. .5", "t.cell");
+    var toks = try lex.tokenizeAll(std.testing.allocator);
+    defer toks.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TokenKind.int, toks.items[0].kind);
+    try std.testing.expectEqualStrings("1", toks.items[0].lexeme);
+    try std.testing.expectEqual(TokenKind.dot, toks.items[1].kind);
+    try std.testing.expectEqual(TokenKind.dot, toks.items[2].kind);
+    try std.testing.expectEqual(TokenKind.int, toks.items[3].kind);
+    try std.testing.expectEqualStrings("5", toks.items[3].lexeme);
+}
+
+test "malformed numbers are invalid tokens not split idents" {
+    const cases = [_][]const u8{ "1_", "1__000", "0x", "0b102", "0x1p1", "0x1.0p1", "1e", "1e+", "123abc" };
+    for (cases) |src| {
+        const t = firstToken(src);
+        try std.testing.expectEqual(TokenKind.invalid, t.kind);
+        try std.testing.expectEqualStrings(src, t.lexeme);
+    }
+}
+
+test "unterminated string is an invalid token" {
+    const t = firstToken("\"hello");
+    try std.testing.expectEqual(TokenKind.invalid, t.kind);
+    try std.testing.expectEqual(@as(u32, 1), t.column);
+    try std.testing.expectEqualStrings("\"hello", t.lexeme);
 }
