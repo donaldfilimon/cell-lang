@@ -39,7 +39,7 @@
 // WHAT IT PRINTS, and how to read a wrong answer. One integer, `7320`:
 //
 //   String   the host's `first_str` returns a 3-character owning string,
-//            `second_str` a 20-character one, and `str_len` reports what the
+//            `second_str` a 20-character one, and `excl_str_len` reports what the
 //            caller's variable holds AFTER the write.
 //   [T]      4 elements before, 300 after.
 //   T?       Some(5) before, Some(7000) after.
@@ -52,7 +52,7 @@
 //
 // THE THREE OBSERVERS TAKE `exclusive` BORROWS TOO, on purpose. Reading
 // through the borrow exercises the pointer argument in the other direction: a
-// backend that passed the aggregate by value would hand `str_len` a copy of
+// backend that passed the aggregate by value would hand `excl_str_len` a copy of
 // the caller's 24 bytes, which reads the correct length and hides the defect
 // on the way out while the write was still being lost on the way in.
 //
@@ -63,7 +63,7 @@
 // was handed and could not say whether it was the caller's object or a copy.
 pub fn first_str() -> String;
 pub fn second_str() -> String;
-pub fn str_len(exclusive s: String) -> Int;
+pub fn excl_str_len(exclusive s: String) -> Int;
 
 pub fn first_list() -> [Int];
 pub fn second_list() -> [Int];
@@ -93,5 +93,5 @@ pub fn main() {
     var owned o: Int? = first_opt()
     reset_opt(exclusive o)
 
-    print_int(copy str_len(exclusive s) + list_len(exclusive xs) + opt_val(exclusive o))
+    print_int(copy excl_str_len(exclusive s) + list_len(exclusive xs) + opt_val(exclusive o))
 }

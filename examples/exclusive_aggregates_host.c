@@ -52,7 +52,7 @@ cell_string_t cell_second_str(void) {
     return cell_string_from_cstr("abcdefghijklmnopqrst");
 }
 
-int64_t cell_str_len(cell_string_t *s) {
+int64_t cell_excl_str_len(cell_string_t *s) {
     return (int64_t)s->len;
 }
 

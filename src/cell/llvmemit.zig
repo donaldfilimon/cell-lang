@@ -19,7 +19,7 @@
 //!      itself, from layouts derived from the header rather than guessed.
 //!
 //! So this slice crosses the C boundary only through SCALAR-ABI symbols:
-//! `cell_print_int(int64_t)`, `cell_assert(bool)`, `cell_panic(const char*)`,
+//! `cell_print_int(int64_t)`, `cell_assert(bool)`, `cell_panic(cell_str_t)`,
 //! `cell_cxx_probe()`, `cell_swift_probe()`. Cell-to-Cell calls inside one
 //! module are ABI-consistent by construction whatever their shape, so struct
 //! locals and struct-passing between Cell functions are in scope.
@@ -237,7 +237,7 @@ const Emitter = struct {
         // generated too. Without this the module references an undefined
         // symbol and clang refuses it outright.
         if (self.uses_panic and self.module.findFn("panic") == null) {
-            try self.out.writeAll("declare void @cell_panic(ptr)\n");
+            try self.out.writeAll("declare void @cell_panic([2 x i64])\n");
         }
         // memcmp is real libc, unlike cell_str_eq which is `static inline`
         // and has no symbol. It is the one runtime helper this backend can
@@ -1663,7 +1663,15 @@ const Emitter = struct {
         );
         const g = try self.internString(msg);
         self.uses_panic = true;
-        try self.out.print("  call void @cell_panic(ptr @{s})\n", .{g});
+        // cell_panic takes cell_str_t, which AAPCS64 passes as [2 x i64]
+        // (pointer bits, length). Measured from clang -S -emit-llvm.
+        const t0 = try self.nextTemp();
+        const t1 = try self.nextTemp();
+        const t2 = try self.nextTemp();
+        try self.out.print("  {s} = ptrtoint ptr @{s} to i64\n", .{ t0, g });
+        try self.out.print("  {s} = insertvalue [2 x i64] undef, i64 {s}, 0\n", .{ t1, t0 });
+        try self.out.print("  {s} = insertvalue [2 x i64] {s}, i64 {d}, 1\n", .{ t2, t1, msg.len });
+        try self.out.print("  call void @cell_panic([2 x i64] {s})\n", .{t2});
         try self.out.writeAll("  unreachable\n");
 
         try self.out.print("{s}:\n", .{end_label});
@@ -1882,8 +1890,8 @@ test "a non-exhaustive match panics and declares the runtime symbol it calls" {
         \\}
     );
     defer e.deinit();
-    try expectContains(e.text, "declare void @cell_panic(ptr)");
-    try expectContains(e.text, "call void @cell_panic(ptr @.cellstr.0)");
+    try expectContains(e.text, "declare void @cell_panic([2 x i64])");
+    try expectContains(e.text, "call void @cell_panic([2 x i64]");
     try expectContains(e.text, "unreachable");
 }
 
