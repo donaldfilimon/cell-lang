@@ -247,7 +247,7 @@ const AssignLiveness = struct {
     live: bool,
 };
 
-/// The two scope exits `Checker.exit_liveness` records. A codegen drop point
+/// The scope exits `Checker.exit_liveness` records. A codegen drop point
 /// names one of them together with the same key the checker used.
 pub const ExitKind = enum {
     /// The fall-through end of a block's statement list, keyed by the
@@ -265,6 +265,11 @@ pub const ExitKind = enum {
     /// The end of a value-position block, keyed by its statement slice,
     /// recorded after the tail is checked.
     value_block_end,
+    /// After a `while` that moved an outer binding and then revived it on
+    /// every path this walk saw. Keyed by the `while` statement's address,
+    /// like a jump. Recorded AFTER `loop_moved` poisons the in-loop exits,
+    /// so those stay skipped. Missing or `live = false` keeps the leak.
+    after_loop,
 };
 
 /// See `Checker.exit_liveness`.
@@ -827,7 +832,9 @@ pub const Checker = struct {
     /// already made, and the same guarantee applies: every program accepted
     /// under this rule is still accepted under a real control-flow analysis,
     /// so tightening now and relaxing later never breaks source compatibility.
-    fn checkWhile(self: *Checker, w: anytype, span: Span) Error!void {
+    fn checkWhile(self: *Checker, stmt: *const ast.Stmt) Error!void {
+        const w = stmt.kind.while_stmt;
+        const span = stmt.span;
         // Taken before the condition: it runs on every iteration too.
         const liveness_before = self.assign_liveness.items.len;
         const exits_before = self.exit_liveness.items.len;
@@ -838,6 +845,7 @@ pub const Checker = struct {
         defer self.invalidateLoopStores(liveness_before, moved_before);
 
         try self.checkExpr(@constCast(&w.cond));
+        const moved_after_cond = self.moved_paths.items.len;
 
         const first_inner_id = self.next_binding_id;
         const dead_before = self.dead.items.len;
@@ -846,6 +854,25 @@ pub const Checker = struct {
         // binding declared in the body dies with it and a named loan created
         // there is truncated on the way out, exactly as in an `if` body.
         try self.checkBlockStmts(w.body);
+
+        // Snapshot P_exit BEFORE invalidation poisons the jump bits.
+        // Recorded after the poison so `after_loop` is not itself cleared.
+        var after_held: std.ArrayListUnmanaged(u32) = .empty;
+        defer after_held.deinit(self.allocator);
+        for (self.moved_paths.items[moved_before..]) |m| {
+            if (m.binding >= first_loop_id) continue;
+            if (!self.bindingInCurrentBlock(m.binding)) continue;
+            var seen = false;
+            for (after_held.items) |h| {
+                if (h == m.binding) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            if (!self.afterLoopHolds(m.binding, moved_before, moved_after_cond, exits_before)) continue;
+            try after_held.append(self.allocator, m.binding);
+        }
 
         // See `exit_liveness`: the back edge and every `break` can carry a
         // move of an outer binding past the revival the walk saw.
@@ -874,6 +901,58 @@ pub const Checker = struct {
                 .{d.display},
             ));
         }
+
+        // After the poison: only the outer bindings this walk proved still
+        // hold a value on every exit from this loop. No record keeps the leak.
+        const after_key = @intFromPtr(stmt);
+        for (after_held.items) |binding| {
+            try self.exit_liveness.append(self.allocator, .{
+                .kind = .after_loop,
+                .key = after_key,
+                .binding = binding,
+                .live = true,
+            });
+        }
+    }
+
+    /// True when `binding` was declared in the block that contains the
+    /// `while` currently being checked. An ancestor's binding (a var
+    /// outside an enclosing loop, or outside a nested block) is still
+    /// `< first_loop_id`, and dropping it after THIS loop would free it
+    /// while the enclosing loop's next iteration still uses it. Missing
+    /// from the current block => no `after_loop` record => leak.
+    fn bindingInCurrentBlock(self: *const Checker, binding: u32) bool {
+        if (self.scopes.items.len == 0) return false;
+        const mark = self.scopes.items[self.scopes.items.len - 1].bindings;
+        for (self.bindings.items[mark..]) |b| {
+            if (b.id == binding) return true;
+        }
+        return false;
+    }
+
+    /// P_exit for `after_loop`, read off the walk *before* invalidation.
+    /// All three must hold; a missing or false bit is no record, not a
+    /// `live = false` entry. Nested-loop jumps in `[exits_before..]` make
+    /// this stricter (a dead inner `continue` refuses the outer drop).
+    fn afterLoopHolds(
+        self: *const Checker,
+        binding: u32,
+        moved_before: usize,
+        moved_after_cond: usize,
+        exits_before: usize,
+    ) bool {
+        for (self.moved_paths.items[moved_before..moved_after_cond]) |m| {
+            if (m.binding == binding) return false;
+        }
+        for (self.dead.items) |d| {
+            if (d.binding == binding) return false;
+        }
+        for (self.exit_liveness.items[exits_before..]) |entry| {
+            if (entry.kind != .jump) continue;
+            if (entry.binding != binding) continue;
+            if (!entry.live) return false;
+        }
+        return true;
     }
 
     /// A store recorded inside a loop body cannot vouch for its target if
@@ -904,7 +983,7 @@ pub const Checker = struct {
         defer self.temp_loans.shrinkRetainingCapacity(region);
 
         switch (stmt.kind) {
-            .while_stmt => |*w| try self.checkWhile(w, stmt.span),
+            .while_stmt => try self.checkWhile(stmt),
             // A `break` or `continue` moves nothing and borrows nothing. It
             // does change which paths reach the end of the body, which R2.a
             // below deliberately ignores; see the note there.
@@ -5078,6 +5157,125 @@ const Harness = struct {
     }
 };
 
+/// Parse and borrow-check `src`, keeping the checker so a test can ask
+/// `liveAtExit`. The module lives in the same arena as the checker.
+const LiveHarness = struct {
+    arena: std.heap.ArenaAllocator,
+    checker: Checker,
+    module: ast.Module,
+
+    fn init(src: []const u8) !LiveHarness {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        errdefer arena.deinit();
+        const gpa = arena.allocator();
+        var lex = lexer.Lexer.init(src, "t.cell");
+        const tokens = try lex.tokenizeAll(gpa);
+        var p = parser.Parser.init(gpa, tokens.items, "t.cell");
+        const module = try p.parseModule();
+        var checker: Checker = .init(gpa, "t.cell", src);
+        errdefer checker.deinit();
+        try checker.checkModule(&module);
+        if (checker.diagnostics.hasErrors()) {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.Writer.fixed(&buf);
+            try checker.diagnostics.printAll(&w);
+            std.debug.print("\nLiveHarness source was rejected:\n{s}\n", .{w.buffered()});
+            return error.TestUnexpectedRejection;
+        }
+        return .{ .arena = arena, .checker = checker, .module = module };
+    }
+
+    fn deinit(self: *LiveHarness) void {
+        self.checker.deinit();
+        self.arena.deinit();
+    }
+
+    fn binding(self: *const LiveHarness, name: []const u8) u32 {
+        var id: u32 = 0;
+        while (id < self.checker.next_binding_id) : (id += 1) {
+            if (self.checker.bindingName(id)) |n| {
+                if (std.mem.eql(u8, n, name)) return id;
+            }
+        }
+        std.debug.print("\nno binding named {s}\n", .{name});
+        unreachable;
+    }
+
+    fn fnBody(self: *const LiveHarness, name: []const u8) []const ast.Stmt {
+        for (self.module.items) |*item| {
+            switch (item.kind) {
+                .fn_def => |f| {
+                    if (std.mem.eql(u8, f.name, name)) return f.body.?;
+                },
+                else => {},
+            }
+        }
+        std.debug.print("\nno function named {s}\n", .{name});
+        unreachable;
+    }
+
+    fn fnBodyKey(self: *const LiveHarness, name: []const u8) usize {
+        const body = self.fnBody(name);
+        return @intFromPtr(body.ptr);
+    }
+
+    fn firstWhile(self: *const LiveHarness, name: []const u8) usize {
+        return firstWhileIn(self.fnBody(name)) orelse {
+            std.debug.print("\nno while in {s}\n", .{name});
+            unreachable;
+        };
+    }
+
+    fn firstJump(self: *const LiveHarness, name: []const u8) usize {
+        return firstJumpIn(self.fnBody(name)) orelse {
+            std.debug.print("\nno jump in {s}\n", .{name});
+            unreachable;
+        };
+    }
+};
+
+fn firstWhileIn(stmts: []const ast.Stmt) ?usize {
+    for (stmts) |*s| {
+        switch (s.kind) {
+            .while_stmt => |w| {
+                if (firstWhileIn(w.body)) |inner| return inner;
+                return @intFromPtr(s);
+            },
+            .expr => |e| if (firstWhileInExpr(&e)) |k| return k,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn firstWhileInExpr(e: *const ast.Expr) ?usize {
+    return switch (e.kind) {
+        .block => |stmts| firstWhileIn(stmts),
+        .if_expr => |i| firstWhileInExpr(i.then_body) orelse if (i.else_body) |eb| firstWhileInExpr(eb) else null,
+        else => null,
+    };
+}
+
+fn firstJumpIn(stmts: []const ast.Stmt) ?usize {
+    for (stmts) |*s| {
+        switch (s.kind) {
+            .break_stmt, .continue_stmt => return @intFromPtr(s),
+            .while_stmt => |w| if (firstJumpIn(w.body)) |k| return k,
+            .expr => |e| if (firstJumpInExpr(&e)) |k| return k,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn firstJumpInExpr(e: *const ast.Expr) ?usize {
+    return switch (e.kind) {
+        .block => |stmts| firstJumpIn(stmts),
+        .if_expr => |i| firstJumpInExpr(i.then_body) orelse if (i.else_body) |eb| firstJumpInExpr(eb) else null,
+        else => null,
+    };
+}
+
 fn expectDiagnostics(src: []const u8, expected: []const u8) !void {
     var h: Harness = .init();
     defer h.deinit();
@@ -7802,6 +8000,104 @@ test "R2.a does not fire for a place declared inside the loop body" {
         \\    }
         \\}
     );
+}
+
+test "after_loop is live for an outer var revived on every path out of the while" {
+    // R16 residual: a var declared outside a while, moved inside it, and
+    // revived before the body ends. `loop_moved` still poisons in-loop
+    // exits and the function-end `block_end`; `after_loop` is the one
+    // record that stays live. P_exit: no condition move, not dead at body
+    // end, every jump this walk saw still held a value (none here).
+    var h: LiveHarness = try .init(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f() {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        take(v)
+        \\        v = "b"
+        \\        i = i + 1
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    const v = h.binding("v");
+    const key = h.firstWhile("f");
+    try std.testing.expect(h.checker.liveAtExit(.after_loop, key, v));
+    try std.testing.expect(!h.checker.liveAtExit(.block_end, h.fnBodyKey("f"), v));
+}
+
+test "after_loop is absent when a break is taken while the outer var is dead" {
+    // `take(v); if i > n { break }; v = "b"`. The jump is recorded live=false
+    // before invalidation, so P_exit fails and there is no after_loop record.
+    // Ignoring that dead jump and emitting the drop was an AddressSanitizer
+    // double free (exit 134), measured: the `break` path already handed the
+    // buffer to `take`, and C `break` runs the code after the while.
+    var h: LiveHarness = try .init(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    const v = h.binding("v");
+    const key = h.firstWhile("f");
+    try std.testing.expect(!h.checker.liveAtExit(.after_loop, key, v));
+}
+
+test "after_loop is absent when the condition moves the outer var" {
+    // `while consume(v) { v = make() }`: the last failing condition already
+    // took `v`. Treating that as live and dropping after the loop was an
+    // AddressSanitizer double free (exit 134), measured.
+    var h: LiveHarness = try .init(
+        \\pub fn consume(owned s: String) -> Bool { return true }
+        \\pub fn f() {
+        \\    var owned v: String = "a"
+        \\    while consume(v) {
+        \\        v = "b"
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    const v = h.binding("v");
+    const key = h.firstWhile("f");
+    try std.testing.expect(!h.checker.liveAtExit(.after_loop, key, v));
+}
+
+test "after_loop is live for a revival then break, and the jump itself stays dead" {
+    // `take(v); v = "b"; if i > n { break }`. Every jump this walk saw still
+    // held a value, so after_loop is live. The jump record is poisoned by
+    // `loop_moved`, so codegen must not drop at `break` (C break already
+    // runs the code after the while).
+    var h: LiveHarness = try .init(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        v = "b"
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    const v = h.binding("v");
+    const key = h.firstWhile("f");
+    try std.testing.expect(h.checker.liveAtExit(.after_loop, key, v));
+    try std.testing.expect(!h.checker.liveAtExit(.jump, h.firstJump("f"), v));
 }
 
 // ── R9: `arc` grants shared access only ─────────────────────────────────

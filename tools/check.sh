@@ -437,6 +437,10 @@ LEAK_VALUE_BLOCK_REVIVAL=0
 # R16 residual 4: a record moved whole then reassigned whole. Measured
 # 1000 before; CLOSED 2026-09-16 by record-revival admission, 1000 -> 0.
 LEAK_REVIVED_RECORD=0
+# R16 residual: a var moved inside a `while` it was declared outside of.
+# Measured 1000 before (2026-09-16, ALLOC=2000 FREE=1000 LIVE=1000);
+# CLOSED the same day by after_loop releases, 1000 -> 0.
+LEAK_LOOP_CROSS=0
 
 # ---- stage 10 disclosed signature disagreements, pinned by defect ---------
 # Each line is `<example key>:<function>:<leg>` naming a place where the C
@@ -925,6 +929,7 @@ else
     run_c_leaks loop_jump_revival "" "$LEAK_LOOP_JUMP_REVIVAL" "R16 residual 2, CLOSED 2026-09-16 by jump releases; 1000 -> 0"
     run_c_leaks value_block_revival "" "$LEAK_VALUE_BLOCK_REVIVAL" "R16 residual 3, CLOSED 2026-09-16 by value-block-end releases; 1000 -> 0"
     run_c_leaks revived_record "" "$LEAK_REVIVED_RECORD" "R16 residual 4, CLOSED 2026-09-16 by record-revival admission; 1000 -> 0"
+    run_c_leaks loop_cross "" "$LEAK_LOOP_CROSS" "R16 residual outer-while-var, CLOSED 2026-09-16 by after_loop releases; 1000 -> 0"
 fi
 
 # ------------------------------------------- 8. cross-backend answer agreement --

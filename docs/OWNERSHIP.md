@@ -2166,9 +2166,18 @@ ways, and each is a real, documented gap rather than an oversight:
   `branch_move.cell`), a revival then `continue` (1000 -> 0,
   `loop_jump_revival.cell`), a revival inside a value-position block (1000
   -> 0, `value_block_revival.cell`), and a record revived after a whole
-  move (1000 -> 0, `revived_record.cell`). What still leaks, by design: a
-  var moved inside a `while` it was declared outside of, and the per-field
-  record case (a field moved on only one branch, a partly moved field).
+  move (1000 -> 0, `revived_record.cell`). **CLOSED 2026-09-16: a var
+  moved inside a `while` it was declared outside of.** `loop_moved` still
+  poisons in-loop exits and the function-end `block_end` (removing that
+  was an AddressSanitizer double free at exit 134). borrowck now records
+  `ExitKind.after_loop`, keyed by the `while` statement, live only when
+  the walk saw no condition move, no dead entry at body end, and every
+  `.jump` still holding a value. Codegen releases that binding after the
+  closing `}`, moved-only. `examples/leaks/loop_cross.cell` measured 1000
+  on both witnesses before and 0 after, pinned in the gate; ASan clean.
+  What still leaks, by design: a skip-revival `break`/`continue`, a
+  `return` inside the loop, and the per-field record case (a field moved
+  on only one branch, a partly moved field).
 
 Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released. What remains out of scope is a field moved on only one branch (it leaks on the other path, pending drop flags) and a partly moved field (the whole field is left unreleased).
 

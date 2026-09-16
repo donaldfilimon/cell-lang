@@ -71,9 +71,11 @@
 //! `assign_liveness`, and `pendingDropsSince` releases a revived var at a
 //! block end, `return`, `break`/`continue`, value-block end, and a revived
 //! record from `exit_liveness`; a var moved inside a `while` it was declared
-//! outside of, and a field moved on only one branch, still leak; and
-//! a local declared inside a VALUE-position block (`emitValueInto`) is not
-//! released at that block's exit, because it may be the value flowing out.
+//! outside of is released after that while when borrowck recorded
+//! `after_loop` live (2026-09-16), while a field moved on only one branch
+//! still leaks; and a local declared inside a VALUE-position block
+//! (`emitValueInto`) is not released at that block's exit, because it may
+//! be the value flowing out.
 //! Why block-scoped release is safe for a local whose initializer moves an
 //! OUTER place inside a loop: borrowck's R2.a refuses that program outright
 //! (the back edge would use the place dead), so no accepted loop body
@@ -791,6 +793,11 @@ pub const Generator = struct {
                 _ = self.loop_marks.pop();
                 try self.writeIndent(indent);
                 try out.writeAll("}\n");
+                // R16 after_loop: an outer var this while moved and then
+                // revived on every path out. Moved-only: emitDropsSince
+                // would also free unmoved locals and double-free them at
+                // function end (ASan exit 134, measured).
+                try self.emitAfterLoopDrops(@intFromPtr(stmt), indent);
             },
             .break_stmt => {
                 try self.emitLoopExitDrops(.{ .kind = .jump, .key = @intFromPtr(stmt) }, indent);
@@ -1289,6 +1296,51 @@ pub const Generator = struct {
         if (self.loop_marks.items.len == 0) return;
         const mark = self.loop_marks.items[self.loop_marks.items.len - 1];
         try self.emitDropsSince(mark, indent, key);
+    }
+
+    /// After a `while`: release an outer binding this loop moved and then
+    /// revived on every path out (`ExitKind.after_loop`). Moved-only, and
+    /// skipped when the enclosing `current_after` already holds the value
+    /// (function-end will drop it). `loop_moved` still poisons in-loop
+    /// jumps and the function-end `block_end`, so those stay skipped.
+    ///
+    /// Guards, each falsified under AddressSanitizer (exit 134) then
+    /// restored: ignoring a dead `.jump` when recording after_loop
+    /// (`take(v); if i > n { break }; v = "b"`) double-frees, because C
+    /// `break` runs this code; emitting these drops for unmoved locals
+    /// double-frees with function-end; dropping the outer var at
+    /// `continue` because the jump bit was live (`take(v); v = "b";
+    /// continue`) is a use-after-free on the next iteration, which is why
+    /// in-loop invalidation stays; treating a condition move as live
+    /// (`while consume(v) { v = make() }`) double-frees, because the last
+    /// failing condition already took `v`.
+    fn emitAfterLoopDrops(self: *Generator, key: usize, indent: usize) EmitError!void {
+        const checker = self.checker orelse return;
+        const here: Exit = .{ .kind = .after_loop, .key = key };
+        const after = self.current_after;
+        var i = self.locals.items.len;
+        while (i > 0) {
+            i -= 1;
+            const local = self.locals.items[i];
+            if (self.isShadowedAt(i)) continue;
+            if (!local.droppable) continue;
+            if (local.ownership != .owned and local.ownership != .arc) continue;
+            if (!try self.needsDrop(local.ty)) continue;
+            if (local.ty.shape == .record) {
+                if (!checker.wasWhollyMoved(local.id)) continue;
+                if (!checker.recordLiveAtExit(here.kind, here.key, local.id)) continue;
+                if (after) |a| {
+                    if (checker.recordLiveAtExit(a.kind, a.key, local.id)) continue;
+                }
+            } else {
+                if (!checker.wasMoved(local.id)) continue;
+                if (!checker.liveAtExit(here.kind, here.key, local.id)) continue;
+                if (after) |a| {
+                    if (checker.liveAtExit(a.kind, a.key, local.id)) continue;
+                }
+            }
+            try self.emitDropFor(indent, local);
+        }
     }
 
     /// The other drop point: before every `return`. When nothing needs
@@ -3562,9 +3614,9 @@ fn optBase(ty: CType) []const u8 {
 /// The predefined `cell_opt_*` instance for a scalar C type, by spelling.
 fn optBaseForPayload(t: CType) ?[]const u8 {
     const map = .{
-        .{ "int64_t", "cell_opt_i64" }, .{ "uint64_t", "cell_opt_u64" },
-        .{ "int32_t", "cell_opt_i32" }, .{ "double", "cell_opt_f64" },
-        .{ "bool", "cell_opt_bool" },   .{ "uint8_t", "cell_opt_byte" },
+        .{ "int64_t", "cell_opt_i64" },   .{ "uint64_t", "cell_opt_u64" },
+        .{ "int32_t", "cell_opt_i32" },   .{ "double", "cell_opt_f64" },
+        .{ "bool", "cell_opt_bool" },     .{ "uint8_t", "cell_opt_byte" },
         .{ "float", "cell_opt_Float32" },
     };
     inline for (map) |row| if (std.mem.eql(u8, t.text, row[0])) return row[1];
@@ -6560,6 +6612,77 @@ test "a revived var stays unreleased where the path may not hold a value" {
         const body = try fnDef(e.text, name);
         try expectAbsent(body, "cell_string_free(&v);");
     }
+    try expectCompiles(e.text);
+}
+
+test "an outer var revived across a while is released after the loop" {
+    // R16 after_loop, 2026-09-16. `loop_moved` still poisons in-loop jumps
+    // and the function-end `block_end`; the drop is the one after `}`.
+    // Guards falsified under AddressSanitizer (exit 134) then restored:
+    // ignoring a dead `.jump` (`take(v); if i > n { break }; v = "b"`)
+    // double-frees because C `break` runs this drop; emitting it for
+    // unmoved locals double-frees with function-end; dropping the outer
+    // var at `continue` (`take(v); v = "b"; continue`) is a use-after-free
+    // on the next iteration; treating a condition move as live
+    // (`while consume(v) { v = make() }`) double-frees because the last
+    // failing condition already took `v`.
+    var e = try emitSource(
+        \\pub fn take(owned s: String);
+        \\pub fn cross() {
+        \\  var owned v: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    take(v)
+        \\    v = "b"
+        \\    i = i + 1
+        \\  }
+        \\}
+        \\pub fn revival_then_break(copy n: Int) {
+        \\  var owned v: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    i = i + 1
+        \\    take(v)
+        \\    v = "b"
+        \\    if i > n {
+        \\      break
+        \\    }
+        \\  }
+        \\}
+        \\pub fn skip_revival_break(copy n: Int) {
+        \\  var owned v: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    i = i + 1
+        \\    take(v)
+        \\    if i > n {
+        \\      break
+        \\    }
+        \\    v = "b"
+        \\  }
+        \\}
+        \\pub fn untouched() {
+        \\  var owned v: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    i = i + 1
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    const cross = try fnDef(e.text, "cross");
+    try expectOccurrences(cross, "cell_string_free(&v);", 1);
+    try expectContains(cross, "}\n  cell_string_free(&v);\n}");
+    const revival_break = try fnDef(e.text, "revival_then_break");
+    try expectOccurrences(revival_break, "cell_string_free(&v);", 1);
+    try expectContains(revival_break, "}\n  cell_string_free(&v);\n}");
+    try expectAbsent(revival_break, "cell_string_free(&v);\n      break;");
+    // skip-revival break does not satisfy P_exit: the jump is dead, so no
+    // after_loop record. Same as break_after; the leak stays.
+    try expectAbsent(try fnDef(e.text, "skip_revival_break"), "cell_string_free(&v);");
+    // Unmoved: function-end drops it. after_loop must not, or this is a
+    // double free with the scope-end drop (measured, exit 134).
+    try expectOccurrences(try fnDef(e.text, "untouched"), "cell_string_free(&v);", 1);
     try expectCompiles(e.text);
 }
 

@@ -1,0 +1,35 @@
+// R16 residual: a var moved inside a `while` it was declared outside of
+// leaks the revived value. `loop_moved` poisons every in-loop exit and the
+// function-end `block_end`, so the last revival is never released.
+//
+// Each call runs the residual once (`take` frees the previous value, so a
+// 1000-iteration loop in one function would leak only the last revival).
+// 1000 calls => 1000 leaked finals. Measured before the after_loop drop:
+// leaks 1000, counter ALLOC=2000 FREE=1000 LIVE=1000. AFTER: 0.
+// CLOSED 2026-09-16 by after_loop releases.
+//
+// Status: parses, passes `cell check`; C only; lives under examples/leaks/.
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn once() {
+    var owned s: String = "aaaaaaaa"
+    var i = 0
+    while i < 1 {
+        take(s)
+        s = "bbbbbbbb"
+        i = i + 1
+    }
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        once()
+        i = i + 1
+    }
+    print_int(i)
+}
