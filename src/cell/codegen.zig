@@ -1725,7 +1725,7 @@ pub const Generator = struct {
                 // Cell has no exhaustiveness checking, so an unmatched value
                 // aborts rather than falling through with a made-up result.
                 try self.writeIndent(indent + 2);
-                try out.print("cell_panic(\"non-exhaustive match in {s}\");\n", .{self.current_fn});
+                try out.print("cell_panic(cell_str_from_cstr(\"non-exhaustive match in {s}\"));\n", .{self.current_fn});
             }
             try self.writeIndent(indent + 1);
             try out.writeAll("}\n");
@@ -4542,7 +4542,7 @@ test "a match without a catch-all arm panics instead of inventing a value" {
         \\}
     );
     defer e.deinit();
-    try expectContains(e.text, "cell_panic(\"non-exhaustive match in describe\");");
+    try expectContains(e.text, "cell_panic(cell_str_from_cstr(\"non-exhaustive match in describe\"));");
 }
 
 test "a match arm binding is declared and kept quiet when unused" {
@@ -4711,7 +4711,7 @@ test "a guarded catch-all arm still leaves the non-exhaustive panic in place" {
         \\}
     );
     defer e.deinit();
-    try expectContains(e.text, "cell_panic(\"non-exhaustive match in f\")");
+    try expectContains(e.text, "cell_panic(cell_str_from_cstr(\"non-exhaustive match in f\")");
 }
 
 test "an unguarded catch-all still removes the panic" {

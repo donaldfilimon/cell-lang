@@ -5,7 +5,7 @@
 
 // C++ helpers for Cell host: containers + probe used by the Zig CLI.
 
-extern "C" int cell_cxx_probe(void) {
+extern "C" int32_t cell_cxx_probe(void) {
     std::vector<int> v{1, 2, 3};
     std::string s = "cell-cxx";
     return static_cast<int>(v.size() + s.size());

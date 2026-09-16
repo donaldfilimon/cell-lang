@@ -1,5 +1,6 @@
 #include "cell_rt.h"
 
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,8 +11,8 @@
  * of every type below lives in the comment block at the top of cell_rt.h.
  */
 
-const char *cell_rt_version(void) {
-    return "cell-rt 0.2.0 (c11, atomic arc)";
+cell_string_t cell_rt_version(void) {
+    return cell_string_from_cstr("cell-rt 0.2.0 (c11, atomic arc)");
 }
 
 /* ------------------------------------------------------------------------ */
@@ -187,7 +188,7 @@ struct cell_rc_box {
 
 cell_arc_t cell_arc_new(void *ptr, void (*drop)(void *)) {
     struct cell_rc_box *box = (struct cell_rc_box *)malloc(sizeof(*box));
-    if (box == NULL) cell_panic("cell_arc_new: out of memory");
+    if (box == NULL) cell_panic(cell_str_from_cstr("cell_arc_new: out of memory"));
     atomic_init(&box->count, (size_t)1);
 
     cell_arc_t arc;
@@ -210,7 +211,7 @@ void cell_arc_drop(cell_arc_t arc) {
 
     /* acq_rel so the last releaser observes every prior writer's stores. */
     size_t prev = atomic_fetch_sub_explicit(&arc.refcount->count, (size_t)1, memory_order_acq_rel);
-    if (prev == 0) cell_panic("cell_arc_drop: refcount underflow");
+    if (prev == 0) cell_panic(cell_str_from_cstr("cell_arc_drop: refcount underflow"));
     if (prev != 1) return;
 
     if (arc.drop != NULL && arc.ptr != NULL) arc.drop(arc.ptr);
@@ -238,14 +239,14 @@ void cell_slice_drop_glue(void *p) {
 
 cell_arc_t cell_arc_from_string(cell_string_t s) {
     cell_string_t *box = (cell_string_t *)malloc(sizeof(*box));
-    if (box == NULL) cell_panic("cell_arc_from_string: out of memory");
+    if (box == NULL) cell_panic(cell_str_from_cstr("cell_arc_from_string: out of memory"));
     *box = s; /* move: box now owns the buffer, s must not be freed */
     return cell_arc_new(box, cell_string_drop_glue);
 }
 
 cell_arc_t cell_arc_from_slice(cell_slice_t s) {
     cell_slice_t *box = (cell_slice_t *)malloc(sizeof(*box));
-    if (box == NULL) cell_panic("cell_arc_from_slice: out of memory");
+    if (box == NULL) cell_panic(cell_str_from_cstr("cell_arc_from_slice: out of memory"));
     *box = s; /* move: box now owns the buffer, s must not be freed */
     return cell_arc_new(box, cell_slice_drop_glue);
 }
@@ -271,31 +272,188 @@ void cell_print_int(int64_t value) {
 }
 
 void cell_assert(bool cond) {
-    if (!cond) cell_panic("assertion failed");
+    if (!cond) cell_panic(cell_str_from_cstr("assertion failed"));
 }
 
 void cell_assert_msg(bool cond, cell_str_t msg) {
     if (cond) return;
-
-    /* cell_panic takes a C string, so the view needs a NUL-terminated copy.
-       Fall back to the bare message if that allocation fails. */
-    cell_string_t owned = cell_string_from_str(msg);
-    if (owned.ptr == NULL) cell_panic("assertion failed");
-    fprintf(stderr, "cell panic: assertion failed: %s\n", owned.ptr);
-    cell_string_free(&owned);
+    fputs("cell panic: assertion failed: ", stderr);
+    if (msg.ptr != NULL && msg.len > 0) fwrite(msg.ptr, 1, msg.len, stderr);
+    fputc('\n', stderr);
     abort();
 }
 
-void cell_panic(const char *msg) {
-    fprintf(stderr, "cell panic: %s\n", msg ? msg : "(null)");
+__attribute__((noreturn))
+void cell_panic(cell_str_t msg) {
+    fputs("cell panic: ", stderr);
+    if (msg.ptr != NULL && msg.len > 0) fwrite(msg.ptr, 1, msg.len, stderr);
+    fputc('\n', stderr);
     abort();
+}
+
+bool cell_str_eq(cell_str_t a, cell_str_t b) {
+    if (a.len != b.len) return false;
+    if (a.len == 0) return true;
+    if (a.ptr == NULL || b.ptr == NULL) return false;
+    return memcmp(a.ptr, b.ptr, a.len) == 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Prelude group 3                                                           */
+/* ------------------------------------------------------------------------ */
+
+void cell_eprintln(cell_str_t msg) {
+    if (msg.ptr != NULL && msg.len > 0) fwrite(msg.ptr, 1, msg.len, stderr);
+    fputc('\n', stderr);
+}
+
+int64_t cell_int_from_int32(int32_t v) { return v; }
+
+cell_opt_i32_t cell_int32_from_int(int64_t v) {
+    if (v < INT32_MIN || v > INT32_MAX) return cell_opt_i32_none();
+    return cell_opt_i32_some((int32_t)v);
+}
+
+cell_opt_u64_t cell_uint_from_int(int64_t v) {
+    if (v < 0) return cell_opt_u64_none();
+    return cell_opt_u64_some((uint64_t)v);
+}
+
+cell_opt_i64_t cell_int_from_uint(uint64_t v) {
+    if (v > (uint64_t)INT64_MAX) return cell_opt_i64_none();
+    return cell_opt_i64_some((int64_t)v);
+}
+
+double cell_float_from_int(int64_t v) { return (double)v; }
+
+cell_opt_i64_t cell_int_from_float(double v) {
+    /* 2^63 is exactly representable; INT64_MAX is not, so compare against
+     * the power of two on the high side and the exact minimum on the low. */
+    if (isnan(v) || isinf(v)) return cell_opt_i64_none();
+    if (v >= 9223372036854775808.0 || v < -9223372036854775808.0) return cell_opt_i64_none();
+    return cell_opt_i64_some((int64_t)v);
+}
+
+float cell_float32_from_float(double v) { return (float)v; }
+double cell_float_from_float32(float v) { return (double)v; }
+
+cell_opt_byte_t cell_byte_from_int(int64_t v) {
+    if (v < 0 || v > 255) return cell_opt_byte_none();
+    return cell_opt_byte_some((uint8_t)v);
+}
+
+int64_t cell_int_from_byte(uint8_t v) { return v; }
+
+cell_opt_i64_t cell_abs_int(int64_t v) {
+    if (v == INT64_MIN) return cell_opt_i64_none();
+    return cell_opt_i64_some(v < 0 ? -v : v);
+}
+
+int64_t cell_min_int(int64_t a, int64_t b) { return a < b ? a : b; }
+int64_t cell_max_int(int64_t a, int64_t b) { return a > b ? a : b; }
+
+cell_opt_i64_t cell_rem_int(int64_t a, int64_t b) {
+    if (b == 0 || (a == INT64_MIN && b == -1)) return cell_opt_i64_none();
+    return cell_opt_i64_some(a % b);
+}
+
+double cell_abs_float(double v) { return fabs(v); }
+double cell_min_float(double a, double b) { return a < b ? a : b; }
+double cell_max_float(double a, double b) { return a > b ? a : b; }
+
+int64_t cell_str_len(cell_str_t s) { return (int64_t)s.len; }
+
+cell_string_t cell_str_concat(cell_str_t a, cell_str_t b) {
+    cell_string_t out = cell_string_from_str(a);
+    if (b.len == 0) return out;
+    /* cap includes the NUL terminator (see cell_string_from_str). */
+    size_t need = out.len + b.len;
+    if (need + 1 > out.cap) {
+        char *grown = (char *)realloc(out.ptr, need + 1);
+        if (grown == NULL) cell_panic(cell_str_from_cstr("cell_str_concat: out of memory"));
+        out.ptr = grown;
+        out.cap = need + 1;
+    }
+    memcpy(out.ptr + out.len, b.ptr, b.len);
+    out.len = need;
+    out.ptr[out.len] = '\0';
+    return out;
+}
+
+cell_opt_byte_t cell_str_byte_at(cell_str_t s, int64_t index) {
+    if (index < 0 || (uint64_t)index >= s.len) return cell_opt_byte_none();
+    return cell_opt_byte_some((uint8_t)s.ptr[index]);
+}
+
+static cell_string_t cell_string_from_buf(const char *buf, int n) {
+    if (n < 0) n = 0;
+    return cell_string_from_str(cell_str_from_parts(buf, (size_t)n));
+}
+
+cell_string_t cell_str_from_int(int64_t v) {
+    char buf[32];
+    int n = snprintf(buf, sizeof buf, "%lld", (long long)v);
+    return cell_string_from_buf(buf, n);
+}
+
+cell_string_t cell_str_from_float(double v) {
+    char buf[64];
+    int n = snprintf(buf, sizeof buf, "%.17g", v);
+    return cell_string_from_buf(buf, n);
+}
+
+cell_string_t cell_str_from_bool(bool v) {
+    return cell_string_from_cstr(v ? "true" : "false");
+}
+
+int64_t cell_bytes_len(cell_slice_t xs) { return (int64_t)xs.len; }
+
+cell_opt_byte_t cell_bytes_at(cell_slice_t xs, int64_t index) {
+    if (index < 0 || (uint64_t)index >= xs.len) return cell_opt_byte_none();
+    return cell_opt_byte_some(((const uint8_t *)xs.ptr)[index]);
+}
+
+void cell_bytes_push(cell_slice_t *xs, uint8_t value) {
+    if (!cell_slice_push(xs, sizeof(uint8_t), &value))
+        cell_panic(cell_str_from_cstr("cell_bytes_push: out of memory"));
+}
+
+cell_opt_byte_t cell_bytes_pop(cell_slice_t *xs) {
+    if (xs->len == 0) return cell_opt_byte_none();
+    xs->len -= 1;
+    return cell_opt_byte_some(((const uint8_t *)xs->ptr)[xs->len]);
+}
+
+void cell_bytes_clear(cell_slice_t *xs) { xs->len = 0; }
+
+cell_slice_t cell_bytes_empty(void) { return cell_slice_empty(); }
+
+cell_slice_t cell_bytes_with_capacity(int64_t cap) {
+    if (cap < 0) cap = 0;
+    return cell_slice_alloc(sizeof(uint8_t), (size_t)cap);
+}
+
+cell_arc_t cell_arc_retain_string(cell_arc_t value) {
+    cell_arc_t out = cell_arc_clone(value);
+    cell_arc_drop(value);
+    return out;
+}
+
+void cell_arc_release_string(cell_arc_t value) {
+    cell_arc_drop(value);
+}
+
+int64_t cell_arc_count_string(cell_arc_t value) {
+    int64_t n = (int64_t)cell_arc_strong_count(value);
+    cell_arc_drop(value);
+    return n;
 }
 
 /* Weak stubs if C++ / Swift not linked. Strong symbols override these. */
-__attribute__((weak)) int cell_cxx_probe(void) {
+__attribute__((weak)) int32_t cell_cxx_probe(void) {
     return 0;
 }
 
-__attribute__((weak)) int cell_swift_probe(void) {
+__attribute__((weak)) int32_t cell_swift_probe(void) {
     return 0;
 }

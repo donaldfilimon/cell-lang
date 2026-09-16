@@ -107,6 +107,9 @@ the three backends disagree about the program.
 same contract: LLVM and MLIR refuse `Some`/`None`/`Ok`/`Err` together with
 `cannot lower`. Scalar payloads only.
 
+`prelude.cell` (prints 123) is C only: it calls prelude functions that return
+optionals and owned Strings, which LLVM and MLIR refuse together.
+
 ## What `cell check` covers
 
 `cell check` parses, typechecks, and borrow-checks. A file in `examples/`

@@ -144,9 +144,6 @@
 extern "C" {
 #endif
 
-/** Runtime version string (null-terminated). ABI frozen: src/main.zig externs it. */
-const char *cell_rt_version(void);
-
 /* ------------------------------------------------------------------------ */
 /* String                                                                    */
 /* ------------------------------------------------------------------------ */
@@ -181,12 +178,7 @@ static inline cell_str_t cell_str_from_cstr(const char *cstr) {
     return cell_str_from_parts(cstr, strlen(cstr));
 }
 
-static inline bool cell_str_eq(cell_str_t a, cell_str_t b) {
-    if (a.len != b.len) return false;
-    if (a.len == 0) return true;
-    if (a.ptr == NULL || b.ptr == NULL) return false;
-    return memcmp(a.ptr, b.ptr, a.len) == 0;
-}
+bool cell_str_eq(cell_str_t a, cell_str_t b);
 
 /** Borrow an owning string as a view. Valid until the owner is freed or moved. */
 static inline cell_str_t cell_string_as_str(const cell_string_t *s) {
@@ -484,18 +476,59 @@ void cell_assert(bool cond);
  */
 void cell_assert_msg(bool cond, cell_str_t msg);
 
-/** Panic with message (aborts). */
-void cell_panic(const char *msg) __attribute__((noreturn));
+/** Panic with message (aborts). The definition in cell_rt.c is noreturn;
+ *  the prototype matches `cell emit stdlib/prelude.cell` byte for byte. */
+void cell_panic(cell_str_t msg);
 
 /* ------------------------------------------------------------------------ */
 /* Bridge probes. ABI frozen: src/main.zig externs both.                     */
 /* ------------------------------------------------------------------------ */
 
 /** Optional C++ bridge entry (defined in cell_rt.cpp when linked). */
-int cell_cxx_probe(void);
+int32_t cell_cxx_probe(void);
 
 /** Optional Swift bridge entry (defined in CellBridge.swift when linked). */
-int cell_swift_probe(void);
+int32_t cell_swift_probe(void);
+
+/* ------------------------------------------------------------------------ */
+/* Prelude (stdlib/prelude.cell group 3)                                     */
+/* ------------------------------------------------------------------------ */
+
+cell_string_t cell_rt_version(void);
+void cell_eprintln(cell_str_t msg);
+int64_t cell_int_from_int32(int32_t v);
+cell_opt_i32_t cell_int32_from_int(int64_t v);
+cell_opt_u64_t cell_uint_from_int(int64_t v);
+cell_opt_i64_t cell_int_from_uint(uint64_t v);
+double cell_float_from_int(int64_t v);
+cell_opt_i64_t cell_int_from_float(double v);
+float cell_float32_from_float(double v);
+double cell_float_from_float32(float v);
+cell_opt_byte_t cell_byte_from_int(int64_t v);
+int64_t cell_int_from_byte(uint8_t v);
+cell_opt_i64_t cell_abs_int(int64_t v);
+int64_t cell_min_int(int64_t a, int64_t b);
+int64_t cell_max_int(int64_t a, int64_t b);
+cell_opt_i64_t cell_rem_int(int64_t a, int64_t b);
+double cell_abs_float(double v);
+double cell_min_float(double a, double b);
+double cell_max_float(double a, double b);
+int64_t cell_str_len(cell_str_t s);
+cell_string_t cell_str_concat(cell_str_t a, cell_str_t b);
+cell_opt_byte_t cell_str_byte_at(cell_str_t s, int64_t index);
+cell_string_t cell_str_from_int(int64_t v);
+cell_string_t cell_str_from_float(double v);
+cell_string_t cell_str_from_bool(bool v);
+int64_t cell_bytes_len(cell_slice_t xs);
+cell_opt_byte_t cell_bytes_at(cell_slice_t xs, int64_t index);
+void cell_bytes_push(cell_slice_t *xs, uint8_t value);
+cell_opt_byte_t cell_bytes_pop(cell_slice_t *xs);
+void cell_bytes_clear(cell_slice_t *xs);
+cell_slice_t cell_bytes_empty(void);
+cell_slice_t cell_bytes_with_capacity(int64_t cap);
+cell_arc_t cell_arc_retain_string(cell_arc_t value);
+void cell_arc_release_string(cell_arc_t value);
+int64_t cell_arc_count_string(cell_arc_t value);
 
 #ifdef __cplusplus
 }

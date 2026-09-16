@@ -1,0 +1,52 @@
+// The prelude, exercised end to end: every group 3 function is called, the
+// optional-returning ones are matched, and one number is printed.
+//
+// Status: C only (optionals and owned Strings; LLVM and MLIR refuse
+// together). Runs through gate stage 12 (`cell run`) as well as stage 8.
+// EXPECT-OUTPUT: 123
+
+pub fn print_int(copy value: Int);
+pub fn str_len(shared s: String) -> Int;
+pub fn str_eq(shared a: String, shared b: String) -> Bool;
+pub fn str_concat(shared a: String, shared b: String) -> owned String;
+pub fn str_byte_at(shared s: String, copy index: Int) -> Byte?;
+pub fn str_from_int(copy v: Int) -> owned String;
+pub fn int_from_byte(copy v: Byte) -> Int;
+pub fn rem_int(copy a: Int, copy b: Int) -> Int?;
+pub fn abs_int(copy v: Int) -> Int?;
+pub fn min_int(copy a: Int, copy b: Int) -> Int;
+pub fn byte_from_int(copy v: Int) -> Byte?;
+pub fn bytes_empty() -> owned [Byte];
+pub fn bytes_push(exclusive xs: [Byte], copy value: Byte);
+pub fn bytes_len(shared xs: [Byte]) -> Int;
+pub fn bytes_pop(exclusive xs: [Byte]) -> Byte?;
+
+pub fn or_zero(copy o: Int?) -> Int {
+    return match o { Some(x) => x, None => 0 }
+}
+
+pub fn main() {
+    let owned ab: String = str_concat("a", "b")
+    let copy n = str_len(ab)
+    let copy same = str_eq(ab, "ab")
+    let copy c = match str_byte_at(ab, 1) { Some(b) => int_from_byte(b), None => 0 }
+    let copy miss = match str_byte_at(ab, 5) { Some(b) => 1, None => 0 }
+    let owned s42: String = str_from_int(42)
+    let copy r = or_zero(rem_int(7, 3))
+    let copy z = or_zero(rem_int(7, 0))
+    let copy a = or_zero(abs_int(-9))
+    let copy m = min_int(3, 4)
+    let copy ok = match byte_from_int(300) { Some(v) => 1, None => 0 }
+    var owned xs: [Byte] = bytes_empty()
+    bytes_push(&mut xs, 5)
+    bytes_push(&mut xs, 6)
+    let copy l = bytes_len(xs)
+    let copy popped = bytes_pop(&mut xs)
+    let copy p = match popped { Some(v) => int_from_byte(v), None => 0 }
+    let copy total = n + c + miss + r + z + a + m + ok + l + p + str_len(s42)
+    if same {
+        print_int(total)
+    } else {
+        print_int(0)
+    }
+}

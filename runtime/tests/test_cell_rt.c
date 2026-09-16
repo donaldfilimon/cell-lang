@@ -10,8 +10,11 @@
 
 #include "cell_rt.h"
 
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /*
  * The concurrent retain/release test needs real threads. POSIX threads are
@@ -42,9 +45,10 @@ static int g_failures = 0;
 /* ------------------------------------------------------------------------ */
 
 static void test_version(void) {
-    const char *v = cell_rt_version();
-    CHECK(v != NULL);
-    CHECK(v[0] != '\0');
+    cell_string_t v = cell_rt_version();
+    CHECK(v.len > 0);
+    CHECK(v.ptr != NULL);
+    cell_string_free(&v);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -672,6 +676,87 @@ static void test_weak_bridge_fallbacks(void) {
     CHECK(cell_swift_probe() == 0);
 }
 
+static void test_prelude_numeric(void) {
+    CHECK(cell_int_from_int32(-3) == -3);
+    CHECK(cell_int32_from_int(7).has_value && cell_int32_from_int(7).value == 7);
+    CHECK(!cell_int32_from_int((int64_t)INT32_MAX + 1).has_value);
+    CHECK(!cell_uint_from_int(-1).has_value);
+    CHECK(cell_uint_from_int(5).value == 5);
+    CHECK(!cell_int_from_uint((uint64_t)INT64_MAX + 1).has_value);
+    CHECK(cell_int_from_uint(9).value == 9);
+    CHECK(cell_float_from_int(2) == 2.0);
+    CHECK(cell_int_from_float(2.9).value == 2);
+    CHECK(!cell_int_from_float(NAN).has_value);
+    CHECK(!cell_int_from_float(INFINITY).has_value);
+    CHECK(!cell_int_from_float(1e300).has_value);
+    CHECK(cell_float32_from_float(0.5) == 0.5f);
+    CHECK(cell_float_from_float32(0.5f) == 0.5);
+    CHECK(cell_byte_from_int(255).value == 255);
+    CHECK(!cell_byte_from_int(256).has_value);
+    CHECK(!cell_byte_from_int(-1).has_value);
+    CHECK(cell_int_from_byte(200) == 200);
+    CHECK(cell_abs_int(-4).value == 4);
+    CHECK(!cell_abs_int(INT64_MIN).has_value);
+    CHECK(cell_min_int(1, 2) == 1 && cell_max_int(1, 2) == 2);
+    CHECK(cell_rem_int(7, 3).value == 1);
+    CHECK(cell_rem_int(-7, 3).value == -1);
+    CHECK(!cell_rem_int(1, 0).has_value);
+    CHECK(!cell_rem_int(INT64_MIN, -1).has_value);
+    CHECK(cell_abs_float(-1.5) == 1.5);
+    CHECK(cell_min_float(1.0, 2.0) == 1.0 && cell_max_float(1.0, 2.0) == 2.0);
+}
+
+static void test_prelude_strings(void) {
+    cell_str_t hi = cell_str_from_cstr("hi");
+    cell_str_t hi2 = cell_str_from_cstr("hi");
+    CHECK(cell_str_len(hi) == 2);
+    CHECK(cell_str_eq(hi, hi2));
+    cell_string_t cat = cell_str_concat(hi, cell_str_from_cstr("!"));
+    CHECK(cat.len == 3 && memcmp(cat.ptr, "hi!", 3) == 0);
+    cell_string_free(&cat);
+    CHECK(cell_str_byte_at(hi, 1).value == 'i');
+    CHECK(!cell_str_byte_at(hi, 2).has_value);
+    CHECK(!cell_str_byte_at(hi, -1).has_value);
+    cell_string_t n = cell_str_from_int(-42);
+    CHECK(n.len == 3 && memcmp(n.ptr, "-42", 3) == 0);
+    cell_string_free(&n);
+    cell_string_t f = cell_str_from_float(1.5);
+    CHECK(f.len == 3 && memcmp(f.ptr, "1.5", 3) == 0);
+    cell_string_free(&f);
+    cell_string_t t = cell_str_from_bool(true);
+    CHECK(t.len == 4 && memcmp(t.ptr, "true", 4) == 0);
+    cell_string_free(&t);
+    cell_string_t v = cell_rt_version();
+    CHECK(v.len > 0);
+    cell_string_free(&v);
+}
+
+static void test_prelude_bytes_and_arc(void) {
+    cell_slice_t xs = cell_bytes_empty();
+    CHECK(cell_bytes_len(xs) == 0);
+    cell_bytes_push(&xs, 7);
+    cell_bytes_push(&xs, 9);
+    CHECK(cell_bytes_len(xs) == 2);
+    CHECK(cell_bytes_at(xs, 1).value == 9);
+    CHECK(!cell_bytes_at(xs, 2).has_value);
+    CHECK(cell_bytes_pop(&xs).value == 9);
+    CHECK(cell_bytes_len(xs) == 1);
+    cell_bytes_clear(&xs);
+    CHECK(cell_bytes_len(xs) == 0);
+    CHECK(!cell_bytes_pop(&xs).has_value);
+    cell_slice_free(&xs);
+    cell_slice_t ys = cell_bytes_with_capacity(16);
+    CHECK(ys.cap >= 16 && ys.len == 0);
+    cell_slice_free(&ys);
+
+    cell_arc_t a = cell_arc_from_string(cell_string_from_cstr("x"));
+    CHECK(cell_arc_count_string(a) == 1);
+    /* count_string released `a`; rebuild for retain. */
+    a = cell_arc_from_string(cell_string_from_cstr("x"));
+    cell_arc_t b = cell_arc_retain_string(a);
+    CHECK(cell_arc_count_string(b) == 1);
+}
+
 /* ------------------------------------------------------------------------ */
 
 int main(void) {
@@ -694,6 +779,9 @@ int main(void) {
     test_result();
     test_intrinsics();
     test_weak_bridge_fallbacks();
+    test_prelude_numeric();
+    test_prelude_strings();
+    test_prelude_bytes_and_arc();
 
     if (g_failures != 0) {
         fprintf(stderr, "cell_rt tests: %d/%d checks FAILED\n", g_failures, g_checks);

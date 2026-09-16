@@ -157,6 +157,12 @@
 #                       directory behind. Since the same night, .c positionals
 #                       are hand-written hosts handed to cc in run_c_host's
 #                       order, so arc (13) and owned_string (44) run here too.
+#  13. prelude sigs     every prototype the C backend emits for
+#                       stdlib/prelude.cell appears verbatim in
+#                       runtime/cell_rt.h. The prelude's own comments checked
+#                       this by hand ("Emits ... / Runtime ...") and were
+#                       found inverted once (2026-09-07); a program that
+#                       calls a prelude function links only while this holds.
 #
 # TRAPS THIS SCRIPT IS WRITTEN AGAINST, each one having actually bitten:
 #
@@ -1783,7 +1789,7 @@ printf '\n== cli build/run (stage 6 through the CLI, embedded runtime) ==\n'
 # concurrent `cell run`, or a directory a crashed one left behind, is not
 # this commit's leak. Only a count that GREW across this stage is.
 staging_before=$(/bin/ls -d "${TMPDIR:-/tmp}"/cell-build-* 2>/dev/null | wc -l | tr -d ' ')
-for pair in hello:42 backends:24 loops:55; do
+for pair in hello:42 backends:24 loops:55 prelude:123; do
     ex=${pair%%:*}; want=${pair##*:}
     got=$("$CELL" run "examples/$ex.cell" 2> "$TMP/run_$ex.err"); rc=$?
     if [ $rc -eq 0 ] && [ "$got" = "$want" ]; then
@@ -1852,6 +1858,23 @@ staging_after=$(/bin/ls -d "${TMPDIR:-/tmp}"/cell-build-* 2>/dev/null | wc -l | 
 [ "$staging_after" -le "$staging_before" ] \
     && pass "no cell-build-* staging directory added under \${TMPDIR:-/tmp} ($staging_before before, $staging_after after)" \
     || fail "cell-build-* staging directories under ${TMPDIR:-/tmp} grew from $staging_before to $staging_after during this stage"
+
+# ------------------------------------------------------------ 13. prelude sigs --
+printf '\n== prelude signatures (emitted prototypes are in cell_rt.h) ==\n'
+if tools/prelude-signatures.sh "$CELL" > "$TMP/prelude_sigs.txt" 2> "$TMP/prelude_sigs.err"; then
+    missing=0
+    while IFS= read -r proto; do
+        if grep -qF -- "$proto" runtime/cell_rt.h; then
+            pass "$proto"
+        else
+            fail "not in runtime/cell_rt.h: $proto"
+            missing=$((missing + 1))
+        fi
+    done < "$TMP/prelude_sigs.txt"
+    [ "$(wc -l < "$TMP/prelude_sigs.txt" | tr -d ' ')" -gt 0 ] || fail "prelude-signatures.sh printed no prototypes (the grep in it matched nothing)"
+else
+    fail "tools/prelude-signatures.sh could not emit the prelude: $(head -1 "$TMP/prelude_sigs.err")"
+fi
 
 # ---------------------------------------------------------------- verdict --
 printf '\n== verdict ==\n'

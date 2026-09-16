@@ -141,9 +141,10 @@ and `examples/owned_string.cell` with its host prints 44. Scalar `T?` and
 (`examples/optionals.cell` prints 43, `examples/results.cell` prints 9);
 LLVM and MLIR refuse those programs together with `cannot lower`. Every other
 command refuses a `.c` positional rather than loading it as Cell source.
-There is no `cell test`, and the prelude's group 3 declarations still resolve
-to no symbol: `cell build` reports that as cc's undefined-symbol link error.
-Gate stage 12 pins five execution answers through this path.
+There is no `cell test`. The prelude links through `cell build`/`cell run`
+(`examples/prelude.cell` prints 123); gate stage 13 keeps every emitted
+prelude prototype in `runtime/cell_rt.h`. Gate stage 12 pins execution
+answers through this path.
 
 `cell emit --target=llvm` and `cell emit --target=mlir` produce textual LLVM IR
 and MLIR by way of a typed IR in `src/cell/hir.zig`. Their retained execution

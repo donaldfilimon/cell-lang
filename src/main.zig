@@ -3,7 +3,13 @@ const cell = @import("cell");
 const Io = std.Io;
 
 // C runtime ABI (Zig master: no @cImport, so declare externs)
-extern fn cell_rt_version() [*:0]const u8;
+const CellString = extern struct {
+    ptr: ?[*]u8,
+    len: usize,
+    cap: usize,
+};
+extern fn cell_rt_version() CellString;
+extern fn cell_string_free(s: *CellString) void;
 extern fn cell_cxx_probe() c_int;
 extern fn cell_swift_probe() c_int;
 
@@ -233,7 +239,11 @@ pub fn main(init: std.process.Init) !void {
             cell.Version.minor,
             cell.Version.patch,
         });
-        std.debug.print("runtime: {s}\n", .{cell_rt_version()});
+        var rt_ver = cell_rt_version();
+        if (rt_ver.ptr) |p| {
+            std.debug.print("runtime: {s}\n", .{p[0..rt_ver.len]});
+        }
+        cell_string_free(&rt_ver);
         std.debug.print("cxx probe: {d}\n", .{cell_cxx_probe()});
         std.debug.print("swift probe: {d}\n", .{cell_swift_probe()});
         return;
