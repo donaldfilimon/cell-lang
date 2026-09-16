@@ -4838,6 +4838,44 @@ test "a local the VALUE-position block's tail borrows is not released before the
     try expectAbsent(e.text, "cell_string_free(&t);");
 }
 
+test "a return block whose tail is an outer owned place moves it: no drop of the source" {
+    // Borrowck records the move through `openBlockTail`, so `pendingDrops`
+    // at the `return` skips `s1`; the block hands the buffer to the caller
+    // once. Measured 2026-09-15 under ASan with the malloc counter:
+    // ALLOC=1 FREE=1 LIVE=0 for this shape, for the block-local tail below,
+    // and for the plain `return s1` control.
+    var e = try emitSource(
+        \\pub fn make() -> String { return "abc" }
+        \\pub fn mk() -> String {
+        \\    let owned s1 = make()
+        \\    return { s1 }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "_cell_t0 = s1;");
+    try expectAbsent(e.text, "cell_string_free(&s1);");
+}
+
+test "a call argument block whose tail is the block's own owned local frees nothing itself" {
+    // `t` is moved into the parameter, so the value-position block emits no
+    // drop for it and the callee owns the buffer (R11 row 1 decides whether
+    // the callee releases it; this test pins only that the caller does not).
+    var e = try emitSource(
+        \\pub fn make() -> String { return "abc" }
+        \\pub fn eat(owned s: String) { }
+        \\pub fn main() {
+        \\    eat(owned {
+        \\        let owned t = make()
+        \\        t
+        \\    })
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_eat(({");
+    try expectContains(e.text, "_cell_t0 = t;");
+    try expectAbsent(e.text, "cell_string_free(&t);");
+}
+
 test "a value-position block's tail resolves through a nested block, and later bindings keep their ids" {
     // Two things at once. The nested block: inference has to push the outer
     // block's `let` as scratch and recurse for the inner one. The id
