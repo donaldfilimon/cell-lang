@@ -39,6 +39,8 @@ if [ "$scenario" != missing ]; then
 printf '\n== declared signatures (C is the reference) ==\n'
   if [ "$scenario" = disclosed ]; then printf '  ok    signatures fixture: MLIR disagrees with C (DISCLOSED, injected)\n'; else printf '  ok    signatures\n'; fi
 fi
+printf '\n== rule lists (docs agree with borrowck.zig) ==\n'
+printf '  ok    rule lists\n'
 if [ "$scenario" = drift ] || [ "$scenario" = dirtydrift ]; then printf 'drift\n' >> tracked.txt; fi
 if [ "$scenario" = signal ]; then kill -TERM $$; fi
 if [ "$scenario" = truncated ]; then exit 0; fi
@@ -84,7 +86,7 @@ class QualifyIntegrationTests(unittest.TestCase):
         self.assertEqual(report["verdict"], "qualified")
         self.assertEqual(report["gate"]["returncode"], 0)
         self.assertEqual(report["test_counts"], {"library": 12, "cli": None, "runtime": None})
-        self.assertEqual(len(report["stages"]), 10)
+        self.assertEqual(len(report["stages"]), 11)
         self.assertTrue(Path(report["artifacts"]["log"]).read_text().endswith("  clean\n"))
 
     def test_partial_and_strict_skip(self):
@@ -140,8 +142,10 @@ class QualifyIntegrationTests(unittest.TestCase):
         result, report = self.run_qualify("signal")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(report["gate"]["returncode"], -15)
-        declared = next(stage for stage in report["stages"] if stage["name"].startswith("declared signatures"))
-        self.assertEqual(declared["outcome"], "incomplete")
+        # The LAST stage is the one an interrupted gate leaves open; it is
+        # "rule lists" since stage 11 was appended on 2026-09-15.
+        last = next(stage for stage in report["stages"] if stage["name"].startswith("rule lists"))
+        self.assertEqual(last["outcome"], "incomplete")
         result, report = self.run_qualify("missing")
         self.assertEqual(result.returncode, 1)
         self.assertIn("declared signatures (C is the reference)", report["missing_required_stages"])
@@ -151,8 +155,10 @@ class QualifyIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(report["gate"]["returncode"], 0)
         self.assertIn("gate output ended without a clean verdict", report["errors"])
-        declared = next(stage for stage in report["stages"] if stage["name"].startswith("declared signatures"))
-        self.assertEqual(declared["outcome"], "incomplete")
+        # The LAST stage is the one an interrupted gate leaves open; it is
+        # "rule lists" since stage 11 was appended on 2026-09-15.
+        last = next(stage for stage in report["stages"] if stage["name"].startswith("rule lists"))
+        self.assertEqual(last["outcome"], "incomplete")
 
     def test_preexisting_tracked_deletion_is_measurable(self):
         (self.root / "tracked.txt").unlink()

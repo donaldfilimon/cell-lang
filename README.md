@@ -177,9 +177,10 @@ enforces.
 ## Checking any of this yourself
 
 `tools/check.sh` is the local compiler gate and its exit code is the verdict.
-Its ten stages cover build, unit tests, corpus contracts, backend acceptance
+Its eleven stages cover build, unit tests, corpus contracts, backend acceptance
 agreement, MLIR lowering, execution, disclosed leak fixtures, backend answers,
-AddressSanitizer execution, and declared ABI signatures. Signature-only
+AddressSanitizer execution, declared ABI signatures, and rule-list agreement
+with `src/cell/borrowck.zig`'s header. Signature-only
 fixtures participate in lowering validation. A clean gate can retain explicitly
 pinned defects; those disclosures are separate from release qualification.
 

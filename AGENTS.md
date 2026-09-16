@@ -101,7 +101,7 @@ See `examples/README.md` for the exact shell loops and the per-file demonstratio
 
 Syntax is not implementation. Verify by running the compiler.
 
-- Borrow rules enforced by `src/cell/borrowck.zig` (see its header comment for the exact current set; it is independent of the typechecker). As of now: R1, R2, **R2.a**, **R2.b**, R3, R3a, R4, R5, R6, R8, **R9**, R14 (both clauses), R15, **R18**, plus ONE clause of R10: an `arc` value may not be made **unique**, refused at SIX consumption sites (an `owned` parameter, an `owned` binding, an assignment to an `owned` place, an `owned` struct field, a list-literal element, and a `return` whose declared return type is not `arc`). Every `arc`-to-`arc` use stays legal, `-> arc T` returning an `arc` local included. The rest of R10, including move-into-`arc`, is still designed only.
+- Borrow rules enforced by `src/cell/borrowck.zig` (see its header comment for the exact current set; it is independent of the typechecker). As of now: R1, R2, **R2.a**, **R2.b**, R3, R3a, R4, R5, R6, **R7's consumption clause**, R8, **R9**, R14 (both clauses), R15, **R18**, plus ONE clause of R10: an `arc` value may not be made **unique**, refused at SIX consumption sites (an `owned` parameter, an `owned` binding, an assignment to an `owned` place, an `owned` struct field, a list-literal element, and a `return` whose declared return type is not `arc`). Every `arc`-to-`arc` use stays legal, `-> arc T` returning an `arc` local included. The rest of R10, including move-into-`arc`, is still designed only.
 
   **That one clause has been widened three times, along three different axes, and each widening found the previous one incomplete.** Hold the three apart, because a claim about one says nothing about the others:
 

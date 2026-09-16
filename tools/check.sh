@@ -133,6 +133,18 @@
 #                       wrong struct. Every stage above was green on it, and
 #                       stage 8 could not have caught it either, because the
 #                       program has no `main` and prints nothing.
+#  11. rule lists       tools/check-rule-lists.sh: every document that lists
+#                       the rules borrowck.zig enforces must mention every
+#                       rule its header names. The list was found stale in
+#                       SIX places in one session on 2026-09-08 and two of
+#                       them re-drifted within the hour; the script existed
+#                       from that day but was never run by this gate, and on
+#                       2026-09-15 it was red again (AGENTS.md and CLAUDE.md
+#                       had missed R7's consumption clause) with nothing
+#                       saying so. Understating what the checker enforces
+#                       invites re-implementing a rule that already exists.
+#                       Appended as the last stage so the ten cross-references
+#                       above keep their numbers.
 #
 # TRAPS THIS SCRIPT IS WRITTEN AGAINST, each one having actually bitten:
 #
@@ -1600,6 +1612,20 @@ else
         pass "every backend that declares a function declares C's calling convention for it"
     fi
 fi
+
+# ---------------------------------------------------- 11. rule lists --
+# Exit 0 is agreement, 1 is drift, 2 is a setup problem (no borrowck.zig, or
+# no rules parsed from its header). 2 is a FAIL and not a SKIP: the authority
+# missing is a repository defect, not an absent tool.
+printf '\n== rule lists (docs agree with borrowck.zig) ==\n'
+sh tools/check-rule-lists.sh > "$TMP/rule_lists.log" 2>&1
+rule_lists_status=$?
+case "$rule_lists_status" in
+    0) pass "every document mentions every rule borrowck.zig enforces" ;;
+    1) fail "rule lists drifted from src/cell/borrowck.zig's header (fix the document, not the header, unless the header is wrong)"
+       grep '^DRIFT' "$TMP/rule_lists.log" | sed 's/^/        /' ;;
+    *) fail "tools/check-rule-lists.sh could not run (exit $rule_lists_status): $(tail -1 "$TMP/rule_lists.log")" ;;
+esac
 
 # ---------------------------------------------------------------- verdict --
 printf '\n== verdict ==\n'

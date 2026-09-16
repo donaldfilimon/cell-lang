@@ -44,8 +44,8 @@ def repo_root(start: Path) -> Path:
 def stage_identities(gate: Path) -> list[str]:
     stages = [match.group(1) for line in gate.read_text().splitlines() if (match := STAGE_RE.match(line))]
     stages = [stage for stage in stages if stage != "verdict"]
-    if len(stages) != 10 or len(set(stages)) != 10:
-        raise RuntimeError(f"expected 10 unique gate stages, found {len(stages)}")
+    if len(stages) != 11 or len(set(stages)) != 11:
+        raise RuntimeError(f"expected 11 unique gate stages, found {len(stages)}")
     return stages
 
 

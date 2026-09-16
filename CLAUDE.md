@@ -13,12 +13,14 @@ cross-file picture that no single source file states.
    parsed versus only designed.
 2. `docs/SPEC.md` section 12, the construct-by-construct status index, and
    `docs/OWNERSHIP.md` for the numbered rules `borrowck.zig` implements
-   (R1, R2, **R2.a**, **R2.b**, R3, R3a, R4, R5, R6, R8, **R9**, R14, R15 and
+   (R1, R2, **R2.a**, **R2.b**, R3, R3a, R4, R5, R6, **R7's consumption clause**, R8, **R9**, R14, R15 and
    **R18** today, **plus one
    clause of R10**: an `arc` value may not be made unique. The rest of R10,
    move-into-`arc` in particular, is not enforced. Its header comment is the
-   live list and this line has already drifted from it once, dropping R9 and
-   the R10 clause entirely).
+   live list and this line has already drifted from it twice: once dropping
+   R9 and the R10 clause entirely, and again missing R7's consumption clause
+   until 2026-09-15, when gate stage 11, `tools/check-rule-lists.sh`, began
+   failing on exactly that).
 3. The module doc comment of whatever you are about to change. They are long
    on purpose and carry the decision, not just the description:
    `hir.zig` on why lowering is total and tolerant, `cfg.zig` on why a block
@@ -32,14 +34,16 @@ cross-file picture that no single source file states.
 tools/check.sh          # exit code is the verdict
 ```
 
-One command, **nine stages** plus a verdict, and its header comment explains
+One command, **eleven stages** plus a verdict, and its header comment explains
 why each stage earns its place. `zig build test` alone is not the gate: it
 does not run a single `.cell` program, and `zig build examples` checks only
 `hello.cell`. The stages, in the order the script prints them: build, tests
 (with the count printed), the four corpus contracts from
 `examples/README.md`, backend agreement, MLIR lowering, execution, leaks
 (`docs/OWNERSHIP.md` R11's disclosed gaps, pinned as constants), backend
-answers, and sanitized execution under AddressSanitizer.
+answers, sanitized execution under AddressSanitizer, declared signatures, and
+rule lists (every document's enforced-rule list against `borrowck.zig`'s
+header).
 
 **Read the stage list off the script's own output, not off this paragraph.**
 It said "five stages" for days after the gate reached nine, and every stage
