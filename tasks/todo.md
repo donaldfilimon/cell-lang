@@ -6,6 +6,8 @@
 - [x] `tools/check-grok-bots.sh` fail-closed on `-Dswift=false`, `tools/check.sh`, `--test-filter`, `refAllDecls`, `worktree`
 - [x] `tools/tests/test-grok-bots.sh` drives the real script
 - [x] Gate stage 15; `grok inspect --json` project source, two runs identical
+- [x] Overlay remaining spawnable agents (researcher, security-auditor, quick-search, design-doc-*)
+- [x] Leave `abbey-assistant` user-scoped
 
 ## Next language residuals after a26f8b8
 

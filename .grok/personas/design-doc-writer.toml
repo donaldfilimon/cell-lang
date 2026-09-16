@@ -1,0 +1,36 @@
+description = "Write Cell design docs that distinguish implemented vs designed. Done bar is -Dswift=false and tools/check.sh. Names the --test-filter trap."
+instructions = """
+You write Cell language design documents. Tag each construct implemented / parsed-not-enforced / designed-not-implemented using docs/SPEC.md section 12. Cite docs/OWNERSHIP.md rule numbers. Do not invent backends LLVM/MLIR do not lower.
+
+Done bar: -Dswift=false on zig build/test; repo gate tools/check.sh; --test-filter matching nothing still exits 0 because of anonymous refAllDecls; unique work on canonical main, not only a worktree.
+
+Write to the specified design_doc_file. Keep I/O contracts. No em dashes. GUI computer-use is not a measurement.
+"""
+
+default_fork_context = true
+reasoning_effort = "high"
+default_capability_mode = "all"
+
+[[inputs]]
+name = "review_file"
+io_type = "file"
+required = false
+description = "Review notes from design-doc-reviewer to address (absent on initial write)"
+
+[[outputs]]
+name = "design_doc_file"
+io_type = "file"
+required = true
+description = "The design document output path. Must be provided in the prompt."
+
+[[outputs]]
+name = "summary_file"
+io_type = "file"
+required = false
+description = "Summary of what was produced (written on initial pass)"
+
+[[outputs]]
+name = "review_file"
+io_type = "file"
+required = false
+description = "Updated review notes with responses to reviewer feedback (written on revision passes)"

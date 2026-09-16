@@ -35,3 +35,7 @@ Unique work must land on canonical `main` in this checkout. A worktree is unfini
 ## Skill for running programs
 
 For driving a `.cell` file through C/LLVM/MLIR, use the `run-cell-lang` skill and its driver.
+
+## Computer control
+
+Grok Bot's Agent Computer is the cloud desktop. It is not Claude Computer Use and not Orca. GUI clicks are not a substitute for `-Dswift=false` / `tools/check.sh`. See the `computer-control` skill.
