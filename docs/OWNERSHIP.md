@@ -1230,13 +1230,28 @@ clauses, `c314a0e`). A fourth, an `owned` place in a list-literal element, was
 already a MEASURED heap-use-after-free for `String` (R2's list-element clause,
 same commit). Both refusals are described under their own rules.
 
-**A typedef-order gap, found while placing the glue and recorded rather than
-fixed.** `struct A { owned b: B }` followed by `struct B { ... }` passes
-`cell check`, and the emitted typedefs come out in source order, so `cell_A`
-names `cell_B` before it exists and `cc` refuses the file
-(`unknown type name 'cell_B'`). That predates the glue and the glue cannot
-make it worse, since its prototypes and definitions all follow every typedef;
-it is its own gap in the C backend's declaration ordering.
+**The typedef-order gap is CLOSED.** It read: `struct A { owned b: B }`
+followed by `struct B { ... }` passes `cell check`, and the emitted typedefs
+come out in source order, so `cell_A` names `cell_B` before it exists and `cc`
+refuses the file (`unknown type name 'cell_B'`). It predated the glue and the
+glue could not worsen it, since its prototypes and definitions all follow
+every typedef; it was its own gap in the C backend's declaration ordering.
+Closed by emitting structs in dependency order instead of source order:
+`emitStructsInDependencyOrder` walks each struct's field types depth-first and
+emits a referenced struct before its referrer. The edge is taken from any type
+name appearing anywhere in a field's type, so a `ref` field (`cell_B *`) takes
+the same edge as a value field; `[B]` lowers to the opaque `cell_slice_t` and
+needs no edge, but the conservative direction only constrains the order
+further, and over-ordering costs nothing while a missed edge emits C that does
+not compile. Enums are hoisted ahead of all structs, which is sound because a
+struct field may name an enum and an enum can never name a struct. A cycle is
+left in source order rather than rotated arbitrarily: a struct containing
+itself by value has no size in C, so no permutation compiles and `cc` is the
+better reporter. Five tests pin it (forward reference, `ref` field,
+independent structs keeping source order, cycle termination, enum before
+referring struct); the ordering assertions compare positions rather than
+asserting presence, because a presence-only test passes in exactly the
+arrangement `cc` rejects, which is how this gap survived in the first place.
 
 **CLOSED (row 5), and gone from the table above.** Reassigning an `arc` `var`
 (`var arc v = "one"` then `v = "two"`) leaked the previous box: `leaks` read 3

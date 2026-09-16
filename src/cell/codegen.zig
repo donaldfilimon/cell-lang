@@ -340,6 +340,11 @@ const Callee = struct {
 };
 
 /// One `CELL_DEFINE_OPTIONAL` instantiation the module needs.
+/// Where a struct is in the dependency-ordered typedef walk.
+/// `visiting` doubles as the cycle mark: meeting it again means the module's
+/// structs contain each other, which no emission order can fix.
+const StructEmitState = enum { unvisited, visiting, emitted };
+
 const OptionalInst = struct {
     /// Macro base, for example `cell_opt_Point`.
     base: []const u8,
@@ -427,13 +432,14 @@ pub const Generator = struct {
             if (item.kind == .use_decl) try out.print("// use {s}\n", .{item.kind.use_decl});
         }
 
+        // Enums first, unconditionally: an enum is a `typedef int32_t` with no
+        // dependencies, and a struct field may name an enum while an enum can
+        // never name a struct, so hoisting them cannot introduce an ordering
+        // problem and removes one.
         for (module.items) |item| {
-            switch (item.kind) {
-                .struct_def => |s| try self.emitStruct(s),
-                .enum_def => |e| try self.emitEnum(e),
-                else => {},
-            }
+            if (item.kind == .enum_def) try self.emitEnum(item.kind.enum_def);
         }
+        try self.emitStructsInDependencyOrder(module);
 
         try self.emitOptionalInstances();
         try self.emitDropGlue(module);
@@ -453,6 +459,82 @@ pub const Generator = struct {
         }
 
         try self.emitEntryPoint();
+    }
+
+    /// Struct typedefs in dependency order rather than source order.
+    ///
+    /// `struct A { owned b: B }` written above `struct B` used to emit
+    /// `cell_A` first, and `cc` refused the module with
+    /// `unknown type name 'cell_B'` while `cell check` accepted it -- a
+    /// front end that passes and a back end that cannot be compiled.
+    /// A field naming another struct needs that struct's typedef already
+    /// emitted whether the field is a value (`cell_B b;`) or a `ref`
+    /// (`cell_B *b;`), so the edge is taken from any `.name` appearing
+    /// anywhere in the field's type expression. That is deliberately
+    /// conservative: `[B]` lowers to the opaque `cell_slice_t` and needs no
+    /// edge, but adding one only constrains the order further, and being
+    /// wrong in that direction costs nothing while missing an edge emits
+    /// C that does not compile.
+    ///
+    /// Depth-first post-order, source order among independent structs so the
+    /// common case keeps emitting exactly as it did. A cycle is left in
+    /// source order rather than reordered: a struct that contains itself by
+    /// value has no size in C, so no permutation compiles, and `cc` reporting
+    /// it is better than this pass picking an arbitrary rotation.
+    fn emitStructsInDependencyOrder(self: *Generator, module: *const ast.Module) EmitError!void {
+        var state: std.StringHashMapUnmanaged(StructEmitState) = .empty;
+        for (module.items) |item| {
+            if (item.kind == .struct_def) {
+                try state.put(self.arena, item.kind.struct_def.name, .unvisited);
+            }
+        }
+        for (module.items) |item| {
+            if (item.kind != .struct_def) continue;
+            try self.emitStructAfterDeps(module, item.kind.struct_def, &state);
+        }
+    }
+
+    fn emitStructAfterDeps(
+        self: *Generator,
+        module: *const ast.Module,
+        s: ast.StructDef,
+        state: *std.StringHashMapUnmanaged(StructEmitState),
+    ) EmitError!void {
+        switch (state.get(s.name) orelse .unvisited) {
+            .emitted, .visiting => return, // already done, or a cycle: see the doc comment
+            .unvisited => {},
+        }
+        try state.put(self.arena, s.name, .visiting);
+        for (s.fields) |f| try self.emitDepsOfType(module, &f.ty, state);
+        try state.put(self.arena, s.name, .emitted);
+        try self.emitStruct(s);
+    }
+
+    fn emitDepsOfType(
+        self: *Generator,
+        module: *const ast.Module,
+        ty: *const ast.TypeExpr,
+        state: *std.StringHashMapUnmanaged(StructEmitState),
+    ) EmitError!void {
+        switch (ty.*) {
+            .name => |n| {
+                if (state.get(n) == null) return; // a builtin or an enum, not a struct in this module
+                for (module.items) |item| {
+                    if (item.kind != .struct_def) continue;
+                    if (!std.mem.eql(u8, item.kind.struct_def.name, n)) continue;
+                    try self.emitStructAfterDeps(module, item.kind.struct_def, state);
+                    return;
+                }
+            },
+            .optional => |inner| try self.emitDepsOfType(module, inner, state),
+            .list => |inner| try self.emitDepsOfType(module, inner, state),
+            .ref => |r| try self.emitDepsOfType(module, r.inner, state),
+            .result => |r| {
+                try self.emitDepsOfType(module, r.ok, state);
+                try self.emitDepsOfType(module, r.err, state);
+            },
+            .unit => {},
+        }
     }
 
     /// `CELL_DEFINE_OPTIONAL` lines for every optional the module names that
@@ -3563,6 +3645,78 @@ test "an enum is an int32_t typedef, not an implementation defined enum" {
         \\};
     );
     try expectAbsent(e.text, "typedef enum");
+}
+
+/// `first` must appear before `second`. An ordering test that only asserted
+/// both are present would pass in the exact arrangement `cc` rejects, which
+/// is how the forward-reference gap survived: `cell check` said ok and no
+/// test looked at the order.
+fn expectBefore(haystack: []const u8, first: []const u8, second: []const u8) !void {
+    const a = std.mem.indexOf(u8, haystack, first) orelse {
+        std.debug.print("\nexpected to find:\n{s}\nin:\n{s}\n", .{ first, haystack });
+        return error.NotFound;
+    };
+    const b = std.mem.indexOf(u8, haystack, second) orelse {
+        std.debug.print("\nexpected to find:\n{s}\nin:\n{s}\n", .{ second, haystack });
+        return error.NotFound;
+    };
+    if (a >= b) {
+        std.debug.print("\nexpected:\n{s}\nbefore:\n{s}\nin:\n{s}\n", .{ first, second, haystack });
+        return error.WrongOrder;
+    }
+}
+
+test "a struct field naming a later struct emits that struct's typedef first" {
+    // `cell check` accepts this and source order emitted `cell_A` first, so
+    // `cc` refused the module with `unknown type name 'cell_B'`.
+    var e = try emitSource(
+        \\pub struct A { owned b: B }
+        \\pub struct B { owned name: String }
+    );
+    defer e.deinit();
+    try expectBefore(e.text, "} cell_B;", "typedef struct cell_A {");
+}
+
+test "a ref field takes the same ordering edge as a value field" {
+    // `shared b: B` lowers to `cell_B *`, which still needs the typedef.
+    var e = try emitSource(
+        \\pub struct A { shared b: B }
+        \\pub struct B { copy x: Int }
+    );
+    defer e.deinit();
+    try expectBefore(e.text, "} cell_B;", "typedef struct cell_A {");
+}
+
+test "independent structs keep source order" {
+    // The reorder must be minimal: structs that do not reference each other
+    // emit exactly as they did before the dependency walk existed.
+    var e = try emitSource(
+        \\pub struct First { copy x: Int }
+        \\pub struct Second { copy y: Int }
+    );
+    defer e.deinit();
+    try expectBefore(e.text, "} cell_First;", "typedef struct cell_Second {");
+}
+
+test "a struct cycle terminates and still emits both typedefs" {
+    // No emission order compiles a by-value cycle, so the pass must not hang
+    // or drop a struct; it leaves the cycle for `cc` to report.
+    var e = try emitSource(
+        \\pub struct A { owned b: B }
+        \\pub struct B { owned a: A }
+    );
+    defer e.deinit();
+    try expectContains(e.text, "} cell_A;");
+    try expectContains(e.text, "} cell_B;");
+}
+
+test "an enum a struct field names is emitted before the struct" {
+    var e = try emitSource(
+        \\pub struct Tagged { copy c: Color }
+        \\pub enum Color { Red, Green }
+    );
+    defer e.deinit();
+    try expectBefore(e.text, "typedef int32_t cell_Color;", "typedef struct cell_Tagged {");
 }
 
 test "a zero-parameter function is prototyped with void" {
