@@ -70,7 +70,7 @@ resolves names from `geometry.cell`. A body with no stem-mate is an error.
 
 ## Requirements
 
-- Zig `0.17.x`. This tree is developed against `0.17.0-dev.2018+ab30a0b9a`.
+- Zig `0.17.x`. This tree is developed against `0.17.0-dev.2131+d08989840`.
 - A C toolchain (Clang).
 - Optional: C++20 (`-Dcxx=true`, default on).
 - Optional: Swift (`swiftc`, macOS; `-Dswift=true`, default on).

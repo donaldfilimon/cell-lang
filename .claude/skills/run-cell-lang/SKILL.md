@@ -16,12 +16,12 @@ backend may not have emitted, and execute.
 each one printed.
 
 All paths below are relative to the repository root. Verified 2026-09-07 on
-Darwin arm64, Apple clang 21.0.0, zig `0.17.0-dev.2018+ab30a0b9a`.
+Darwin arm64, Apple clang 21.0.0, zig `0.17.0-dev.2131+d08989840`.
 
 ## Prerequisites
 
 - **Zig master.** `build.zig.zon` pins `.minimum_zig_version =
-  "0.17.0-dev.2018+ab30a0b9a"`. On this machine that is `~/.zvm/bin/zig`, which
+  "0.17.0-dev.2131+d08989840"`. On this machine that is `~/.zvm/bin/zig`, which
   is on PATH as `zig`. A release Zig will not build this.
 - **A C compiler as `cc`.** Apple clang is what was used here. Needed for the
   runtime and for every emitted program.
