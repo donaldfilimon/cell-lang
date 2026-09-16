@@ -24,7 +24,9 @@
 //! read `s1`, `pendingDrops` kept both bindings, and one buffer was freed
 //! twice (exit 134, no `arc` anywhere in it). Enforced at the same six sites,
 //! by `ownedMoveSource`, whose `.unknown` is REFUSED and whose branch arms can
-//! never return a movable place. A resource-bearing owned struct field now
+//! never return a movable place. A BLOCK in any of the six positions is one
+//! path, not a branch: each site opens it first (`openBlockTail`) and consumes
+//! its tail with the block's `let`s in scope, so the tail moves. A resource-bearing owned struct field now
 //! permits only a fresh value: copying a place into the field and later moving
 //! the field out was a live double free even before record drops existed.
 //! List elements remain a separate transfer/release boundary.
@@ -639,7 +641,13 @@ pub const Checker = struct {
                     }
                     return;
                 }
-                if (opt.*) |*e| {
+                if (opt.*) |*ret| {
+                    // R2.b: a block is opened first, so `v` below is the
+                    // expression this site really consumes (the block's tail
+                    // with the block's scope still open), not the block.
+                    var v: *const ast.Expr = ret;
+                    var depth: usize = 0;
+                    defer self.closeBlockTail(depth);
                     // R10, the return position, and the second of the two
                     // consumption sites the four-position enumeration never
                     // asked at. A `-> [Int]` return slot is `owned` by R1, so
@@ -652,8 +660,16 @@ pub const Checker = struct {
                     // `-> arc T` is untouched: `fresh()` returning its own
                     // `arc` local is the legal arc-to-arc case.
                     if (self.fn_return_owned) |fn_name| {
+                        switch (try self.openBlockTail(ret)) {
+                            .not_block => {},
+                            .unit => return,
+                            .tail => |t| {
+                                v = t.expr;
+                                depth = t.depth;
+                            },
+                        }
                         if (try self.refuseArcUnique(
-                            try self.arcUniqueSource(e),
+                            try self.arcUniqueSource(v),
                             "return",
                             "from",
                             "function",
@@ -664,7 +680,7 @@ pub const Checker = struct {
                         // `return match c { 0 => s1, _ => s1 }` from a
                         // `-> String` function was exit 134, the caller and
                         // the callee's scope drop freeing one buffer.
-                        switch (try self.ownedMoveSource(e)) {
+                        switch (try self.ownedMoveSource(v)) {
                             .unknown => |s| {
                                 try self.refuseUnknownMove(s, "return", "from", "function", fn_name);
                                 return;
@@ -680,11 +696,11 @@ pub const Checker = struct {
                             .place, .no_owned_place => {},
                         }
                     }
-                    if (try self.placeOf(e)) |place| {
+                    if (try self.placeOf(v)) |place| {
                         const note = try self.msg("'{s}' was moved here by returning it", .{place.display});
                         try self.movePlace(place, note);
                     } else {
-                        try self.checkExpr(e);
+                        try self.checkExpr(v);
                     }
                 }
             },
@@ -776,20 +792,21 @@ pub const Checker = struct {
     fn checkLetInit(
         self: *Checker,
         l: *const @FieldType(ast.Stmt.Kind, "let"),
-        v: *const ast.Expr,
+        written: *const ast.Expr,
     ) Error!void {
-        // A BLOCK in an `owned` position is one path, not a branch: its tail
-        // always evaluates, so consuming the tail is a real move that this
-        // checker can record, unlike an `if` or `match` whose taken arm it
-        // cannot know. It is handled here, at the consumption site, and not
-        // inside `arcUniqueSource`/`ownedMoveSource`, because those two walks
-        // run back to back over the same initializer and `checkExpr` may
-        // walk it a third time: declaring the block's `let`s inside a walk
-        // would advance `next_binding_id` once per walk and break the id
-        // lockstep with codegen. See `checkOwnedLetFromBlock`.
-        if (l.ownership == .owned and v.kind == .block) {
-            return self.checkOwnedLetFromBlock(l, v.kind.block);
-        }
+        // R2.b at the `let` position opens a block initializer first, like
+        // every other `owned` consumption site; see `openBlockTail`.
+        var v = written;
+        var depth: usize = 0;
+        defer self.closeBlockTail(depth);
+        if (l.ownership == .owned) switch (try self.openBlockTail(written)) {
+            .not_block => {},
+            .unit => return,
+            .tail => |t| {
+                v = t.expr;
+                depth = t.depth;
+            },
+        };
         // R18, the `let` position, and the ONE question asked about the
         // initializer's borrow-ness anywhere in this function.
         //
@@ -924,46 +941,91 @@ pub const Checker = struct {
         try self.checkExpr(v);
     }
 
-    /// `let owned s = { ...; tail }`: the block's statements are checked in
-    /// a scope that stays OPEN while the tail is treated as the `let`'s own
-    /// initializer, so a tail naming a block-local resolves through `lookup`
-    /// to the real binding and `movePlace` records the move in `moved`, which
-    /// outlives the scope (a future value-position drop pass reads
-    /// `wasMoved` for it). Every other tail shape gets the same answer it
-    /// would get as a bare initializer: `&t` is R18, an `arc` local is R10
-    /// naming it, a nested block recurses, a call falls to `checkExpr`.
+    /// What `openBlockTail` found at an `owned` consumption site.
+    const BlockTail = union(enum) {
+        /// Not a block: consume the expression as written.
+        not_block,
+        /// A block yielding no value. Every statement was checked exactly
+        /// once and no scope is left open. The site has nothing to consume
+        /// and must RETURN (typecheck reports the unit mismatch); falling
+        /// through to `checkExpr` would declare the block's `let`s a second
+        /// time and break the binding-id lockstep with codegen.
+        unit,
+        /// The innermost tail expression, with `depth` scopes left OPEN so
+        /// the site consumes it with the block's `let`s in scope. The site
+        /// closes them with `closeBlockTail(depth)` when it is done.
+        tail: struct { expr: *const ast.Expr, depth: usize },
+    };
+
+    /// A BLOCK in an `owned` consumption position is one path, not a
+    /// branch: its tail always evaluates, so consuming the tail is a real
+    /// move this checker can record, unlike an `if` or `match` whose taken
+    /// arm it cannot know. The block's statements are checked in a scope
+    /// that stays OPEN while the site consumes the tail as if it were the
+    /// expression written there, so a tail naming a block-local resolves
+    /// through `lookup` to the real binding and `movePlace` records the move
+    /// in `moved`, which outlives the scope (a future value-position drop
+    /// pass reads `wasMoved` for it). Every other tail shape gets the answer
+    /// it would get as a bare expression at that site: `&t` is R18 at a
+    /// `let`, an `arc` local is R10 naming it, a call falls to `checkExpr`.
+    /// A nested block tail opens again; an `owned` keyword in front of a
+    /// block is peeled the way `placeOf` peels it.
     ///
-    /// The scope and the `open_blocks` entry are pushed exactly as
-    /// `checkBlockStmts` does, because a loan created inside the block
-    /// records `block_index`/`stmt_index` and is truncated by depth on the
-    /// way out. Each statement is checked exactly once here and the generic
-    /// `checkExpr(v)` never sees this block, so the block's `let`s are
+    /// Done at the CONSUMPTION SITE and not inside `arcUniqueSource` /
+    /// `ownedMoveSource`, because those two walks run back to back over the
+    /// same expression and `checkExpr` may walk it a third time: declaring
+    /// the block's `let`s inside a walk would advance `next_binding_id` once
+    /// per walk and break the id lockstep with codegen. The scope and the
+    /// `open_blocks` entry are pushed exactly as `checkBlockStmts` does,
+    /// because a loan created inside the block records
+    /// `block_index`/`stmt_index` and is truncated by depth on the way out.
+    /// Each statement is checked exactly once here and the generic
+    /// `checkExpr` never sees an opened block, so the block's `let`s are
     /// declared once, in codegen's order (statements, then the tail).
     ///
-    /// Until 2026-09-15 this program was refused with "cannot bind the
-    /// unresolved name 't'": the ownership-source walks descended to the tail
-    /// without the block's scope. The other five R2.b consumption sites still
-    /// refuse a block-local tail (with an accurate message now); only the
-    /// `let` position resolves a block's value today.
-    fn checkOwnedLetFromBlock(
-        self: *Checker,
-        l: *const @FieldType(ast.Stmt.Kind, "let"),
-        stmts: []const ast.Stmt,
-    ) Error!void {
-        if (stmts.len == 0 or stmts[stmts.len - 1].kind != .expr) {
-            // No value flows out; typecheck reports the unit mismatch.
-            return self.checkBlockStmts(stmts);
+    /// History: until 2026-09-15 a block-local tail was refused everywhere
+    /// ("cannot bind the unresolved name 't'"), then resolved at the `let`
+    /// alone (`checkOwnedLetFromBlock`, `b608d59`), and the same day at all
+    /// six sites through this one function. The classifier's own block arm
+    /// is now reached only through a branch, and its message says so.
+    fn openBlockTail(self: *Checker, e: *const ast.Expr) Error!BlockTail {
+        var cur = e;
+        var depth: usize = 0;
+        while (true) {
+            switch (cur.kind) {
+                .annotated => |a| cur = a.value,
+                .block => |stmts| {
+                    if (stmts.len == 0 or stmts[stmts.len - 1].kind != .expr) {
+                        try self.checkBlockStmts(stmts);
+                        self.closeBlockTail(depth);
+                        return .unit;
+                    }
+                    try self.pushScope();
+                    try self.open_blocks.append(self.allocator, .{ .stmts = stmts, .index = 0 });
+                    depth += 1;
+                    for (stmts[0 .. stmts.len - 1], 0..) |*st, i| {
+                        self.open_blocks.items[self.open_blocks.items.len - 1].index = i;
+                        try self.checkStmt(st);
+                    }
+                    self.open_blocks.items[self.open_blocks.items.len - 1].index = stmts.len - 1;
+                    cur = &stmts[stmts.len - 1].kind.expr;
+                },
+                else => break,
+            }
         }
-        try self.pushScope();
-        defer self.popScope();
-        try self.open_blocks.append(self.allocator, .{ .stmts = stmts, .index = 0 });
-        defer _ = self.open_blocks.pop();
-        for (stmts[0 .. stmts.len - 1], 0..) |*st, i| {
-            self.open_blocks.items[self.open_blocks.items.len - 1].index = i;
-            try self.checkStmt(st);
+        if (depth == 0) return .not_block;
+        return .{ .tail = .{ .expr = cur, .depth = depth } };
+    }
+
+    /// Closes what `openBlockTail` left open, in the reverse of the order
+    /// `checkBlockStmts`'s defers run it. A `depth` of zero is a no-op, so a
+    /// site can `defer` this unconditionally.
+    fn closeBlockTail(self: *Checker, depth: usize) void {
+        var i: usize = 0;
+        while (i < depth) : (i += 1) {
+            _ = self.open_blocks.pop();
+            self.popScope();
         }
-        self.open_blocks.items[self.open_blocks.items.len - 1].index = stmts.len - 1;
-        try self.checkLetInit(l, &stmts[stmts.len - 1].kind.expr);
     }
 
     fn checkAssign(self: *Checker, a: *const @FieldType(ast.Stmt.Kind, "assign")) Error!void {
@@ -1141,13 +1203,30 @@ pub const Checker = struct {
             }
         }
 
+        // R2.b: a block value is opened first (see `openBlockTail`), so `v`
+        // is what this site consumes from here on.
+        var v: *const ast.Expr = &a.value;
+        var depth: usize = 0;
+        defer self.closeBlockTail(depth);
+
         // R10, the assignment position: the same double free as the `let`
         // one, reached by writing into an already-declared `owned` place
         // instead of declaring a new one. Asked of the whole EXPRESSION's
         // verdict, so a value position and a call result are both refused.
         if (self.placeOwnership(b, place.path) == .owned) {
+            switch (try self.openBlockTail(&a.value)) {
+                .not_block => {},
+                .unit => {
+                    self.revive(place);
+                    return;
+                },
+                .tail => |t| {
+                    v = t.expr;
+                    depth = t.depth;
+                },
+            }
             if (try self.refuseArcUnique(
-                try self.arcUniqueSource(&a.value),
+                try self.arcUniqueSource(v),
                 "assign",
                 "to",
                 "place",
@@ -1160,7 +1239,7 @@ pub const Checker = struct {
             // because the double free needs the target to be dropped and
             // `pendingDrops` drops `.owned` bindings. Measured at `0e82266`:
             // `s2 = match c { 0 => s1, _ => s1 }` was exit 134.
-            switch (try self.ownedMoveSource(&a.value)) {
+            switch (try self.ownedMoveSource(v)) {
                 .unknown => |s| {
                     try self.refuseUnknownMove(s, "assign", "to", "place", place.display);
                     self.revive(place);
@@ -1179,14 +1258,14 @@ pub const Checker = struct {
             }
         }
 
-        if (try self.placeOf(&a.value)) |src| {
+        if (try self.placeOf(v)) |src| {
             const note = try self.msg(
                 "'{s}' was moved here by assigning it to '{s}'",
                 .{ src.display, place.display },
             );
             try self.movePlace(src, note);
         } else {
-            try self.checkExpr(&a.value);
+            try self.checkExpr(v);
         }
 
         // R3a: the target is live again.
@@ -1243,21 +1322,34 @@ pub const Checker = struct {
                 // fields; moving such a field out was a live double free.
                 const def = self.structs.get(sl.name);
                 for (sl.fields) |*f| {
+                    // R2.b: a block value is opened first (see
+                    // `openBlockTail`); `v` is what this site consumes.
+                    var v: *const ast.Expr = &f.value;
+                    var depth: usize = 0;
+                    defer self.closeBlockTail(depth);
                     if (def) |d| {
                         if (findField(d, f.name)) |fld| {
                             if (fld.ownership == .owned) {
+                                switch (try self.openBlockTail(&f.value)) {
+                                    .not_block => {},
+                                    .unit => continue,
+                                    .tail => |t| {
+                                        v = t.expr;
+                                        depth = t.depth;
+                                    },
+                                }
                                 // Asked of the whole EXPRESSION's verdict, so
                                 // a value position or a call result in a field
                                 // is refused too.
                                 if (try self.refuseArcUnique(
-                                    try self.arcUniqueSource(&f.value),
+                                    try self.arcUniqueSource(v),
                                     "store",
                                     "in",
                                     "field",
                                     f.name,
                                 )) continue;
                                 switch (try self.fieldResourceShape(&fld)) {
-                                    .no_resources => switch (try self.ownedMoveSource(&f.value)) {
+                                    .no_resources => switch (try self.ownedMoveSource(v)) {
                                         .unknown => |s| {
                                             try self.refuseUnknownMove(s, "store", "in", "field", f.name);
                                             continue;
@@ -1273,7 +1365,7 @@ pub const Checker = struct {
                                         continue;
                                     },
                                     .resources => {
-                                        switch (try self.borrowSource(&f.value)) {
+                                        switch (try self.borrowSource(v)) {
                                             .not_borrow => {},
                                             .borrow => |s| {
                                                 try self.refuseOwnedFieldTransfer(s, f.name, "a borrow does not transfer ownership");
@@ -1284,7 +1376,7 @@ pub const Checker = struct {
                                                 continue;
                                             },
                                         }
-                                        switch (try self.ownedMoveSource(&f.value)) {
+                                        switch (try self.ownedMoveSource(v)) {
                                             .no_owned_place => {},
                                             .place => |p| {
                                                 try self.refuseOwnedFieldTransfer(
@@ -1304,7 +1396,7 @@ pub const Checker = struct {
                             }
                         }
                     }
-                    try self.checkExpr(&f.value);
+                    try self.checkExpr(v);
                 }
             },
             // R10, the list-element position, and one of the two consumption
@@ -1326,8 +1418,21 @@ pub const Checker = struct {
             // refcount, is what gets freed twice.
             .list_lit => |items| {
                 for (items) |*item| {
+                    // R2.b: a block element is opened first (see
+                    // `openBlockTail`); `v` is what this site consumes.
+                    var v: *const ast.Expr = item;
+                    var depth: usize = 0;
+                    defer self.closeBlockTail(depth);
+                    switch (try self.openBlockTail(item)) {
+                        .not_block => {},
+                        .unit => continue,
+                        .tail => |t| {
+                            v = t.expr;
+                            depth = t.depth;
+                        },
+                    }
                     if (try self.refuseArcUnique(
-                        try self.arcUniqueSource(item),
+                        try self.arcUniqueSource(v),
                         "store",
                         "in",
                         "list element",
@@ -1340,7 +1445,7 @@ pub const Checker = struct {
                     // disclosed in OWNERSHIP.md R11 and closing it is what
                     // decides whether this position moves; turning it into a
                     // move here, ahead of that, would leak instead.
-                    switch (try self.ownedMoveSource(item)) {
+                    switch (try self.ownedMoveSource(v)) {
                         .unknown => |s| {
                             try self.refuseUnknownMove(s, "store", "in", "list element", null);
                             continue;
@@ -1352,7 +1457,7 @@ pub const Checker = struct {
                         // (measured at `4698dbc`, exit 0).
                         .aliases_place, .place, .no_owned_place => {},
                     }
-                    try self.checkExpr(item);
+                    try self.checkExpr(v);
                 }
             },
             .block => |stmts| try self.checkBlockStmts(stmts),
@@ -1559,6 +1664,11 @@ pub const Checker = struct {
             // argument to an `owned` parameter moves.
             const mode: ?Ownership = explicit orelse if (param) |p| p.ownership else null;
 
+            // R2.b: a block argument to an `owned` parameter is opened
+            // first (see `openBlockTail`), and `operand` becomes its tail.
+            var depth: usize = 0;
+            defer self.closeBlockTail(depth);
+
             // R10, the call-argument position, asked on the EXPRESSION and
             // asked BEFORE the place check below. It has to be before it:
             // `placeOf` returns null for a `match`, and the early exit under
@@ -1566,6 +1676,14 @@ pub const Checker = struct {
             // escaped a rule that refuses `take(owned xs)`.
             if (mode == .owned) {
                 const slot_name = if (param) |p| p.name else null;
+                switch (try self.openBlockTail(operand)) {
+                    .not_block => {},
+                    .unit => continue,
+                    .tail => |t| {
+                        operand = t.expr;
+                        depth = t.depth;
+                    },
+                }
                 if (try self.refuseArcUnique(
                     try self.arcUniqueSource(operand),
                     "pass",
@@ -2055,16 +2173,17 @@ pub const Checker = struct {
             // that ends in anything else (or in nothing) yields unit.
             //
             // A tail naming one of the block's OWN `let`s cannot resolve
-            // here: this walk runs without the block's scope, on purpose (see
-            // `checkLetInit`'s dispatch). The `let` position resolves it
-            // through `checkOwnedLetFromBlock` before ever reaching this arm;
-            // every other consumption site refuses, and says why.
+            // here: this walk runs without the block's scope, on purpose.
+            // Every `owned` consumption site opens a block with
+            // `openBlockTail` before asking, so a block reaching this arm
+            // sits under an `if` or `match` arm (or a borrow operand), and
+            // the message names that route.
             .block => |stmts| blk: {
                 if (stmts.len == 0) break :blk .not_arc;
                 const last = &stmts[stmts.len - 1];
                 if (last.kind != .expr) break :blk .not_arc;
                 if (blockLocalTail(stmts)) |name| break :blk .{ .unknown = .{
-                    .display = try self.msg("the block-local binding '{s}' (only a 'let' resolves a block's value today)", .{name}),
+                    .display = try self.msg("the block-local binding '{s}' reached through a branch", .{name}),
                     .span = last.kind.expr.span,
                 } };
                 break :blk try self.arcUniqueSource(&last.kind.expr);
@@ -2327,14 +2446,15 @@ pub const Checker = struct {
             // A block's value is its trailing expression statement. A block
             // that ends in anything else, or in nothing, yields unit. A tail
             // naming one of the block's own `let`s is unresolvable here, as
-            // `arcUniqueSource`'s arm explains; the `let` position never
-            // reaches this arm (`checkOwnedLetFromBlock`).
+            // `arcUniqueSource`'s arm explains; no consumption site reaches
+            // this arm with its own block any more (`openBlockTail`), only a
+            // branch does.
             .block => |stmts| blk: {
                 if (stmts.len == 0) break :blk .no_owned_place;
                 const last = &stmts[stmts.len - 1];
                 if (last.kind != .expr) break :blk .no_owned_place;
                 if (blockLocalTail(stmts)) |name| break :blk .{ .unknown = .{
-                    .display = try self.msg("the block-local binding '{s}' (only a 'let' resolves a block's value today)", .{name}),
+                    .display = try self.msg("the block-local binding '{s}' reached through a branch", .{name}),
                     .span = last.kind.expr.span,
                 } };
                 break :blk try self.ownedMoveBranch(&last.kind.expr);
@@ -5538,7 +5658,7 @@ test "R2.b covers an if branch and a block tail, which typecheck alone would hid
     );
     // CHANGED 2026-09-15: the block half is no longer refused. A block is
     // ONE path, so its tail always evaluates and `s1` is moved through it
-    // (`checkOwnedLetFromBlock`); the branch reasoning above is for `if`
+    // (`openBlockTail`); the branch reasoning above is for `if`
     // and `match`, whose taken arm is unknown. The test "a block tail naming
     // an OUTER owned place moves it" proves the move is recorded, by using
     // `x` afterwards and getting a use-after-move.
@@ -5851,17 +5971,188 @@ test "a block tail that borrows the block's own local is R18" {
     );
 }
 
-test "a block-local tail at a call argument is still refused, and the message says why" {
-    try expectDiagnostics(block_prelude ++
+test "a block-local tail at a call argument resolves like the let position" {
+    // CHANGED 2026-09-15 (later the same day): refused until the six
+    // consumption sites shared `openBlockTail`. The move is proven by the
+    // use-after-move test that follows, not by acceptance alone.
+    try expectAccepted(block_prelude ++
         \\pub fn main() {
         \\    eat(owned {
         \\        let owned t = make()
         \\        t
         \\    })
         \\}
+    );
+}
+
+test "a call argument block whose tail is an OUTER place moves it" {
+    try expectDiagnostics(block_prelude ++
+        \\pub fn main() {
+        \\    let owned s1 = make()
+        \\    eat(owned { s1 })
+        \\    eat(owned s1)
+        \\}
     ,
-        \\t.cell:6:9: error: cannot pass the block-local binding 't' (only a 'let' resolves a block's value today) to 'owned' parameter 's': its ownership cannot be resolved here
+        \\t.cell:6:15: error: use of 's1' after it was moved
+        \\t.cell:5:17: note: 's1' was moved here by the call to 'eat'
+        \\
+    );
+}
+
+test "a return block resolves its own owned local" {
+    try expectAccepted(block_prelude ++
+        \\pub fn mk() -> String {
+        \\    return {
+        \\        let owned t = make()
+        \\        t
+        \\    }
+        \\}
+    );
+}
+
+test "a return block whose tail is an OUTER place moves it" {
+    // The move is recorded before the function ends, so a use on a later
+    // path sees it: the `return` sits in one branch and the use follows.
+    try expectDiagnostics(block_prelude ++
+        \\pub fn mk(copy c: Bool) -> String {
+        \\    let owned s1 = make()
+        \\    if c {
+        \\        return { s1 }
+        \\    }
+        \\    eat(owned s1)
+        \\    return make()
+        \\}
+    ,
+        \\t.cell:8:15: error: use of 's1' after it was moved
+        \\t.cell:6:18: note: 's1' was moved here by returning it
+        \\
+    );
+}
+
+test "an assignment block resolves its own owned local" {
+    try expectAccepted(block_prelude ++
+        \\pub fn main() {
+        \\    var owned s2 = make()
+        \\    s2 = {
+        \\        let owned t = make()
+        \\        t
+        \\    }
+        \\}
+    );
+}
+
+test "an assignment block whose tail is an OUTER place moves it" {
+    try expectDiagnostics(block_prelude ++
+        \\pub fn main() {
+        \\    let owned s1 = make()
+        \\    var owned s2 = make()
+        \\    s2 = { s1 }
+        \\    eat(owned s1)
+        \\}
+    ,
+        \\t.cell:7:15: error: use of 's1' after it was moved
+        \\t.cell:6:12: note: 's1' was moved here by assigning it to 's2'
+        \\
+    );
+}
+
+test "a resource-bearing struct field resolves a block-local tail and still refuses the place" {
+    // The field site resolves the tail like the other five, and then its
+    // own rule applies: a PLACE cannot be moved into an aggregate yet (R11,
+    // aggregate transfer). The refusal now names `t` instead of blaming
+    // the block.
+    try expectDiagnostics(block_prelude ++
+        \\struct Box { owned s: String }
+        \\pub fn main() {
+        \\    let owned b = Box { s: {
+        \\        let owned t = make()
+        \\        t
+        \\    } }
+        \\}
+    ,
+        \\t.cell:7:9: error: cannot store t in owned field 's': moving a place into an aggregate is not implemented
+        \\t.cell:7:9: note: aggregate ownership transfer and partial-move drop state are not implemented; construct a fresh field value instead
+        \\
+    );
+}
+
+test "a resource-free struct field reads a block-local tail" {
+    try expectAccepted(block_prelude ++
+        \\struct Pair { owned n: Int }
+        \\pub fn main() {
+        \\    let owned p = Pair { n: {
+        \\        let copy t = 1
+        \\        t
+        \\    } }
+        \\}
+    );
+}
+
+test "a list element block resolves its own owned local, and reads it like any element" {
+    try expectAccepted(block_prelude ++
+        \\pub fn main() {
+        \\    let owned xs: [String] = [{
+        \\        let owned t = make()
+        \\        t
+        \\    }]
+        \\}
+    );
+}
+
+test "an owned keyword in front of a block is peeled, so the block still opens" {
+    try expectDiagnostics(block_prelude ++
+        \\pub fn main() {
+        \\    let owned s1 = make()
+        \\    let owned s2 = owned { s1 }
+        \\    eat(owned s1)
+        \\}
+    ,
+        \\t.cell:6:15: error: use of 's1' after it was moved
+        \\t.cell:5:28: note: 's1' was moved here by binding it to 's2'
+        \\
+    );
+}
+
+test "a block-local tail reached through a BRANCH is still refused, and says so" {
+    // A block inside an `if` arm is not the consumed expression; the `if`
+    // is, and which arm ran is unknown. The classifier's block arm is now
+    // reached only this way.
+    try expectDiagnostics(block_prelude ++
+        \\pub fn main(copy c: Bool) {
+        \\    let owned s = if c {
+        \\        let owned t = make()
+        \\        t
+        \\    } else {
+        \\        make()
+        \\    }
+        \\}
+    ,
+        \\t.cell:6:9: error: cannot bind the block-local binding 't' reached through a branch to 'owned' binding 's': its ownership cannot be resolved here
         \\t.cell:6:9: note: R10 refuses what it cannot prove is not 'arc': an 'arc' value made unique is freed twice
+        \\
+    );
+}
+
+test "a valueless block at a consumption site is checked once, and a later binding keeps its id" {
+    // The unit case must not fall through to `checkExpr`, which would
+    // declare the block's `let` a second time and advance the binding id
+    // counter past codegen's. The proof is indirect: `t` is moved, so a
+    // second declaration of it would report nothing new, but `u`'s use
+    // after its move must still be reported at the right binding.
+    try expectDiagnostics(block_prelude ++
+        \\pub fn main() {
+        \\    var owned s2 = make()
+        \\    s2 = {
+        \\        let owned t = make()
+        \\        eat(owned t)
+        \\    }
+        \\    let owned u = make()
+        \\    eat(owned u)
+        \\    eat(owned u)
+        \\}
+    ,
+        \\t.cell:11:15: error: use of 'u' after it was moved
+        \\t.cell:10:15: note: 'u' was moved here by the call to 'eat'
         \\
     );
 }

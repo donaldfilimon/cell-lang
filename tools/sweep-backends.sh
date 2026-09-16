@@ -23,7 +23,8 @@
 # RESULT ON 2026-09-15 (tree after 671d14d, with the value-position block rows
 # added the same day): 88 programs probed and 5 reported, the same five as
 # below. Re-run the same evening after `let owned x = { let owned t = mk() t }`
-# stopped being a front-end refusal (borrowck's `checkOwnedLetFromBlock`): the
+# stopped being a front-end refusal (borrowck's `checkOwnedLetFromBlock`, since
+# generalised to every owned consumption site as `openBlockTail`): the
 # owned value-block rows now reach `cc`, and still 88 probed / 5 reported. RESULT ON 2026-09-08 at 8eb1a21, 78 programs probed and 5 reported:
 # no new defect. Everything it
 # reported belonged to ONE disclosed gap, R10's unimplemented move-into-`arc`

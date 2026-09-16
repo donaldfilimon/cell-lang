@@ -935,8 +935,8 @@ a rule whose enforcement depends on a coincidence of two types. Typecheck now
 types a block as its tail and an `if` with an `else` as its branches (SPEC
 6.10), so both forms reach borrowck typed, and borrowck's own tests pin them
 on their own merits: an `arc` place through an `if` is still refused here, and
-an `arc` block-local tail is refused at the `let` by name (see the R11 row 4
-closure below for how a block tail is resolved at all).
+an `arc` block-local tail is refused by name at every `owned` consumption site
+(see the R11 row 4 closure below for how a block tail is resolved at all).
 
 **THE SECOND AXIS, the arc SOURCE: a CALL RESULT whose return type is `arc`.
 This one was a LIVE double free, not a masked one, and it is now CLOSED.**
@@ -1182,7 +1182,8 @@ block's scope. **Resolved at the `let` position the same day**, and at the
 consumption site rather than inside those walks (they run back to back over
 one initializer, and `checkExpr` may walk it a third time, so declaring inside
 them would advance the binding-id counter once per walk and break the id
-lockstep with codegen): `checkOwnedLetFromBlock` checks the block's statements
+lockstep with codegen): `openBlockTail` (first `checkOwnedLetFromBlock`, the
+`let`-only form) checks the block's statements
 in a scope it keeps open, then treats the tail as the `let`'s own initializer,
 so a block-local tail resolves through `lookup`, `movePlace` records the move
 in `moved` (which outlives the scope, for a future value-position drop pass),
@@ -1202,14 +1203,37 @@ yielding a struct in an UNANNOTATED `let` leaves `struct_name` null, so a later
 to while every block tail was refused, now has one; write the type and it
 resolves, as that comment says. Measured: the emitted C
 runs under AddressSanitizer with the malloc counter at ALLOC=1 FREE=1 LIVE=0,
-so the move is balanced and `t` needs no drop of its own. **Residual, stated:**
-the other five R2.b consumption sites (an assignment into an `owned` place, a
-call argument, a `return`, an `owned` struct field, a list-literal element; the
-`ownedMoveSource` callers in `checkAssign`, `checkCall`, `checkStmt`'s return
-arm and the struct-literal and list-literal arms of `checkExpr`) still refuse a
-block-local tail,
-now with a message that says so ("the block-local binding 't' (only a 'let'
-resolves a block's value today)") instead of blaming ownership.
+so the move is balanced and `t` needs no drop of its own. **Extended to all six R2.b consumption sites later the same day.** The `let`
+resolver became one function, `openBlockTail`, and the other five sites (an
+assignment into an `owned` place, a call argument, a `return`, an `owned`
+struct field, a list-literal element) call it before asking R10 or R2.b: the
+block's statements are checked in a scope kept open, a nested block tail opens
+again, an `owned` keyword in front of a block is peeled the way `placeOf`
+peels it, and the site then consumes the tail as the expression written
+there. So a block tail MOVES at the `let`, the assignment, the call argument
+and the `return`, whether it names the block's own local or an outer place
+(`s2 = { s1 }` and `eat(owned { s1 })` each report a later use of `s1` as a
+use-after-move); the list element READS it, which is the same disclosed gap
+as `[s1]` (elements are never released, so `t` leaks and `s1` is dropped
+once); and the resource-bearing struct field resolves it and then applies its
+own rule, refusing a PLACE by name ("cannot store t in owned field 's': moving
+a place into an aggregate is not implemented") while a resource-free field
+reads it. A block under an `if` or `match` arm is not the consumed expression
+and is still refused, now saying so ("the block-local binding 't' reached
+through a branch"). A block that yields no value is checked once and the
+site stops; falling through to the generic walk would declare its `let`s
+twice and break the binding-id lockstep with codegen, and a test pins a
+later binding's id. Measured under AddressSanitizer with the malloc counter,
+each shape beside its plain-place control: `return { let owned t = make() \n
+t }` and `return { s1 }` both ALLOC=1 FREE=1 LIVE=0, equal to `return s1`;
+`s2 = { ... t }` and `s2 = { s1 }` both ALLOC=2 FREE=1 LIVE=1, equal to
+`s2 = s1` (the LIVE=1 is row 5, the old value of `s2`); `eat(owned { ... t
+})` and `eat(owned { s1 })` both ALLOC=1 FREE=0 LIVE=1, equal to `eat(owned
+s1)` (row 1, the parameter); no ASan report anywhere, all compiled under
+`-Wall -Wextra -Werror`. **Residual, stated:** an unmoved local inside any
+value-position block is still not released (the row 4 residual above, pinned
+at 3000), and the list element and struct field keep the transfer gaps they
+already had.
 
 **A SIXTH gap existed and was never in this table. It is closed by REFUSAL, so
 it gets no fixture and changes no constant in the gate.** `let owned ys: [Int] =
