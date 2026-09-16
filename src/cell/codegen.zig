@@ -72,10 +72,11 @@
 //! block end, `return`, `break`/`continue`, value-block end, and a revived
 //! record from `exit_liveness`; a var moved inside a `while` it was declared
 //! outside of is released after that while when borrowck recorded
-//! `after_loop` live (2026-09-16), while a field moved on only one branch
-//! still leaks; and a local declared inside a VALUE-position block
-//! (`emitValueInto`) is not released at that block's exit, because it may
-//! be the value flowing out.
+//! `after_loop` live (2026-09-16); a nested field whose sibling was moved
+//! is released by recursing `emitPartialRecordDrop` (2026-09-16); a field
+//! moved on only one branch still leaks; and a local declared inside a
+//! VALUE-position block (`emitValueInto`) is not released at that block's
+//! exit, because it may be the value flowing out.
 //! Why block-scoped release is safe for a local whose initializer moves an
 //! OUTER place inside a loop: borrowck's R2.a refuses that program outright
 //! (the back edge would use the place dead), so no accepted loop body
@@ -1125,16 +1126,20 @@ pub const Generator = struct {
     /// A record some of whose fields were moved out (`let owned m = p.a`),
     /// and not the record itself: release every owning field that was NOT
     /// moved, one call each, in the glue's reverse declaration order.
+    /// Nested records recurse: a path equal to `"inner"` skips that field
+    /// whole, a proper `"inner."` prefix partial-drops the inner struct
+    /// (skip `inner.a`, free `inner.b`). Same fail-closed skip
+    /// `fieldWasMoved` already uses: an unrecognised descendant still
+    /// leaks rather than being freed while something else may own a piece.
     ///
     /// Before this existed the whole record was skipped, because
     /// `pendingDrops` read the binding-level `wasMoved`, so `p.b` leaked.
     /// It never double freed; this keeps it that way by construction. A
-    /// field that was moved in whole OR IN PART is skipped
-    /// (`fieldWasMoved`), and a move borrowck records on only one branch of
-    /// an `if` is recorded as if it happened on every path, so any doubt
-    /// resolves to leaving a field unreleased, never to releasing a buffer
-    /// something else now owns. The indent for the first line is already
-    /// written by `emitDropFor`, which is why it gets the comment.
+    /// move borrowck records on only one branch of an `if` is recorded as
+    /// if it happened on every path, so any doubt resolves to leaving a
+    /// field unreleased, never to releasing a buffer something else now
+    /// owns. The indent for the first line is already written by
+    /// `emitDropFor`, which is why it gets the comment.
     fn emitPartialRecordDrop(self: *Generator, indent: usize, local: Local) EmitError!void {
         const checker = self.checker.?;
         const out = self.writer;
@@ -1148,30 +1153,59 @@ pub const Generator = struct {
             return;
         }
         try out.print("/* {s}: fields moved out; releasing only unmoved owning fields */\n", .{local.name});
-        const def = self.findStruct(local.ty.name) orelse return;
+        try self.emitPartialFields(indent, local.id, local.name, local.ty.name, "", 0);
+    }
+
+    /// Walk one record's owning fields under `path_prefix`, releasing
+    /// those not moved. `c_base` is the C access (`p`, then `p.inner`).
+    /// Depth 16 matches `recordNeedsDrop`: a self-referential struct the
+    /// typechecker does not refuse has no finite C layout anyway.
+    fn emitPartialFields(
+        self: *Generator,
+        indent: usize,
+        binding: u32,
+        c_base: []const u8,
+        struct_name: []const u8,
+        path_prefix: []const u8,
+        depth: usize,
+    ) EmitError!void {
+        if (depth > 16) return;
+        const checker = self.checker.?;
+        const out = self.writer;
+        const def = self.findStruct(struct_name) orelse return;
         var i = def.fields.len;
         while (i > 0) {
             i -= 1;
             const f = def.fields[i];
             if (f.ownership != .owned and f.ownership != .arc) continue;
-            if (checker.fieldWasMoved(local.id, f.name)) continue;
+            const field_path: []const u8 = if (path_prefix.len == 0) f.name else try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ path_prefix, f.name });
+            if (checker.fieldWasMovedWhole(binding, field_path)) continue;
             const fty = try self.lowerType(&f.ty, f.ownership);
+            if (checker.fieldWasMoved(binding, field_path)) {
+                // Proper prefix only: whole was already skipped. Recurse
+                // into a nested record; anything else fails closed.
+                if (fty.shape == .record and try self.recordNeedsDrop(fty.name, 1)) {
+                    const nested_c = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ c_base, f.name });
+                    try self.emitPartialFields(indent, binding, nested_c, fty.name, field_path, depth + 1);
+                }
+                continue;
+            }
             switch (fty.shape) {
                 .string => {
                     try self.writeIndent(indent);
-                    try out.print("cell_string_free(&{s}.{s});\n", .{ local.name, f.name });
+                    try out.print("cell_string_free(&{s}.{s});\n", .{ c_base, f.name });
                 },
                 .slice => {
                     try self.writeIndent(indent);
-                    try out.print("cell_slice_free(&{s}.{s});\n", .{ local.name, f.name });
+                    try out.print("cell_slice_free(&{s}.{s});\n", .{ c_base, f.name });
                 },
                 .arc => {
                     try self.writeIndent(indent);
-                    try out.print("cell_arc_drop({s}.{s});\n", .{ local.name, f.name });
+                    try out.print("cell_arc_drop({s}.{s});\n", .{ c_base, f.name });
                 },
                 .record => if (try self.recordNeedsDrop(fty.name, 1)) {
                     try self.writeIndent(indent);
-                    try out.print("cell_drop_{s}(&{s}.{s});\n", .{ fty.name, local.name, f.name });
+                    try out.print("cell_drop_{s}(&{s}.{s});\n", .{ fty.name, c_base, f.name });
                 },
                 else => {},
             }
@@ -5229,12 +5263,14 @@ test "a record with nothing moved still goes through its drop glue" {
     try expectAbsent(e.text, "fields moved out");
 }
 
-test "a moved field of a nested record leaves that whole field unreleased" {
-    // `p.inner.a` moves only part of `p.inner`, and `fieldWasMoved` answers
-    // for the top-level field as a whole, so `p.inner` is skipped entirely
-    // (its `b` leaks) rather than released through `cell_drop_Inner`, which
-    // would free `m`'s buffer a second time. `p.tag` is untouched and is
-    // released.
+test "a moved field of a nested record releases the sibling, not the moved field" {
+    // `p.inner.a` moves only part of `p.inner`. Recursing the partial drop
+    // frees `p.inner.b` and skips `p.inner.a` (`m` owns that buffer). The
+    // whole-inner glue and the outer glue stay absent: either would free
+    // `m` a second time. Falsified 2026-09-16 by emitting
+    // `cell_drop_Inner(&p.inner)` (and separately `cell_string_free(&p.inner.a)`)
+    // on this program: AddressSanitizer double free of `m`, exit 134.
+    // Restored; the sibling free is the remaining owning field, not glue.
     var e = try emitSource(
         \\pub struct Inner {
         \\    owned a: String
@@ -5250,9 +5286,12 @@ test "a moved field of a nested record leaves that whole field unreleased" {
         \\}
     );
     defer e.deinit();
+    try expectOccurrences(e.text, "cell_string_free(&p.inner.b);", 1);
+    try expectAbsent(e.text, "cell_string_free(&p.inner.a);");
     try expectAbsent(e.text, "cell_drop_Inner(&p.inner);");
     try expectAbsent(e.text, "cell_drop_Outer(&p);");
     try expectOccurrences(e.text, "cell_string_free(&p.tag);", 1);
+    try expectOccurrences(e.text, "cell_string_free(&m);", 1);
 }
 
 test "an unmoved arc local gets cell_arc_drop, by value with no ampersand" {

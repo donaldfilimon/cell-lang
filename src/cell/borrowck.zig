@@ -760,11 +760,25 @@ pub const Checker = struct {
         return false;
     }
 
-    /// True when top-level `field` of `binding` was moved, in whole (`field`)
-    /// or in part (`field.x`). Codegen releases a field only when this is
-    /// false, so a partly moved field is left to leak rather than freed
-    /// while something else may own a piece of it. A whole-binding move is
-    /// deliberately NOT reported here: callers check `wasWhollyMoved` first.
+    /// True when `path` itself was moved (exact match: `"inner"`, not
+    /// `"inner.a"`). Codegen skips that field whole. A whole-binding move
+    /// is deliberately NOT reported here: callers check `wasWhollyMoved`
+    /// first.
+    pub fn fieldWasMovedWhole(self: *const Checker, binding: u32, path: []const u8) bool {
+        for (self.moved_paths.items) |m| {
+            if (m.binding != binding or m.path.len == 0) continue;
+            if (std.mem.eql(u8, m.path, path)) return true;
+        }
+        return false;
+    }
+
+    /// True when `path` of `binding` was moved, in whole (`path`) or in
+    /// part (`path.x`). The fail-closed skip: codegen releases a field
+    /// only when this is false, so an unrecognised descendant still leaks
+    /// rather than being freed while something else may own a piece of it.
+    /// A whole-binding move is deliberately NOT reported here: callers
+    /// check `wasWhollyMoved` first. `path` is a dotted field path, so
+    /// `"inner"` and `"inner.a"` are both valid.
     pub fn fieldWasMoved(self: *const Checker, binding: u32, field: []const u8) bool {
         for (self.moved_paths.items) |m| {
             if (m.binding != binding or m.path.len == 0) continue;
@@ -9029,7 +9043,13 @@ test "moved_paths: a nested field path counts against its top-level field only" 
     const p = try idNamed(&checker, "p");
     try std.testing.expect(!checker.wasWhollyMoved(p));
     try std.testing.expect(checker.fieldWasMoved(p, "inner"));
+    try std.testing.expect(!checker.fieldWasMovedWhole(p, "inner"));
+    try std.testing.expect(checker.fieldWasMovedWhole(p, "inner.a"));
+    try std.testing.expect(!checker.fieldWasMovedWhole(p, "inner.b"));
+    try std.testing.expect(checker.fieldWasMoved(p, "inner.a"));
+    try std.testing.expect(!checker.fieldWasMoved(p, "inner.b"));
     try std.testing.expect(!checker.fieldWasMoved(p, "tag"));
+    try std.testing.expect(!checker.fieldWasMovedWhole(p, "tag"));
     // A prefix that is not a whole path segment must not match: `in` is not
     // `inner`.
     try std.testing.expect(!checker.fieldWasMoved(p, "in"));

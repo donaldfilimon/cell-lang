@@ -1,0 +1,41 @@
+// R16 residual: a nested field whose sibling was moved. `p.inner.a` is
+// moved into `moved`, and `fieldWasMoved` used to skip the whole `inner`
+// field, so `p.inner.b` leaked. `p.tag` was already released.
+//
+// CLOSED 2026-09-16: `emitPartialRecordDrop` recurses. A path equal to
+// `inner` still skips the field whole; a proper `inner.` prefix partial-
+// drops the inner struct (skip `inner.a`, free `inner.b`). Measured 1000
+// before on both witnesses (`leaks` 1000, counter ALLOC=3000 FREE=2000
+// LIVE=1000) through this same host and counter on the tree before the
+// change. AFTER: 0. It stays in the gate BECAUSE it is closed: pinned at
+// 0, any nonzero reading re-opens it.
+//
+// What this fixture does NOT cover: a field moved on only one branch of
+// an `if` (still leaked by design; needs drop flags, not recursion).
+//
+// Status: parses, passes `cell check`. LLVM and MLIR refuse it (`String`
+// crossing the C boundary is scalar-first-refused there); lives under
+// examples/leaks/ so it is invisible to the top-level corpus, agreement and
+// mlir-lowering loops (see examples/leaks/README.md).
+
+pub struct Inner {
+    owned a: String
+    owned b: String
+}
+
+pub struct Outer {
+    owned inner: Inner
+    owned tag: String
+}
+
+pub fn print_int(copy value: Int);
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        let owned p: Outer = Outer { inner: Inner { a: "aaaaaaaa", b: "bbbbbbbb" }, tag: "tttttttt" }
+        let owned moved: String = p.inner.a
+        i = i + 1
+    }
+    print_int(i)
+}
