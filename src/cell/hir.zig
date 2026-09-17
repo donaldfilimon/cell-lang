@@ -191,6 +191,10 @@ pub const FieldSel = struct {
     struct_name: []const u8,
     index: u32,
     ty: Ty,
+    /// The field's declared ownership. `ty` alone cannot say whether a
+    /// `String` field is the borrowed view or the owning value, and the two
+    /// differ in size, so a backend reading a field or writing one needs this.
+    ownership: Ownership,
 };
 
 /// How a value reaches a callee. Recorded per argument because the call site
@@ -245,6 +249,18 @@ pub const Expr = struct {
     ty: Ty,
     span: Span,
     kind: Kind,
+    /// The ownership the VALUE carries, which is what decides a `String`'s
+    /// representation: `.shared` is the 16-byte borrowed view, `.owned`,
+    /// `.copy` and `.exclusive` the 24-byte owning value (`abi.stringStruct`).
+    /// Ownership stays out of `Ty`, per the module header; it rides here so
+    /// the emitters read one recorded fact instead of re-deriving it.
+    ///
+    /// Set on a `.ref` (the binding's), a `.field` (the field's), a `.call`
+    /// (the declared return), a string constant (`.shared`), a borrow
+    /// `.unary` (its operand's), and a `block`/`if`/`match` (its first arm's,
+    /// unless a destination stamps it; see `Lowerer.convertTo`). Null means
+    /// the lowering recorded nothing, and a reader treats that as the view.
+    own: ?Ownership = null,
 
     pub const Kind = union(enum) {
         int_const: i64,
@@ -610,7 +626,7 @@ const Lowerer = struct {
             if (!std.mem.eql(u8, s.name, struct_name)) continue;
             for (s.fields, 0..) |f, i| {
                 if (std.mem.eql(u8, f.name, name)) {
-                    return .{ .struct_name = struct_name, .index = @intCast(i), .ty = f.ty };
+                    return .{ .struct_name = struct_name, .index = @intCast(i), .ty = f.ty, .ownership = f.ownership };
                 }
             }
         }
@@ -632,11 +648,13 @@ const Lowerer = struct {
             .int => |v| return self.lowerIntLiteral(e.span, v, expected),
             .float => |v| return self.lit(e.span, types.t_float, .{ .float_const = v }),
             .bool => |v| return self.lit(e.span, types.t_bool, .{ .bool_const = v }),
-            .string => |v| return self.lit(e.span, types.t_string, .{ .string_const = v }),
+            // A literal is a borrowed view of static bytes.
+            .string => |v| return .{ .ty = types.t_string, .span = e.span, .kind = .{ .string_const = v }, .own = .shared },
 
             .ident => |name| {
                 if (self.lookup(name)) |slot| {
-                    return .{ .ty = self.bindings.items[slot].ty, .span = e.span, .kind = .{ .ref = slot } };
+                    const b = self.bindings.items[slot];
+                    return .{ .ty = b.ty, .span = e.span, .kind = .{ .ref = slot }, .own = b.ownership };
                 }
                 // A bare enum variant in value position, `Red` for `Color.Red`.
                 if (self.findVariant(null, name)) |ev| {
@@ -685,7 +703,14 @@ const Lowerer = struct {
                     // not part of a type here.
                     .neg, .ref_shared, .ref_exclusive => operand.ty,
                 };
-                return .{ .ty = ty, .span = e.span, .kind = .{ .unary = .{ .op = u.op, .operand = operand } } };
+                // A borrow sigil is transparent in both emitters, which emit
+                // its operand, so it carries the operand's fact. Without this
+                // `peek(&s)` and `peek(shared s)` would read differently.
+                const own: ?Ownership = switch (u.op) {
+                    .ref_shared, .ref_exclusive => operand.own,
+                    .neg, .not => null,
+                };
+                return .{ .ty = ty, .span = e.span, .kind = .{ .unary = .{ .op = u.op, .operand = operand } }, .own = own };
             },
 
             .field => |fe| {
@@ -704,7 +729,7 @@ const Lowerer = struct {
                     }
                 }
                 if (self.selectField(base.ty, fe.name)) |sel| {
-                    return .{ .ty = sel.ty, .span = e.span, .kind = .{ .field = .{ .base = base, .sel = sel } } };
+                    return .{ .ty = sel.ty, .span = e.span, .kind = .{ .field = .{ .base = base, .sel = sel } }, .own = sel.ownership };
                 }
                 // An unknown base type (`void*` in C today, per SPEC 0.6)
                 // has no fields to resolve. Keep the projection and type it
@@ -714,7 +739,7 @@ const Lowerer = struct {
                     .span = e.span,
                     .kind = .{ .field = .{
                         .base = base,
-                        .sel = .{ .struct_name = "", .index = 0, .ty = types.t_unknown },
+                        .sel = .{ .struct_name = "", .index = 0, .ty = types.t_unknown, .ownership = .owned },
                     } },
                 };
             },
@@ -781,6 +806,7 @@ const Lowerer = struct {
                     .ty = if (tail) |t| t.ty else types.t_unit,
                     .span = e.span,
                     .kind = .{ .block = .{ .stmts = lowered, .tail = tail } },
+                    .own = if (tail) |t| t.own else null,
                 };
             },
 
@@ -795,6 +821,9 @@ const Lowerer = struct {
                     .ty = if (else_body != null) then_body.ty else types.t_unit,
                     .span = e.span,
                     .kind = .{ .if_expr = .{ .cond = cond, .then_body = then_body, .else_body = else_body } },
+                    // The first arm's, as C's `inferExpr` types it, until a
+                    // destination stamps its own.
+                    .own = if (else_body != null) then_body.own else null,
                 };
             },
 
@@ -802,6 +831,7 @@ const Lowerer = struct {
                 const scrutinee = try self.box(try self.lowerExpr(me.scrutinee));
                 var arms = try self.arena.alloc(Arm, me.arms.len);
                 var result_ty: Ty = types.t_unit;
+                var result_own: ?Ownership = null;
                 for (me.arms, 0..) |arm, i| {
                     self.pushScope();
                     const pat = try self.lowerPattern(&arm.pattern, scrutinee.ty);
@@ -810,12 +840,16 @@ const Lowerer = struct {
                     const body = try self.box(try self.lowerExpr(arm.body));
                     self.popScope();
                     arms[i] = .{ .pattern = pat, .guard = guard, .body = body, .span = arm.span };
-                    if (i == 0) result_ty = body.ty;
+                    if (i == 0) {
+                        result_ty = body.ty;
+                        result_own = body.own;
+                    }
                 }
                 return .{
                     .ty = result_ty,
                     .span = e.span,
                     .kind = .{ .match_expr = .{ .scrutinee = scrutinee, .arms = arms } },
+                    .own = result_own,
                 };
             },
 
@@ -905,15 +939,17 @@ const Lowerer = struct {
         else
             try self.box(try self.lowerExpr(callee));
 
+        const ret_ownership: Ownership = if (sig) |s| s.ret_ownership else .owned;
         return .{
             .ty = if (sig) |s| s.ret else types.t_unknown,
             .span = span,
+            .own = ret_ownership,
             .kind = .{ .call = .{
                 .symbol = symbol,
                 .callee = callee_expr,
                 .args = lowered_args,
                 .modes = modes,
-                .ret_ownership = if (sig) |s| s.ret_ownership else .owned,
+                .ret_ownership = ret_ownership,
             } },
         };
     }
@@ -1394,6 +1430,67 @@ test "Result and optional forms the IR backends do not carry are refused" {
             return error.MissingRefusal;
         }
     }
+}
+
+test "Expr.own records the ownership a value carries" {
+    // The fact the IR emitters read instead of re-deriving ownership from a
+    // bare `Ty`, which spells every String as the borrowed view.
+    var l = try lowerSource(
+        \\pub struct Tag { owned name: String, copy n: Int }
+        \\pub fn make() -> String;
+        \\pub fn peek(shared v: String) -> Int;
+        \\pub fn f(exclusive e: String, shared v: String) -> Int {
+        \\    let owned s: String = make()
+        \\    let owned t: Tag = Tag { name: make(), n: 1 }
+        \\    let copy a = peek(shared s)
+        \\    let copy b = peek(&s)
+        \\    let copy c = peek(shared t.name)
+        \\    let copy d = peek(shared e)
+        \\    let copy g = peek(shared v)
+        \\    let copy h = peek(shared "lit")
+        \\    return t.n
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const body = l.module.findFn("f").?.body.?;
+    try std.testing.expectEqual(@as(?Ownership, .owned), body[0].kind.let.value.?.own);
+    const a = body[2].kind.let.value.?.kind.call.args[0];
+    try std.testing.expectEqual(@as(?Ownership, .owned), a.own);
+    // The sigil spelling carries the operand's fact, so it cannot diverge
+    // from the keyword spelling above.
+    const b = body[3].kind.let.value.?.kind.call.args[0];
+    try std.testing.expectEqual(.unary, std.meta.activeTag(b.kind));
+    try std.testing.expectEqual(@as(?Ownership, .owned), b.own);
+    const c = body[4].kind.let.value.?.kind.call.args[0];
+    try std.testing.expectEqual(.field, std.meta.activeTag(c.kind));
+    try std.testing.expectEqual(Ownership.owned, c.kind.field.sel.ownership);
+    try std.testing.expectEqual(@as(?Ownership, .owned), c.own);
+    try std.testing.expectEqual(@as(?Ownership, .exclusive), body[5].kind.let.value.?.kind.call.args[0].own);
+    try std.testing.expectEqual(@as(?Ownership, .shared), body[6].kind.let.value.?.kind.call.args[0].own);
+    try std.testing.expectEqual(@as(?Ownership, .shared), body[7].kind.let.value.?.kind.call.args[0].own);
+    // A copy field read is copy, and a scalar call result is owned.
+    try std.testing.expectEqual(@as(?Ownership, .copy), body[8].kind.ret.?.own);
+    try std.testing.expectEqual(@as(?Ownership, .owned), body[2].kind.let.value.?.own);
+}
+
+test "a block, if or match with no destination takes its first arm's ownership" {
+    var l = try lowerSource(
+        \\pub fn make() -> String;
+        \\pub fn f(copy n: Int) {
+        \\    match n { 0 => make(), _ => "x", }
+        \\    match n { 0 => "x", _ => make(), }
+        \\    if n == 0 { make() } else { "x" }
+        \\    { make() }
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const body = l.module.findFn("f").?.body.?;
+    try std.testing.expectEqual(@as(?Ownership, .owned), body[0].kind.expr.own);
+    try std.testing.expectEqual(@as(?Ownership, .shared), body[1].kind.expr.own);
+    try std.testing.expectEqual(@as(?Ownership, .owned), body[2].kind.expr.own);
+    try std.testing.expectEqual(@as(?Ownership, .owned), body[3].kind.expr.own);
 }
 
 test "UInt8 and Byte stay distinct destination widths" {
