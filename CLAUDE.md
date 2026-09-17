@@ -219,9 +219,13 @@ in explains most surprises:
   return answer is a fact about the position, not the type, and merging them
   means passing a mode flag into a clean type-directed conversion.
 - **`--target=llvm` and `--target=mlir` go through `hir.lower`** and are
-  deliberately **scalar-first**. They refuse `String`, `[T]`, `T?`, `Result`,
+  deliberately **scalar-first**. They refuse `[T]`, most `T?` and `Result`,
   `arc`, and most aggregates crossing the C boundary with a `cannot lower`
-  diagnostic at the span. They never emit plausible wrong code. Because they
+  diagnostic at the span. They never emit plausible wrong code. `String` is
+  the widest exception since 2026-09-17: owned and borrowed Strings and the
+  view-to-owned conversion lower in both (`hir.lower` inserts the
+  `cell_string_from_str` call), and neither frees an owned String yet,
+  because neither has a drop pass. Because they
   share `hir`, a disagreement between them means one is wrong, which is what
   the gate's agreement stage exists to catch.
 

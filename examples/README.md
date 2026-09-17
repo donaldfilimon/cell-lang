@@ -98,13 +98,15 @@ backend carried no structs. It does now (`!llvm.struct`), so `hello.cell`
 runs through all three and prints `42` from each. What all three still refuse
 is `[T]`, which SPEC 3.3 says has no representation at all.
 
-`owned_string.cell` is the deliberate opposite: **C only, and the other two
-backends refusing it is the correct answer, not a gap to close.** Turning a
-borrowed view into an owning `String` is a call to `cell_string_from_str`, and
-every aggregate constructor in `runtime/cell_rt.h` is `static inline` with no
-symbol for LLVM IR or MLIR to call, so both refuse with `cannot lower`. They
-refuse TOGETHER, which is why the agreement contract below still holds while
-the three backends disagree about the program.
+`owned_string.cell` runs through all three backends and prints `44` from
+each since IR String step (a) (2026-09-17). It was C only until then.
+Turning a borrowed view into an owning `String` is a call to
+`cell_string_from_str`, which is a real runtime symbol (this paragraph used
+to say every such constructor was `static inline`; that is true of
+`cell_str_from_parts` and friends, not of this one). `hir.lower` inserts the
+call at each declared destination for both IR backends. Neither IR backend
+frees the result yet: `examples/leaks/README.md` records the pinned
+counts.
 
 `optionals.cell` (prints 43), `results.cell` (prints 9) and
 `results_wide.cell` (prints -8999999983, a 64-bit error) run on all three
@@ -163,7 +165,8 @@ both halves of it are measured over every file here rather than a chosen few:
   `arc_return_field` 7, and `ownership` and `borrows` both silent at exit 0);
   three more link once their host is added (`arc` 13 with `arc_host.c`,
   `write_through` 142 with `write_through_host.c`, `owned_string` 44 with
-  `owned_string_host.c`); the rest do not link for
+  `owned_string_host.c`, which gate stage 6 also runs through LLVM and MLIR
+  since 2026-09-17); the rest do not link for
   one reason, and it is not a codegen defect: they declare no `pub fn main()`
   with a body, so no C `main` is emitted and the link stops at `_main`.
 

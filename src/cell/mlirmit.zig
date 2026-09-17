@@ -59,11 +59,13 @@
 //! Measured 2026-09-08 rather than remembered. ACCEPTED: struct parameters,
 //! struct literals and field reads, `owned String` parameters, and, since
 //! `a6c41e8`, `exclusive String`/`[T]`/`T?` parameters and whole-value writes
-//! through them. STILL REFUSED with `cannot lower to MLIR`: the borrowed-view
-//! to owning-`String` conversion (a scope choice while there is no IR drop
-//! pass; `cell_string_from_str` is a real symbol, and the earlier "cannot
-//! call a `static inline` helper" reason was wrong, corrected 2026-09-17),
-//! non-empty list literals, and `arc` locals.
+//! through them. Since IR String step (a) (2026-09-17), also the
+//! borrowed-view to owning-`String` conversion (a `cell_string_from_str` call
+//! hir.lower inserts), owned String places read as themselves, borrowed views
+//! of them, and String-valued `if`/`match` (on an `llvm.alloca` slot). No
+//! owned String this backend builds is freed: there is no IR drop pass.
+//! STILL REFUSED with `cannot lower to MLIR`: assignment through a field
+//! path, non-empty list literals, and `arc` locals.
 //!
 //! So the boundary is a list of operations that shrinks, not a property of
 //! the types. Probe the emitter rather than trusting this paragraph, and
@@ -508,10 +510,12 @@ const Emitter = struct {
     /// runtime types, a borrowed 16-byte `(ptr, i64)` view and an owning
     /// 24-byte `(ptr, i64, i64)` value, and converting the first into the
     /// second is a call to `cell_string_from_str` that copies the characters.
-    /// Neither backend can emit that call, so both must refuse it, and they
-    /// must refuse it on the SAME programs: `tools/check.sh`'s agreement stage
-    /// exists because two backends splitting accept-versus-refuse on one
-    /// program is worse than a shared limitation.
+    /// hir.lower inserts that call wherever a destination declares one, so a
+    /// mismatch reaching this guard is a position the funnel did not convert,
+    /// and both backends must refuse it on the SAME programs:
+    /// `tools/check.sh`'s agreement stage exists because two backends
+    /// splitting accept-versus-refuse on one program is worse than a shared
+    /// limitation.
     ///
     /// One predicate rather than a check per construct. Six positional checks
     /// would close six holes and leave the seventh open, which is the reasoning

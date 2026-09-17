@@ -19,12 +19,13 @@
 //!      itself, from layouts derived from the header rather than guessed.
 //!      **Corrected 2026-09-17:** that holds for the helpers named here, but
 //!      not for every runtime entry point. `cell_string_from_str` and
-//!      `cell_str_eq` are real symbols in `runtime/cell_rt.c`, and a declared
-//!      prelude call to them already lowers. The view-to-owning refusal below
-//!      is a scope choice while this backend has no drop pass (an owned
-//!      String it builds would never be freed; `examples/leaks/ir_owned_string.cell`
-//!      pins that leak for the owned Strings it already accepts), not an
-//!      inability to call.
+//!      `cell_str_eq` are real symbols in `runtime/cell_rt.c`. Since IR
+//!      String step (a) the view-to-owning conversion CALLS the first: hir.lower
+//!      inserts the call (and its declaration, through `hir.runtime_callees`),
+//!      and this backend lowers it like any other bodyless callee. It has no
+//!      drop pass, so no owned String it builds is freed;
+//!      `examples/leaks/ir_owned_string.cell` and `ir_string_conversion.cell`
+//!      pin that leak in gate stage 7.
 //!
 //! So this slice crosses the C boundary only through SCALAR-ABI symbols:
 //! `cell_print_int(int64_t)`, `cell_assert(bool)`, `cell_panic(cell_str_t)`,
@@ -492,13 +493,14 @@ const Emitter = struct {
     /// are two different runtime types: a literal is the 16-byte borrowed view
     /// `%cell_str`, an owned `String` is the 24-byte owning `%cell_string`, and
     /// turning the first into the second is a real call to
-    /// `cell_string_from_str` that copies the characters. This backend does
-    /// not make that call yet (it is a real symbol; see the corrected header
-    /// note: the refusal is a scope choice while there is no IR drop pass), so
-    /// it must refuse. It did not. It ACCEPTED the conversion at six separate
-    /// positions and emitted a 16-byte store into 24 bytes of storage, leaving
-    /// `cap` uninitialized and `.ptr` aimed at a static literal that the drop
-    /// path would eventually free.
+    /// `cell_string_from_str` that copies the characters. hir.lower inserts
+    /// that call at every declared destination (`Lowerer.convertTo`), so a
+    /// mismatch reaching this guard is a position the funnel did not convert,
+    /// and it must be refused. Before any of this existed the backend
+    /// ACCEPTED the conversion at six separate positions and emitted a
+    /// 16-byte store into 24 bytes of storage, leaving `cap` uninitialized and
+    /// `.ptr` aimed at a static literal that a drop path would eventually
+    /// free. The guard is the backstop that keeps that from coming back.
     ///
     /// Six positional checks would have closed six holes and left the seventh
     /// open, which is the reasoning failure `AGENTS.md` records sixteen times
