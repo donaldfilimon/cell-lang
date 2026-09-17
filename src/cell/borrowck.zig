@@ -827,7 +827,7 @@ pub const Checker = struct {
     /// found it holding a value that no loop could have moved. False for an
     /// exit the checker did not record, so a drop point it did not vouch for
     /// keeps the leak. See `exit_liveness`.
-    /// True when `Ok(x)` at this expression moved its operand place.
+    /// True when the `Ok(x)` whose operand is at this address moved it.
     pub fn wrapMoved(self: *const Checker, wrap_key: usize) bool {
         return std.mem.indexOfScalar(usize, self.wrap_moves.items, wrap_key) != null;
     }
@@ -2518,7 +2518,7 @@ pub const Checker = struct {
             .if_expr => try self.checkIf(e),
             .match_expr => |*m| try self.checkMatch(m),
             .annotated => |a| try self.checkExpr(a.value),
-            .wrap => |w| try self.checkWrap(e, w),
+            .wrap => |w| try self.checkWrap(w),
         }
     }
 
@@ -2752,7 +2752,7 @@ pub const Checker = struct {
     /// resolving at all, is read, and codegen copies an owning one it was not
     /// told was moved. An alias or an undecidable value shape that may own a
     /// resource is refused, as at every other consumption site.
-    fn checkWrap(self: *Checker, e: *const ast.Expr, w: @FieldType(ast.Expr.Kind, "wrap")) Error!void {
+    fn checkWrap(self: *Checker, w: @FieldType(ast.Expr.Kind, "wrap")) Error!void {
         const o = w.operand orelse return;
         if (w.ctor != .ok) return self.checkExpr(o);
         switch (try self.ownedMoveSource(o)) {
@@ -2761,7 +2761,10 @@ pub const Checker = struct {
                 if (try self.placeResourceShape(b, pl.path)) |shape| {
                     if (shape == .resources) {
                         try self.movePlace(pl, try self.msg("'{s}' was moved here by 'Ok'", .{pl.display}));
-                        try self.wrap_moves.append(self.allocator, @intFromPtr(e));
+                        // Keyed by the OPERAND pointer: the wrap node itself
+                        // is copied by value on some paths (a `return`'s
+                        // optional value), the heap operand never is.
+                        try self.wrap_moves.append(self.allocator, @intFromPtr(o));
                         return;
                     }
                 }
