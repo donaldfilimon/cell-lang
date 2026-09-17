@@ -2681,7 +2681,7 @@ pub const Checker = struct {
                     // means nothing, so a mode here names a String payload.
                     // Without a mode the payload is a scalar copied out of
                     // the scrutinee (spec B.2): it aliases and owns nothing.
-                    const mode: ?Ownership = if (wp.ctor == .ok) wp.mode else null;
+                    const mode: ?Ownership = if (wp.ctor == .ok or wp.ctor == .err) wp.mode else null;
                     const owning = mode != null and (mode.? == .owned or mode.? == .shared);
                     _ = try self.declare(.{
                         .id = 0,
@@ -2702,7 +2702,7 @@ pub const Checker = struct {
                             try self.diagnostics.err(
                                 self.allocator,
                                 arm.body.span,
-                                try self.msg("yielding the 'Ok(owned {s})' binding directly from its arm is not implemented", .{name}),
+                                try self.msg("yielding the '{s}(owned {s})' binding directly from its arm is not implemented", .{ if (wp.ctor == .ok) "Ok" else "Err", name }),
                             );
                             try self.diagnostics.note(
                                 self.allocator,
@@ -2711,7 +2711,7 @@ pub const Checker = struct {
                             );
                         }
                         if (scrutinee_place) |sp| {
-                            try self.movePlace(sp, try self.msg("'{s}' was moved here by 'Ok(owned {s})'", .{ sp.display, name }));
+                            try self.movePlace(sp, try self.msg("'{s}' was moved here by '{s}(owned {s})'", .{ sp.display, if (wp.ctor == .ok) "Ok" else "Err", name }));
                         }
                     } else if (owning) {
                         if (scrutinee_place) |sp| try self.createLoan(sp, .shared, true, name);
@@ -2754,7 +2754,8 @@ pub const Checker = struct {
     /// resource is refused, as at every other consumption site.
     fn checkWrap(self: *Checker, w: @FieldType(ast.Expr.Kind, "wrap")) Error!void {
         const o = w.operand orelse return;
-        if (w.ctor != .ok) return self.checkExpr(o);
+        // `Ok` and, since sub-project 3, `Err` can carry an owning String.
+        if (w.ctor != .ok and w.ctor != .err) return self.checkExpr(o);
         switch (try self.ownedMoveSource(o)) {
             .place => |pl| {
                 const b = self.bindingById(pl.binding) orelse return self.checkExpr(o);
@@ -9352,6 +9353,62 @@ test "Ok of a match alias is refused like any consumption of an alias" {
     try expectRejectedWith(owning_ok_prelude ++
         \\pub fn f(owned s: String) -> Result<String, Int32> {
         \\    return match s { y => Ok(y) }
+        \\}
+        \\
+    , "the scrutinee still owns the value");
+}
+
+const owning_err_prelude =
+    \\pub fn take(owned s: String) { }
+    \\pub fn keepe(owned r: Result<Int, String>) { }
+    \\pub fn viewe(shared s: String) -> Int { return 0 }
+    \\
+;
+
+test "Err moves an owning String and Err(owned ..) consumes on its arm only" {
+    // Owning String in Err (sub-project 3, 2026-09-17).
+    try expectRejectedWith(owning_err_prelude ++
+        \\pub fn f(owned s: String) -> Result<Int, String> {
+        \\    let r: Result<Int, String> = Err(s)
+        \\    take(s)
+        \\    return r
+        \\}
+        \\
+    , "use of 's' after it was moved");
+    try expectRejectedWith(owning_err_prelude ++
+        \\pub fn f(owned r: Result<Int, String>) {
+        \\    match r {
+        \\        Ok(_) => {},
+        \\        Err(owned e) => take(e),
+        \\    }
+        \\    keepe(r)
+        \\}
+        \\
+    , "use of 'r' after it was moved");
+    try expectAccepted(owning_err_prelude ++
+        \\pub fn f(owned r: Result<Int, String>) {
+        \\    match r {
+        \\        Ok(_) => keepe(r),
+        \\        Err(owned e) => take(e),
+        \\    }
+        \\}
+        \\
+    );
+    try expectRejectedWith(owning_err_prelude ++
+        \\pub fn f(owned r: Result<Int, String>) -> Int {
+        \\    return match r {
+        \\        Ok(_) => 0,
+        \\        Err(shared e) => {
+        \\            keepe(r)
+        \\            viewe(e)
+        \\        },
+        \\    }
+        \\}
+        \\
+    , "cannot move 'r' while it is borrowed");
+    try expectRejectedWith(owning_err_prelude ++
+        \\pub fn f(owned s: String) -> Result<Int, String> {
+        \\    return match s { y => Err(y) }
         \\}
         \\
     , "the scrutinee still owns the value");
