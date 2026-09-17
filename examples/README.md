@@ -211,7 +211,10 @@ are not.
 | `unit_type.cell` | explicit `()` in type position: `-> ()` is the same unit as an omitted `->`; a `let` of `()` is refused |
 | `escapes.cell` | SPEC 2.8 simple escapes: `"\n"` is one newline byte and `"\\"` is one backslash; prints 11 through all three backends |
 | `silent_literals.cell` | SPEC 2.6/2.7: `0x1F` is 31, `1_000` is 1000, `1e9` is a Float; prints 31 through all three backends |
-| `index.cell` | postfix `a[i]` for `String` and `[Byte]` as `Byte?`, and for `[Int]`/`[Float]`/`[Bool]` as the element's optional; prints 1142125 through C; LLVM and MLIR refuse together |
+| `index.cell` | postfix `a[i]` for `String` and `[Byte]` as `Byte?`, and for `[Int]`/`[Int32]`/`[Float]`/`[Bool]` as the element's optional; prints 1142125 through C; LLVM and MLIR refuse together |
+| `early_return.cell` | an `if` branch or `match` arm that always leaves keeps its moves out of the code after it; prints 1124 through all three backends |
+| `results_wide.cell` | 16-byte per-pair Results with a 64-bit error; prints -8999999983 through all three backends |
+| `results_small.cell` | 8-byte and 2-byte per-pair Results crossing calls in one word; prints 7533 through all three backends |
 
 ## Running `arc.cell`, the one example with a C host
 

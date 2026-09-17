@@ -1,0 +1,59 @@
+// Small per-instantiation Results cross calls in a single register word
+// (cell_rt.h ABI 2): `Result<Bool, Int32>` is 8 bytes and
+// `Result<Int8, Int8>` is 2, so both travel as one word each way, where
+// `results.cell` and `results_wide.cell` exercise the 16-byte, two-word path.
+// `pass_b` returns its parameter unchanged, so a value makes the round trip
+// through both coercions.
+//
+// Status: parses, passes `cell check`, and runs on the C, LLVM and MLIR
+// backends, printing the same answer on each (see EXPECT-OUTPUT).
+// EXPECT-OUTPUT: 7533
+
+pub fn print_int(copy value: Int);
+
+pub fn check(copy n: Int32) -> Result<Bool, Int32> {
+    let copy zero: Int32 = 0
+    let copy five: Int32 = 5
+    if n > zero {
+        return Ok(n > five)
+    }
+    return Err(n)
+}
+
+pub fn tiny(copy n: Int8) -> Result<Int8, Int8> {
+    let copy zero: Int8 = 0
+    if n > zero {
+        return Ok(n)
+    }
+    return Err(n)
+}
+
+pub fn pass_b(copy r: Result<Bool, Int32>) -> Result<Bool, Int32> {
+    return r
+}
+
+pub fn score_b(copy r: Result<Bool, Int32>) -> Int {
+    let copy low: Int32 = -5
+    return match r {
+        Ok(v) => if v { 1 } else { 2 },
+        Err(e) => if e < low { 30 } else { 40 },
+    }
+}
+
+pub fn score_t(copy r: Result<Int8, Int8>) -> Int {
+    let copy three: Int8 = 3
+    let copy minus_two: Int8 = -2
+    return match r {
+        Ok(v) => if v == three { 500 } else { 600 },
+        Err(e) => if e == minus_two { 7000 } else { 8000 },
+    }
+}
+
+pub fn main() {
+    let copy a = score_b(pass_b(check(9)))
+    let copy b = score_b(check(2))
+    let copy c = score_b(pass_b(check(-7)))
+    let copy d = score_t(tiny(3))
+    let copy e = score_t(tiny(-2))
+    print_int(a + b + c + d + e)
+}
