@@ -182,6 +182,9 @@ const Emitter = struct {
     /// The return type the BODY must produce, which for an sret function is
     /// the pointee of the caller's buffer rather than a func result.
     ret_natural: []const u8 = "",
+    /// What a direct `return` hands back: `ret_natural`, or the coerced
+    /// integer/array spelling `abi.classifyReturn` gives a small aggregate.
+    ret_abi: []const u8 = "",
     /// String literals become llvm.mlir.global constants, emitted at module
     /// scope once the bodies that reference them are known.
     strings: std.ArrayList(StringGlobal) = .empty,
@@ -228,7 +231,7 @@ const Emitter = struct {
                 try self.unsupported(f.span, what);
                 continue;
             }
-            const ret = self.mlirType(f.ret);
+            const ret = self.returnAbiType(f.ret);
             if (ret == null and f.ret.tag() != .unit) {
                 try self.unsupported(f.span, "declared return type");
                 continue;
@@ -307,7 +310,7 @@ const Emitter = struct {
             try self.unsupported(f.span, what);
             return;
         }
-        const ret = self.mlirType(f.ret);
+        const ret = self.returnAbiType(f.ret);
         if (ret == null and f.ret.tag() != .unit) {
             try self.unsupported(f.span, "return type");
             return;
@@ -344,7 +347,8 @@ const Emitter = struct {
         self.ret_natural = if (uses_sret)
             (self.mlirTypeOwned(f.ret, .owned) orelse "")
         else
-            (ret orelse "");
+            (self.mlirType(f.ret) orelse "");
+        self.ret_abi = if (uses_sret) "" else (ret orelse "");
         try self.out.print("  func.func @{s}(", .{f.symbol});
         if (uses_sret) {
             const nat = self.mlirTypeOwned(f.ret, .owned) orelse "!llvm.struct<()>";
@@ -435,20 +439,37 @@ const Emitter = struct {
             }
         }
         // The parameter prologue goes through the guard here, unlike its
-        // counterpart in `llvmemit.zig`, and that asymmetry is real rather than
-        // an oversight: this backend passes natural types and performs no
-        // AAPCS64 coercion, so `%argN` already has the slot's own type and the
+        // counterpart in `llvmemit.zig`. Since 2026-09-17 this backend places
+        // parameters by `abi.classifyParam` too, so a coerced or indirect
+        // `%argN` is first read back into its NATURAL type (`paramPlacement`
+        // below) and only that natural value reaches the guard, where the
         // comparison is free. If it ever fails, `paramType` and the binding
         // loop have disagreed about one parameter, which is a defect worth a
         // diagnostic rather than a silent store.
         for (f.params(), 0..) |p, i| {
             const t = self.paramType(p.ty, p.ownership) orelse continue;
-            if (self.passesResultCopyByPointer(p.ty, p.ownership)) {
-                // The caller's copy arrives by address; take our own.
-                const copied = try self.nextSsa();
-                try self.line("{s} = llvm.load %arg{d} : !llvm.ptr -> {s}", .{ copied, i, result_type });
-                try self.storeSlot(f.span, @intCast(i), .{ .text = copied, .ty = result_type }, "a parameter's incoming value");
-                continue;
+            switch (self.paramPlacement(p.ty, p.ownership).?) {
+                .natural, .borrow_ptr => {},
+                .copy_ptr => |nat| {
+                    // The caller's copy arrives by address; take our own.
+                    const copied = try self.nextSsa();
+                    try self.line("{s} = llvm.load %arg{d} : !llvm.ptr -> {s}", .{ copied, i, nat });
+                    try self.storeSlot(f.span, @intCast(i), .{ .text = copied, .ty = nat }, "a parameter's incoming value");
+                    continue;
+                },
+                .coerced => |c| {
+                    // Registers carry the coerced words; read the struct back
+                    // out of a slot sized by the (never smaller) coerced type.
+                    const one = try self.nextSsa();
+                    try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
+                    const tmp = try self.nextSsa();
+                    try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ tmp, one, c.abi });
+                    try self.line("llvm.store %arg{d}, {s} : {s}, !llvm.ptr", .{ i, tmp, c.abi });
+                    const back = try self.nextSsa();
+                    try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ back, tmp, c.natural });
+                    try self.storeSlot(f.span, @intCast(i), .{ .text = back, .ty = c.natural }, "a parameter's incoming value");
+                    continue;
+                },
             }
             try self.storeSlot(
                 f.span,
@@ -466,7 +487,11 @@ const Emitter = struct {
                 try self.line("return", .{});
             } else if (ret) |r| {
                 const zero = try self.nextSsa();
-                try self.line("{s} = arith.constant 0 : {s}", .{ zero, r });
+                if (std.mem.startsWith(u8, r, "!llvm.")) {
+                    try self.line("{s} = llvm.mlir.zero : {s}", .{ zero, r });
+                } else {
+                    try self.line("{s} = arith.constant 0 : {s}", .{ zero, r });
+                }
                 try self.line("return {s} : {s}", .{ zero, r });
             } else {
                 try self.line("return", .{});
@@ -609,6 +634,18 @@ const Emitter = struct {
                     } else if (self.sret) |dest| {
                         try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ val.text, dest, self.ret_natural });
                         try self.line("return", .{});
+                    } else if (!std.mem.eql(u8, self.ret_abi, self.ret_natural)) {
+                        // A coerced return: reinterpret through memory, the
+                        // way clang and llvmemit.zig do. The coerced type is
+                        // never smaller than the struct, so it sizes the slot.
+                        const one = try self.nextSsa();
+                        try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
+                        const slot = try self.nextSsa();
+                        try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ slot, one, self.ret_abi });
+                        try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ val.text, slot, self.ret_natural });
+                        const out = try self.nextSsa();
+                        try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ out, slot, self.ret_abi });
+                        try self.line("return {s} : {s}", .{ out, self.ret_abi });
                     } else {
                         try self.line("return {s} : {s}", .{ val.text, self.ret_natural });
                     }
@@ -871,6 +908,7 @@ const Emitter = struct {
             .if_expr => |ie| return self.emitIf(e, ie.cond, ie.then_body, ie.else_body),
             .match_expr => |me| return self.emitMatch(e, me.scrutinee, me.arms),
             .result_ctor => |rc| return self.emitResultCtor(e, rc.is_ok, rc.operand),
+            .option_ctor => |oc| return self.emitOptionCtor(e, oc.is_some, oc.operand),
             .struct_lit => |sl| {
                 const t = self.structType(sl.name) orelse {
                     try self.unsupported(e.span, "struct literal for an unrepresentable type");
@@ -1212,18 +1250,35 @@ const Emitter = struct {
                     try self.unsupported(a.span, "an argument whose parameter type this backend cannot render");
                     return Value.none;
                 };
-                if (self.passesResultCopyByPointer(a.ty, modes[i].param)) {
-                    // Always a fresh copy, never the caller's own slot.
-                    const v = try self.emitExpr(&a);
-                    if (v.isNone()) return Value.none;
-                    if (!try self.fits(a.span, v.ty, result_type, "a Result argument")) return Value.none;
-                    const one = try self.nextSsa();
-                    try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
-                    const tmp = try self.nextSsa();
-                    try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ tmp, one, result_type });
-                    try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ v.text, tmp, result_type });
-                    vals[i] = .{ .text = tmp, .ty = "!llvm.ptr" };
-                    continue;
+                switch (self.paramPlacement(a.ty, modes[i].param).?) {
+                    .natural, .borrow_ptr => {},
+                    .copy_ptr => |nat| {
+                        // Always a fresh copy, never the caller's own slot.
+                        // emitArg yields the natural value, loading through a
+                        // borrow consumed by value (`read(copy s)`).
+                        const v = try self.emitArg(&a, nat);
+                        if (v.isNone()) return Value.none;
+                        const one = try self.nextSsa();
+                        try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
+                        const tmp = try self.nextSsa();
+                        try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ tmp, one, nat });
+                        try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ v.text, tmp, nat });
+                        vals[i] = .{ .text = tmp, .ty = "!llvm.ptr" };
+                        continue;
+                    },
+                    .coerced => |c| {
+                        const v = try self.emitArg(&a, c.natural);
+                        if (v.isNone()) return Value.none;
+                        const one = try self.nextSsa();
+                        try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
+                        const tmp = try self.nextSsa();
+                        try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ tmp, one, c.abi });
+                        try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ v.text, tmp, c.natural });
+                        const words = try self.nextSsa();
+                        try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ words, tmp, c.abi });
+                        vals[i] = .{ .text = words, .ty = c.abi };
+                        continue;
+                    },
                 }
             }
             vals[i] = try self.emitArg(&a, want);
@@ -1241,7 +1296,7 @@ const Emitter = struct {
             sret_slot = try self.nextSsa();
             try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ sret_slot, one, nat });
         }
-        const ret = if (via_sret) null else self.mlirType(e.ty);
+        const ret = if (via_sret) null else self.returnAbiType(e.ty);
         var result: []const u8 = "";
         if (ret != null) {
             result = try self.nextSsa();
@@ -1278,7 +1333,20 @@ const Emitter = struct {
             try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ loaded, sret_slot, nat });
             return .{ .text = loaded, .ty = nat };
         }
-        if (ret) |r| return .{ .text = result, .ty = r };
+        if (ret) |r| {
+            const natural = self.mlirType(e.ty) orelse r;
+            if (std.mem.eql(u8, r, natural)) return .{ .text = result, .ty = r };
+            // A coerced return: the words go into a slot the coerced type
+            // sizes, and the struct is read back out of it.
+            const one = try self.nextSsa();
+            try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
+            const slot = try self.nextSsa();
+            try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ slot, one, r });
+            try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ result, slot, r });
+            const back = try self.nextSsa();
+            try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ back, slot, natural });
+            return .{ .text = back, .ty = natural };
+        }
         return Value.none;
     }
 
@@ -1400,6 +1468,29 @@ const Emitter = struct {
         const out = try self.nextSsa();
         try self.line("{s} = memref.load {s}[] : memref<i1>", .{ out, res });
         return .{ .text = out, .ty = "i1" };
+    }
+
+    /// `Some(x)`/`None`: a zeroed `!llvm.struct<(i8, T)>`, then `has_value`
+    /// and the payload, as CELL_DEFINE_OPTIONAL's constructors build it.
+    fn emitOptionCtor(self: *Emitter, e: *const hir.Expr, is_some: bool, operand_e: ?*const hir.Expr) EmitError!Value {
+        const opt_ty = self.mlirType(e.ty) orelse {
+            try self.unsupported(e.span, "optional type");
+            return Value.none;
+        };
+        const zero = try self.nextSsa();
+        try self.line("{s} = llvm.mlir.zero : {s}", .{ zero, opt_ty });
+        if (!is_some) return .{ .text = zero, .ty = opt_ty };
+        const inner = self.mlirType(e.ty.optional.*) orelse "i8";
+        const v = try self.emitExpr(operand_e.?);
+        if (v.isNone()) return Value.none;
+        if (!try self.fits(operand_e.?.span, v.ty, inner, "a Some payload")) return Value.none;
+        const one = try self.nextSsa();
+        try self.line("{s} = llvm.mlir.constant(1 : i8) : i8", .{one});
+        const tagged = try self.nextSsa();
+        try self.line("{s} = llvm.insertvalue {s}, {s}[0] : {s}", .{ tagged, one, zero, opt_ty });
+        const out = try self.nextSsa();
+        try self.line("{s} = llvm.insertvalue {s}, {s}[1] : {s}", .{ out, v.text, tagged, opt_ty });
+        return .{ .text = out, .ty = opt_ty };
     }
 
     /// `Ok(x)`/`Err(e)`, built the way llvmemit.zig builds it and cell_rt.h's
@@ -1532,6 +1623,19 @@ const Emitter = struct {
                     const eq = try self.emitStringEq(scrutinee, arm.pattern.kind.string);
                     if (eq.isNone()) return Value.none;
                     cmp = eq.text;
+                } else if (arm.pattern.kind == .option_ctor) {
+                    const tag = try self.nextSsa();
+                    try self.line("{s} = llvm.extractvalue {s}[0] : {s}", .{ tag, scrutinee.text, scrutinee.ty });
+                    const zero = try self.nextSsa();
+                    try self.line("{s} = arith.constant 0 : i8", .{zero});
+                    const c = try self.nextSsa();
+                    try self.line("{s} = arith.cmpi {s}, {s}, {s} : i8", .{
+                        c,
+                        if (arm.pattern.kind.option_ctor.is_some) "ne" else "eq",
+                        tag,
+                        zero,
+                    });
+                    cmp = c;
                 } else if (arm.pattern.kind == .result_ctor) {
                     // `ok` is cell_result_t's first field, a C bool byte.
                     const tag = try self.nextSsa();
@@ -1552,7 +1656,7 @@ const Emitter = struct {
                         .bool => |v| try std.fmt.allocPrint(self.arena, "{d}", .{@intFromBool(v)}),
                         .enum_variant => |ev| try std.fmt.allocPrint(self.arena, "{d}", .{ev.value}),
                         .float, .string => null,
-                        .wildcard, .binding, .result_ctor => unreachable,
+                        .wildcard, .binding, .result_ctor, .option_ctor => unreachable,
                     };
                     const tt = test_text orelse {
                         try self.unsupported(arm.span, "this match pattern is not lowered to MLIR yet");
@@ -1584,6 +1688,14 @@ const Emitter = struct {
             if (arm.pattern.kind == .binding) {
                 const bslot = arm.pattern.kind.binding;
                 try self.storeSlot(arm.span, bslot, scrutinee, "a match binding pattern");
+            }
+            if (arm.pattern.kind == .option_ctor) {
+                if (arm.pattern.kind.option_ctor.binding) |bslot| {
+                    const inner_ty = self.mlirType(scrutinee_e.ty.optional.*) orelse "i8";
+                    const raw = try self.nextSsa();
+                    try self.line("{s} = llvm.extractvalue {s}[1] : {s}", .{ raw, scrutinee.text, scrutinee.ty });
+                    try self.storeSlot(arm.span, bslot, .{ .text = raw, .ty = inner_ty }, "an optional payload binding");
+                }
             }
             if (arm.pattern.kind == .result_ctor) {
                 const rc = arm.pattern.kind.result_ctor;
@@ -1660,9 +1772,62 @@ const Emitter = struct {
     /// declared all three by value. `borrowsByPointer` asks
     /// `abi.classifyParam`, so a type nobody enumerated gets the ABI's answer.
     fn paramType(self: *Emitter, ty: hir.Ty, own: hir.Ownership) ?[]const u8 {
-        if (self.borrowsByPointer(ty, own)) return "!llvm.ptr";
-        if (self.passesResultCopyByPointer(ty, own)) return "!llvm.ptr";
-        return self.mlirTypeOwned(ty, own);
+        const p = self.paramPlacement(ty, own) orelse return null;
+        return switch (p) {
+            .natural => |t| t,
+            .borrow_ptr, .copy_ptr => "!llvm.ptr",
+            .coerced => |c| c.abi,
+        };
+    }
+
+    /// How a parameter of `(ty, own)` crosses a call, by `abi.classifyParam`,
+    /// the same classification llvmemit.zig follows. Null when refused.
+    const Placement = union(enum) {
+        /// Passed as its own type: scalars.
+        natural: []const u8,
+        /// A borrow: the lender's address.
+        borrow_ptr,
+        /// An aggregate over 16 bytes: a pointer to a caller-owned copy,
+        /// carrying the natural pointee type.
+        copy_ptr: []const u8,
+        /// An aggregate of at most 16 bytes: `[n x i64]`, or an HFA's
+        /// `[n x f64]`, reinterpreted through memory at both ends.
+        coerced: struct { abi: []const u8, natural: []const u8 },
+    };
+
+    fn paramPlacement(self: *Emitter, ty: hir.Ty, own: hir.Ownership) ?Placement {
+        if (self.borrowsByPointer(ty, own)) return .borrow_ptr;
+        const nat = self.mlirTypeOwned(ty, own) orelse return null;
+        return switch (abi.classifyParam(self.module, ty, own)) {
+            .direct => .{ .natural = nat },
+            .coerce_int => |n| .{ .coerced = .{
+                .abi = std.fmt.allocPrint(self.arena, "!llvm.array<{d} x i64>", .{n}) catch return null,
+                .natural = nat,
+            } },
+            .coerce_float => |f| .{ .coerced = .{
+                .abi = std.fmt.allocPrint(self.arena, "!llvm.array<{d} x {s}>", .{ f.count, mlirScalar(f.elem) }) catch return null,
+                .natural = nat,
+            } },
+            .indirect => .{ .copy_ptr = nat },
+            .unclassified => null,
+        };
+    }
+
+    /// The type a DIRECT return is declared with: the natural type, or the
+    /// coerced spelling clang uses for a small integer-class aggregate
+    /// (`iN` for at most 8 bytes, `[2 x i64]` above that). Null for unit or
+    /// a refused type. An sret return never reaches this.
+    fn returnAbiType(self: *Emitter, ty: hir.Ty) ?[]const u8 {
+        const nat = self.mlirType(ty) orelse return null;
+        return switch (abi.classifyReturn(self.module, ty)) {
+            .coerce_int => |n| blk: {
+                const l = abi.layoutOf(self.module, ty, .owned) orelse break :blk null;
+                if (l.size <= 8) break :blk std.fmt.allocPrint(self.arena, "i{d}", .{l.size * 8}) catch null;
+                break :blk std.fmt.allocPrint(self.arena, "!llvm.array<{d} x i64>", .{n}) catch null;
+            },
+            .unclassified => null,
+            .direct, .coerce_float, .indirect => nat,
+        };
     }
 
     /// Whether `(ty, own)` is a BORROW PASSED BY POINTER: the one parameter
@@ -1678,16 +1843,6 @@ const Emitter = struct {
     /// tells them apart. `llvmemit.borrowsByPointer` is the same function for
     /// the same reason, and the two backends must keep agreeing here or
     /// `tools/check.sh`'s agreement stage splits.
-    /// A Result argument the ABI passes INDIRECTLY: a copy the caller places
-    /// in memory it owns, handed over as `ptr`, which the callee copies in.
-    /// That is how clang declares `cell_result_t` parameters (24 bytes), and
-    /// how llvmemit.zig already places them. Other indirect aggregates still
-    /// pass by value here; that gap is pinned in tools/check.sh.
-    fn passesResultCopyByPointer(self: *Emitter, ty: hir.Ty, own: hir.Ownership) bool {
-        if (ty.tag() != .result) return false;
-        return abi.classifyParam(self.module, ty, own) == .indirect;
-    }
-
     fn borrowsByPointer(self: *Emitter, ty: hir.Ty, own: hir.Ownership) bool {
         return switch (abi.classifyParam(self.module, ty, own)) {
             .direct => |spelling| std.mem.eql(u8, spelling, "ptr"),
@@ -2476,6 +2631,44 @@ test "a borrow consumed BY VALUE is loaded through, not passed as an address" {
     try std.testing.expectEqualStrings("42\n", out);
 }
 
+test "MLIR places aggregates by the ABI classification, and a Byte? round-trips" {
+    const gpa = std.testing.allocator;
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn take(shared xs: [Byte]) -> Int;
+        \\pub fn mk(copy v: Int) -> Byte? { if v > 0 { return Some(7) } return None }
+        \\pub fn get(copy o: Byte?) -> Int { return match o { Some(x) => 5, None => 1 } }
+        \\pub fn main() { print_int(get(mk(1)) + get(mk(0))) }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    // A 24-byte view is an indirect copy: its address, as clang passes it.
+    try expectContains(e.text, "func.func private @cell_take(!llvm.ptr)");
+    // A 2-byte optional returns as i16 and is passed as one word.
+    try expectContains(e.text, "func.func @cell_mk(%arg0: i64) -> i16");
+    try expectContains(e.text, "func.func @cell_get(%arg0: !llvm.array<1 x i64>) -> i64");
+
+    const out = try runThroughMlir(gpa, e.text);
+    defer gpa.free(out);
+    // Some -> 5, None -> 1. The by-value placement this replaced read the
+    // tag and payload out of the wrong registers.
+    try std.testing.expectEqualStrings("6\n", out);
+}
+
+test "Some/None lower to a zeroed tagged struct in the llvm dialect" {
+    var e = try emitSource(
+        \\pub fn pick(copy a: Int) -> Int? { if a > 0 { return Some(a) } return None }
+        \\pub fn get(copy o: Int?, copy d: Int) -> Int { return match o { Some(v) => v, None => d } }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "llvm.mlir.zero : !llvm.struct<(i8, i64)>");
+    try expectContains(e.text, "llvm.insertvalue");
+    try expectContains(e.text, "[0] : !llvm.struct<(i8, i64)>");
+    try expectContains(e.text, "[1] : !llvm.struct<(i8, i64)>");
+    try expectContains(e.text, "arith.cmpi ne,");
+}
+
 test "a scalar Result lowers to the cell_result_t struct in the llvm dialect" {
     var e = try emitSource(
         \\pub enum ParseError { Empty, TooLong }
@@ -2552,17 +2745,19 @@ test "an exclusive String, list and optional are POINTERS, and writes through th
     try std.testing.expect(!o.bag.hasErrors());
     try expectContains(o.text, "func.func @cell_seto(%arg0: !llvm.ptr)");
 
-    // And the two `shared` rows do NOT move. `cell_str_t` and `cell_opt_i64_t`
-    // really are passed by value in C, so making every aggregate a pointer
-    // would be the same mistake with the sign reversed.
+    // And the two `shared` rows do NOT become pointers. `cell_str_t` and
+    // `cell_opt_i64_t` really are passed by value in C, so making every
+    // aggregate a pointer would be the same mistake with the sign reversed.
+    // By value means AS CLANG PLACES IT: a 16-byte integer aggregate is
+    // `[2 x i64]`, which is what llvmemit.zig declares too.
     var sh = try emitSource(
         \\pub fn look(shared s: String);
         \\pub fn peek(shared v: Int?);
     );
     defer sh.deinit();
     try std.testing.expect(!sh.bag.hasErrors());
-    try expectContains(sh.text, "func.func private @cell_look(!llvm.struct<(ptr, i64)>)");
-    try expectContains(sh.text, "func.func private @cell_peek(!llvm.struct<(i8, i64)>)");
+    try expectContains(sh.text, "func.func private @cell_look(!llvm.array<2 x i64>)");
+    try expectContains(sh.text, "func.func private @cell_peek(!llvm.array<2 x i64>)");
 }
 
 test "a borrowed PRIMITIVE parameter still writes its own slot, matching C" {
@@ -2750,8 +2945,8 @@ test "the borrowed-view to owning-String conversion is refused at EVERY position
 }
 
 test "the guard does not refuse a matching String or a borrowed aggregate" {
-    // The other half. This backend performs no AAPCS64 coercion, so there is
-    // no `coerceArg` to place the guard around, but there IS the borrow path:
+    // The other half. This backend's coercion happens after the guard has seen
+    // the NATURAL value (see `paramPlacement`), and there is the borrow path:
     // `paramType` renders a borrow the ABI passes by pointer as `!llvm.ptr`
     // and `emitArg` hands over the slot. That is a deliberate ABI spelling,
     // not a conversion, and it must stay invisible to the guard.

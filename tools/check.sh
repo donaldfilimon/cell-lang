@@ -482,21 +482,19 @@ LEAK_FIELD_REVIVAL=0
 #
 # DO NOT "fix" a failure here by adding a pin. A new disagreement is a new ABI
 # defect; it belongs in src/ or, if it is genuinely disclosed elsewhere, in a
-# pin that says WHERE it is disclosed, as these two do. The former LLVM and
-# MLIR `arc_string_return` pins were deleted when HIR began preserving return
+# pin that says WHERE it is disclosed. The former LLVM and MLIR
+# `arc_string_return` pins were deleted when HIR began preserving return
 # ownership and both backends explicitly refused that unsupported contract.
 #
-#   primitives:cell_take_list, primitives:cell_take_nested  (MLIR)
-#       a `shared` list is `const T *` by runtime/cell_rt.h section 7 and the
-#       C backend passes `ptr`; the MLIR backend passes the 24-byte view BY
-#       VALUE. This is the unfixed twin of the `abi.classifyParam` defect that
-#       1fffcf8 fixed for the LLVM backend, it lives in src/cell/mlirmit.zig,
-#       and stage 8's header already describes it in prose for `exclusive
-#       String` without any stage checking it. These two pins are EXPECTED to
-#       flip to "gap closed, un-pin" when that fix lands: read that red as the
-#       prompt it is, not as a regression.
-SIG_DISCLOSED='primitives:cell_take_list:MLIR
-primitives:cell_take_nested:MLIR'
+# The list is EMPTY. The last two pins, `primitives:cell_take_list:MLIR` and
+# `primitives:cell_take_nested:MLIR`, were deleted when mlirmit.zig began
+# placing every parameter and return by `abi.classifyParam`/`classifyReturn`
+# (2026-09-17). Their comment gave the wrong reason: a `shared` list is a
+# by-value view in cell_rt.h section 7, and clang's `ptr` is the INDIRECT
+# copy of that 24-byte struct, not a borrow. MLIR now passes the copy's
+# address, coerces 16-byte-or-smaller aggregates to `[n x i64]`/`iN`, and
+# agrees with C.
+SIG_DISCLOSED=''
 
 fails=0
 skips=0

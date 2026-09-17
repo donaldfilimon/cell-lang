@@ -508,6 +508,7 @@ const Walker = struct {
             .struct_lit => |sl| for (sl.fields) |*fv| try self.walkExpr(fv),
             .list_lit => |elems| for (elems) |*el| try self.walkExpr(el),
             .result_ctor => |rc| try self.walkExpr(rc.operand),
+            .option_ctor => |oc| if (oc.operand) |o| try self.walkExpr(o),
             .ref => |slot| try self.addOp(self.cur.?, .{ .use = slot }),
             .int_const,
             .float_const,
@@ -599,6 +600,7 @@ const Walker = struct {
                 // `Ok(v)`/`Err(e)` defines its payload slot at the same point
                 // the emitters store it: the start of the arm's body.
                 .result_ctor => |rc| if (rc.binding) |slot| try self.addOp(body_id, .{ .def = slot }),
+                .option_ctor => |oc| if (oc.binding) |slot| try self.addOp(body_id, .{ .def = slot }),
                 else => {},
             }
             try self.walkExpr(arm.body);

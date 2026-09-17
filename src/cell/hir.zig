@@ -233,6 +233,9 @@ pub const Pattern = struct {
         /// for `Ok(_)`/`Err(_)`. Only the payloads `abi.resultPayload` and
         /// `abi.resultErrorCarried` accept are lowered to this form.
         result_ctor: struct { is_ok: bool, binding: ?u32 },
+        /// `Some(x)` or `None` on a scalar optional scrutinee. `binding` is the
+        /// payload slot for `Some(x)`, null for `Some(_)` and `None`.
+        option_ctor: struct { is_some: bool, binding: ?u32 },
     };
 };
 
@@ -285,6 +288,8 @@ pub const Expr = struct {
         /// `Ok(x)` or `Err(e)` building the scalar Result named by `ty`. The
         /// operand is already typed as the Result's `ok` or `err` type.
         result_ctor: struct { is_ok: bool, operand: *Expr },
+        /// `Some(x)` or `None` building the scalar optional named by `ty`.
+        option_ctor: struct { is_some: bool, operand: ?*Expr },
     };
 };
 
@@ -815,15 +820,12 @@ const Lowerer = struct {
             },
 
             .wrap => |w| {
+                const want = expected orelse types.t_unknown;
                 const is_ok = switch (w.ctor) {
                     .ok => true,
                     .err => false,
-                    .some, .none => {
-                        try self.cannotLower(e.span, "optional values are not lowered by the IR backends");
-                        return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
-                    },
+                    .some, .none => return self.lowerOptionCtor(e, w.ctor == .some, w.operand, want),
                 };
-                const want = expected orelse types.t_unknown;
                 if (want.tag() != .result) {
                     try self.cannotLower(e.span, "Ok/Err need a declared Result destination (a typed let, a parameter, or a return)");
                     return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
@@ -965,10 +967,7 @@ const Lowerer = struct {
                 const is_ok = switch (wp.ctor) {
                     .ok => true,
                     .err => false,
-                    .some, .none => {
-                        try self.cannotLower(p.span, "optional patterns are not lowered by the IR backends");
-                        return .{ .kind = .wildcard, .span = p.span };
-                    },
+                    .some, .none => return self.lowerOptionPattern(p, wp.ctor == .some, wp.binding, scrutinee_ty),
                 };
                 if (scrutinee_ty.tag() != .result) {
                     try self.cannotLower(p.span, "an Ok/Err pattern on a value that is not a Result");
@@ -998,6 +997,53 @@ const Lowerer = struct {
                 return .{ .kind = .{ .result_ctor = .{ .is_ok = is_ok, .binding = binding } }, .span = p.span };
             },
         }
+    }
+
+    fn lowerOptionCtor(self: *Lowerer, e: *const ast.Expr, is_some: bool, operand_ast: ?*ast.Expr, want: Ty) LowerError!Expr {
+        if (want.tag() != .optional) {
+            try self.cannotLower(e.span, "Some/None need a declared optional destination (a typed let, a parameter, or a return)");
+            return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
+        }
+        const inner = want.optional.*;
+        if (!abi.optionPayloadCarried(inner)) {
+            try self.cannotLower(e.span, "an optional whose payload is not a scalar with a runtime instance");
+            return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
+        }
+        var operand: ?*Expr = null;
+        if (is_some) {
+            const o = operand_ast orelse {
+                try self.cannotLower(e.span, "Some without an operand");
+                return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
+            };
+            operand = try self.box(try self.lowerExprIn(o, inner));
+        }
+        return .{
+            .ty = want,
+            .span = e.span,
+            .kind = .{ .option_ctor = .{ .is_some = is_some, .operand = operand } },
+        };
+    }
+
+    fn lowerOptionPattern(self: *Lowerer, p: *const ast.Pattern, is_some: bool, name: ?[]const u8, scrutinee_ty: Ty) LowerError!Pattern {
+        if (scrutinee_ty.tag() != .optional or !abi.optionPayloadCarried(scrutinee_ty.optional.*)) {
+            try self.cannotLower(p.span, "a Some/None pattern on a value that is not a scalar optional");
+            return .{ .kind = .wildcard, .span = p.span };
+        }
+        var binding: ?u32 = null;
+        if (is_some) if (name) |n| {
+            const slot: u32 = @intCast(self.bindings.items.len);
+            try self.bindings.append(self.arena, .{
+                .name = n,
+                .ty = scrutinee_ty.optional.*,
+                .ownership = .copy,
+                .mutable = false,
+                .is_param = false,
+                .slot = slot,
+            });
+            try self.scope.append(self.arena, .{ .name = n, .slot = slot, .depth = self.depth });
+            binding = slot;
+        };
+        return .{ .kind = .{ .option_ctor = .{ .is_some = is_some, .binding = binding } }, .span = p.span };
     }
 
     // -- helpers ------------------------------------------------------------
@@ -1298,11 +1344,37 @@ test "Ok/Err lower to result_ctor typed by the declared Result, and patterns bin
     try std.testing.expect(score.bindings[err_pat.binding.?].ownership == .copy);
 }
 
-test "Result forms the IR backends do not carry are refused, and optionals still are" {
+test "Some/None lower to option_ctor, and a Some pattern binds the payload" {
+    var l = try lowerSource(
+        \\pub fn pick(copy a: Int) -> Int? {
+        \\    if a > 0 { return Some(a) }
+        \\    return None
+        \\}
+        \\pub fn get(copy o: Byte?, copy d: Byte) -> Byte {
+        \\    return match o { Some(v) => v, None => d }
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const pick = l.module.findFn("pick").?;
+    const none = pick.body.?[1].kind.ret.?;
+    try std.testing.expectEqual(.optional, none.ty.tag());
+    try std.testing.expect(!none.kind.option_ctor.is_some);
+    try std.testing.expect(none.kind.option_ctor.operand == null);
+    const get = l.module.findFn("get").?;
+    const arms = get.body.?[0].kind.ret.?.kind.match_expr.arms;
+    const some = arms[0].pattern.kind.option_ctor;
+    try std.testing.expect(some.is_some);
+    try std.testing.expectEqual(.byte, get.bindings[some.binding.?].ty.tag());
+    try std.testing.expect(arms[1].pattern.kind.option_ctor.binding == null);
+}
+
+test "Result and optional forms the IR backends do not carry are refused" {
     const cases = [_]struct { src: []const u8, needle: []const u8 }{
         .{ .src = "pub fn f() { let copy r: Result<String, Int32> = Ok(\"x\") }", .needle = "Ok payload is not a scalar" },
         .{ .src = "pub fn f() { let copy r: Result<Int, Int> = Err(1) }", .needle = "Err payload is not Int32" },
-        .{ .src = "pub fn f() { let copy o: Int? = Some(1) }", .needle = "optional values are not lowered" },
+        .{ .src = "pub fn f() { let copy o: String? = Some(\"x\") }", .needle = "optional whose payload is not a scalar" },
+        .{ .src = "pub fn f() { let copy o = Some(1) }", .needle = "Some/None need a declared optional destination" },
     };
     for (cases) |c| {
         var l = try lowerSource(c.src);

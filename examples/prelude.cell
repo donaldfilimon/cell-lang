@@ -1,8 +1,8 @@
 // The prelude, exercised end to end: every group 3 function is called, the
 // optional-returning ones are matched, and one number is printed.
 //
-// Status: C only (optionals and owned Strings; LLVM and MLIR refuse
-// together). Runs through gate stage 12 (`cell run`) as well as stage 8.
+// Status: runs on the C, LLVM and MLIR backends, printing 123 on each, and
+// through gate stage 12 (`cell run`) as well as stage 8.
 // EXPECT-OUTPUT: 123
 
 pub fn print_int(copy value: Int);

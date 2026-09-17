@@ -438,13 +438,20 @@ const Emitter = struct {
                         try self.out.print("  store {s} %arg{d}, ptr {s}\n", .{ natural, i, self.slots.items[i] });
                     }
                 },
-                // A coerced aggregate arrives as [n x i64] or [n x double] and
-                // the slot is the natural struct. Storing the coerced value
-                // straight into it is legal and is what clang does: pointers
-                // are opaque, so the alloca is just correctly sized memory.
+                // A coerced aggregate arrives as [n x i64] or [n x double]. It
+                // is at least as large as the natural struct and sometimes
+                // larger (`[1 x i64]` for a 2-byte optional), so it lands in a
+                // slot of its OWN size and the struct is read back out, the
+                // way clang allocas the coerced type. Storing it straight into
+                // the natural slot wrote past the end of that slot.
                 .coerce_int, .coerce_float => {
                     const coerced = abi.renderParam(self.arena, self.module, p.ty, p.ownership) orelse continue;
-                    try self.out.print("  store {s} %arg{d}, ptr {s}\n", .{ coerced, i, self.slots.items[i] });
+                    const tmp = try self.nextTemp();
+                    try self.out.print("  {s} = alloca {s}\n", .{ tmp, coerced });
+                    try self.out.print("  store {s} %arg{d}, ptr {s}\n", .{ coerced, i, tmp });
+                    const back = try self.nextTemp();
+                    try self.out.print("  {s} = load {s}, ptr {s}\n", .{ back, natural, tmp });
+                    try self.out.print("  store {s} {s}, ptr {s}\n", .{ natural, back, self.slots.items[i] });
                 },
                 .indirect => {
                     // Passed as a pointer to a caller-owned copy, but owned by
@@ -715,7 +722,7 @@ const Emitter = struct {
                         // clang does and what keeps this correct without a
                         // bitcast that opaque pointers no longer allow.
                         const slot = try self.nextTemp();
-                        try self.out.print("  {s} = alloca {s}\n", .{ slot, self.ret_natural });
+                        try self.out.print("  {s} = alloca {s}\n", .{ slot, self.ret_abi });
                         try self.out.print("  store {s} {s}, ptr {s}\n", .{ val.ty, val.text, slot });
                         const out = try self.nextTemp();
                         try self.out.print("  {s} = load {s}, ptr {s}\n", .{ out, self.ret_abi, slot });
@@ -1016,6 +1023,7 @@ const Emitter = struct {
             .if_expr => |ie| return self.emitIf(e, ie.cond, ie.then_body, ie.else_body),
             .match_expr => |me| return self.emitMatch(e, me.scrutinee, me.arms),
             .result_ctor => |rc| return self.emitResultCtor(e, rc.is_ok, rc.operand),
+            .option_ctor => |oc| return self.emitOptionCtor(e, oc.is_some, oc.operand),
         }
     }
 
@@ -1227,10 +1235,15 @@ const Emitter = struct {
     fn coerceArg(self: *Emitter, v: Value, want: []const u8) EmitError!Value {
         if (std.mem.eql(u8, v.ty, want)) return v;
         const slot = try self.nextTemp();
-        try self.out.print("  {s} = alloca {s}\n", .{ slot, v.ty });
+        // An indirect argument IS the address, so its slot is the natural
+        // type. A coerced one is loaded as `want`, which is never smaller than
+        // the struct (`[1 x i64]` for a 2-byte optional, `[2 x i64]` for a
+        // 12-byte struct), so `want` sizes the slot; sizing it by the struct
+        // read past the end of it.
+        const is_ptr = std.mem.eql(u8, want, "ptr");
+        try self.out.print("  {s} = alloca {s}\n", .{ slot, if (is_ptr) v.ty else want });
         try self.out.print("  store {s} {s}, ptr {s}\n", .{ v.ty, v.text, slot });
-        // An indirect argument IS the address, so no reload.
-        if (std.mem.eql(u8, want, "ptr")) return .{ .text = slot, .ty = "ptr" };
+        if (is_ptr) return .{ .text = slot, .ty = "ptr" };
         const out = try self.nextTemp();
         try self.out.print("  {s} = load {s}, ptr {s}\n", .{ out, want, slot });
         return .{ .text = out, .ty = want };
@@ -1361,14 +1374,62 @@ const Emitter = struct {
         // The ABI may have returned a coerced form; the rest of the body wants
         // the natural one.
         if (!std.mem.eql(u8, ret, natural)) {
+            // The coerced form is never smaller than the struct, so it sizes
+            // the slot (`[2 x i64]` over a 12-byte struct overflowed it).
             const slot = try self.nextTemp();
-            try self.out.print("  {s} = alloca {s}\n", .{ slot, natural });
+            try self.out.print("  {s} = alloca {s}\n", .{ slot, ret });
             try self.out.print("  store {s} {s}, ptr {s}\n", .{ ret, result, slot });
             const back = try self.nextTemp();
             try self.out.print("  {s} = load {s}, ptr {s}\n", .{ back, natural, slot });
             return .{ .text = back, .ty = natural };
         }
         return .{ .text = result, .ty = natural };
+    }
+
+    /// The runtime field type of an optional's payload: the payload's own
+    /// type, except a C `bool`, which occupies a byte (`cell_opt_bool`).
+    fn optionField(self: *Emitter, inner: hir.Ty) []const u8 {
+        if (inner.tag() == .boolean) return "i8";
+        return self.llType(inner) orelse "i8";
+    }
+
+    /// `Some(x)`/`None`, as CELL_DEFINE_OPTIONAL's constructors build it: a
+    /// zeroed instance, then `has_value` and the payload.
+    fn emitOptionCtor(self: *Emitter, e: *const hir.Expr, is_some: bool, operand_e: ?*const hir.Expr) EmitError!Value {
+        const opt_ty = self.llType(e.ty) orelse {
+            try self.unsupported(e.span, "optional type");
+            return Value.void_value;
+        };
+        const tagged = try self.nextTemp();
+        try self.out.print("  {s} = insertvalue {s} zeroinitializer, i8 {d}, 0\n", .{ tagged, opt_ty, @intFromBool(is_some) });
+        if (!is_some) return .{ .text = tagged, .ty = opt_ty };
+        const inner = e.ty.optional.*;
+        const natural = self.llType(inner) orelse "i8";
+        const field = self.optionField(inner);
+        const v = try self.emitExpr(operand_e.?);
+        if (v.isVoid()) return Value.void_value;
+        if (!try self.fits(operand_e.?.span, v.ty, natural, "a Some payload")) return Value.void_value;
+        var stored = v.text;
+        if (!std.mem.eql(u8, natural, field)) {
+            stored = try self.nextTemp();
+            try self.out.print("  {s} = zext {s} {s} to {s}\n", .{ stored, natural, v.text, field });
+        }
+        const out = try self.nextTemp();
+        try self.out.print("  {s} = insertvalue {s} {s}, {s} {s}, 1\n", .{ out, opt_ty, tagged, field, stored });
+        return .{ .text = out, .ty = opt_ty };
+    }
+
+    /// The payload a matched `Some(x)` binds.
+    fn readOptionPayload(self: *Emitter, scrutinee: Value, ty: hir.Ty) EmitError!Value {
+        const inner = ty.optional.*;
+        const natural = self.llType(inner) orelse "i8";
+        const field = self.optionField(inner);
+        const raw = try self.nextTemp();
+        try self.out.print("  {s} = extractvalue {s} {s}, 1\n", .{ raw, scrutinee.ty, scrutinee.text });
+        if (std.mem.eql(u8, natural, field)) return .{ .text = raw, .ty = natural };
+        const n = try self.nextTemp();
+        try self.out.print("  {s} = trunc {s} {s} to {s}\n", .{ n, field, raw, natural });
+        return .{ .text = n, .ty = natural };
     }
 
     /// `Ok(x)`/`Err(e)`. Built exactly the way cell_rt.h's constructors build
@@ -1654,6 +1715,17 @@ const Emitter = struct {
                     const eq = try self.emitStringEq(scrutinee, arm.pattern.kind.string);
                     if (eq.isVoid()) return Value.void_value;
                     cmp = eq.text;
+                } else if (arm.pattern.kind == .option_ctor) {
+                    // `has_value` is the optional's first field, a C bool byte.
+                    const tag = try self.nextTemp();
+                    try self.out.print("  {s} = extractvalue {s} {s}, 0\n", .{ tag, scrutinee.ty, scrutinee.text });
+                    const c = try self.nextTemp();
+                    try self.out.print("  {s} = icmp {s} i8 {s}, 0\n", .{
+                        c,
+                        if (arm.pattern.kind.option_ctor.is_some) "ne" else "eq",
+                        tag,
+                    });
+                    cmp = c;
                 } else if (arm.pattern.kind == .result_ctor) {
                     // `ok` is cell_result_t's first field, a C bool byte.
                     const tag = try self.nextTemp();
@@ -1677,7 +1749,7 @@ const Emitter = struct {
                             .ty = "i32",
                         },
                         .float, .string => null,
-                        .wildcard, .binding, .result_ctor => unreachable,
+                        .wildcard, .binding, .result_ctor, .option_ctor => unreachable,
                     };
                     const tv = test_val orelse {
                         try self.unsupported(arm.span, "this match pattern is not lowered to LLVM IR yet");
@@ -1728,6 +1800,18 @@ const Emitter = struct {
                     self.slots.items[slot],
                     "a match binding pattern",
                 );
+            }
+            if (arm.pattern.kind == .option_ctor) {
+                if (arm.pattern.kind.option_ctor.binding) |slot| {
+                    const payload = try self.readOptionPayload(scrutinee, scrutinee_e.ty);
+                    try self.storeValue(
+                        arm.span,
+                        payload,
+                        self.slotType(slot),
+                        self.slots.items[slot],
+                        "an optional payload binding",
+                    );
+                }
             }
             if (arm.pattern.kind == .result_ctor) {
                 const rc = arm.pattern.kind.result_ctor;
@@ -2469,6 +2553,39 @@ test "a narrow Result payload is widened in and narrowed out the way cell_ok_* d
     try expectContains(e.text, " to i8");
     try expectContains(e.text, "trunc i64 ");
     try expectContains(e.text, "trunc i8 ");
+}
+
+test "Some/None build the tagged instance and match reads has_value" {
+    var e = try emitSource(
+        \\pub fn pick(copy a: Int) -> Int? { if a > 0 { return Some(a) } return None }
+        \\pub fn flag(copy b: Bool) -> Bool? { return Some(b) }
+        \\pub fn get(copy o: Int?, copy d: Int) -> Int { return match o { Some(v) => v, None => d } }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "insertvalue %cell_opt_i64 zeroinitializer, i8 1, 0");
+    try expectContains(e.text, "insertvalue %cell_opt_i64 zeroinitializer, i8 0, 0");
+    try expectContains(e.text, "extractvalue %cell_opt_i64 ");
+    // A C bool payload is a byte in cell_opt_bool.
+    try expectContains(e.text, "zext i1 ");
+    try expectContains(e.text, "insertvalue %cell_opt_bool ");
+}
+
+test "a small aggregate crosses a call the way clang places it" {
+    var e = try emitSource(
+        \\pub fn mk(copy v: Int) -> Byte?;
+        \\pub fn get(copy o: Byte?) -> Int { return match o { Some(x) => 5, None => 1 } }
+        \\pub fn f() -> Int { return get(mk(1)) }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    // clang: a 2-byte return is i16; the same aggregate is passed as a word.
+    try expectContains(e.text, "declare i16 @cell_mk(i64)");
+    try expectContains(e.text, "define i64 @cell_get([1 x i64] %arg0)");
+    // The coerced word lands in a word-sized slot, never the 2-byte one.
+    try expectContains(e.text, "= alloca [1 x i64]");
+    try expectContains(e.text, "store [1 x i64] %arg0, ptr");
+    try expectContains(e.text, "= load %cell_opt_byte, ptr");
 }
 
 test "an optional lowers to the runtime's tagged instance" {

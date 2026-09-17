@@ -1,9 +1,8 @@
 // Optional values: construction with Some/None and inspection in match.
 //
-// Status: parses, passes `cell check`, and the emitted C compiles, links and
-// runs, printing 43 (see EXPECT-OUTPUT). C backend only: LLVM and MLIR refuse
-// the constructors and patterns together with `cannot lower`, so the
-// agreement contract holds. Payloads are scalar primitives (SPEC 3.2).
+// Status: parses, passes `cell check`, and runs on the C, LLVM and MLIR
+// backends, printing 43 on each (see EXPECT-OUTPUT). Payloads are scalar
+// primitives (SPEC 3.2).
 // EXPECT-OUTPUT: 43
 
 pub fn print_int(copy value: Int);

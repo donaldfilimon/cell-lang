@@ -106,16 +106,17 @@ symbol for LLVM IR or MLIR to call, so both refuse with `cannot lower`. They
 refuse TOGETHER, which is why the agreement contract below still holds while
 the three backends disagree about the program.
 
-`optionals.cell` (prints 43) is C only by the same contract: LLVM and MLIR
-refuse `Some`/`None` together with `cannot lower`. `results.cell` (prints 9)
-runs on all three backends since 2026-09-17: scalar `Ok`/`Err` payloads only.
+`optionals.cell` (prints 43) and `results.cell` (prints 9) run on all three
+backends since 2026-09-17: scalar `Some`/`None`/`Ok`/`Err` payloads only.
 
 `index.cell` (prints 125) is C only by the same contract: postfix `a[i]` for
 `String` and `[Byte]` lowers through `cell_str_byte_at` / `cell_bytes_at`,
 and LLVM and MLIR refuse indexing together with `cannot lower`.
 
-`prelude.cell` (prints 123) is C only: it calls prelude functions that return
-optionals and owned Strings, which LLVM and MLIR refuse together.
+`prelude.cell` (prints 123) runs on all three backends since 2026-09-17. It
+calls prelude functions that return `Byte?`, a 2-byte optional clang returns
+as `i16`, and take `shared [Byte]`, a 24-byte view clang passes as a pointer
+to a copy; both IR backends now place those the way clang does.
 
 ## What `cell check` covers
 

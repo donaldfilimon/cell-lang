@@ -116,6 +116,14 @@ pub fn resultPayload(ty: hir.Ty) ?ResultPayload {
     };
 }
 
+/// Whether an optional over `ty` is one the IR backends build and match: a
+/// scalar with a pre-defined runtime instance (`optionalBase`). `String?`
+/// has an instance too, but its payload is an aggregate and stays refused.
+pub fn optionPayloadCarried(ty: hir.Ty) bool {
+    if (ty.tag() == .string) return false;
+    return optionalBase(ty) != null;
+}
+
 /// Whether `ty` is an error type the IR backends carry: the C backend narrows
 /// E to an `int32_t` code, and only Int32 and payload-free enums reach it.
 pub fn resultErrorCarried(ty: hir.Ty) bool {
@@ -440,7 +448,18 @@ pub fn renderParam(
 /// An `.indirect` return renders as "void"; the caller adds the `sret`
 /// parameter, because that changes the signature rather than the type.
 pub fn renderReturn(arena: std.mem.Allocator, m: *const hir.Module, ty: hir.Ty) ?[]const u8 {
-    return renderClass(arena, classifyReturn(m, ty), ty, true);
+    const class = classifyReturn(m, ty);
+    // Measured: clang returns an integer-class aggregate of at most 8 bytes as
+    // an integer of EXACTLY its size in bits (a 2-byte `{bool, uint8_t}` is
+    // `i16`, 3 bytes is `i24`), while it passes the same aggregate as a whole
+    // word. `[1 x i64]` here was a different calling convention, and loading
+    // 8 bytes out of a 2-byte slot to produce it was an out-of-bounds read.
+    if (class == .coerce_int) {
+        if (layoutOf(m, ty, .owned)) |l| {
+            if (l.size <= 8) return std.fmt.allocPrint(arena, "i{d}", .{l.size * 8}) catch null;
+        }
+    }
+    return renderClass(arena, class, ty, true);
 }
 
 fn renderClass(
@@ -546,6 +565,31 @@ test "a Result is cell_result_t: 24 bytes, align 8, passed and returned indirect
     try std.testing.expect(resultPayload(types.t_string) == null);
     try std.testing.expect(resultErrorCarried(types.t_int32));
     try std.testing.expect(!resultErrorCarried(types.t_int));
+}
+
+test "a small integer-class return is an exact-width integer, as clang returns it" {
+    // clang -S -emit-llvm on AArch64/Darwin:
+    //   struct { bool; uint8_t }  -> define i16 @r2(i64)
+    //   struct { bool; int16_t }  -> define i32 @r4(i64)
+    //   struct { bool; int32_t }  -> define i64 @r8(i64)
+    //   struct { bool; int64_t }  -> define [2 x i64] @r16([2 x i64])
+    const a = std.testing.allocator;
+    const m = emptyModule();
+    const cases = [_]struct { inner: hir.Ty, ret: []const u8, param: []const u8 }{
+        .{ .inner = types.t_byte, .ret = "i16", .param = "[1 x i64]" },
+        .{ .inner = types.t_int16, .ret = "i32", .param = "[1 x i64]" },
+        .{ .inner = types.t_int32, .ret = "i64", .param = "[1 x i64]" },
+        .{ .inner = types.t_int, .ret = "[2 x i64]", .param = "[2 x i64]" },
+    };
+    for (cases) |c| {
+        const opt: hir.Ty = .{ .optional = &c.inner };
+        const r = renderReturn(a, &m, opt).?;
+        defer a.free(r);
+        try std.testing.expectEqualStrings(c.ret, r);
+        const p = renderParam(a, &m, opt, .copy).?;
+        defer a.free(p);
+        try std.testing.expectEqualStrings(c.param, p);
+    }
 }
 
 test "two doubles are an HFA of two" {

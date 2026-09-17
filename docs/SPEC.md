@@ -724,7 +724,8 @@ section, so the name stays unknown.
 
 ### 3.2 Optional types
 
-**Status: implemented for scalar payloads, C backend only (2026-09-16).**
+**Status: implemented for scalar payloads: C backend 2026-09-16, LLVM and MLIR
+backends 2026-09-17.**
 
 ```cell
 Int?
@@ -739,8 +740,13 @@ Constructors are `Some(e)` and `None`. Patterns are `Some(x)`, `Some(_)`, and
 `Int16`, `Int32`, `UInt`, `UInt8`, `UInt16`, `UInt32`, `Float`, `Float32`,
 `Bool`, `Byte`); anything else is refused.
 `None` needs a declared optional slot (`let a: Int? = None`); `Some(e)` is
-complete from its operand. LLVM and MLIR refuse constructors and patterns
-together with `cannot lower`.
+complete from its operand in C. LLVM and MLIR build the runtime's tagged
+instance (zeroed, `has_value`, payload; a C `bool` payload as one byte) and
+need a declared optional destination for `Some` too (a typed let, a
+parameter, or a `return`). They carry only payloads with a pre-defined runtime
+instance, so they refuse `Float32?` (and `String?`) together with
+`cannot lower`. Passing an optional by value across a function boundary is
+checked against C per example by `tools/check.sh` stage 10.
 
 The runtime representation (section 10.3) is a tagged struct
 `{ bool has_value; T value; }`, deliberately not a sentinel, because every
