@@ -1,0 +1,92 @@
+// EXPECT: currently-accepted
+// Violates: docs/OWNERSHIP.md R2.a (a move inside a loop is a use-after-move
+// on the next iteration, or after the loop), on paths the body-end check
+// never saw.
+//
+// THIS FILE PINS A LIVE HOLE. Every function below is ACCEPTED by
+// `cell check` (exit 0) at 05116dc and aborts under AddressSanitizer with
+// `attempting double-free` (exit 134) when run through `cell run` with
+// `CC` set to a `cc -fsanitize=address -g` wrapper. For the first shape both
+// frees happen inside `cell_take`, and the emitted C has no
+// `cell_string_free(&v)` at all, so the fault is in borrowck, not in the drop
+// pass.
+//
+// R2.a used to be checked at exactly one point, the fall-through end of the
+// body, against an index range of the `dead` list. Five paths escaped it:
+//
+//   skip_continue   a `continue` between the move and the revival reaches
+//                   the next iteration with `v` moved.
+//   skip_break_use  a `break` between the move and the revival leaves the
+//                   loop with `v` moved, and the use after the loop reads it.
+//   cond_move       the final, failing condition evaluation moves `v`, and
+//                   the use after the loop reads it.
+//   swap_hide       reviving `a` (moved before the loop) inside the body
+//                   `swapRemove`d the entry for `b`'s in-body move below the
+//                   index the body-end check started from.
+//   zero_iter       a body that revives `v` may run zero times, so after the
+//                   loop `v` is still the value moved before it.
+//
+// The flip to currently-rejected lands with the fix, together with the
+// diagnostics it prints.
+
+pub fn take(owned s: String) { }
+
+pub fn consume(owned s: String) -> Bool { return false }
+
+pub fn skip_continue(copy n: Int) {
+    var owned v: String = "aaaaaaaa"
+    var i = 0
+    while i < 3 {
+        i = i + 1
+        take(v)
+        if i < n {
+            continue
+        }
+        v = "bbbbbbbb"
+    }
+}
+
+pub fn skip_break_use(copy n: Int) {
+    var owned v: String = "aaaaaaaa"
+    var i = 0
+    while i < 3 {
+        i = i + 1
+        take(v)
+        if i > n {
+            break
+        }
+        v = "bbbbbbbb"
+    }
+    take(v)
+}
+
+pub fn cond_move() {
+    var owned v: String = "aaaaaaaa"
+    while consume(v) {
+        v = "bbbbbbbb"
+    }
+    take(v)
+}
+
+pub fn swap_hide(copy n: Int) {
+    var owned a: String = "aaaaaaaa"
+    var owned b: String = "bbbbbbbb"
+    take(a)
+    var i = 0
+    while i < n {
+        i = i + 1
+        take(b)
+        a = "cccccccc"
+    }
+}
+
+pub fn zero_iter(copy n: Int) {
+    var owned v: String = "aaaaaaaa"
+    take(v)
+    var i = 0
+    while i < n {
+        i = i + 1
+        v = "bbbbbbbb"
+    }
+    take(v)
+}
