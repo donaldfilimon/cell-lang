@@ -1,6 +1,12 @@
 # Owning `String` in `Ok` (Result sub-project 2)
 
-Status: approved by Donald 2026-09-17 for plan and build, with his review answers applied (see the last section): `Ok(_)` is allowed, and the release helper is generated per module.
+Status: approved by Donald 2026-09-17 and implemented the same day by
+`docs/superpowers/plans/2026-09-17-owning-string-ok.md` (review answers
+applied: `Ok(_)` is allowed, the release glue is generated per module).
+Differences found while building: `Ok(x)` moves only an operand whose type
+the checker resolves and copies any other; yielding the `Ok(owned ..)`
+binding straight out of its arm is refused for now; a temporary scrutinee is
+not released when its arm leaves early (a leak).
 Parent: `2026-09-17-per-instantiation-results-design.md` (sub-project 1,
 landed through `0a29df3`).
 

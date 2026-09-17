@@ -1,0 +1,79 @@
+// An owning String in Ok (2026-09-17): `Result<String, Int32>` is built by
+// `Ok(x)`, which moves `x`, and read by `Ok(owned s)` (takes the payload and
+// consumes the Result on that arm only), `Ok(shared s)` (borrows it) and
+// `Ok(_)`. A Result is released on every path that still holds it,
+// including a temporary scrutinee no arm took.
+//
+// Status: parses, passes `cell check`, and the emitted C compiles, links and
+// runs, printing 1105240143 (see EXPECT-OUTPUT). C backend only: LLVM and
+// MLIR refuse a Result with a String side together, so the agreement
+// contract holds.
+// EXPECT-OUTPUT: 1105240143
+
+pub fn print_int(copy value: Int);
+pub fn str_from_int(copy v: Int) -> String;
+pub fn str_len(shared s: String) -> Int;
+
+pub fn parse(copy n: Int) -> Result<String, Int32> {
+    if n < 0 {
+        return Err(7)
+    }
+    return Ok(str_from_int(n))
+}
+
+pub fn take_len(owned s: String) -> Int {
+    return str_len(s)
+}
+
+pub fn owned_len(owned r: Result<String, Int32>) -> Int {
+    return match r {
+        Ok(owned s) => take_len(s),
+        Err(_) => 0,
+    }
+}
+
+pub fn shared_len(owned r: Result<String, Int32>) -> Int {
+    return match r {
+        Ok(shared s) => str_len(s),
+        Err(_) => 1,
+    }
+}
+
+pub fn is_ok(owned r: Result<String, Int32>) -> Int {
+    return match r {
+        Ok(_) => 10,
+        Err(_) => 20,
+    }
+}
+
+pub fn wrap(owned s: String) -> Result<String, Int32> {
+    return Ok(s)
+}
+
+pub fn main() {
+    var owned r: Result<String, Int32> = parse(12345)
+    r = parse(-1)
+    let copy a = owned_len(parse(123))
+    let copy b = shared_len(parse(4567))
+    let copy c = shared_len(parse(-5))
+    let copy d = is_ok(parse(9))
+    let copy e = owned_len(wrap(str_from_int(99)))
+    let copy f = match parse(55555) {
+        Ok(owned s) => take_len(s),
+        Err(_) => 0,
+    }
+    let copy g = match parse(-3) {
+        Ok(owned s) => take_len(s),
+        Err(_) => 100,
+    }
+    let copy h = owned_len(r)
+    let copy k = match parse(333) {
+        Ok(shared s) => str_len(s),
+        Err(_) => 0,
+    }
+    let copy m = match parse(4) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
+    print_int(a + b * 10 + c * 100 + d * 1000 + e * 100000 + f * 1000000 + g * 10000000 + h + k * 10000 + m * 100000000)
+}

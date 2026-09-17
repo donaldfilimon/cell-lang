@@ -137,7 +137,7 @@ Syntax is not implementation. Verify by running the compiler.
   **The structural answer stopped being "enumerate harder" at round 5**, because enumerating harder had been tried three times and found a new axis each time. R10's classifier now returns a TOTAL verdict whose undecidable case is refused, so an unenumerated form fails closed rather than being silently permitted. That does not make the reasoning failure impossible; it makes this rule's version of it loud.
 
   **Do not restate any of this as "arc never dangles".** Two earlier versions of this line said exactly that and review falsified both. `docs/OWNERSHIP.md` R11 tables the positions and the arm-body forms the current search covered, which is a record of what was looked at rather than a claim about what exists.
-- Generics, enum payloads, and loops other than `while` are not present. `Result<T,E>` is present for scalar payloads only, as per-pair structs (cell_rt.h ABI 2, SPEC 3.4). NLL is present for named loans only, with the boundary stated above; nothing shortens a temporary loan beyond the two exceptions 0.3 already had.
+- Generics, enum payloads, and loops other than `while` are not present. `Result<T,E>` is present for scalar payloads, as per-pair structs (cell_rt.h ABI 2, SPEC 3.4), and for an owning `String` in `Ok` in the C backend only (`Ok(owned s)`/`Ok(shared s)` patterns, 2026-09-17). NLL is present for named loans only, with the boundary stated above; nothing shortens a temporary loan beyond the two exceptions 0.3 already had.
 
 ## Codegen and backends
 

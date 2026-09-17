@@ -807,6 +807,22 @@ only name that takes type arguments: any other `Name<` is a parse error that
 says generic types are not implemented, and `Result<T>` or three arguments is
 a parse error too.
 
+**Owning String in `Ok` (C backend, 2026-09-17).** `Result<String, E>` is
+admitted for every scalar or payload-free-enum `E`, as the per-pair struct
+`cell_res_string_<err>_t`. `Ok(x)` MOVES `x` when its type is known to own
+resources (and copies it when the checker cannot resolve it). A binding on
+the owning payload must say its mode: `Ok(owned s)` takes the String and
+consumes the Result on that arm only (it stays live on the other arms and is
+released there); `Ok(shared s)` borrows it for the arm; a bare `Ok(s)` is
+refused, as is `exclusive`/`arc`/`copy`, a mode on a wildcard, on a scalar
+payload, or on `Some`/`Err`. `Ok(_)` neither moves nor borrows. Yielding the
+`owned` binding straight out of its arm is not implemented yet. A
+temporary scrutinee is released in every arm that did not take the payload.
+Codegen generates `cell_drop_res_string_<err>` per module. LLVM and MLIR
+refuse a Result with a String side. `examples/results_string.cell` and
+`examples/leaks/owned_string_result.cell` pin it. See
+`docs/superpowers/specs/2026-09-17-owning-string-ok-design.md`.
+
 Constructors are `Ok(e)` and `Err(e)`. Patterns are `Ok(x)` and `Err(x)` (or
 `_`). Payloads this slice admits are the scalar primitives (or unit) for `T`,
 and for `E` any scalar primitive or a payload-free enum. `Ok`/`Err` need a
@@ -1774,8 +1790,10 @@ structured `Pattern` and a body expression. The scrutinee is parsed with the
 struct-literal restriction on (section 6.7), so `match c { ... }` works.
 
 Wrap patterns `Some(x)`, `Some(_)`, `None`, `Ok(x)`, `Err(x)` inspect an
-optional or Result scrutinee. The inner pattern is a binding or `_`; nested
-patterns are a parse error.
+optional or Result scrutinee. The inner pattern is a binding or `_`, optionally
+preceded by an ownership keyword (`Ok(owned s)`, `Ok(shared s)`; 2026-09-17),
+which only an owning payload accepts (section 3.4); nested patterns are a
+parse error.
 
 ### 9.0 Match guards
 
@@ -1953,7 +1971,7 @@ for primitives, strings, slices, optionals, structs, payload-free enums, and
 | `copy String` | `cell_string_t` from `cell_string_clone` | `cell_string_t` (no clone call) |
 | `[T]` | `cell_slice_t { ptr, len, cap }`, type-erased, `elem_size` at each call site | `cell_slice_t` |
 | `T?` | tagged `{ bool has_value; T value; }` | `CELL_DEFINE_OPTIONAL` instance |
-| `Result<T, E>` | `cell_res_<ok>_<err>_t { bool ok; union { T ok; E err; } as; }` (ABI 2) for scalar pairs; the deprecated `cell_result_t` for any other pair | scalar `Ok`/`Err` construct and match in C, LLVM and MLIR; no drop (3.4) |
+| `Result<T, E>` | `cell_res_<ok>_<err>_t { bool ok; union { T ok; E err; } as; }` (ABI 2) for scalar pairs and an owning String Ok (`cell_res_string_<err>_t`, C only); the deprecated `cell_result_t` for any other pair | scalar `Ok`/`Err` construct and match in C, LLVM and MLIR; no drop (3.4) |
 | struct | C struct, same field order, each field lowered by its own ownership | `cell_<Name>` |
 | payload-free enum | distinct integer type of width `int32_t` | `typedef int32_t cell_<Name>` |
 
@@ -2144,7 +2162,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | `[T]?` | designed, not implemented |
 | `[T]` list syntax | implemented as a type (no indexing; see 3.3) |
 | List lowering to `cell_slice_t` | implemented (C backend; LLVM/MLIR lower exclusive list parameters) |
-| `Result<T, E>` | implemented (scalar payloads, C backend; LLVM/MLIR refuse) |
+| `Result<T, E>` | implemented: scalar payloads on all three backends, an owning String `Ok` in C (2026-09-17) |
 | Generic types | designed, not implemented |
 | Unit type `()` in type position | implemented (return type; bindings of `()` are refused) |
 | Implicit unit from an omitted `->` | implemented |

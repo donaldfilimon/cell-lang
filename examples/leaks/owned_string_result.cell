@@ -1,0 +1,88 @@
+// Owning String in Ok (2026-09-17). Every shape `results_string.cell` pins,
+// looped 1000 times: a Result built and passed on, consumed by
+// `Ok(owned s)`, borrowed by `Ok(shared s)`, matched by `Ok(_)`, an `Err`
+// arm keeping the Result, a reassigned `var`, and temporary scrutinees
+// that no arm took. Each release happens on exactly the path that still
+// holds the value.
+//
+// Pinned at 0 on both witnesses, and also run by hand under
+// AddressSanitizer (stage 9 does not see examples/leaks/).
+//
+// Status: parses, passes `cell check`; C only; lives under examples/leaks/.
+
+pub fn print_int(copy value: Int);
+pub fn str_from_int(copy v: Int) -> String;
+pub fn str_len(shared s: String) -> Int;
+
+pub fn parse(copy n: Int) -> Result<String, Int32> {
+    if n < 0 {
+        return Err(7)
+    }
+    return Ok(str_from_int(n))
+}
+
+pub fn take_len(owned s: String) -> Int {
+    return str_len(s)
+}
+
+pub fn owned_len(owned r: Result<String, Int32>) -> Int {
+    return match r {
+        Ok(owned s) => take_len(s),
+        Err(_) => 0,
+    }
+}
+
+pub fn shared_len(owned r: Result<String, Int32>) -> Int {
+    return match r {
+        Ok(shared s) => str_len(s),
+        Err(_) => 1,
+    }
+}
+
+pub fn is_ok(owned r: Result<String, Int32>) -> Int {
+    return match r {
+        Ok(_) => 10,
+        Err(_) => 20,
+    }
+}
+
+pub fn wrap(owned s: String) -> Result<String, Int32> {
+    return Ok(s)
+}
+
+pub fn once(copy i: Int) -> Int {
+    var owned r: Result<String, Int32> = parse(i + 10000)
+    r = parse(i - 500)
+    let copy a = owned_len(parse(i))
+    let copy b = shared_len(parse(i + 1))
+    let copy c = is_ok(parse(i - 2))
+    let copy d = owned_len(wrap(str_from_int(i)))
+    let copy e = match parse(i + 3) {
+        Ok(owned s) => take_len(s),
+        Err(_) => 0,
+    }
+    let copy f = match parse(i - 700) {
+        Ok(owned s) => take_len(s),
+        Err(_) => 1,
+    }
+    let copy g = shared_len(r)
+    let copy h = match parse(i + 5) {
+        Ok(shared s) => str_len(s),
+        Err(_) => 0,
+    }
+    let copy k = match parse(i + 6) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
+    return a + b + c + d + e + f + g + h + k
+}
+
+pub fn main() {
+    var i = 0
+    var n = 0
+    while i < 1000 {
+        n = n + once(i)
+        i = i + 1
+    }
+    print_int(n)
+}

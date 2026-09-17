@@ -685,6 +685,21 @@ compared by prefix. Nothing in the tree is missing.
 Matching on an `owned` place moves it into the arm's bindings. Matching on a
 `shared` borrow binds `shared`. Matching on `exclusive` binds `exclusive`.
 
+**Owning `Ok` payloads (implemented 2026-09-17, C backend).** For a
+`Result<String, E>` the payload binding says its mode. `Ok(owned s)` MOVES
+the scrutinee place on that arm only: the per-arm merge leaves it live on the
+other arms (released there by the branch-end records) and maybe-dead after
+the match, so a later use is an R2 error. `Ok(shared s)` creates a lexical
+shared loan on the scrutinee for the arm (R4/R6 refuse moving it inside).
+A bare binding, and any mode where it means nothing, is refused by the type
+checker. Construction `Ok(x)` is an owned position: a place whose type owns
+resources is moved (R2), an alias is refused (this rule), and an undecidable
+value that may own one is refused (R2.b); a place the checker cannot type is
+only read, and codegen copies its header into the Result
+(`cell_string_clone`), so no buffer has two owners. Falsified: removing the
+arm's scrutinee move makes `examples/results_string.cell` an AddressSanitizer
+double free (exit 134).
+
 ```cell
 pub fn main() {
     let owned c = classify()
@@ -1214,6 +1229,16 @@ existing scalar representation, but refuse nonprimitive `arc`, `shared`, and
 `exclusive` return contracts before choosing an ABI. This closes the former
 `arc String` calling-convention mismatch by explicit refusal; it does not add
 ARC retain/release support to either IR backend.
+
+**Owning Result release (2026-09-17).** A `Result<String, E>` is released
+through per-module glue, `cell_drop_res_string_<err>` (`if (r->ok)` free the
+payload), wherever an owned local of that type is still live: scope end, a
+branch end (every match arm now ends with those releases), an owned
+reassignment, and, for a temporary scrutinee, the end of every arm that did
+not bind `Ok(owned ..)`. `examples/leaks/owned_string_result.cell` is pinned
+at 0 on both witnesses; with the temporary release removed it measured 2000.
+Residual: an arm that leaves early does not release a temporary scrutinee
+(a leak).
 
 **The IR backends insert no releases at all (measured 2026-09-17).** Both
 accept an owned `String` from a call (`let owned s = str_from_int(i)`, and an
