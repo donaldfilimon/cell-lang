@@ -376,6 +376,7 @@ const Builder = struct {
             .field => |f| try self.lowerExprValue(f.base),
             .struct_lit => |sl| for (sl.fields) |*fv| try self.lowerExprValue(fv),
             .list_lit => |elems| for (elems) |*el| try self.lowerExprValue(el),
+            .result_ctor => |rc| try self.lowerExprValue(rc.operand),
             .int_const,
             .float_const,
             .bool_const,

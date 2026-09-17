@@ -98,8 +98,8 @@
 //!   - `ref(slot)`: a use. This is the only place a use comes from.
 //!   - every other `Expr.Kind` (`int_const`, `float_const`, `bool_const`,
 //!     `string_const`, `unresolved_ref`, `enum_const`, `binary`, `unary`,
-//!     `call`, `field`, `struct_lit`, `list_lit`, `block`, `if_expr`,
-//!     `match_expr`) carries no def or use of its own; it is walked only to
+//!     `call`, `field`, `struct_lit`, `list_lit`, `result_ctor`, `block`,
+//!     `if_expr`, `match_expr`) carries no def or use of its own; it is walked only to
 //!     reach the `ref`s and sub-blocks nested inside it, in the same
 //!     sub-expression order `cfg.zig` walks them (left-to-right for
 //!     `binary`, callee-then-args for `call`, and so on).
@@ -115,7 +115,8 @@
 //!     defines the slot only at the body regardless, matching the total,
 //!     tolerant HIR this module -- like `cfg.zig` -- accepts. No other
 //!     `Pattern.Kind` (`wildcard`, `enum_variant`, `int`, `float`, `string`,
-//!     `bool`) introduces a slot; that is the whole `Kind` union, so this
+//!     `bool`) introduces a slot, except `result_ctor`, whose optional payload
+//!     slot is a def at the same point; that is the whole `Kind` union, so this
 //!     is complete, not merely the forms that happened to come to mind.
 //!     The `pattern_matches_all` switch below is `else`-armed rather than
 //!     compiler-enforced exhaustive, matching `cfg.zig`'s identical switch
@@ -506,6 +507,7 @@ const Walker = struct {
             .field => |f| try self.walkExpr(f.base),
             .struct_lit => |sl| for (sl.fields) |*fv| try self.walkExpr(fv),
             .list_lit => |elems| for (elems) |*el| try self.walkExpr(el),
+            .result_ctor => |rc| try self.walkExpr(rc.operand),
             .ref => |slot| try self.addOp(self.cur.?, .{ .use = slot }),
             .int_const,
             .float_const,
@@ -592,8 +594,12 @@ const Walker = struct {
             // diverged and no edge was ever wired into `body_id` in the
             // real graph. See "WHAT THIS MODULE TOLERATES" above.
             self.cur = body_id;
-            if (arm.pattern.kind == .binding) {
-                try self.addOp(body_id, .{ .def = arm.pattern.kind.binding });
+            switch (arm.pattern.kind) {
+                .binding => |slot| try self.addOp(body_id, .{ .def = slot }),
+                // `Ok(v)`/`Err(e)` defines its payload slot at the same point
+                // the emitters store it: the start of the arm's body.
+                .result_ctor => |rc| if (rc.binding) |slot| try self.addOp(body_id, .{ .def = slot }),
+                else => {},
             }
             try self.walkExpr(arm.body);
             if (self.cur != null) join_reachable = true;

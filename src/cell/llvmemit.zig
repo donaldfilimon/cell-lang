@@ -180,6 +180,8 @@ const Emitter = struct {
             \\%cell_opt_bool = type { i8, i8 }
             \\%cell_opt_byte = type { i8, i8 }
             \\%cell_opt_str = type { i8, %cell_str }
+            \\%cell_value = type { %cell_str }
+            \\%cell_result = type { i8, i32, %cell_value }
             \\
             \\
         );
@@ -1013,6 +1015,7 @@ const Emitter = struct {
             },
             .if_expr => |ie| return self.emitIf(e, ie.cond, ie.then_body, ie.else_body),
             .match_expr => |me| return self.emitMatch(e, me.scrutinee, me.arms),
+            .result_ctor => |rc| return self.emitResultCtor(e, rc.is_ok, rc.operand),
         }
     }
 
@@ -1368,6 +1371,79 @@ const Emitter = struct {
         return .{ .text = result, .ty = natural };
     }
 
+    /// `Ok(x)`/`Err(e)`. Built exactly the way cell_rt.h's constructors build
+    /// it: a zeroed cell_result_t, the `ok` byte, then either the payload in
+    /// the union at offset 8 (widened the way `cell_ok_*` widens it) or the
+    /// `int32_t` error code at offset 4.
+    fn emitResultCtor(self: *Emitter, e: *const hir.Expr, is_ok: bool, operand_e: *const hir.Expr) EmitError!Value {
+        const r = e.ty.result;
+        const v = try self.emitExpr(operand_e);
+        if (v.isVoid()) return Value.void_value;
+        const buf = try self.nextTemp();
+        try self.out.print("  {s} = alloca %cell_result\n", .{buf});
+        try self.out.print("  store %cell_result zeroinitializer, ptr {s}\n", .{buf});
+        if (is_ok) {
+            const p = abi.resultPayload(r.ok.*).?;
+            if (!try self.fits(operand_e.span, v.ty, p.natural, "an Ok payload")) return Value.void_value;
+            try self.out.print("  store i8 1, ptr {s}\n", .{buf});
+            const stored = switch (p.widen) {
+                .none => v.text,
+                .sext, .zext, .fpext, .bool_byte => blk: {
+                    const w = try self.nextTemp();
+                    const op: []const u8 = switch (p.widen) {
+                        .sext => "sext",
+                        .zext, .bool_byte => "zext",
+                        .fpext => "fpext",
+                        .none => unreachable,
+                    };
+                    try self.out.print("  {s} = {s} {s} {s} to {s}\n", .{ w, op, p.natural, v.text, p.store });
+                    break :blk w;
+                },
+            };
+            const at = try self.nextTemp();
+            try self.out.print("  {s} = getelementptr inbounds %cell_result, ptr {s}, i32 0, i32 2\n", .{ at, buf });
+            try self.out.print("  store {s} {s}, ptr {s}\n", .{ p.store, stored, at });
+        } else {
+            if (!try self.fits(operand_e.span, v.ty, "i32", "an Err code")) return Value.void_value;
+            const at = try self.nextTemp();
+            try self.out.print("  {s} = getelementptr inbounds %cell_result, ptr {s}, i32 0, i32 1\n", .{ at, buf });
+            try self.out.print("  store i32 {s}, ptr {s}\n", .{ v.text, at });
+        }
+        const out = try self.nextTemp();
+        try self.out.print("  {s} = load %cell_result, ptr {s}\n", .{ out, buf });
+        return .{ .text = out, .ty = "%cell_result" };
+    }
+
+    /// The payload a matched `Ok(v)` or `Err(e)` binds: the union slot read
+    /// back and narrowed to the payload's own type, or the error code.
+    fn readResultPayload(self: *Emitter, scrutinee: Value, ty: hir.Ty, is_ok: bool) EmitError!Value {
+        const r = ty.result;
+        if (!is_ok) {
+            const code = try self.nextTemp();
+            try self.out.print("  {s} = extractvalue %cell_result {s}, 1\n", .{ code, scrutinee.text });
+            return .{ .text = code, .ty = "i32" };
+        }
+        const p = abi.resultPayload(r.ok.*).?;
+        // The payload is inside a union, so it is read through memory rather
+        // than with extractvalue, which would see the union's pointer member.
+        const buf = try self.nextTemp();
+        try self.out.print("  {s} = alloca %cell_result\n", .{buf});
+        try self.out.print("  store %cell_result {s}, ptr {s}\n", .{ scrutinee.text, buf });
+        const at = try self.nextTemp();
+        try self.out.print("  {s} = getelementptr inbounds %cell_result, ptr {s}, i32 0, i32 2\n", .{ at, buf });
+        const raw = try self.nextTemp();
+        try self.out.print("  {s} = load {s}, ptr {s}\n", .{ raw, p.store, at });
+        if (p.widen == .none) return .{ .text = raw, .ty = p.natural };
+        const n = try self.nextTemp();
+        const op: []const u8 = switch (p.widen) {
+            .sext, .zext, .bool_byte => "trunc",
+            .fpext => "fptrunc",
+            .none => unreachable,
+        };
+        try self.out.print("  {s} = {s} {s} {s} to {s}\n", .{ n, op, p.store, raw, p.natural });
+        return .{ .text = n, .ty = p.natural };
+    }
+
     fn emitStructLit(
         self: *Emitter,
         e: *const hir.Expr,
@@ -1578,6 +1654,17 @@ const Emitter = struct {
                     const eq = try self.emitStringEq(scrutinee, arm.pattern.kind.string);
                     if (eq.isVoid()) return Value.void_value;
                     cmp = eq.text;
+                } else if (arm.pattern.kind == .result_ctor) {
+                    // `ok` is cell_result_t's first field, a C bool byte.
+                    const tag = try self.nextTemp();
+                    try self.out.print("  {s} = extractvalue %cell_result {s}, 0\n", .{ tag, scrutinee.text });
+                    const c = try self.nextTemp();
+                    try self.out.print("  {s} = icmp {s} i8 {s}, 0\n", .{
+                        c,
+                        if (arm.pattern.kind.result_ctor.is_ok) "ne" else "eq",
+                        tag,
+                    });
+                    cmp = c;
                 } else {
                     const test_val: ?Value = switch (arm.pattern.kind) {
                         .int => |v| Value{
@@ -1590,7 +1677,7 @@ const Emitter = struct {
                             .ty = "i32",
                         },
                         .float, .string => null,
-                        .wildcard, .binding => unreachable,
+                        .wildcard, .binding, .result_ctor => unreachable,
                     };
                     const tv = test_val orelse {
                         try self.unsupported(arm.span, "this match pattern is not lowered to LLVM IR yet");
@@ -1641,6 +1728,19 @@ const Emitter = struct {
                     self.slots.items[slot],
                     "a match binding pattern",
                 );
+            }
+            if (arm.pattern.kind == .result_ctor) {
+                const rc = arm.pattern.kind.result_ctor;
+                if (rc.binding) |slot| {
+                    const payload = try self.readResultPayload(scrutinee, scrutinee_e.ty, rc.is_ok);
+                    try self.storeValue(
+                        arm.span,
+                        payload,
+                        self.slotType(slot),
+                        self.slots.items[slot],
+                        "a Result payload binding",
+                    );
+                }
             }
             const body_val = try self.emitExpr(arm.body);
             if (produces_value and !body_val.isVoid()) {
@@ -1723,7 +1823,13 @@ const Emitter = struct {
                 const base = abi.optionalBase(inner.*) orelse break :blk null;
                 break :blk std.fmt.allocPrint(self.arena, "%{s}", .{base}) catch null;
             },
-            .result, .func, .unknown => null,
+            // cell_result_t, for exactly the payloads this backend reads and
+            // writes. Any other Result is refused, not given a plausible type.
+            .result => |r| if (abi.resultPayload(r.ok.*) != null and abi.resultErrorCarried(r.err.*))
+                "%cell_result"
+            else
+                null,
+            .func, .unknown => null,
         };
     }
 
@@ -2321,6 +2427,48 @@ test "a String return comes back through sret as an owning cell_string" {
     defer e.deinit();
     try std.testing.expect(!e.bag.hasErrors());
     try expectContains(e.text, "declare void @cell_make(ptr sret(%cell_string))");
+}
+
+test "a scalar Result lowers to cell_result_t, built zeroed and matched on its ok byte" {
+    var e = try emitSource(
+        \\pub enum ParseError { Empty, TooLong }
+        \\pub fn parse_len(copy n: Int) -> Result<Int, ParseError> {
+        \\    if n == 0 { return Err(ParseError.Empty) }
+        \\    return Ok(n * 2)
+        \\}
+        \\pub fn score(copy r: Result<Int, ParseError>) -> Int {
+        \\    return match r { Ok(v) => v, Err(e) => 1 }
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "%cell_result = type { i8, i32, %cell_value }");
+    try expectContains(e.text, "%cell_value = type { %cell_str }");
+    // 24 bytes: returned through sret and passed by pointer, as clang does.
+    try expectContains(e.text, "define void @cell_parse_len(ptr sret(%cell_result) %sret, i64 %arg0)");
+    try expectContains(e.text, "define i64 @cell_score(ptr %arg0)");
+    try expectContains(e.text, "store %cell_result zeroinitializer, ptr");
+    try expectContains(e.text, "getelementptr inbounds %cell_result, ptr %");
+    try expectContains(e.text, "extractvalue %cell_result");
+    try expectContains(e.text, "icmp ne i8");
+    try expectContains(e.text, "icmp eq i8");
+}
+
+test "a narrow Result payload is widened in and narrowed out the way cell_ok_* does" {
+    var e = try emitSource(
+        \\pub fn wrap8(copy v: Int8) -> Result<Int8, Int32> { return Ok(v) }
+        \\pub fn flag(copy b: Bool) -> Result<Bool, Int32> { return Ok(b) }
+        \\pub fn get8(copy r: Result<Int8, Int32>, copy d: Int8) -> Int8 { return match r { Ok(v) => v, Err(_) => d } }
+        \\pub fn getb(copy r: Result<Bool, Int32>) -> Bool { return match r { Ok(v) => v, Err(_) => false } }
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "sext i8 ");
+    try expectContains(e.text, " to i64");
+    try expectContains(e.text, "zext i1 ");
+    try expectContains(e.text, " to i8");
+    try expectContains(e.text, "trunc i64 ");
+    try expectContains(e.text, "trunc i8 ");
 }
 
 test "an optional lowers to the runtime's tagged instance" {

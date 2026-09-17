@@ -787,7 +787,8 @@ yet.
 
 ### 3.4 Result
 
-**Status: implemented for scalar payloads, C backend only (2026-09-16).**
+**Status: implemented for scalar payloads: C backend 2026-09-16, LLVM and MLIR
+backends 2026-09-17.**
 
 ```cell
 Result<Int, IoError>
@@ -804,9 +805,12 @@ a parse error too.
 Constructors are `Ok(e)` and `Err(e)`. Patterns are `Ok(x)` and `Err(x)` (or
 `_`). Payloads this slice admits are the scalar primitives for `T`; `E` is an
 `Int32` code or a payload-free enum. `Ok`/`Err` need a declared Result slot
-(`let r: Result<Int, E> = Ok(1)`); LLVM and MLIR refuse constructors and
-patterns together with `cannot lower`. The C backend lowers the type to
-`cell_result_t`. A `Result` has no drop spelling, so an `owned` one is never
+(`let r: Result<Int, E> = Ok(1)`, a parameter, or a `return`). All three
+backends lower the type to `cell_result_t`; LLVM and MLIR build it the way
+`cell_ok_*` does (zeroed, `ok` byte, payload widened into the union's 64-bit
+slot, a C `bool` as one byte) and pass and return it indirectly, as clang does
+for a 24-byte struct. They refuse, together and with `cannot lower`, a `Byte`
+or non-scalar `T` and a constructor with no declared Result destination. A `Result` has no drop spelling, so an `owned` one is never
 released: the leak direction, and the stated boundary for a resource-bearing
 `T` or `E`, whose payload layout in `cell_value_t` is not designed.
 `let arc r: Result<Int, Int> = read()` is a loud C type error (a
@@ -1922,7 +1926,7 @@ for primitives, strings, slices, optionals, structs, payload-free enums, and
 | `copy String` | `cell_string_t` from `cell_string_clone` | `cell_string_t` (no clone call) |
 | `[T]` | `cell_slice_t { ptr, len, cap }`, type-erased, `elem_size` at each call site | `cell_slice_t` |
 | `T?` | tagged `{ bool has_value; T value; }` | `CELL_DEFINE_OPTIONAL` instance |
-| `Result<T, E>` | `cell_result_t { ok, error_code, cell_value_t value }` | parses and checks; pass-through only, no construction (3.4) |
+| `Result<T, E>` | `cell_result_t { ok, error_code, cell_value_t value }` | scalar `Ok`/`Err` construct and match in C, LLVM and MLIR; no drop (3.4) |
 | struct | C struct, same field order, each field lowered by its own ownership | `cell_<Name>` |
 | payload-free enum | distinct integer type of width `int32_t` | `typedef int32_t cell_<Name>` |
 

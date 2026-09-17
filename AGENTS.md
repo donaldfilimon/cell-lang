@@ -137,14 +137,14 @@ Syntax is not implementation. Verify by running the compiler.
   **The structural answer stopped being "enumerate harder" at round 5**, because enumerating harder had been tried three times and found a new axis each time. R10's classifier now returns a TOTAL verdict whose undecidable case is refused, so an unenumerated form fails closed rather than being silently permitted. That does not make the reasoning failure impossible; it makes this rule's version of it loud.
 
   **Do not restate any of this as "arc never dangles".** Two earlier versions of this line said exactly that and review falsified both. `docs/OWNERSHIP.md` R11 tables the positions and the arm-body forms the current search covered, which is a record of what was looked at rather than a claim about what exists.
-- Generics, `Result<T,E>`, enum payloads, and loops other than `while` are not present. NLL is present for named loans only, with the boundary stated above; nothing shortens a temporary loan beyond the two exceptions 0.3 already had.
+- Generics, enum payloads, and loops other than `while` are not present. `Result<T,E>` is present for scalar payloads only (SPEC 3.4). NLL is present for named loans only, with the boundary stated above; nothing shortens a temporary loan beyond the two exceptions 0.3 already had.
 
 ## Codegen and backends
 
 Three emitters selected by `cell emit --target=`:
 
 - `c` (default): only one that lowers the whole language today (if/else, match, blocks, struct/list literals, mangled calls). Walks AST directly.
-- `llvm`, `mlir`: go through `hir`; deliberately **scalar-first**. Refuse most of `String`, `[T]`, `T?`, `Result`, `arc` (and most aggregates crossing the C boundary) with a `cannot lower` diagnostic at the span. Never emit plausible wrong code. **Two exceptions, both narrower than the blanket claim this line used to make:** an `exclusive` `String`/`[T]`/`T?` PARAMETER and a whole-value write through it now lower in both backends, since `a6c41e8` made them pointers matching `abi.classifyParam` and the C ABI; and the `str` -> owning-`String` conversion is refused for the specific reason that neither backend can call a `static inline` runtime helper, not because aggregates are out of scope.
+- `llvm`, `mlir`: go through `hir`; deliberately **scalar-first**. Refuse most of `String`, `[T]`, `T?`, any `Result` beyond scalar `Ok`/`Err` payloads, `arc` (and most aggregates crossing the C boundary) with a `cannot lower` diagnostic at the span. Never emit plausible wrong code. **Two exceptions, both narrower than the blanket claim this line used to make:** an `exclusive` `String`/`[T]`/`T?` PARAMETER and a whole-value write through it now lower in both backends, since `a6c41e8` made them pointers matching `abi.classifyParam` and the C ABI; and the `str` -> owning-`String` conversion is refused for the specific reason that neither backend can call a `static inline` runtime helper, not because aggregates are out of scope.
 
 `examples/backends.cell` (scalar) and now `hello.cell` (with struct) and `loops.cell` execute through all three. `arc.cell` executes through C alone, and needs `examples/arc_host.c` for its two bodyless declarations; `tools/check.sh` runs it with `run_c_host`.
 

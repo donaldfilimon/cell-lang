@@ -49,6 +49,7 @@ const Io = std.Io;
 const ast = @import("ast.zig");
 const types = @import("types.zig");
 const diag = @import("diag.zig");
+const abi = @import("abi.zig");
 
 pub const Ty = types.Type;
 pub const Ownership = ast.Ownership;
@@ -227,6 +228,11 @@ pub const Pattern = struct {
         float: f64,
         string: []const u8,
         bool: bool,
+        /// `Ok(x)` or `Err(e)` on a scalar Result scrutinee. `binding` is the
+        /// payload's slot, typed as the Result's `ok` or `err` type, or null
+        /// for `Ok(_)`/`Err(_)`. Only the payloads `abi.resultPayload` and
+        /// `abi.resultErrorCarried` accept are lowered to this form.
+        result_ctor: struct { is_ok: bool, binding: ?u32 },
     };
 };
 
@@ -276,6 +282,9 @@ pub const Expr = struct {
         block: struct { stmts: []Stmt, tail: ?*Expr },
         if_expr: struct { cond: *Expr, then_body: *Expr, else_body: ?*Expr },
         match_expr: struct { scrutinee: *Expr, arms: []Arm },
+        /// `Ok(x)` or `Err(e)` building the scalar Result named by `ty`. The
+        /// operand is already typed as the Result's `ok` or `err` type.
+        result_ctor: struct { is_ok: bool, operand: *Expr },
     };
 };
 
@@ -353,6 +362,10 @@ const Lowerer = struct {
     scope: std.ArrayList(ScopeEntry) = .empty,
 
     depth: u32 = 0,
+
+    /// The declared return type of the function being lowered: the expected
+    /// type of a `return Ok(..)`/`return Err(..)`, which has no type of its own.
+    ret_ty: Ty = types.t_unit,
 
     const ScopeEntry = struct { name: []const u8, slot: u32, depth: u32 };
     const Sig = struct {
@@ -436,6 +449,7 @@ const Lowerer = struct {
         const param_count: u32 = @intCast(self.bindings.items.len);
         const ret = if (f.return_type) |*rt| self.resolve(rt) else types.t_unit;
         const ret_ownership = returnOwnership(f.return_type);
+        self.ret_ty = ret;
 
         var body: ?[]Stmt = null;
         if (f.body) |stmts| {
@@ -521,7 +535,12 @@ const Lowerer = struct {
             .continue_stmt => return .{ .span = stmt.span, .kind = .cont },
             .return_stmt => |maybe| {
                 if (maybe) |e| {
-                    return .{ .span = stmt.span, .kind = .{ .ret = try self.lowerExpr(&e) } };
+                    // Destination typing stays let- and call-arg-only for
+                    // literals (`return 7` from `-> Int8` is still Int). The
+                    // one form that needs the declared return type is
+                    // `Ok`/`Err`, which has no type of its own.
+                    const expected: ?Ty = if (e.kind == .wrap) self.ret_ty else null;
+                    return .{ .span = stmt.span, .kind = .{ .ret = try self.lowerExprIn(&e, expected) } };
                 }
                 return .{ .span = stmt.span, .kind = .{ .ret = null } };
             },
@@ -796,9 +815,38 @@ const Lowerer = struct {
             },
 
             .wrap => |w| {
-                _ = w;
-                try self.cannotLower(e.span, "optional and Result values are not lowered by the IR backends");
-                return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
+                const is_ok = switch (w.ctor) {
+                    .ok => true,
+                    .err => false,
+                    .some, .none => {
+                        try self.cannotLower(e.span, "optional values are not lowered by the IR backends");
+                        return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
+                    },
+                };
+                const want = expected orelse types.t_unknown;
+                if (want.tag() != .result) {
+                    try self.cannotLower(e.span, "Ok/Err need a declared Result destination (a typed let, a parameter, or a return)");
+                    return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
+                }
+                const r = want.result;
+                if (abi.resultPayload(r.ok.*) == null) {
+                    try self.cannotLower(e.span, "a Result whose Ok payload is not a scalar integer, float or Bool");
+                    return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
+                }
+                if (!abi.resultErrorCarried(r.err.*)) {
+                    try self.cannotLower(e.span, "a Result whose Err payload is not Int32 or a payload-free enum");
+                    return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
+                }
+                const operand_ast = w.operand orelse {
+                    try self.cannotLower(e.span, "Ok/Err without an operand");
+                    return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
+                };
+                const operand = try self.box(try self.lowerExprIn(operand_ast, if (is_ok) r.ok.* else r.err.*));
+                return .{
+                    .ty = want,
+                    .span = e.span,
+                    .kind = .{ .result_ctor = .{ .is_ok = is_ok, .operand = operand } },
+                };
             },
 
             .index => {
@@ -913,9 +961,41 @@ const Lowerer = struct {
                 try self.scope.append(self.arena, .{ .name = name, .slot = slot, .depth = self.depth });
                 return .{ .kind = .{ .binding = slot }, .span = p.span };
             },
-            .wrap_pattern => {
-                try self.cannotLower(p.span, "optional and Result patterns are not lowered by the IR backends");
-                return .{ .kind = .wildcard, .span = p.span };
+            .wrap_pattern => |wp| {
+                const is_ok = switch (wp.ctor) {
+                    .ok => true,
+                    .err => false,
+                    .some, .none => {
+                        try self.cannotLower(p.span, "optional patterns are not lowered by the IR backends");
+                        return .{ .kind = .wildcard, .span = p.span };
+                    },
+                };
+                if (scrutinee_ty.tag() != .result) {
+                    try self.cannotLower(p.span, "an Ok/Err pattern on a value that is not a Result");
+                    return .{ .kind = .wildcard, .span = p.span };
+                }
+                const r = scrutinee_ty.result;
+                if (abi.resultPayload(r.ok.*) == null or !abi.resultErrorCarried(r.err.*)) {
+                    try self.cannotLower(p.span, "a Result pattern whose payload is not a scalar Ok and an Int32 or enum Err");
+                    return .{ .kind = .wildcard, .span = p.span };
+                }
+                var binding: ?u32 = null;
+                if (wp.binding) |name| {
+                    // Payloads are scalar copies, as typecheck.zig binds them
+                    // and as the C backend reads them out of the union.
+                    const slot: u32 = @intCast(self.bindings.items.len);
+                    try self.bindings.append(self.arena, .{
+                        .name = name,
+                        .ty = if (is_ok) r.ok.* else r.err.*,
+                        .ownership = .copy,
+                        .mutable = false,
+                        .is_param = false,
+                        .slot = slot,
+                    });
+                    try self.scope.append(self.arena, .{ .name = name, .slot = slot, .depth = self.depth });
+                    binding = slot;
+                }
+                return .{ .kind = .{ .result_ctor = .{ .is_ok = is_ok, .binding = binding } }, .span = p.span };
             },
         }
     }
@@ -1186,6 +1266,56 @@ test "a bare integer literal in return position stays Int" {
     try std.testing.expect(!l.diagnostics.hasErrors());
     const ret = l.module.findFn("f").?.body.?[0].kind.ret.?;
     try std.testing.expectEqual(.int, ret.ty.tag());
+}
+
+test "Ok/Err lower to result_ctor typed by the declared Result, and patterns bind the payload" {
+    var l = try lowerSource(
+        \\pub enum ParseError { Empty, TooLong }
+        \\pub fn parse_len(copy n: Int) -> Result<Int, ParseError> {
+        \\    if n == 0 { return Err(ParseError.Empty) }
+        \\    return Ok(n * 2)
+        \\}
+        \\pub fn score(copy r: Result<Int, ParseError>) -> Int {
+        \\    return match r { Ok(v) => v, Err(e) => 1 }
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const parse = l.module.findFn("parse_len").?;
+    const ok = parse.body.?[1].kind.ret.?;
+    try std.testing.expectEqual(.result, ok.ty.tag());
+    try std.testing.expect(ok.kind.result_ctor.is_ok);
+    try std.testing.expectEqual(.int, ok.kind.result_ctor.operand.ty.tag());
+
+    const score = l.module.findFn("score").?;
+    const arms = score.body.?[0].kind.ret.?.kind.match_expr.arms;
+    const ok_pat = arms[0].pattern.kind.result_ctor;
+    try std.testing.expect(ok_pat.is_ok);
+    try std.testing.expectEqual(.int, score.bindings[ok_pat.binding.?].ty.tag());
+    const err_pat = arms[1].pattern.kind.result_ctor;
+    try std.testing.expect(!err_pat.is_ok);
+    try std.testing.expectEqual(.enum_type, score.bindings[err_pat.binding.?].ty.tag());
+    try std.testing.expect(score.bindings[err_pat.binding.?].ownership == .copy);
+}
+
+test "Result forms the IR backends do not carry are refused, and optionals still are" {
+    const cases = [_]struct { src: []const u8, needle: []const u8 }{
+        .{ .src = "pub fn f() { let copy r: Result<String, Int32> = Ok(\"x\") }", .needle = "Ok payload is not a scalar" },
+        .{ .src = "pub fn f() { let copy r: Result<Int, Int> = Err(1) }", .needle = "Err payload is not Int32" },
+        .{ .src = "pub fn f() { let copy o: Int? = Some(1) }", .needle = "optional values are not lowered" },
+    };
+    for (cases) |c| {
+        var l = try lowerSource(c.src);
+        defer l.deinit();
+        var found = false;
+        for (l.diagnostics.list.items) |d| {
+            if (std.mem.indexOf(u8, d.message, c.needle) != null) found = true;
+        }
+        if (!found) {
+            std.debug.print("no '{s}' diagnostic for: {s}\n", .{ c.needle, c.src });
+            return error.MissingRefusal;
+        }
+    }
 }
 
 test "UInt8 and Byte stay distinct destination widths" {

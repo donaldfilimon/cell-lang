@@ -95,6 +95,16 @@ pub const lowering_passes = [_][]const u8{
     "--reconcile-unrealized-casts",
 };
 
+/// The MLIR spelling of `%cell_result` in llvmemit.zig.
+const result_type = "!llvm.struct<(i8, i32, !llvm.struct<(!llvm.struct<(ptr, i64)>)>)>";
+
+/// abi.ResultPayload speaks LLVM IR; MLIR's builtin floats are f32/f64.
+fn mlirScalar(llvm_ty: []const u8) []const u8 {
+    if (std.mem.eql(u8, llvm_ty, "double")) return "f64";
+    if (std.mem.eql(u8, llvm_ty, "float")) return "f32";
+    return llvm_ty;
+}
+
 const Value = struct {
     text: []const u8,
     ty: []const u8,
@@ -433,6 +443,13 @@ const Emitter = struct {
         // diagnostic rather than a silent store.
         for (f.params(), 0..) |p, i| {
             const t = self.paramType(p.ty, p.ownership) orelse continue;
+            if (self.passesResultCopyByPointer(p.ty, p.ownership)) {
+                // The caller's copy arrives by address; take our own.
+                const copied = try self.nextSsa();
+                try self.line("{s} = llvm.load %arg{d} : !llvm.ptr -> {s}", .{ copied, i, result_type });
+                try self.storeSlot(f.span, @intCast(i), .{ .text = copied, .ty = result_type }, "a parameter's incoming value");
+                continue;
+            }
             try self.storeSlot(
                 f.span,
                 @intCast(i),
@@ -853,6 +870,7 @@ const Emitter = struct {
             },
             .if_expr => |ie| return self.emitIf(e, ie.cond, ie.then_body, ie.else_body),
             .match_expr => |me| return self.emitMatch(e, me.scrutinee, me.arms),
+            .result_ctor => |rc| return self.emitResultCtor(e, rc.is_ok, rc.operand),
             .struct_lit => |sl| {
                 const t = self.structType(sl.name) orelse {
                     try self.unsupported(e.span, "struct literal for an unrepresentable type");
@@ -1194,6 +1212,19 @@ const Emitter = struct {
                     try self.unsupported(a.span, "an argument whose parameter type this backend cannot render");
                     return Value.none;
                 };
+                if (self.passesResultCopyByPointer(a.ty, modes[i].param)) {
+                    // Always a fresh copy, never the caller's own slot.
+                    const v = try self.emitExpr(&a);
+                    if (v.isNone()) return Value.none;
+                    if (!try self.fits(a.span, v.ty, result_type, "a Result argument")) return Value.none;
+                    const one = try self.nextSsa();
+                    try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
+                    const tmp = try self.nextSsa();
+                    try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ tmp, one, result_type });
+                    try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ v.text, tmp, result_type });
+                    vals[i] = .{ .text = tmp, .ty = "!llvm.ptr" };
+                    continue;
+                }
             }
             vals[i] = try self.emitArg(&a, want);
             if (vals[i].isNone()) return Value.none;
@@ -1371,6 +1402,88 @@ const Emitter = struct {
         return .{ .text = out, .ty = "i1" };
     }
 
+    /// `Ok(x)`/`Err(e)`, built the way llvmemit.zig builds it and cell_rt.h's
+    /// constructors do: a zeroed cell_result_t, the `ok` byte, then the
+    /// widened payload at field 2 or the int32 code at field 1.
+    fn emitResultCtor(self: *Emitter, e: *const hir.Expr, is_ok: bool, operand_e: *const hir.Expr) EmitError!Value {
+        const r = e.ty.result;
+        const v = try self.emitExpr(operand_e);
+        if (v.isNone()) return Value.none;
+        const one = try self.nextSsa();
+        try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
+        const buf = try self.nextSsa();
+        try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ buf, one, result_type });
+        const zero = try self.nextSsa();
+        try self.line("{s} = llvm.mlir.zero : {s}", .{ zero, result_type });
+        try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ zero, buf, result_type });
+        if (is_ok) {
+            const p = abi.resultPayload(r.ok.*).?;
+            const natural = mlirScalar(p.natural);
+            const store = mlirScalar(p.store);
+            if (!try self.fits(operand_e.span, v.ty, natural, "an Ok payload")) return Value.none;
+            const tag = try self.nextSsa();
+            try self.line("{s} = llvm.mlir.constant(1 : i8) : i8", .{tag});
+            try self.line("llvm.store {s}, {s} : i8, !llvm.ptr", .{ tag, buf });
+            const stored = switch (p.widen) {
+                .none => v.text,
+                .sext, .zext, .fpext, .bool_byte => blk: {
+                    const w = try self.nextSsa();
+                    const op: []const u8 = switch (p.widen) {
+                        .sext => "arith.extsi",
+                        .zext, .bool_byte => "arith.extui",
+                        .fpext => "arith.extf",
+                        .none => unreachable,
+                    };
+                    try self.line("{s} = {s} {s} : {s} to {s}", .{ w, op, v.text, natural, store });
+                    break :blk w;
+                },
+            };
+            const at = try self.nextSsa();
+            try self.line("{s} = llvm.getelementptr inbounds {s}[0, 2] : (!llvm.ptr) -> !llvm.ptr, {s}", .{ at, buf, result_type });
+            try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ stored, at, store });
+        } else {
+            if (!try self.fits(operand_e.span, v.ty, "i32", "an Err code")) return Value.none;
+            const at = try self.nextSsa();
+            try self.line("{s} = llvm.getelementptr inbounds {s}[0, 1] : (!llvm.ptr) -> !llvm.ptr, {s}", .{ at, buf, result_type });
+            try self.line("llvm.store {s}, {s} : i32, !llvm.ptr", .{ v.text, at });
+        }
+        const out = try self.nextSsa();
+        try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ out, buf, result_type });
+        return .{ .text = out, .ty = result_type };
+    }
+
+    /// The payload a matched `Ok(v)`/`Err(e)` binds, read back and narrowed.
+    fn readResultPayload(self: *Emitter, scrutinee: Value, ty: hir.Ty, is_ok: bool) EmitError!Value {
+        const r = ty.result;
+        if (!is_ok) {
+            const code = try self.nextSsa();
+            try self.line("{s} = llvm.extractvalue {s}[1] : {s}", .{ code, scrutinee.text, result_type });
+            return .{ .text = code, .ty = "i32" };
+        }
+        const p = abi.resultPayload(r.ok.*).?;
+        const natural = mlirScalar(p.natural);
+        const store = mlirScalar(p.store);
+        // Through memory: the payload is a union member, not a struct field.
+        const one = try self.nextSsa();
+        try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
+        const buf = try self.nextSsa();
+        try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ buf, one, result_type });
+        try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ scrutinee.text, buf, result_type });
+        const at = try self.nextSsa();
+        try self.line("{s} = llvm.getelementptr inbounds {s}[0, 2] : (!llvm.ptr) -> !llvm.ptr, {s}", .{ at, buf, result_type });
+        const raw = try self.nextSsa();
+        try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ raw, at, store });
+        if (p.widen == .none) return .{ .text = raw, .ty = natural };
+        const n = try self.nextSsa();
+        const op: []const u8 = switch (p.widen) {
+            .sext, .zext, .bool_byte => "arith.trunci",
+            .fpext => "arith.truncf",
+            .none => unreachable,
+        };
+        try self.line("{s} = {s} {s} : {s} to {s}", .{ n, op, raw, store, natural });
+        return .{ .text = n, .ty = natural };
+    }
+
     fn emitMatch(
         self: *Emitter,
         e: *const hir.Expr,
@@ -1419,13 +1532,27 @@ const Emitter = struct {
                     const eq = try self.emitStringEq(scrutinee, arm.pattern.kind.string);
                     if (eq.isNone()) return Value.none;
                     cmp = eq.text;
+                } else if (arm.pattern.kind == .result_ctor) {
+                    // `ok` is cell_result_t's first field, a C bool byte.
+                    const tag = try self.nextSsa();
+                    try self.line("{s} = llvm.extractvalue {s}[0] : {s}", .{ tag, scrutinee.text, result_type });
+                    const zero = try self.nextSsa();
+                    try self.line("{s} = arith.constant 0 : i8", .{zero});
+                    const c = try self.nextSsa();
+                    try self.line("{s} = arith.cmpi {s}, {s}, {s} : i8", .{
+                        c,
+                        if (arm.pattern.kind.result_ctor.is_ok) "ne" else "eq",
+                        tag,
+                        zero,
+                    });
+                    cmp = c;
                 } else {
                     const test_text: ?[]const u8 = switch (arm.pattern.kind) {
                         .int => |v| try std.fmt.allocPrint(self.arena, "{d}", .{v}),
                         .bool => |v| try std.fmt.allocPrint(self.arena, "{d}", .{@intFromBool(v)}),
                         .enum_variant => |ev| try std.fmt.allocPrint(self.arena, "{d}", .{ev.value}),
                         .float, .string => null,
-                        .wildcard, .binding => unreachable,
+                        .wildcard, .binding, .result_ctor => unreachable,
                     };
                     const tt = test_text orelse {
                         try self.unsupported(arm.span, "this match pattern is not lowered to MLIR yet");
@@ -1457,6 +1584,13 @@ const Emitter = struct {
             if (arm.pattern.kind == .binding) {
                 const bslot = arm.pattern.kind.binding;
                 try self.storeSlot(arm.span, bslot, scrutinee, "a match binding pattern");
+            }
+            if (arm.pattern.kind == .result_ctor) {
+                const rc = arm.pattern.kind.result_ctor;
+                if (rc.binding) |bslot| {
+                    const payload = try self.readResultPayload(scrutinee, scrutinee_e.ty, rc.is_ok);
+                    try self.storeSlot(arm.span, bslot, payload, "a Result payload binding");
+                }
             }
             const body_val = try self.emitExpr(arm.body);
             if (produces and !body_val.isNone()) {
@@ -1505,7 +1639,7 @@ const Emitter = struct {
     /// is allocated, stored, loaded and projected.
     fn isAggregate(ty: hir.Ty) bool {
         return switch (ty.tag()) {
-            .struct_type, .string, .optional, .list => true,
+            .struct_type, .string, .optional, .list, .result => true,
             else => false,
         };
     }
@@ -1527,6 +1661,7 @@ const Emitter = struct {
     /// `abi.classifyParam`, so a type nobody enumerated gets the ABI's answer.
     fn paramType(self: *Emitter, ty: hir.Ty, own: hir.Ownership) ?[]const u8 {
         if (self.borrowsByPointer(ty, own)) return "!llvm.ptr";
+        if (self.passesResultCopyByPointer(ty, own)) return "!llvm.ptr";
         return self.mlirTypeOwned(ty, own);
     }
 
@@ -1543,6 +1678,16 @@ const Emitter = struct {
     /// tells them apart. `llvmemit.borrowsByPointer` is the same function for
     /// the same reason, and the two backends must keep agreeing here or
     /// `tools/check.sh`'s agreement stage splits.
+    /// A Result argument the ABI passes INDIRECTLY: a copy the caller places
+    /// in memory it owns, handed over as `ptr`, which the callee copies in.
+    /// That is how clang declares `cell_result_t` parameters (24 bytes), and
+    /// how llvmemit.zig already places them. Other indirect aggregates still
+    /// pass by value here; that gap is pinned in tools/check.sh.
+    fn passesResultCopyByPointer(self: *Emitter, ty: hir.Ty, own: hir.Ownership) bool {
+        if (ty.tag() != .result) return false;
+        return abi.classifyParam(self.module, ty, own) == .indirect;
+    }
+
     fn borrowsByPointer(self: *Emitter, ty: hir.Ty, own: hir.Ownership) bool {
         return switch (abi.classifyParam(self.module, ty, own)) {
             .direct => |spelling| std.mem.eql(u8, spelling, "ptr"),
@@ -1598,7 +1743,14 @@ const Emitter = struct {
             // One type-erased header for every element type, per cell_rt.h
             // section 3: elem_size travels at the call site, not in the type.
             .list => "!llvm.struct<(ptr, i64, i64)>",
-            .result, .func, .unknown => null,
+            // cell_result_t, `{ bool ok; int32_t error_code; cell_value_t
+            // value; }`, with the union spelled as clang spells it: its widest
+            // member, cell_str_t. Only for the payloads both IR backends read.
+            .result => |r| if (abi.resultPayload(r.ok.*) != null and abi.resultErrorCarried(r.err.*))
+                result_type
+            else
+                null,
+            .func, .unknown => null,
         };
     }
 
@@ -2322,6 +2474,32 @@ test "a borrow consumed BY VALUE is loaded through, not passed as an address" {
     defer gpa.free(out);
     // 20 read through the borrow, 20 through the copy of it, plus 2.
     try std.testing.expectEqualStrings("42\n", out);
+}
+
+test "a scalar Result lowers to the cell_result_t struct in the llvm dialect" {
+    var e = try emitSource(
+        \\pub enum ParseError { Empty, TooLong }
+        \\pub fn parse_len(copy n: Int) -> Result<Int, ParseError> {
+        \\    if n == 0 { return Err(ParseError.Empty) }
+        \\    return Ok(n * 2)
+        \\}
+        \\pub fn score(copy r: Result<Int8, ParseError>, copy d: Int8) -> Int8 {
+        \\    return match r { Ok(v) => v, Err(_) => d }
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "llvm.sret = !llvm.struct<(i8, i32, !llvm.struct<(!llvm.struct<(ptr, i64)>)>)>");
+    try expectContains(e.text, "llvm.mlir.zero : !llvm.struct<(i8, i32, !llvm.struct<(!llvm.struct<(ptr, i64)>)>)>");
+    try expectContains(e.text, "llvm.getelementptr inbounds");
+    try expectContains(e.text, "[0, 2] : (!llvm.ptr) -> !llvm.ptr");
+    try expectContains(e.text, "[0, 1] : (!llvm.ptr) -> !llvm.ptr");
+    try expectContains(e.text, "arith.cmpi ne,");
+    try expectContains(e.text, "arith.trunci");
+    // A Result parameter is a pointer to the caller's copy, as in C.
+    try expectContains(e.text, "@cell_score(%arg0: !llvm.ptr, %arg1: i8)");
+    // A Result slot is an llvm.alloca: memref cannot hold an !llvm.struct.
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "memref<!llvm.struct<(i8, i32") == null);
 }
 
 test "an exclusive String, list and optional are POINTERS, and writes through them LAND" {

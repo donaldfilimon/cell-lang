@@ -74,9 +74,54 @@ pub fn layoutOf(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) ?Layout {
         // depend on the element, and at 24 bytes it takes the same indirect
         // path cell_string_t already uses.
         .list => .{ .size = 24, .alignment = 8 },
-        // Still out of scope: Result's payload is a union this module does not
-        // model yet.
-        .result, .func, .unknown => null,
+        // A Result is `cell_result_t`, `{ bool ok; int32_t error_code;
+        // cell_value_t value; }`, whatever T and E are: the payload rides in a
+        // 16-byte union whose widest member is cell_str_t. Measured with
+        // clang on AArch64/Darwin: size 24, align 8, fields at 0, 4, 8. So,
+        // like a list, it takes the indirect path. Which T and E a backend
+        // can actually read and write is decided by resultPayload below.
+        .result => .{ .size = 24, .alignment = 8 },
+        .func, .unknown => null,
+    };
+}
+
+/// How a scalar Result payload is stored in `cell_value_t`, matching the C
+/// backend's `resultField` table and cell_rt.h's `cell_ok_*` constructors.
+/// `store` is the LLVM type written at offset 8; `widen` is how the payload
+/// reaches it. Null for a payload the IR backends refuse.
+pub const ResultPayload = struct {
+    /// The payload's own LLVM type.
+    natural: []const u8,
+    /// What occupies the union slot: i64, double, or i8 for a C `bool`.
+    store: []const u8,
+    widen: Widen,
+
+    pub const Widen = enum { none, sext, zext, fpext, bool_byte };
+};
+
+pub fn resultPayload(ty: hir.Ty) ?ResultPayload {
+    return switch (ty) {
+        .int => .{ .natural = "i64", .store = "i64", .widen = .none },
+        .int8 => .{ .natural = "i8", .store = "i64", .widen = .sext },
+        .int16 => .{ .natural = "i16", .store = "i64", .widen = .sext },
+        .int32 => .{ .natural = "i32", .store = "i64", .widen = .sext },
+        .uint => .{ .natural = "i64", .store = "i64", .widen = .none },
+        .uint8 => .{ .natural = "i8", .store = "i64", .widen = .zext },
+        .uint16 => .{ .natural = "i16", .store = "i64", .widen = .zext },
+        .uint32 => .{ .natural = "i32", .store = "i64", .widen = .zext },
+        .float => .{ .natural = "double", .store = "double", .widen = .none },
+        .float32 => .{ .natural = "float", .store = "double", .widen = .fpext },
+        .boolean => .{ .natural = "i1", .store = "i8", .widen = .bool_byte },
+        else => null,
+    };
+}
+
+/// Whether `ty` is an error type the IR backends carry: the C backend narrows
+/// E to an `int32_t` code, and only Int32 and payload-free enums reach it.
+pub fn resultErrorCarried(ty: hir.Ty) bool {
+    return switch (ty) {
+        .int32, .enum_type => true,
+        else => false,
     };
 }
 
@@ -481,6 +526,26 @@ test "a struct is laid out with C padding rules" {
 test "an out-of-scope type has no layout yet" {
     const m = emptyModule();
     try std.testing.expect(layoutOf(&m, types.t_string, .arc) == null);
+}
+
+test "a Result is cell_result_t: 24 bytes, align 8, passed and returned indirectly" {
+    // Measured with clang -S -emit-llvm on AArch64/Darwin:
+    // %struct.cell_result = type { i8, i32, %union.cell_value }, sizeof 24,
+    // offsets 0/4/8, and `cell_result_t f(cell_result_t)` compiles to
+    // `void @f(ptr sret(%struct.cell_result), ptr)`.
+    const m = emptyModule();
+    const t_int = types.t_int;
+    const t_i32 = types.t_int32;
+    const r: hir.Ty = .{ .result = .{ .ok = &t_int, .err = &t_i32 } };
+    const l = layoutOf(&m, r, .copy).?;
+    try std.testing.expectEqual(@as(u32, 24), l.size);
+    try std.testing.expectEqual(@as(u32, 8), l.alignment);
+    try std.testing.expect(classifyParam(&m, r, .copy) == .indirect);
+    try std.testing.expect(classifyReturn(&m, r) == .indirect);
+    try std.testing.expectEqualStrings("i64", resultPayload(types.t_int32).?.store);
+    try std.testing.expect(resultPayload(types.t_string) == null);
+    try std.testing.expect(resultErrorCarried(types.t_int32));
+    try std.testing.expect(!resultErrorCarried(types.t_int));
 }
 
 test "two doubles are an HFA of two" {

@@ -106,9 +106,9 @@ symbol for LLVM IR or MLIR to call, so both refuse with `cannot lower`. They
 refuse TOGETHER, which is why the agreement contract below still holds while
 the three backends disagree about the program.
 
-`optionals.cell` (prints 43) and `results.cell` (prints 9) are C only by the
-same contract: LLVM and MLIR refuse `Some`/`None`/`Ok`/`Err` together with
-`cannot lower`. Scalar payloads only.
+`optionals.cell` (prints 43) is C only by the same contract: LLVM and MLIR
+refuse `Some`/`None` together with `cannot lower`. `results.cell` (prints 9)
+runs on all three backends since 2026-09-17: scalar `Ok`/`Err` payloads only.
 
 `index.cell` (prints 125) is C only by the same contract: postfix `a[i]` for
 `String` and `[Byte]` lowers through `cell_str_byte_at` / `cell_bytes_at`,
