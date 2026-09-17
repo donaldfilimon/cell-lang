@@ -342,7 +342,9 @@ CELL_DEFINE_OPTIONAL(cell_opt_ptr, void *)
 
 /*
  * Every in-scope pair, predefined like the scalar optionals. Slugs: i64 i32
- * i16 i8 u64 u32 u16 u8 f64 f32 bool byte, plus unit for T. A payload-free
+ * i16 i8 u64 u32 u16 u8 f64 f32 bool byte, plus unit for T, plus `string`
+ * (an owning cell_string_t, sub-project 2) for T. The caller releases an
+ * owning payload; codegen emits per-module release glue for it. A payload-free
  * enum is int32_t and uses i32. Byte stays distinct from UInt8.
  */
 #define CELL_RES_ERRS(X, pfx, OT)                                              \
@@ -362,7 +364,8 @@ CELL_DEFINE_OPTIONAL(cell_opt_ptr, void *)
     Y(cell_res_u64, uint64_t) Y(cell_res_u32, uint32_t)                        \
     Y(cell_res_u16, uint16_t) Y(cell_res_u8, uint8_t)                          \
     Y(cell_res_f64, double) Y(cell_res_f32, float)                             \
-    Y(cell_res_bool, bool) Y(cell_res_byte, uint8_t)
+    Y(cell_res_bool, bool) Y(cell_res_byte, uint8_t)                          \
+    Y(cell_res_string, cell_string_t)
 #define CELL_RES_DEFINE_ONE(pfx, OT, err, ET) CELL_DEFINE_RESULT(pfx##_##err, OT, ET)
 #define CELL_RES_DEFINE_UNIT(pfx, OT, err, ET) CELL_DEFINE_RESULT_UNIT(pfx##_##err, ET)
 #define CELL_RES_FOR_OK(pfx, OT) CELL_RES_ERRS(CELL_RES_DEFINE_ONE, pfx, OT)

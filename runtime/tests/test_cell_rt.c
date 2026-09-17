@@ -617,6 +617,8 @@ _Static_assert(sizeof(cell_res_unit_i32_t) == 8 && offsetof(cell_res_unit_i32_t,
     "cell_res_unit_i32_t layout");
 _Static_assert(sizeof(cell_res_f64_f64_t) == 16, "cell_res_f64_f64_t layout");
 _Static_assert(sizeof(cell_res_i8_i8_t) == 2, "cell_res_i8_i8_t layout");
+_Static_assert(sizeof(cell_res_string_i32_t) == 32 && _Alignof(cell_res_string_i32_t) == 8
+    && offsetof(cell_res_string_i32_t, as) == 8, "cell_res_string_i32_t layout");
 
 static void test_result(void) {
     /* Per-instantiation Results (CELL_RT_ABI_VERSION 2). Every payload is
@@ -655,6 +657,14 @@ static void test_result(void) {
     cell_res_i8_f64_t z1 = cell_res_i8_f64_ok(7);
     cell_res_i8_f64_t z2 = cell_res_i8_f64_ok(7);
     CHECK(memcmp(&z1, &z2, sizeof(z1)) == 0);
+
+    /* An owning String Ok (sub-project 2): the payload is the owning
+     * header itself; the caller releases it. */
+    cell_res_string_i64_t so = cell_res_string_i64_ok(cell_string_from_cstr("payload"));
+    CHECK(so.ok && so.as.ok.len == 7);
+    cell_string_free(&so.as.ok);
+    cell_res_string_i64_t se = cell_res_string_i64_err(INT64_C(5000000000));
+    CHECK(!se.ok && se.as.err == INT64_C(5000000000));
 
     /* The deprecated legacy names still compile for one runtime version. */
     cell_result_t legacy = cell_err(4);
