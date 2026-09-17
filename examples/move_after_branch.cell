@@ -1,0 +1,59 @@
+// A value moved only AFTER an unrelated `if` or `match` must still be
+// intact when it is moved.
+//
+// WHY THIS FILE EXISTS. The C backend's branch-end release (1eaed84,
+// extended to match arms in 38e33a2) freed an owned local at the end of
+// every branch of an `if`/`match` that did not touch it, whenever the same
+// local was moved LATER in the block. The later move then handed over a
+// zeroed header. It printed a wrong number with AddressSanitizer silent,
+// and no corpus program had the shape, so every gate stage stayed green.
+// Found 2026-09-17 while grounding IR String step (b); fixed by borrowck's
+// `after_branch` exit record, which says whether any branch moved the value.
+//
+// WHAT IT PRINTS. `make()` returns a 7-byte String and `take` returns the
+// length of what it receives. Each of the four values is moved after an
+// unrelated statement `if`, statement `match`, value `match` or `else if`
+// chain. The branches taken add 1, 10 and 100 to `k`, and the value match
+// gives e = 1, so the correct total is 4 * 7 + 1 + 111 = 140. A value freed
+// early contributes 0 instead of 7.
+//
+// EXPECT-OUTPUT: 140
+
+pub fn print_int(copy value: Int);
+pub fn make() -> String;
+pub fn take(owned s: String) -> Int;
+
+pub fn main() {
+    let owned a = make()
+    let owned b = make()
+    let owned c = make()
+    let owned d = make()
+    let copy flag = true
+    var copy k = 0
+    if flag {
+        k = k + 1
+    } else {
+        k = k + 2
+    }
+    let copy x = take(a)
+    match flag {
+        true => {
+            k = k + 10
+        },
+        false => {
+            k = k + 20
+        },
+    }
+    let copy y = take(b)
+    let copy e = match flag {
+        true => 1,
+        false => 0,
+    }
+    let copy z = take(c)
+    if e > 5 {
+        k = k + 1000
+    } else if e > 0 {
+        k = k + 100
+    }
+    print_int(x + y + z + take(d) + e + k)
+}

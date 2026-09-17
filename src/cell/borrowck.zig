@@ -290,6 +290,14 @@ pub const ExitKind = enum {
     /// after the loop and turns each listed `break` into a jump past that
     /// release, because a plain C `break` would run it on a moved buffer.
     after_loop_skip,
+    /// Right AFTER an `if` or `match` merges its branches (2026-09-17).
+    /// An `if` is keyed by the `if` expression's address, a `match` by the
+    /// address of its arms slice (codegen receives the match by value).
+    /// `live = true` means no branch moved the binding, so a branch-end
+    /// release must not free it: a later move or the scope end owns it.
+    /// Without this, a value moved AFTER an unrelated `if` was freed at
+    /// every branch end (1eaed84, extended to match arms in 38e33a2).
+    after_branch,
 };
 
 /// A `break` that must jump past the releases after its loop, recorded
@@ -2566,6 +2574,7 @@ pub const Checker = struct {
         } else if (!then_diverges) {
             try self.unionDead(then_dead.items);
         }
+        try self.recordExit(.after_branch, @intFromPtr(expr));
     }
 
     fn checkMatch(self: *Checker, m: *const @FieldType(ast.Expr.Kind, "match_expr")) Error!void {
@@ -2735,6 +2744,7 @@ pub const Checker = struct {
 
         self.dead.clearRetainingCapacity();
         try self.dead.appendSlice(self.allocator, merged.items);
+        try self.recordExit(.after_branch, @intFromPtr(m.arms.ptr));
     }
 
     fn unionDead(self: *Checker, other: []const Dead) Error!void {

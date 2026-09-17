@@ -410,6 +410,10 @@ pub const Generator = struct {
     /// The enclosing statement list's block-end exit, for branch-end drops
     /// that ask "live here, dead after the merge".
     current_after: ?Exit = null,
+    /// The `after_branch` exit of the innermost statement-position `if` or
+    /// `match` whose branches are being emitted. A branch-end release is
+    /// skipped for a binding borrowck recorded still held there.
+    current_merge: ?Exit = null,
     /// The drop point currently being emitted. A jump after a move and
     /// before a later revival must not free the taken field; missing or
     /// not-dead keeps the leak.
@@ -1915,6 +1919,9 @@ pub const Generator = struct {
     fn emitIfStmt(self: *Generator, e: *const ast.Expr, indent: usize) EmitError!void {
         const i = e.kind.if_expr;
         const after = self.current_after;
+        const saved_merge = self.current_merge;
+        self.current_merge = .{ .kind = .after_branch, .key = @intFromPtr(e) };
+        defer self.current_merge = saved_merge;
         const mark = self.locals.items.len;
         const out = self.writer;
         try self.writeIndent(indent);
@@ -1982,6 +1989,17 @@ pub const Generator = struct {
     /// are live here and dead after the merge; the whole record is never
     /// freed on this path (that double-frees the unmoved sibling with the
     /// later partial drop).
+    /// Held right after the enclosing if/match merge: no branch moved it,
+    /// so no branch end may release it. False when there is no record.
+    fn heldAfterMerge(self: *const Generator, binding: u32, whole_record: bool) bool {
+        const checker = self.checker orelse return false;
+        const m = self.current_merge orelse return false;
+        return if (whole_record)
+            checker.recordLiveAtExit(m.kind, m.key, binding)
+        else
+            checker.liveAtExit(m.kind, m.key, binding);
+    }
+
     fn emitBranchEndDrops(self: *Generator, key: usize, mark: usize, after: ?Exit, indent: usize) EmitError!void {
         const checker = self.checker orelse return;
         const here: Exit = .{ .kind = .branch_end, .key = key };
@@ -1994,6 +2012,7 @@ pub const Generator = struct {
             if (!try self.needsDrop(local.ty)) continue;
             if (local.ty.shape == .record) {
                 if (checker.wasWhollyMoved(local.id)) {
+                    if (self.heldAfterMerge(local.id, true)) continue;
                     if (!checker.recordLiveAtExit(here.kind, here.key, local.id)) continue;
                     if (after) |a| {
                         if (checker.recordLiveAtExit(a.kind, a.key, local.id)) continue;
@@ -2005,6 +2024,7 @@ pub const Generator = struct {
                 continue;
             }
             if (!checker.wasMoved(local.id)) continue;
+            if (self.heldAfterMerge(local.id, false)) continue;
             if (!checker.liveAtExit(here.kind, here.key, local.id)) continue;
             if (after) |a| {
                 if (checker.liveAtExit(a.kind, a.key, local.id)) continue;
@@ -2025,6 +2045,7 @@ pub const Generator = struct {
             if (!try self.needsDrop(local.ty)) continue;
             if (local.ty.shape == .record) {
                 if (checker.wasWhollyMoved(local.id)) {
+                    if (self.heldAfterMerge(local.id, true)) continue;
                     if (!checker.recordLiveAtExit(here.kind, here.key, local.id)) continue;
                     if (after) |a| {
                         if (checker.recordLiveAtExit(a.kind, a.key, local.id)) continue;
@@ -2035,6 +2056,7 @@ pub const Generator = struct {
                 continue;
             }
             if (!checker.wasMoved(local.id)) continue;
+            if (self.heldAfterMerge(local.id, false)) continue;
             if (!checker.liveAtExit(here.kind, here.key, local.id)) continue;
             if (after) |a| {
                 if (checker.liveAtExit(a.kind, a.key, local.id)) continue;
@@ -2099,7 +2121,8 @@ pub const Generator = struct {
             if (f.ownership != .owned and f.ownership != .arc) continue;
             const field_path: []const u8 = if (path_prefix.len == 0) f.name else try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ path_prefix, f.name });
             const fty = try self.lowerType(&f.ty, f.ownership);
-            if (fieldKeptOnBranch(checker, here, after, binding, field_path)) {
+            const held = if (self.current_merge) |m| checker.fieldLiveAtExit(m.kind, m.key, binding, field_path) else false;
+            if (!held and fieldKeptOnBranch(checker, here, after, binding, field_path)) {
                 if (emit) try self.emitOneFieldDrop(indent, c_base, f.name, fty);
                 any = true;
                 continue;
@@ -2145,6 +2168,11 @@ pub const Generator = struct {
     /// `dest` is set every arm assigns into it instead of running for effect.
     fn emitMatch(self: *Generator, m: anytype, dest: ?Dest, indent: usize) EmitError!void {
         const out = self.writer;
+        // Keyed by the arms slice, which survives `m` being passed by value;
+        // borrowck records `after_branch` under the same address.
+        const saved_merge = self.current_merge;
+        self.current_merge = .{ .kind = .after_branch, .key = @intFromPtr(m.arms.ptr) };
+        defer self.current_merge = saved_merge;
         const scrut_ty = try self.inferExpr(m.scrutinee);
         const temp = try self.nextTemp();
         const outer_mark = self.locals.items.len;
@@ -5738,6 +5766,69 @@ test "a value moved in one branch of an if is released on the other" {
     const f = try fnDef(e.text, "f");
     try expectOccurrences(f, "cell_string_free(&s);", 1);
     try expectContains(f, "} else {\n    cell_string_free(&s);\n  }");
+}
+
+test "a value moved only AFTER an if or match is not released inside it" {
+    // Found 2026-09-17 while grounding IR String step (b). The branch-end
+    // release (1eaed84, extended to match arms in 38e33a2) asked "moved
+    // somewhere in the function" and "dead at the enclosing block's end",
+    // so a value moved by a statement AFTER an unrelated if/match was freed
+    // at the end of every branch, and the later move read a freed header:
+    // `print_int(e + take(ns))` printed 1 in C where LLVM printed 43, with
+    // AddressSanitizer silent because the free zeroes the header. The fix
+    // asks borrowck whether the value is still held right after the merge
+    // (`ExitKind.after_branch`); only a value some branch moved is released.
+    var e = try emitSource(
+        \\pub struct Pair { owned a: String, owned b: String }
+        \\pub fn make() -> String;
+        \\pub fn pair() -> Pair;
+        \\pub fn print_int(copy value: Int);
+        \\pub fn take(owned s: String) -> Int;
+        \\pub fn eat(owned p: Pair) -> Int;
+        \\pub fn f(copy flag: Bool) {
+        \\  let owned s = make()
+        \\  let owned p = pair()
+        \\  let owned q = pair()
+        \\  if flag { print_int(1) } else { print_int(0) }
+        \\  match flag {
+        \\    true => print_int(2),
+        \\    false => print_int(3),
+        \\  }
+        \\  let copy e = match flag {
+        \\    true => 1,
+        \\    false => 0,
+        \\  }
+        \\  if flag { print_int(4) } else if e > 0 { print_int(5) }
+        \\  print_int(e + take(s) + eat(p) + take(q.a))
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectAbsent(f, "cell_string_free(&s);");
+    try expectAbsent(f, "cell_drop_Pair(&p);");
+    try expectAbsent(f, "cell_string_free(&q.a);");
+    // q.b is still released once, at function end.
+    try expectOccurrences(f, "cell_string_free(&q.b);", 1);
+}
+
+test "a value moved on one branch is still released on the other, after the fix" {
+    // The case the branch-end release exists for must survive the
+    // after_branch guard: moved in `then`, held in `else`, dead after.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn take(owned s: String) -> Int;
+        \\pub fn print_int(copy value: Int);
+        \\pub fn f(copy flag: Bool) {
+        \\  let owned s = make()
+        \\  match flag {
+        \\    true => print_int(take(s)),
+        \\    false => print_int(0),
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectOccurrences(f, "cell_string_free(&s);", 1);
 }
 
 test "a value moved by being returned is not dropped" {

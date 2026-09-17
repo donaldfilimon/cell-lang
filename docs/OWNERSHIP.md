@@ -2391,6 +2391,17 @@ ways, and each is a real, documented gap rather than an oversight:
   `cell_drop_Pair(&p)` on the else path, freeing `p.a` at scope end as well
   as else, or freeing `p.a` on the then path, each AddressSanitizer double
   free at exit 134; restored.
+  **FIXED 2026-09-17: a value moved only AFTER an `if` or `match` was
+  freed inside it.** The branch-end release (whole values, records and
+  fields alike) read "moved somewhere in the function" and "dead at the
+  enclosing block's end", which a move later in the block satisfies, so
+  every branch of an unrelated `if` (since 1eaed84) or `match` (since
+  38e33a2) freed the value and the later move handed over a zeroed header.
+  A wrong answer, not a crash: AddressSanitizer stays silent because
+  `free(NULL)` is legal. borrowck now records `after_branch`, the liveness
+  right after each `if`/`match` merge, and codegen skips a branch-end
+  release for a binding still held there. `examples/move_after_branch.cell`
+  prints 29 on all three backends; the pre-fix compiler prints 1.
   **CLOSED 2026-09-16: a field revived after it was moved.** R3a retracts
   matching field paths from `moved_paths` drop queries; `fieldWasMoved`
   is false for the revived field so the new value is released at scope
