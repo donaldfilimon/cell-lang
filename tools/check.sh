@@ -464,6 +464,21 @@ LEAK_SKIP_REVIVAL_BREAK=0
 LEAK_IR_OWNED_STRING_C=0
 LEAK_IR_OWNED_STRING_LLVM=3000
 LEAK_IR_OWNED_STRING_MLIR=3000
+# IR String step (a) (2026-09-17): the IR backends convert a borrowed view
+# into an owned String with cell_string_from_str and still free nothing.
+# examples/leaks/ir_string_conversion.cell runs the eight conversion
+# positions 1000 times, nine allocations per call. Measured on first run:
+# C ALLOC=9000 FREE=9000 LIVE=0 (and 0 leaks); LLVM and MLIR ALLOC=9000
+# FREE=0 LIVE=9000.
+LEAK_IR_STRING_CONVERSION_C=0
+LEAK_IR_STRING_CONVERSION_LLVM=9000
+LEAK_IR_STRING_CONVERSION_MLIR=9000
+# examples/owned_string.cell once, with its host (whose `take` frees the one
+# owned argument it is handed). Measured on first run: C ALLOC=9 FREE=9
+# LIVE=0 (and 0 leaks); LLVM and MLIR ALLOC=9 FREE=1 LIVE=8.
+LEAK_OWNED_STRING_C=0
+LEAK_OWNED_STRING_LLVM=8
+LEAK_OWNED_STRING_MLIR=8
 # R16 residual: a `return` inside a loop after the outer var's revival.
 # Measured 500 before (2026-09-17, ALLOC=2500 FREE=2000 LIVE=500); CLOSED
 # the same day by sparing an accepted loop's `return` records.
@@ -814,18 +829,21 @@ run_c_host() {
     [ "$got" = "$want" ] && pass "C    $ex -> $got" || fail "C    $ex -> $got, want $want"
 }
 
+# `host` is optional, as in run_c_host: a hand-written C file for the
+# example's bodyless declarations, compiled against the runtime header.
 run_llvm() {
-    ex=$1; want=$2
+    ex=$1; want=$2; host=${3:-}
     $CELL emit --target=llvm "examples/$ex.cell" > "$TMP/$ex.ll" 2>/dev/null || { fail "llvm emit $ex"; return; }
     # cc, never `zig cc`: measured, `zig cc -x ir` fails outright.
     cc -Wno-override-module -x ir "$TMP/$ex.ll" -c -o "$TMP/$ex.o" 2>/dev/null || { fail "llvm compile $ex"; return; }
-    cc "$TMP/$ex.o" "$TMP/rt.o" -o "$TMP/${ex}_l" 2>/dev/null || { fail "llvm link $ex"; return; }
+    # $host is deliberately unquoted: empty means no extra source.
+    cc -I runtime "$TMP/$ex.o" $host "$TMP/rt.o" -o "$TMP/${ex}_l" 2>/dev/null || { fail "llvm link $ex"; return; }
     got=$("$TMP/${ex}_l")
     [ "$got" = "$want" ] && pass "LLVM $ex -> $got" || fail "LLVM $ex -> $got, want $want"
 }
 
 run_mlir() {
-    ex=$1; want=$2
+    ex=$1; want=$2; host=${3:-}
     if [ ! -x "$LLVM_BIN/mlir-opt" ] || [ ! -x "$LLVM_BIN/mlir-translate" ] || [ ! -x "$LLVM_BIN/llc" ]; then
         skip "MLIR $ex (mlir-opt/mlir-translate/llc not found in $LLVM_BIN)"
         return
@@ -839,7 +857,8 @@ run_mlir() {
     "$LLVM_BIN/mlir-translate" --mlir-to-llvmir "$TMP/${ex}_low.mlir" -o "$TMP/${ex}_m.ll" 2>/dev/null \
         || { fail "mlir-translate $ex"; return; }
     "$LLVM_BIN/llc" -filetype=obj "$TMP/${ex}_m.ll" -o "$TMP/${ex}_m.o" 2>/dev/null || { fail "llc $ex"; return; }
-    cc "$TMP/${ex}_m.o" "$TMP/drv.c" "$TMP/rt.o" -o "$TMP/${ex}_m" 2>/dev/null || { fail "mlir link $ex"; return; }
+    # $host is deliberately unquoted: empty means no extra source.
+    cc -I runtime "$TMP/${ex}_m.o" "$TMP/drv.c" $host "$TMP/rt.o" -o "$TMP/${ex}_m" 2>/dev/null || { fail "mlir link $ex"; return; }
     got=$("$TMP/${ex}_m")
     [ "$got" = "$want" ] && pass "MLIR $ex -> $got" || fail "MLIR $ex -> $got, want $want"
 }
@@ -863,23 +882,28 @@ done
 # changing the retain rules, not only under this equality.
 run_c_host arc 13 examples/arc_host.c
 
-# owned_string is C only for the same KIND of reason and a different one: the
-# `str` -> owning-`String` conversion is a call to cell_string_from_str, which
-# is `static inline` in the header and so has no symbol the LLVM or MLIR
-# backend can call. Both refuse it, together, which stage 4 pins.
+# owned_string runs through ALL THREE backends since IR String step (a)
+# (2026-09-17). Until then it was C only: the LLVM and MLIR backends refused
+# every `str` -> owning-`String` conversion. hir.lower now inserts a call to
+# cell_string_from_str (a real runtime symbol) at each position, so both IR
+# backends make the same copy C does. They still free nothing, which stage 7
+# pins; stage 10 compares the helper's declaration against C's.
 #
 # 44 is 2+3+4+5+6+7+8+9, the byte length of each of the EIGHT positions where
 # a borrowed view meets a declared owning `String`. Six of those were the
 # recorded defect; the seventh and eighth are a value-slot `match` arm at a
 # `let` and at a `return`, which no list of positions predicted. A conversion
 # that produced an empty or a mis-sized value moves this number rather than
-# passing quietly, and the emitted C would still compile.
+# passing quietly, and the emitted code would still compile.
 #
-# Stage 9 is the other half and the half that matters: its host FREES the
-# `owned` argument, so a caller that passed a borrowed view of a string
-# literal frees a non-heap pointer and AddressSanitizer says so. Compiling was
-# never the hard part for this defect.
+# Stage 9 is the other half for C: its host FREES the `owned` argument, so a
+# caller that passed a borrowed view of a string literal frees a non-heap
+# pointer and AddressSanitizer says so. Compiling was never the hard part for
+# this defect. Stage 9 builds C only; the LLVM build was run under ASan by
+# hand for step (a) and exited 0.
 run_c_host owned_string 44 examples/owned_string_host.c
+run_llvm owned_string 44 examples/owned_string_host.c
+run_mlir owned_string 44 examples/owned_string_host.c
 
 # -------------------------------------------------------------- 7. leaks --
 # THESE FIXTURES ASSERT LEAKS THAT CURRENTLY EXIST. Read this script's header
@@ -922,10 +946,12 @@ else
         || { fail "leaks: C compile examples/leaks/leak_host.c"; leak_shared_ok=0; }
     $LEAKCC -include examples/leaks/malloc_counter.h -c runtime/cell_rt.c -o "$TMP/leak_rt.o" 2>/dev/null \
         || { fail "leaks: C compile runtime/cell_rt.c with the malloc counter"; leak_shared_ok=0; }
+    # `src` is optional and defaults to the fixture of the same name, so a
+    # corpus example (owned_string) can be measured without a copy here.
     run_c_leaks() {
-        ex=$1; host=$2; want=$3; note=$4
+        ex=$1; host=$2; want=$3; note=$4; src=${5:-examples/leaks/$ex.cell}
         [ "$leak_shared_ok" -eq 1 ] || { fail "leaks $ex: shared objects did not build"; return; }
-        $CELL emit "examples/leaks/$ex.cell" > "$TMP/leak_$ex.c" 2>/dev/null \
+        $CELL emit "$src" > "$TMP/leak_$ex.c" 2>/dev/null \
             || { fail "leaks: C emit $ex"; return; }
         $LEAKCC -include examples/leaks/malloc_counter.h -Dmain=cell_program_main \
             -c "$TMP/leak_$ex.c" -o "$TMP/leak_$ex.o" 2>/dev/null \
@@ -992,23 +1018,32 @@ else
     # `main`; MLIR emits `cell_main` for the driver). A DROP in an IR pin
     # means an IR drop pass landed: update the pin and docs/OWNERSHIP.md
     # together; a RISE is a regression. The C row keeps both witnesses.
+    # `src` and `host` are optional, as in run_c_leaks. A host is compiled
+    # with the malloc counter included, so its allocations and frees count.
     run_ir_leaks() {
-        ex=$1; backend=$2; want=$3; note=$4
+        ex=$1; backend=$2; want=$3; note=$4; src=${5:-examples/leaks/$ex.cell}; host=${6:-}
         [ "$leak_shared_ok" -eq 1 ] || { fail "ir leaks $ex: shared objects did not build"; return; }
+        host_obj=""
+        if [ -n "$host" ]; then
+            host_obj="$TMP/irleak_${ex}_host.o"
+            $LEAKCC -include examples/leaks/malloc_counter.h -c "$host" -o "$host_obj" 2>/dev/null \
+                || { fail "ir leaks: C compile $host for $ex"; return; }
+        fi
         case "$backend" in
             llvm)
-                $CELL emit --target=llvm "examples/leaks/$ex.cell" > "$TMP/irleak_$ex.ll" 2>/dev/null \
+                $CELL emit --target=llvm "$src" > "$TMP/irleak_$ex.ll" 2>/dev/null \
                     || { fail "ir leaks: llvm emit $ex"; return; }
                 cc -Wno-override-module -x ir "$TMP/irleak_$ex.ll" -c -o "$TMP/irleak_${ex}_l.o" 2>/dev/null \
                     || { fail "ir leaks: llvm compile $ex"; return; }
-                cc "$TMP/irleak_${ex}_l.o" "$TMP/leak_rt.o" "$TMP/leak_counter.o" -o "$TMP/irleak_${ex}_l" 2>/dev/null \
+                # $host_obj is deliberately unquoted: empty means no extra object.
+                cc "$TMP/irleak_${ex}_l.o" "$TMP/leak_rt.o" "$TMP/leak_counter.o" $host_obj -o "$TMP/irleak_${ex}_l" 2>/dev/null \
                     || { fail "ir leaks: llvm link $ex"; return; }
                 bin="$TMP/irleak_${ex}_l" ;;
             mlir)
                 if [ ! -x "$LLVM_BIN/mlir-opt" ]; then
                     skip "ir leaks $ex (mlir-opt not found in $LLVM_BIN)"; return
                 fi
-                $CELL emit --target=mlir "examples/leaks/$ex.cell" > "$TMP/irleak_$ex.mlir" 2>/dev/null \
+                $CELL emit --target=mlir "$src" > "$TMP/irleak_$ex.mlir" 2>/dev/null \
                     || { fail "ir leaks: mlir emit $ex"; return; }
                 pipeline=$(mlir_pipeline "$TMP/irleak_$ex.mlir")
                 [ -n "$pipeline" ] || { fail "ir leaks: mlir $ex carries no '// lower with:' line"; return; }
@@ -1019,7 +1054,7 @@ else
                     || { fail "ir leaks: mlir-translate $ex"; return; }
                 "$LLVM_BIN/llc" -filetype=obj "$TMP/irleak_${ex}_m.ll" -o "$TMP/irleak_${ex}_m.o" 2>/dev/null \
                     || { fail "ir leaks: llc $ex"; return; }
-                cc "$TMP/irleak_${ex}_m.o" "$TMP/drv.c" "$TMP/leak_rt.o" "$TMP/leak_counter.o" -o "$TMP/irleak_${ex}_m" 2>/dev/null \
+                cc "$TMP/irleak_${ex}_m.o" "$TMP/drv.c" "$TMP/leak_rt.o" "$TMP/leak_counter.o" $host_obj -o "$TMP/irleak_${ex}_m" 2>/dev/null \
                     || { fail "ir leaks: mlir link $ex"; return; }
                 bin="$TMP/irleak_${ex}_m" ;;
         esac
@@ -1037,6 +1072,12 @@ else
     run_c_leaks ir_owned_string "" "$LEAK_IR_OWNED_STRING_C" "C frees what the IR backends leak, 2026-09-17"
     run_ir_leaks ir_owned_string llvm "$LEAK_IR_OWNED_STRING_LLVM" "no IR drop pass, 2026-09-17"
     run_ir_leaks ir_owned_string mlir "$LEAK_IR_OWNED_STRING_MLIR" "no IR drop pass, 2026-09-17"
+    run_c_leaks ir_string_conversion "" "$LEAK_IR_STRING_CONVERSION_C" "C frees every converted String, 2026-09-17"
+    run_ir_leaks ir_string_conversion llvm "$LEAK_IR_STRING_CONVERSION_LLVM" "IR String step (a) converts, no IR drop pass, 2026-09-17"
+    run_ir_leaks ir_string_conversion mlir "$LEAK_IR_STRING_CONVERSION_MLIR" "IR String step (a) converts, no IR drop pass, 2026-09-17"
+    run_c_leaks owned_string examples/owned_string_host.c "$LEAK_OWNED_STRING_C" "C frees what the IR backends leak, 2026-09-17" examples/owned_string.cell
+    run_ir_leaks owned_string llvm "$LEAK_OWNED_STRING_LLVM" "the host frees take's argument; no IR drop pass, 2026-09-17" examples/owned_string.cell examples/owned_string_host.c
+    run_ir_leaks owned_string mlir "$LEAK_OWNED_STRING_MLIR" "the host frees take's argument; no IR drop pass, 2026-09-17" examples/owned_string.cell examples/owned_string_host.c
 fi
 
 # ------------------------------------------- 8. cross-backend answer agreement --

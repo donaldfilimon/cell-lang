@@ -1,0 +1,84 @@
+// The eight borrowed-view to owned-String conversion positions of
+// examples/owned_string.cell, with no host, called 1000 times.
+//
+// Every conversion is a `cell_string_from_str` call that allocates. The C
+// backend frees each result where its owner goes out of scope (the `owned`
+// locals, the record's drop glue, the `owned` parameter, the reassignment's
+// pre-drop). The LLVM and MLIR backends make the same calls since IR String
+// step (a) and have no drop pass, so nothing they convert is freed.
+//
+// Nine allocations per call: rows 1 to 8 are one conversion each, plus the
+// initial `d = label()` that row 6's assignment overwrites. Measured counts
+// are pinned in tools/check.sh (stage 7), the malloc counter being the one
+// witness an IR build carries. A DROP in an IR pin means an IR drop pass
+// landed; update the pin and docs/OWNERSHIP.md together.
+//
+// It prints 44000: 44 per call, as owned_string.cell prints 44.
+//
+// Status: parses, passes `cell check`; C, LLVM and MLIR; lives under
+// examples/leaks/.
+
+pub fn print_int(copy value: Int);
+pub fn str_len(shared s: String) -> Int;
+
+pub struct Tag {
+    owned name: String
+}
+
+/// Row 4's destination, written in Cell so no host is needed.
+pub fn take(owned s: String) -> Int {
+    return str_len(shared s)
+}
+
+/// Row 1: a `return` from a `-> String` body.
+pub fn label() -> String {
+    return "ab"
+}
+
+/// Row 8: a value-slot `match` arm at a `return`.
+pub fn pick(copy n: Int) -> String {
+    return match n {
+        0 => label(),
+        _ => "abcdefghi",
+    }
+}
+
+pub fn once(copy n: Int) -> Int {
+    // Row 1.
+    let owned a: String = label()
+    // Row 2.
+    let owned b: String = "abc"
+    // Row 3.
+    var owned c: String = "abcd"
+    // Row 5.
+    let owned t: Tag = Tag { name: "abcdef" }
+    // Row 6: the literal is only on the assignment.
+    var owned d: String = label()
+    d = "abcdefg"
+    // Row 7: a value-slot `match` arm at a `let`.
+    let owned e: String = match n {
+        0 => label(),
+        _ => "abcdefgh",
+    }
+    // Row 8.
+    let owned g: String = pick(copy n)
+    // Row 4 is the call.
+    return str_len(shared a)
+        + str_len(shared b)
+        + str_len(shared c)
+        + take(owned "abcde")
+        + str_len(shared t.name)
+        + str_len(shared d)
+        + str_len(shared e)
+        + str_len(shared g)
+}
+
+pub fn main() {
+    var i = 0
+    var n = 0
+    while i < 1000 {
+        n = n + once(1)
+        i = i + 1
+    }
+    print_int(n)
+}

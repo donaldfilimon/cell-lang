@@ -48,6 +48,23 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `branch_field.cell` | R16 residual 1 at field granularity: a field moved on only one branch of an `if` leaked on the other; **CLOSED 2026-09-16** by branch-end field releases (live here, dead after the merge), 1000 -> 0 |
 | `field_revival.cell` | R16 residual: a field revived after it was moved leaked the new value; **CLOSED 2026-09-16** by retracting the revived path from `fieldWasMoved`, 1000 -> 0 |
 
+## IR backend pins
+
+The LLVM and MLIR backends have no drop pass, so every owned `String` they
+build is never freed. These rows are measured with ONE witness, the malloc
+counter, because an IR object cannot take `leak_host.c`'s renamed `main`; each
+also has a C row on both witnesses. A drop in an IR pin means an IR drop pass
+landed.
+
+| Fixture | What it pins |
+|---|---|
+| `ir_owned_string.cell` | owned Strings the IR backends accepted before any conversion existed: C 0, LLVM and MLIR 3000 (2026-09-17) |
+| `ir_string_conversion.cell` | the eight borrowed-view to owned-`String` positions of `examples/owned_string.cell`, which the IR backends convert through `cell_string_from_str` since IR String step (a): nine allocations per call, C 0, LLVM and MLIR 9000 (2026-09-17) |
+
+`tools/check.sh` also measures `examples/owned_string.cell` itself with its
+host in this stage: C 0, LLVM and MLIR 8 (nine allocations, one freed by the
+host's `take`).
+
 R11's sixth disclosed gap (an `owned` String or list place bound as `arc`) was
 never a runtime leak: it was a C type error, then a borrowck refusal, and since
 2026-09-16 it is implemented at `let`, at a direct `-> arc T` return, by
