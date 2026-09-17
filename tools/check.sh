@@ -760,7 +760,26 @@ while IFS= read -r f; do
         disagreements=$((disagreements + 1))
     fi
 done < "$TMP/accepted_examples"
-[ $disagreements -eq 0 ] && pass "llvm and mlir agree on every example"
+# The leak fixtures are invisible to the corpus loops on purpose, but a
+# VERDICT split hides there just as well: examples/leaks/field_revival.cell
+# was accepted by LLVM and refused by MLIR (assignment through a field path)
+# until 35d5c33, and nothing read it. Verdicts only; stage 7 owns their
+# counts and no other stage lowers them.
+for f in examples/leaks/*.cell; do
+    [ -f "$f" ] || continue
+    tag=$(artifact_tag "$f")
+    backend_emit_verdict llvm "$f" "$TMP/agree_$tag.ll" "$TMP/agree_$tag.llvm.err"
+    l=$BACKEND_VERDICT
+    backend_emit_verdict mlir "$f" "$TMP/agree_$tag.mlir" "$TMP/agree_$tag.mlir.err"
+    m=$BACKEND_VERDICT
+    if [ "$l" = error ] || [ "$m" = error ]; then
+        fail "$f: emit failed unexpectedly (llvm=$l mlir=$m)"
+    elif [ "$l" != "$m" ]; then
+        fail "$f: llvm=$l mlir=$m"
+        disagreements=$((disagreements + 1))
+    fi
+done
+[ $disagreements -eq 0 ] && pass "llvm and mlir agree on every example and leak fixture"
 
 # --------------------------------------------------------- 5. mlir lowering --
 # A VERDICT is not a lowering. Stage 4 asks each backend only whether it
