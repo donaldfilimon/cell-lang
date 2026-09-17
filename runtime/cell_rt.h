@@ -343,7 +343,7 @@ CELL_DEFINE_OPTIONAL(cell_opt_ptr, void *)
 /*
  * Every in-scope pair, predefined like the scalar optionals. Slugs: i64 i32
  * i16 i8 u64 u32 u16 u8 f64 f32 bool byte, plus unit for T, plus `string`
- * (an owning cell_string_t, sub-project 2) for T. The caller releases an
+ * (an owning cell_string_t, sub-project 2) for T and for E (sub-project 3). The caller releases an
  * owning payload; codegen emits per-module release glue for it. A payload-free
  * enum is int32_t and uses i32. Byte stays distinct from UInt8.
  */
@@ -353,7 +353,8 @@ CELL_DEFINE_OPTIONAL(cell_opt_ptr, void *)
     X(pfx, OT, u64, uint64_t) X(pfx, OT, u32, uint32_t)                        \
     X(pfx, OT, u16, uint16_t) X(pfx, OT, u8, uint8_t)                          \
     X(pfx, OT, f64, double) X(pfx, OT, f32, float)                             \
-    X(pfx, OT, bool, bool) X(pfx, OT, byte, uint8_t)
+    X(pfx, OT, bool, bool) X(pfx, OT, byte, uint8_t)                          \
+    X(pfx, OT, string, cell_string_t)
 /* The Ok side travels as its already-pasted prefix: <stdbool.h> makes
  * `bool` a macro, and a bare `bool` slug passed through two macro levels
  * would expand to `_Bool` before it is pasted. The Err slug is only ever an

@@ -619,6 +619,10 @@ _Static_assert(sizeof(cell_res_f64_f64_t) == 16, "cell_res_f64_f64_t layout");
 _Static_assert(sizeof(cell_res_i8_i8_t) == 2, "cell_res_i8_i8_t layout");
 _Static_assert(sizeof(cell_res_string_i32_t) == 32 && _Alignof(cell_res_string_i32_t) == 8
     && offsetof(cell_res_string_i32_t, as) == 8, "cell_res_string_i32_t layout");
+_Static_assert(sizeof(cell_res_i64_string_t) == 32 && offsetof(cell_res_i64_string_t, as) == 8,
+    "cell_res_i64_string_t layout");
+_Static_assert(sizeof(cell_res_string_string_t) == 32, "cell_res_string_string_t layout");
+_Static_assert(sizeof(cell_res_unit_string_t) == 32, "cell_res_unit_string_t layout");
 
 static void test_result(void) {
     /* Per-instantiation Results (CELL_RT_ABI_VERSION 2). Every payload is
@@ -665,6 +669,16 @@ static void test_result(void) {
     cell_string_free(&so.as.ok);
     cell_res_string_i64_t se = cell_res_string_i64_err(INT64_C(5000000000));
     CHECK(!se.ok && se.as.err == INT64_C(5000000000));
+
+    /* An owning String Err (sub-project 3), and both sides owning. */
+    cell_res_i64_string_t ee = cell_res_i64_string_err(cell_string_from_cstr("bad"));
+    CHECK(!ee.ok && ee.as.err.len == 3);
+    cell_string_free(&ee.as.err);
+    cell_res_string_string_t bo = cell_res_string_string_ok(cell_string_from_cstr("yes"));
+    cell_res_string_string_t be = cell_res_string_string_err(cell_string_from_cstr("no"));
+    CHECK(bo.ok && bo.as.ok.len == 3 && !be.ok && be.as.err.len == 2);
+    cell_string_free(&bo.as.ok);
+    cell_string_free(&be.as.err);
 
     /* The deprecated legacy names still compile for one runtime version. */
     cell_result_t legacy = cell_err(4);
