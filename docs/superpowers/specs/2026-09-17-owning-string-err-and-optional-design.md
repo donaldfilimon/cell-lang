@@ -1,6 +1,8 @@
 # Owning `String` in `Err` and in `String?` (Result sub-projects 3 and 4)
 
-Status: design for review, 2026-09-17. Not yet approved for implementation.
+Status: approved by Donald 2026-09-17 for plan and build (sub-project 3
+first). Review answers: `String?` is owning; `Result<String, String>` is in
+sub-project 3; both sub-projects proceed.
 Parents:
 - `2026-09-17-per-instantiation-results-design.md` (sub-project 1, landed).
 - `2026-09-17-owning-string-ok-design.md` (sub-project 2, landed through
