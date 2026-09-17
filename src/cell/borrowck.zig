@@ -370,6 +370,38 @@ const OpenBlock = struct {
     index: usize,
 };
 
+/// One `while` whose body is being walked. A `break` or `continue` targets
+/// the innermost `while` (SPEC 7.7), so only the top frame is consulted.
+/// See `checkWhile`.
+const LoopFrame = struct {
+    /// Every binding with a smaller id was declared before the loop, so
+    /// the back edge and a `break` carry its moves.
+    first_loop_id: u32,
+    /// `dead` as it stood before the condition's first evaluation, owned by
+    /// `checkWhile`. The body is walked from this state, so an iteration
+    /// that restarts with one of these entries still dead is a state the
+    /// walk already checked.
+    entry: []const Dead,
+    /// The outer part of `dead` at every `break`, unioned into `dead` after
+    /// the loop.
+    break_dead: std.ArrayListUnmanaged(Dead) = .empty,
+    /// Moves R2.a already reported at a `continue`, so the body end does not
+    /// report the same move twice.
+    reported: std.ArrayListUnmanaged(Dead) = .empty,
+
+    /// True when `d` is a move that the back edge or a `break` carries out
+    /// of this iteration: a binding declared before the loop, moved in this
+    /// loop's condition or body and not revived since.
+    fn carries(self: *const LoopFrame, d: Dead) bool {
+        return d.binding < self.first_loop_id and !containsDead(self.entry, d);
+    }
+
+    fn deinit(self: *LoopFrame, allocator: std.mem.Allocator) void {
+        self.break_dead.deinit(allocator);
+        self.reported.deinit(allocator);
+    }
+};
+
 pub const Checker = struct {
     allocator: std.mem.Allocator,
     /// Owns every formatted diagnostic message, so messages outlive the walk
@@ -393,6 +425,8 @@ pub const Checker = struct {
     block_loans: std.ArrayList(Loan) = .empty,
     temp_loans: std.ArrayList(Loan) = .empty,
     open_blocks: std.ArrayList(OpenBlock) = .empty,
+    /// The `while` statements being walked, innermost last. See `LoopFrame`.
+    loop_frames: std.ArrayListUnmanaged(LoopFrame) = .empty,
     next_binding_id: u32 = 0,
     /// Every binding id that was moved at least once, anywhere in the
     /// function that declared it (task 3: conservative drop insertion).
@@ -561,6 +595,8 @@ pub const Checker = struct {
         self.block_loans.deinit(self.allocator);
         self.temp_loans.deinit(self.allocator);
         self.open_blocks.deinit(self.allocator);
+        for (self.loop_frames.items) |*frame| frame.deinit(self.allocator);
+        self.loop_frames.deinit(self.allocator);
         self.diagnostics.deinit(self.allocator);
         self.arena.deinit();
     }
@@ -960,16 +996,36 @@ pub const Checker = struct {
         const first_loop_id = self.next_binding_id;
         defer self.invalidateLoopStores(liveness_before, moved_before);
 
+        // A COPY, not an index: `revive` removes entries with `swapRemove`,
+        // so an index into `dead` taken here can end up past a move the body
+        // made (the `swap_hide` shape in examples/rejected/skip_revival_jump.cell).
+        // Taken before the condition, so a move there counts as a loop move.
+        var entry_dead = try self.dead.clone(self.allocator);
+        defer entry_dead.deinit(self.allocator);
+
         try self.checkExpr(@constCast(&w.cond));
         const moved_after_cond = self.moved_paths.items.len;
 
-        const first_inner_id = self.next_binding_id;
-        const dead_before = self.dead.items.len;
+        // The frame is pushed after the condition: a jump in a condition's
+        // value block is counted by typecheck against the enclosing loop.
+        try self.loop_frames.append(self.allocator, .{
+            .first_loop_id = first_loop_id,
+            .entry = entry_dead.items,
+        });
+        var frame_popped = false;
+        defer if (!frame_popped) {
+            var f = self.loop_frames.pop().?;
+            f.deinit(self.allocator);
+        };
 
         // checkBlockStmts pushes the scope and the open-block entry, so a
         // binding declared in the body dies with it and a named loan created
         // there is truncated on the way out, exactly as in an `if` body.
         try self.checkBlockStmts(w.body);
+
+        var frame = self.loop_frames.pop().?;
+        frame_popped = true;
+        defer frame.deinit(self.allocator);
 
         // Snapshot P_exit BEFORE invalidation poisons the jump bits.
         // Recorded after the poison so `after_loop` is not itself cleared.
@@ -1000,12 +1056,13 @@ pub const Checker = struct {
             }
         }
 
-        // Anything still dead that was declared before the loop was moved in
-        // the body and never revived.
-        var i = dead_before;
-        while (i < self.dead.items.len) : (i += 1) {
-            const d = self.dead.items[i];
-            if (d.binding >= first_inner_id) continue;
+        // Anything still dead that was declared before the loop and was not
+        // already dead on entry was moved in the condition or the body and
+        // never revived. A move a `continue` already reported is not
+        // reported again.
+        for (self.dead.items) |d| {
+            if (!frame.carries(d)) continue;
+            if (containsDead(frame.reported.items, d)) continue;
             try self.diagnostics.err(self.arena.allocator(), d.span, try std.fmt.allocPrint(
                 self.arena.allocator(),
                 "'{s}' is moved inside a loop, so the next iteration would use it after the move",
@@ -1085,6 +1142,32 @@ pub const Checker = struct {
         }
     }
 
+    /// R2.a at a `continue`: the jump reaches the next iteration, so every
+    /// move the frame carries is a use-after-move there, exactly as it would
+    /// be at the end of the body. The body end never sees this path when a
+    /// revival follows the `continue`.
+    fn checkContinue(self: *Checker, span: Span) Error!void {
+        const n = self.loop_frames.items.len;
+        // Typecheck refuses a jump outside a loop.
+        if (n == 0) return;
+        const frame = &self.loop_frames.items[n - 1];
+        for (self.dead.items) |d| {
+            if (!frame.carries(d)) continue;
+            if (containsDead(frame.reported.items, d)) continue;
+            try frame.reported.append(self.allocator, d);
+            try self.diagnostics.err(self.arena.allocator(), d.span, try std.fmt.allocPrint(
+                self.arena.allocator(),
+                "'{s}' is moved inside a loop, so the next iteration would use it after the move",
+                .{d.display},
+            ));
+            try self.diagnostics.note(self.arena.allocator(), span, try std.fmt.allocPrint(
+                self.arena.allocator(),
+                "this 'continue' is reached before '{s}' is assigned again",
+                .{d.display},
+            ));
+        }
+    }
+
     fn checkStmt(self: *Checker, stmt: *const ast.Stmt) Error!void {
         try self.checkStmtKind(stmt);
         // After the returned expression is checked, so a place it moves out
@@ -1103,7 +1186,11 @@ pub const Checker = struct {
             // A `break` or `continue` moves nothing and borrows nothing. It
             // does change which paths reach the end of the body, which R2.a
             // below deliberately ignores; see the note there.
-            .break_stmt, .continue_stmt => try self.recordExit(.jump, @intFromPtr(stmt)),
+            .break_stmt => try self.recordExit(.jump, @intFromPtr(stmt)),
+            .continue_stmt => {
+                try self.checkContinue(stmt.span);
+                try self.recordExit(.jump, @intFromPtr(stmt));
+            },
             .let => |*l| try self.checkLet(l, stmt.span),
             .expr => |*e| try self.checkExpr(e),
             .return_stmt => |*opt| {
@@ -7775,6 +7862,144 @@ test "R2.a: reassigning before the body ends revives the place and the loop is l
         \\        i = i + 1
         \\    }
         \\}
+    );
+}
+
+// ── R2.a at a `continue` (2026-09-16) ───────────────────────────────────────
+//
+// Each refused program below was accepted before this change and ran as an
+// AddressSanitizer double free (exit 134), measured with `cell run` and a
+// `cc -fsanitize=address` wrapper.
+
+const jump_prelude =
+    \\pub fn take(owned s: String) { }
+    \\pub fn consume(owned s: String) -> Bool { return false }
+    \\
+;
+// jump_prelude occupies lines 1 and 2, so a test body's first line is 3.
+
+test "R2.a: a continue between a move and its revival is refused" {
+    try expectDiagnostics(jump_prelude ++
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        if i < n {
+        \\            continue
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\}
+    ,
+        \\t.cell:8:14: error: 'v' is moved inside a loop, so the next iteration would use it after the move
+        \\t.cell:10:13: note: this 'continue' is reached before 'v' is assigned again
+        \\
+    );
+}
+
+test "R2.a: a continue after the revival is accepted" {
+    try expectAccepted(jump_prelude ++
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        v = "b"
+        \\        if i < n {
+        \\            continue
+        \\        }
+        \\    }
+        \\}
+    );
+}
+
+test "R2.a: a continue in an inner loop is checked against the inner loop" {
+    try expectDiagnostics(jump_prelude ++
+        \\pub fn f() {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 2 {
+        \\        i = i + 1
+        \\        var j = 0
+        \\        while j < 2 {
+        \\            j = j + 1
+        \\            take(v)
+        \\            if j < 2 {
+        \\                continue
+        \\            }
+        \\            v = "b"
+        \\        }
+        \\    }
+        \\}
+    ,
+        \\t.cell:11:18: error: 'v' is moved inside a loop, so the next iteration would use it after the move
+        \\t.cell:13:17: note: this 'continue' is reached before 'v' is assigned again
+        \\
+    );
+}
+
+test "R2.a: a place already moved before the loop does not fire at a continue" {
+    // The body is walked from the entry state, so an iteration that restarts
+    // with `v` still moved is exactly the state that was checked. The body
+    // never reads `v`, so nothing here is a use.
+    try expectAccepted(jump_prelude ++
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    take(v)
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        if i < n {
+        \\            continue
+        \\        }
+        \\    }
+        \\}
+    );
+}
+
+test "R2.a: a move reached by both a continue and the body end is reported once" {
+    try expectDiagnostics(jump_prelude ++
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        if i < n {
+        \\            continue
+        \\        }
+        \\    }
+        \\}
+    ,
+        \\t.cell:8:14: error: 'v' is moved inside a loop, so the next iteration would use it after the move
+        \\t.cell:10:13: note: this 'continue' is reached before 'v' is assigned again
+        \\
+    );
+}
+
+test "R2.a: reviving a place moved before the loop does not hide a body move" {
+    // `a = ...` removes `a`'s entry from `dead` with `swapRemove`, which
+    // moved `b`'s in-body entry below the index the body-end check used to
+    // start from, so `b` was never reported.
+    try expectDiagnostics(jump_prelude ++
+        \\pub fn f(copy n: Int) {
+        \\    var owned a: String = "a"
+        \\    var owned b: String = "b"
+        \\    take(a)
+        \\    var i = 0
+        \\    while i < n {
+        \\        i = i + 1
+        \\        take(b)
+        \\        a = "c"
+        \\    }
+        \\}
+    ,
+        \\t.cell:10:14: error: 'b' is moved inside a loop, so the next iteration would use it after the move
+        \\t.cell:8:5: note: 'b' is declared outside this loop; assign to it before the end of the body to revive it
+        \\
     );
 }
 
