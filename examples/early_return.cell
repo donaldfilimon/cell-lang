@@ -1,0 +1,57 @@
+// Early exits end their path in the borrow checker: a branch that always
+// leaves by `return`, `break` or `continue` keeps its moves out of the code
+// after the `if` (2026-09-17). Each function below was refused before
+// ("use of 'p' after it was moved").
+//
+// Status: parses, passes `cell check`, and runs on the C, LLVM and MLIR
+// backends, printing 1114 on each (see EXPECT-OUTPUT).
+// EXPECT-OUTPUT: 1114
+
+pub fn print_int(copy value: Int);
+
+pub struct Pair {
+    a: Int,
+    b: Int,
+}
+
+pub fn sum(owned p: Pair) -> Int {
+    return p.a + p.b
+}
+
+pub fn pick(copy c: Bool, owned p: Pair) -> Int {
+    if c {
+        return sum(p) * 10
+    }
+    return sum(p)
+}
+
+pub fn pick_else(copy c: Bool, owned p: Pair) -> Int {
+    if c {
+        let n = 0
+    } else {
+        return sum(p) * 100
+    }
+    return sum(p)
+}
+
+pub fn first_big(copy limit: Int, owned p: Pair) -> Int {
+    var total = 0
+    var i = 0
+    while i < 5 {
+        i = i + 1
+        if i > limit {
+            total = total + sum(p)
+            break
+        }
+        total = total + i
+    }
+    return total
+}
+
+pub fn main() {
+    let copy x = pick(true, Pair { a: 1, b: 0 })
+    let copy y = pick(false, Pair { a: 1, b: 1 })
+    let copy z = pick_else(false, Pair { a: 1, b: 9 })
+    let copy w = first_big(2, Pair { a: 50, b: 49 })
+    print_int(x + y + z + w)
+}

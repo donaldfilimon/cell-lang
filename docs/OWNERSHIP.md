@@ -224,6 +224,17 @@ pub fn main() {
 Corpus: `examples/rejected/use_after_move.cell`, which passes `cell check`
 today and must not once this rule exists.
 
+**A branch that always leaves does not reach the code after its `if`
+(2026-09-17).** When an `if` branch provably ends in `return`, `break` or
+`continue` (its last statement, or a trailing `if`/`else` whose branches
+both do), its moves stay out of the state after the `if`: a `break` already
+saved its state for the code after the loop, a `continue` already met R2.a,
+and a `return` left the function. `if c { return s }; return s` is accepted.
+A branch that only sometimes leaves still merges. `match` arms still merge
+unconditionally. Corpus: `examples/early_return.cell` (1114 on all three
+backends), `examples/leaks/early_return.cell` (pinned at 0). Plan:
+`docs/superpowers/plans/2026-09-17-early-return-divergence.md`.
+
 **That list names the forms a PLACE takes, and reading it as a list of
 initializers is what R2.b below exists to correct.** Every one of the five
 positions asked `placeOf` first and READ anything else, so an `owned` slot
@@ -2194,7 +2205,8 @@ ways, and each is a real, documented gap rather than an oversight:
 - **Conservative on moves, in the leak-safe direction.** Borrowck's move
   tracking merges branches conservatively (a move in one arm of an `if`
   marks the place moved for everything after it, whether or not that arm
-  ran), so a conditionally-moved value is never dropped on any path,
+  ran, unless that arm always leaves by `return`/`break`/`continue`,
+  2026-09-17), so a conditionally-moved value is never dropped on any path,
   including the paths where it was not actually moved. That is a real leak,
   and it is intentional: dropping a maybe-moved place risks a double free,
   and leaking is the strictly safer failure.

@@ -1882,6 +1882,29 @@ pub const Checker = struct {
     /// The key codegen uses for a branch body: the block's statement slice
     /// when the branch is a block, else the expression itself. Mirrored by
     /// `codegen.branchKey`.
+    /// True only when `e` provably never falls through: a block whose last
+    /// statement is `return`, `break` or `continue`, or ends in an `if` with
+    /// an `else` whose branches both diverge, or in a block that does.
+    /// Anything unproven is false, which keeps the conservative merge.
+    fn branchDiverges(e: *const ast.Expr) bool {
+        switch (e.kind) {
+            .block => |stmts| {
+                if (stmts.len == 0) return false;
+                const last = &stmts[stmts.len - 1];
+                return switch (last.kind) {
+                    .return_stmt, .break_stmt, .continue_stmt => true,
+                    .expr => |*x| branchDiverges(x),
+                    else => false,
+                };
+            },
+            .if_expr => |x| {
+                const else_body = x.else_body orelse return false;
+                return branchDiverges(x.then_body) and branchDiverges(else_body);
+            },
+            else => return false,
+        }
+    }
+
     fn branchKeyOf(e: *const ast.Expr) usize {
         return switch (e.kind) {
             .block => |stmts| if (stmts.len > 0) @intFromPtr(stmts.ptr) else @intFromPtr(e),
@@ -2503,15 +2526,27 @@ pub const Checker = struct {
 
         self.dead.clearRetainingCapacity();
         try self.dead.appendSlice(self.allocator, entry.items);
+        var else_diverges = false;
         if (i.else_body) |else_body| {
             try self.checkExpr(else_body);
             try self.recordExit(.branch_end, branchKeyOf(else_body));
+            else_diverges = branchDiverges(else_body);
         } else {
             // Missing else: live iff not moved before the if. Keyed by the
             // if expression, matching codegen's synthesized-else drops.
             try self.recordExit(.branch_end, @intFromPtr(expr));
         }
-        try self.unionDead(then_dead.items);
+        // A branch that always leaves by `return`, `break` or `continue`
+        // never reaches the code after the `if` (2026-09-17): a `break`
+        // saved its state, a `continue` met R2.a, a `return` left the
+        // function. Its moves stay out of the merge.
+        const then_diverges = branchDiverges(i.then_body);
+        if (else_diverges) {
+            self.dead.clearRetainingCapacity();
+            try self.dead.appendSlice(self.allocator, if (then_diverges) entry.items else then_dead.items);
+        } else if (!then_diverges) {
+            try self.unionDead(then_dead.items);
+        }
     }
 
     fn checkMatch(self: *Checker, m: *const @FieldType(ast.Expr.Kind, "match_expr")) Error!void {
@@ -7023,9 +7058,14 @@ test "R10's move into arc: a whole owned String or list binding is moved at retu
         \\    return t
         \\}
     );
-    // The return still MOVES: a use after a conditional return is refused
-    // exactly as it is for a `-> String` function.
-    try expectRejectedWith(
+    // A conditional return followed by a use is ACCEPTED since 2026-09-17:
+    // the use is only reached on the path that did not return, where `p`
+    // still holds its value. This assertion used to require a refusal, which
+    // was the false refusal docs/superpowers/plans/2026-09-17-early-return-divergence.md
+    // fixed. That the return moves is pinned where it is observable: the
+    // return's liveness record (no drop of `p` there) and
+    // examples/leaks/arc_box_move.cell.
+    try expectAccepted(
         \\pub fn view(shared s: String) -> Int;
         \\pub fn f(copy c: Int, owned p: String) -> arc String {
         \\    if c > 0 {
@@ -7034,7 +7074,7 @@ test "R10's move into arc: a whole owned String or list binding is moved at retu
         \\    let n = view(p)
         \\    return "x"
         \\}
-    , "use of 'p' after it was moved");
+    );
     // Every other source keeps the refusal: a field, an `Int?`, a block tail
     // (its binding is block-scoped and that box path was not built), and a
     // branch value.
@@ -8514,10 +8554,13 @@ test "a return block resolves its own owned local" {
     );
 }
 
-test "a return block whose tail is an OUTER place moves it" {
-    // The move is recorded before the function ends, so a use on a later
-    // path sees it: the `return` sits in one branch and the use follows.
-    try expectDiagnostics(block_prelude ++
+test "a return block whose tail is an OUTER place is accepted after a conditional return" {
+    // A use after a conditional return is reached only on the path that did
+    // not return, so it is ACCEPTED since 2026-09-17 (this test used to pin
+    // the false refusal). The move itself is pinned by the codegen test "a
+    // return block whose tail is an outer owned place moves it: no drop of
+    // the source".
+    try expectAccepted(block_prelude ++
         \\pub fn mk(copy c: Bool) -> String {
         \\    let owned s1 = make()
         \\    if c {
@@ -8526,10 +8569,6 @@ test "a return block whose tail is an OUTER place moves it" {
         \\    eat(owned s1)
         \\    return make()
         \\}
-    ,
-        \\t.cell:8:15: error: use of 's1' after it was moved
-        \\t.cell:6:18: note: 's1' was moved here by returning it
-        \\
     );
 }
 
@@ -8942,6 +8981,111 @@ test "a return between the move and the revival stays dead" {
     );
     defer h.deinit();
     try std.testing.expect(!h.checker.liveAtExit(.return_stmt, firstReturnIn(h.fnBody("f")).?, h.binding("v")));
+}
+
+test "an if branch that always returns does not reach the code after the if" {
+    // 2026-09-17, docs/superpowers/plans/2026-09-17-early-return-divergence.md.
+    try expectAccepted(
+        \\pub fn take(owned s: String) { }
+        \\pub fn early(copy c: Bool, owned s: String) {
+        \\    if c {
+        \\        take(s)
+        \\        return
+        \\    }
+        \\    take(s)
+        \\}
+        \\pub fn early_value(copy c: Bool, owned s: String) -> String {
+        \\    if c {
+        \\        return s
+        \\    }
+        \\    return s
+        \\}
+        \\pub fn else_side(copy c: Bool, owned s: String) {
+        \\    if c {
+        \\        let n = 1
+        \\    } else {
+        \\        take(s)
+        \\        return
+        \\    }
+        \\    take(s)
+        \\}
+        \\pub fn nested(copy c: Bool, copy d: Bool, owned s: String) {
+        \\    if c {
+        \\        take(s)
+        \\        if d {
+        \\            return
+        \\        } else {
+        \\            return
+        \\        }
+        \\    }
+        \\    take(s)
+        \\}
+        \\
+    );
+}
+
+test "a branch that only sometimes returns still reaches the code after the if" {
+    try expectRejectedWith(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy c: Bool, copy d: Bool, owned s: String) {
+        \\    if c {
+        \\        take(s)
+        \\        if d {
+        \\            return
+        \\        }
+        \\    }
+        \\    take(s)
+        \\}
+        \\
+    , "use of 's' after it was moved");
+    try expectRejectedWith(
+        \\pub fn take(owned s: String) { }
+        \\pub fn g(copy c: Bool, owned s: String) {
+        \\    if c {
+        \\        return
+        \\    } else {
+        \\        take(s)
+        \\    }
+        \\    take(s)
+        \\}
+        \\
+    , "use of 's' after it was moved");
+}
+
+test "a moved-then-break branch is accepted inside the loop and refused after it" {
+    try expectAccepted(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy c: Bool, owned s: String) {
+        \\    var owned v: String = s
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        if c {
+        \\            take(v)
+        \\            break
+        \\        }
+        \\        take(v)
+        \\        v = "c"
+        \\    }
+        \\}
+        \\
+    );
+    try expectRejectedWith(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy c: Bool, owned s: String) {
+        \\    var owned v: String = s
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        if c {
+        \\            take(v)
+        \\            break
+        \\        }
+        \\    }
+        \\    take(v)
+        \\}
+        \\
+    , "use of 'v' after it was moved");
 }
 
 test "after_loop is absent when the condition moves the outer var" {

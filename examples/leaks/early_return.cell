@@ -1,0 +1,61 @@
+// Early exits (2026-09-17): a branch that always leaves keeps its moves out
+// of the code after the `if`. These shapes were refused before, so this is
+// a regression pin, not a closed gap: every path must release what it holds
+// exactly once.
+//
+// `tail_only` moves on the returning branch and holds the value on the
+// other, released at function end. `after_if` moves on both paths. `in_loop`
+// moves then `break`s on one path (a skip-revival `break`, jumped past the
+// release after the loop) and revives on the other. 1000 calls each,
+// alternating the flag. Measured: leaks 0, counter LIVE=0.
+//
+// Status: parses, passes `cell check`; C only; lives under examples/leaks/.
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn tail_only(copy c: Bool) {
+    var owned s: String = "aaaaaaaa"
+    if c {
+        take(s)
+        return
+    }
+}
+
+pub fn after_if(copy c: Bool) {
+    var owned s: String = "aaaaaaaa"
+    if c {
+        take(s)
+        return
+    }
+    take(s)
+}
+
+pub fn in_loop(copy c: Bool) {
+    var owned v: String = "aaaaaaaa"
+    var i = 0
+    while i < 2 {
+        i = i + 1
+        if c {
+            take(v)
+            break
+        }
+        take(v)
+        v = "bbbbbbbb"
+    }
+}
+
+pub fn main() {
+    var i = 0
+    var c = true
+    while i < 1000 {
+        tail_only(c)
+        after_if(c)
+        in_loop(c)
+        c = !c
+        i = i + 1
+    }
+    print_int(i)
+}
