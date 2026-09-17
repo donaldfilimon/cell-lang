@@ -396,6 +396,12 @@ pub const Generator = struct {
     /// local declared since the LOOP's mark, not since the innermost
     /// block's: `emitLoopExitDrops` reads the top of this stack.
     loop_marks: std.ArrayList(usize) = .empty,
+    /// Temporary owning scrutinees of the `match`es being emitted, innermost
+    /// last (2026-09-17). An early exit releases the untaken ones it leaves:
+    /// a `return` all of them, a `break`/`continue` those created inside the
+    /// loop it leaves. `taken` is set while emitting the arm that bound the
+    /// owning payload with `owned`.
+    owning_temps: std.ArrayList(OwningTemp) = .empty,
     /// Every `while` being emitted whose skip-revival `break`s jump to a
     /// label after its releases (`after_loop_skip`), innermost last.
     skip_labels: std.ArrayList(SkipLabel) = .empty,
@@ -1485,6 +1491,8 @@ pub const Generator = struct {
         self.drop_exit = key;
         defer self.drop_exit = saved;
         try self.emitDropsSince(mark, indent, key);
+        // Temporaries created inside the loop this jump leaves.
+        try self.emitTempReleases(self.loop_marks.items.len, indent);
     }
 
     /// After a `while`: release an outer binding this loop moved and then
@@ -1572,7 +1580,7 @@ pub const Generator = struct {
         defer self.drop_exit = saved;
         const to_drop = try self.pendingDrops(exit);
         const retain = if (opt) |v| try self.returnedArcNeedsRetain(&v) else false;
-        if (to_drop.len == 0) {
+        if (to_drop.len == 0 and !self.hasUntakenTemps(0)) {
             try self.writeIndent(indent);
             try out.writeAll("return");
             if (opt) |v| {
@@ -1590,12 +1598,34 @@ pub const Generator = struct {
             try self.emitReturnValue(&v, retain, indent);
             try out.writeAll(";\n");
             for (to_drop) |local| try self.emitDropFor(indent, local);
+            try self.emitTempReleases(0, indent);
             try self.writeIndent(indent);
             try out.print("return {s};\n", .{temp});
         } else {
             for (to_drop) |local| try self.emitDropFor(indent, local);
+            try self.emitTempReleases(0, indent);
             try self.writeIndent(indent);
             try out.writeAll("return;\n");
+        }
+    }
+
+    fn hasUntakenTemps(self: *const Generator, min_depth: usize) bool {
+        for (self.owning_temps.items) |t| {
+            if (t.loop_depth >= min_depth and !t.taken) return true;
+        }
+        return false;
+    }
+
+    /// Release the untaken temporary owning scrutinees created at loop depth
+    /// `min_depth` or deeper, innermost first.
+    fn emitTempReleases(self: *Generator, min_depth: usize, indent: usize) EmitError!void {
+        var i = self.owning_temps.items.len;
+        while (i > 0) {
+            i -= 1;
+            const t = self.owning_temps.items[i];
+            if (t.loop_depth < min_depth or t.taken) continue;
+            try self.writeIndent(indent);
+            try self.writer.print("cell_drop_{s}(&{s});\n", .{ t.stem, t.name });
         }
     }
 
@@ -2120,6 +2150,17 @@ pub const Generator = struct {
         const outer_mark = self.locals.items.len;
         const scrut_inner = unwrapAnnotated(m.scrutinee);
         const scrut_is_temp = scrut_inner.kind != .ident and scrut_inner.kind != .field;
+        const tracks_temp = scrut_is_temp and hasOwningGlue(scrut_ty);
+        if (tracks_temp) {
+            try self.owning_temps.append(self.arena, .{
+                .name = temp,
+                .stem = glueStem(scrut_ty),
+                .loop_depth = self.loop_marks.items.len,
+            });
+        }
+        defer if (tracks_temp) {
+            _ = self.owning_temps.pop();
+        };
 
         try self.writeIndent(indent);
         try out.writeAll("{\n");
@@ -2207,6 +2248,14 @@ pub const Generator = struct {
         const mark = self.locals.items.len;
         defer self.locals.shrinkRetainingCapacity(mark);
         const outer_after = self.current_after;
+        const took = arm.pattern.kind == .wrap_pattern and
+            arm.pattern.kind.wrap_pattern.mode == .owned and
+            ((arm.pattern.kind.wrap_pattern.ctor == .ok and resultOkOwning(scrut_ty)) or
+                (arm.pattern.kind.wrap_pattern.ctor == .err and resultErrOwning(scrut_ty)) or
+                (arm.pattern.kind.wrap_pattern.ctor == .some and isOwningOptional(scrut_ty)));
+        if (scrut_is_temp and hasOwningGlue(scrut_ty)) {
+            self.owning_temps.items[self.owning_temps.items.len - 1].taken = took;
+        }
 
         if (arm.pattern.kind == .binding) {
             const name = arm.pattern.kind.binding;
@@ -2300,11 +2349,6 @@ pub const Generator = struct {
         try self.emitBranchEndDrops(key, arm_outer_mark, outer_after, indent);
         // A temporary owning scrutinee no arm binding took.
         if (scrut_is_temp and hasOwningGlue(scrut_ty)) {
-            const took = arm.pattern.kind == .wrap_pattern and
-                arm.pattern.kind.wrap_pattern.mode == .owned and
-                ((arm.pattern.kind.wrap_pattern.ctor == .ok and resultOkOwning(scrut_ty)) or
-                    (arm.pattern.kind.wrap_pattern.ctor == .err and resultErrOwning(scrut_ty)) or
-                    (arm.pattern.kind.wrap_pattern.ctor == .some and isOwningOptional(scrut_ty)));
             if (!took) {
                 try self.writeIndent(indent);
                 try self.writer.print("cell_drop_{s}(&{s});\n", .{ glueStem(scrut_ty), temp });
@@ -4336,6 +4380,13 @@ fn endsInJump(body: []const ast.Stmt) bool {
 const Exit = struct {
     kind: borrowck.ExitKind,
     key: usize,
+};
+
+const OwningTemp = struct {
+    name: []const u8,
+    stem: []const u8,
+    loop_depth: usize,
+    taken: bool = false,
 };
 
 const SkipLabel = struct {
@@ -7822,6 +7873,61 @@ test "an owning String? is its own instance, bound, released and copied when unr
     try expectOccurrences(try fnDef(e.text, "temp"), "cell_drop_opt_string(&_cell_t", 2);
     try expectOccurrences(try fnDef(e.text, "reassign"), "cell_drop_opt_string(&o);", 2);
     try expectContains(try fnDef(e.text, "unresolved"), "cell_opt_string_some(cell_string_clone(&s))");
+    try expectCompiles(e.text);
+}
+
+test "a temporary owning scrutinee is released when its arm leaves early" {
+    // 2026-09-17: the residual sub-projects 2-4 recorded. A `return` releases
+    // every untaken temporary; a `break`/`continue` those created inside the
+    // loop it leaves; an arm that took the payload releases nothing.
+    var e = try emitSource(
+        \\pub fn find() -> String?;
+        \\pub fn view(shared s: String) -> Int;
+        \\pub fn take(owned s: String);
+        \\pub fn early() -> Int {
+        \\  match find() {
+        \\    Some(shared x) => {
+        \\      return view(x)
+        \\    },
+        \\    None => {},
+        \\  }
+        \\  return 0
+        \\}
+        \\pub fn taken() -> Int {
+        \\  match find() {
+        \\    Some(owned x) => {
+        \\      take(x)
+        \\      return 1
+        \\    },
+        \\    None => {},
+        \\  }
+        \\  return 0
+        \\}
+        \\pub fn loop_exit(copy n: Int) -> Int {
+        \\  var i = 0
+        \\  while i < n {
+        \\    i = i + 1
+        \\    match find() {
+        \\      Some(_) => {
+        \\        break
+        \\      },
+        \\      None => {
+        \\        continue
+        \\      },
+        \\    }
+        \\  }
+        \\  return i
+        \\}
+    );
+    defer e.deinit();
+    const early = try fnDef(e.text, "early");
+    // Before the early return (after its value is computed), and at the end
+    // of the None arm.
+    try expectOccurrences(early, "cell_drop_opt_string(&_cell_t", 2);
+    const tk = try fnDef(e.text, "taken");
+    try expectOccurrences(tk, "cell_drop_opt_string(&_cell_t", 1);
+    const lx = try fnDef(e.text, "loop_exit");
+    try expectOccurrences(lx, "cell_drop_opt_string(&_cell_t", 2);
     try expectCompiles(e.text);
 }
 

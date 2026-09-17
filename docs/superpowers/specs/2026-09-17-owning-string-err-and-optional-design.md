@@ -191,7 +191,8 @@ What `String?` means **(default: owning, like `String`)**.
     corpus.
   - **Carried-over residual.** The residuals found in sub-project 2 carry
     over unchanged: yielding an `owned` binding straight from its arm, and a
-    temporary scrutinee not released on an arm's early exit.
+    temporary scrutinee not released on an arm's early exit (the latter closed
+later the same day).
 
 ## Open questions for review
 

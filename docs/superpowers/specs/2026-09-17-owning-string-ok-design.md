@@ -6,7 +6,8 @@ applied: `Ok(_)` is allowed, the release glue is generated per module).
 Differences found while building: `Ok(x)` moves only an operand whose type
 the checker resolves and copies any other; yielding the `Ok(owned ..)`
 binding straight out of its arm is refused for now; a temporary scrutinee is
-not released when its arm leaves early (a leak).
+not released when its arm leaves early (a leak; closed later the same day,
+see OWNERSHIP R11).
 Parent: `2026-09-17-per-instantiation-results-design.md` (sub-project 1,
 landed through `0a29df3`).
 

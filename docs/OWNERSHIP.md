@@ -1245,8 +1245,10 @@ branch end (every match arm now ends with those releases), an owned
 reassignment, and, for a temporary scrutinee, the end of every arm that did
 not bind `Ok(owned ..)`. `examples/leaks/owned_string_result.cell` is pinned
 at 0 on both witnesses; with the temporary release removed it measured 2000.
-Residual: an arm that leaves early does not release a temporary scrutinee
-(a leak).
+An arm that leaves early releases the untaken temporary scrutinees it
+leaves (2026-09-17): a `return` all of them, a `break`/`continue` those
+created inside the loop it leaves; `examples/leaks/owned_string_optional.cell`
+covers both (0, and 3000 with those releases disabled).
 
 **The IR backends insert no releases at all (measured 2026-09-17).** Both
 accept an owned `String` from a call (`let owned s = str_from_int(i)`, and an

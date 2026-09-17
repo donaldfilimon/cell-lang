@@ -478,6 +478,8 @@ LEAK_OWNED_STRING_RESULT=0
 LEAK_OWNED_STRING_ERR=0
 # Owning String? (sub-project 4, 2026-09-17), 1000 times. Measured 0
 # (ALLOC=8000 FREE=8000); with the release glue emptied it measured 5000.
+# Early-exit shapes added the same day: 0 (ALLOC=11000); with the
+# early-exit temporary releases disabled, 3000.
 LEAK_OWNED_STRING_OPTIONAL=0
 # Early exits (2026-09-17): shapes refused before the divergence rule, so a
 # regression pin rather than a closed gap. Measured 0 on first run.

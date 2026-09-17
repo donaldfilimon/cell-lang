@@ -1,6 +1,7 @@
 // Owning String? (sub-project 4, 2026-09-17). Every shape
 // optional_string.cell pins, looped 1000 times, plus temporaries no arm
-// takes (`Some(_)`, `Some(shared ..)`) and a reassigned `var`.
+// takes (`Some(_)`, `Some(shared ..)`), a reassigned `var`, and temporaries
+// whose arm leaves early by `return`, `break` or `continue` (2026-09-17).
 //
 // Pinned at 0 on both witnesses, and also run by hand under
 // AddressSanitizer (stage 9 does not see examples/leaks/).
@@ -40,6 +41,33 @@ pub fn wrap(owned s: String) -> String? {
     return Some(s)
 }
 
+pub fn early(copy i: Int) -> Int {
+    match lookup(i) {
+        Some(shared s) => {
+            return str_len(s)
+        },
+        None => {},
+    }
+    return 0
+}
+
+pub fn loop_exit(copy i: Int) -> Int {
+    var k = 0
+    while k < 3 {
+        k = k + 1
+        match lookup(i + k) {
+            Some(_) => {
+                if k > 1 {
+                    break
+                }
+                continue
+            },
+            None => {},
+        }
+    }
+    return k
+}
+
 pub fn once(copy i: Int) -> Int {
     var owned o: String? = lookup(i + 1)
     o = lookup(i + 2)
@@ -59,7 +87,7 @@ pub fn once(copy i: Int) -> Int {
         None => 0,
     }
     let copy g = shared_len(o)
-    return a + b + c + d + e + f + g
+    return a + b + c + d + e + f + g + early(i) + loop_exit(i)
 }
 
 pub fn main() {
