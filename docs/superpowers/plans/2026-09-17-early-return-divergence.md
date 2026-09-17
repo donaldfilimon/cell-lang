@@ -1,7 +1,9 @@
 # Early `return` ends its path in borrowck: plan
 
 Date: 2026-09-17. Approved by Donald the same day ("Both, A then B").
-Scope: borrowck `checkIf` only. `match` arms are a follow-up, not this plan.
+Scope: borrowck `checkIf` only. `match` arms were the follow-up and landed
+the same day as design C (same rule in `checkMatch`, plus a trailing
+`match` whose arms all diverge).
 
 ## Problem
 

@@ -1884,7 +1884,8 @@ pub const Checker = struct {
     /// `codegen.branchKey`.
     /// True only when `e` provably never falls through: a block whose last
     /// statement is `return`, `break` or `continue`, or ends in an `if` with
-    /// an `else` whose branches both diverge, or in a block that does.
+    /// an `else` whose branches both diverge, a `match` whose arms all do,
+    /// or a block that does.
     /// Anything unproven is false, which keeps the conservative merge.
     fn branchDiverges(e: *const ast.Expr) bool {
         switch (e.kind) {
@@ -1900,6 +1901,13 @@ pub const Checker = struct {
             .if_expr => |x| {
                 const else_body = x.else_body orelse return false;
                 return branchDiverges(x.then_body) and branchDiverges(else_body);
+            },
+            .match_expr => |x| {
+                if (x.arms.len == 0) return false;
+                for (x.arms) |arm| {
+                    if (!branchDiverges(arm.body)) return false;
+                }
+                return true;
             },
             else => return false,
         }
@@ -2662,6 +2670,10 @@ pub const Checker = struct {
             try self.recordExit(.branch_end, branchKeyOf(arm.body));
             self.popScope();
 
+            // An arm that always leaves never reaches the code after the
+            // match (2026-09-17, the `checkIf` rule). `merged` starts as the
+            // entry state, so a match whose every arm leaves keeps it.
+            if (branchDiverges(arm.body)) continue;
             for (self.dead.items) |d| {
                 if (!containsDead(merged.items, d)) {
                     try merged.append(self.allocator, d);
@@ -9022,6 +9034,74 @@ test "an if branch that always returns does not reach the code after the if" {
         \\}
         \\
     );
+}
+
+test "a match arm that always leaves does not reach the code after the match" {
+    // 2026-09-17, design C: the divergence rule applied to `match` arms.
+    try expectAccepted(
+        \\pub fn take(owned s: String) { }
+        \\pub fn arm(copy o: Int?, owned s: String) {
+        \\    match o {
+        \\        Some(x) => {
+        \\            take(s)
+        \\            return
+        \\        },
+        \\        None => {
+        \\            let n = 0
+        \\        },
+        \\    }
+        \\    take(s)
+        \\}
+        \\pub fn tail_match(copy c: Bool, copy o: Int?, owned s: String) {
+        \\    if c {
+        \\        take(s)
+        \\        match o {
+        \\            Some(x) => {
+        \\                return
+        \\            },
+        \\            None => {
+        \\                return
+        \\            },
+        \\        }
+        \\    }
+        \\    take(s)
+        \\}
+        \\
+    );
+    try expectRejectedWith(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy o: Int?, copy d: Bool, owned s: String) {
+        \\    match o {
+        \\        Some(x) => {
+        \\            take(s)
+        \\            if d {
+        \\                return
+        \\            }
+        \\        },
+        \\        None => {
+        \\            let n = 0
+        \\        },
+        \\    }
+        \\    take(s)
+        \\}
+        \\
+    , "use of 's' after it was moved");
+    try expectRejectedWith(
+        \\pub fn take(owned s: String) { }
+        \\pub fn g(copy o: Int?, owned s: String) {
+        \\    take(s)
+        \\    match o {
+        \\        Some(x) => {
+        \\            return
+        \\        },
+        \\        None => {
+        \\            return
+        \\        },
+        \\    }
+        \\    take(s)
+        \\}
+        \\
+    , "use of 's' after it was moved");
 }
 
 test "a branch that only sometimes returns still reaches the code after the if" {

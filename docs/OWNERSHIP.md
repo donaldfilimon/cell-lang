@@ -230,9 +230,10 @@ today and must not once this rule exists.
 both do), its moves stay out of the state after the `if`: a `break` already
 saved its state for the code after the loop, a `continue` already met R2.a,
 and a `return` left the function. `if c { return s }; return s` is accepted.
-A branch that only sometimes leaves still merges. `match` arms still merge
-unconditionally. Corpus: `examples/early_return.cell` (1114 on all three
-backends), `examples/leaks/early_return.cell` (pinned at 0). Plan:
+A branch that only sometimes leaves still merges. The same rule applies to
+`match` arms, and a trailing `match` diverges when every arm does (sound
+because every backend aborts on an unmatched value). Corpus:
+`examples/early_return.cell` (1124 on all three backends), `examples/leaks/early_return.cell` (pinned at 0). Plan:
 `docs/superpowers/plans/2026-09-17-early-return-divergence.md`.
 
 **That list names the forms a PLACE takes, and reading it as a list of

@@ -4,8 +4,9 @@
 // ("use of 'p' after it was moved").
 //
 // Status: parses, passes `cell check`, and runs on the C, LLVM and MLIR
-// backends, printing 1114 on each (see EXPECT-OUTPUT).
-// EXPECT-OUTPUT: 1114
+// backends, printing 1124 on each (see EXPECT-OUTPUT). `by_option` is the
+// same rule for a `match` arm.
+// EXPECT-OUTPUT: 1124
 
 pub fn print_int(copy value: Int);
 
@@ -48,10 +49,24 @@ pub fn first_big(copy limit: Int, owned p: Pair) -> Int {
     return total
 }
 
+pub fn by_option(copy o: Int?, owned p: Pair) -> Int {
+    match o {
+        Some(k) => {
+            return sum(p) * k
+        },
+        None => {
+            let n = 0
+        },
+    }
+    return sum(p)
+}
+
 pub fn main() {
     let copy x = pick(true, Pair { a: 1, b: 0 })
     let copy y = pick(false, Pair { a: 1, b: 1 })
     let copy z = pick_else(false, Pair { a: 1, b: 9 })
     let copy w = first_big(2, Pair { a: 50, b: 49 })
-    print_int(x + y + z + w)
+    let copy u = by_option(Some(3), Pair { a: 1, b: 1 })
+    let copy v = by_option(None, Pair { a: 2, b: 2 })
+    print_int(x + y + z + w + u + v)
 }

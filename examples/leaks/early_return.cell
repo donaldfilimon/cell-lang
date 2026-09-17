@@ -6,7 +6,8 @@
 // `tail_only` moves on the returning branch and holds the value on the
 // other, released at function end. `after_if` moves on both paths. `in_loop`
 // moves then `break`s on one path (a skip-revival `break`, jumped past the
-// release after the loop) and revives on the other. 1000 calls each,
+// release after the loop) and revives on the other. `match_arm` is the
+// `tail_only` shape through a `match` arm. 1000 calls each,
 // alternating the flag. Measured: leaks 0, counter LIVE=0.
 //
 // Status: parses, passes `cell check`; C only; lives under examples/leaks/.
@@ -47,6 +48,19 @@ pub fn in_loop(copy c: Bool) {
     }
 }
 
+pub fn match_arm(copy o: Int?) {
+    var owned s: String = "aaaaaaaa"
+    match o {
+        Some(k) => {
+            take(s)
+            return
+        },
+        None => {
+            let n = 0
+        },
+    }
+}
+
 pub fn main() {
     var i = 0
     var c = true
@@ -54,6 +68,11 @@ pub fn main() {
         tail_only(c)
         after_if(c)
         in_loop(c)
+        if c {
+            match_arm(Some(1))
+        } else {
+            match_arm(None)
+        }
         c = !c
         i = i + 1
     }
