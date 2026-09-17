@@ -19,10 +19,11 @@
 // that the enumeration is never the fix.
 //
 // C ONLY, DELIBERATELY. The LLVM and MLIR backends refuse every line below
-// with `cannot lower`, because the conversion is a call to
-// `cell_string_from_str` and every aggregate constructor in
-// `runtime/cell_rt.h` is `static inline` with no symbol to call. They refuse
-// TOGETHER, so the gate's agreement stage stays green; the three backends
+// with `cannot lower`. The conversion is a call to `cell_string_from_str`,
+// which IS a real symbol (corrected 2026-09-17: this header used to say it was
+// `static inline`); the IR backends refuse because they have no drop pass, so
+// the owned result would never be freed (see
+// examples/leaks/ir_owned_string.cell). They refuse TOGETHER, so the gate's agreement stage stays green; the three backends
 // disagreeing here is the intended end state, not a defect.
 //
 // It prints 44, which is 2+3+4+5+6+7+8+9: the byte length of each of the

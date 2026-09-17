@@ -1215,6 +1215,17 @@ existing scalar representation, but refuse nonprimitive `arc`, `shared`, and
 `arc String` calling-convention mismatch by explicit refusal; it does not add
 ARC retain/release support to either IR backend.
 
+**The IR backends insert no releases at all (measured 2026-09-17).** Both
+accept an owned `String` from a call (`let owned s = str_from_int(i)`, and an
+owned `var` reassigned from a call) and never free it, while the C backend
+frees every one. Stage 8 still reports agreement, because the printed answer is
+the same. `examples/leaks/ir_owned_string.cell` pins it in stage 7: C 0 on both
+witnesses, LLVM and MLIR 3000 on the malloc counter (one witness; an IR object
+cannot take `leak_host.c`'s renamed `main`). Donald's decision the same day:
+build the IR String work (conversions, indexing, list literals) with these
+leaks pinned, then port the C backend's drop decisions onto HIR so both IR
+backends share them.
+
 The checker decides where these go; codegen emits them. The runtime functions
 exist and work: `cell_arc_new`, `cell_arc_clone` (increment), and
 `cell_arc_drop` (decrement, and call the drop function at zero), all in

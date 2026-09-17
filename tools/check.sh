@@ -458,6 +458,12 @@ LEAK_LOOP_CROSS=0
 # revived after it). Measured 500 before (2026-09-17, ALLOC=2000
 # FREE=1500 LIVE=500); CLOSED the same day by after_loop_skip releases.
 LEAK_SKIP_REVIVAL_BREAK=0
+# The IR backends insert no drops (2026-09-17): examples/leaks/ir_owned_string.cell
+# allocates three owned Strings per call, 1000 calls. C frees them all; LLVM and
+# MLIR free none. IR rows have one witness (the malloc counter).
+LEAK_IR_OWNED_STRING_C=0
+LEAK_IR_OWNED_STRING_LLVM=3000
+LEAK_IR_OWNED_STRING_MLIR=3000
 # R16 residual: a `return` inside a loop after the outer var's revival.
 # Measured 500 before (2026-09-17, ALLOC=2500 FREE=2000 LIVE=500); CLOSED
 # the same day by sparing an accepted loop's `return` records.
@@ -976,6 +982,61 @@ else
     run_c_leaks partial_nested_field "" "$LEAK_PARTIAL_NESTED_FIELD" "R16 residual nested partial field, CLOSED 2026-09-16 by recursive emitPartialRecordDrop; 1000 -> 0"
     run_c_leaks branch_field "" "$LEAK_BRANCH_FIELD" "R16 residual 1 at field granularity, CLOSED 2026-09-16 by branch-end field releases; 1000 -> 0"
     run_c_leaks field_revival "" "$LEAK_FIELD_REVIVAL" "R16 residual field revival, CLOSED 2026-09-16 by retracting the revived path from fieldWasMoved; 1000 -> 0"
+
+    # THE IR BACKENDS INSERT NO DROPS (found 2026-09-17). Stages 7 and 9 used
+    # to build C only, so an owned String that LLVM or MLIR accepts and never
+    # frees was invisible here while stage 8 reported agreement. These rows
+    # pin that leak. ONE witness only: the malloc counter, linked into the IR
+    # object beside the counted runtime. `leaks -atExit` needs leak_host.c's
+    # renamed `main`, which an IR object cannot take (LLVM emits its own
+    # `main`; MLIR emits `cell_main` for the driver). A DROP in an IR pin
+    # means an IR drop pass landed: update the pin and docs/OWNERSHIP.md
+    # together; a RISE is a regression. The C row keeps both witnesses.
+    run_ir_leaks() {
+        ex=$1; backend=$2; want=$3; note=$4
+        [ "$leak_shared_ok" -eq 1 ] || { fail "ir leaks $ex: shared objects did not build"; return; }
+        case "$backend" in
+            llvm)
+                $CELL emit --target=llvm "examples/leaks/$ex.cell" > "$TMP/irleak_$ex.ll" 2>/dev/null \
+                    || { fail "ir leaks: llvm emit $ex"; return; }
+                cc -Wno-override-module -x ir "$TMP/irleak_$ex.ll" -c -o "$TMP/irleak_${ex}_l.o" 2>/dev/null \
+                    || { fail "ir leaks: llvm compile $ex"; return; }
+                cc "$TMP/irleak_${ex}_l.o" "$TMP/leak_rt.o" "$TMP/leak_counter.o" -o "$TMP/irleak_${ex}_l" 2>/dev/null \
+                    || { fail "ir leaks: llvm link $ex"; return; }
+                bin="$TMP/irleak_${ex}_l" ;;
+            mlir)
+                if [ ! -x "$LLVM_BIN/mlir-opt" ]; then
+                    skip "ir leaks $ex (mlir-opt not found in $LLVM_BIN)"; return
+                fi
+                $CELL emit --target=mlir "examples/leaks/$ex.cell" > "$TMP/irleak_$ex.mlir" 2>/dev/null \
+                    || { fail "ir leaks: mlir emit $ex"; return; }
+                pipeline=$(mlir_pipeline "$TMP/irleak_$ex.mlir")
+                [ -n "$pipeline" ] || { fail "ir leaks: mlir $ex carries no '// lower with:' line"; return; }
+                # Unquoted on purpose: $pipeline is a list of flags and must split.
+                "$LLVM_BIN/mlir-opt" "$TMP/irleak_$ex.mlir" $pipeline -o "$TMP/irleak_${ex}_low.mlir" 2>/dev/null \
+                    || { fail "ir leaks: mlir-opt $ex"; return; }
+                "$LLVM_BIN/mlir-translate" --mlir-to-llvmir "$TMP/irleak_${ex}_low.mlir" -o "$TMP/irleak_${ex}_m.ll" 2>/dev/null \
+                    || { fail "ir leaks: mlir-translate $ex"; return; }
+                "$LLVM_BIN/llc" -filetype=obj "$TMP/irleak_${ex}_m.ll" -o "$TMP/irleak_${ex}_m.o" 2>/dev/null \
+                    || { fail "ir leaks: llc $ex"; return; }
+                cc "$TMP/irleak_${ex}_m.o" "$TMP/drv.c" "$TMP/leak_rt.o" "$TMP/leak_counter.o" -o "$TMP/irleak_${ex}_m" 2>/dev/null \
+                    || { fail "ir leaks: mlir link $ex"; return; }
+                bin="$TMP/irleak_${ex}_m" ;;
+        esac
+        "$bin" > /dev/null 2> "$TMP/irleak_${ex}_$backend.stderr"
+        live=$(sed -n 's/^MALLOC_COUNTER ALLOC=[0-9]* FREE=[0-9]* LIVE=\([0-9][0-9]*\)$/\1/p' "$TMP/irleak_${ex}_$backend.stderr" | tail -1)
+        if [ -z "$live" ]; then
+            fail "ir leaks $ex ($backend): the malloc counter printed no MALLOC_COUNTER line"
+        elif [ "$live" -eq "$want" ]; then
+            pass "ir leaks $ex ($backend) -> counter LIVE=$live (pinned, one witness, $note)"
+        else
+            fail "ir leaks $ex ($backend) -> counter LIVE=$live, want $want (pinned $note; a DROP means an IR drop pass landed, a RISE is a regression)"
+        fi
+    }
+
+    run_c_leaks ir_owned_string "" "$LEAK_IR_OWNED_STRING_C" "C frees what the IR backends leak, 2026-09-17"
+    run_ir_leaks ir_owned_string llvm "$LEAK_IR_OWNED_STRING_LLVM" "no IR drop pass, 2026-09-17"
+    run_ir_leaks ir_owned_string mlir "$LEAK_IR_OWNED_STRING_MLIR" "no IR drop pass, 2026-09-17"
 fi
 
 # ------------------------------------------- 8. cross-backend answer agreement --

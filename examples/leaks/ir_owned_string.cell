@@ -1,0 +1,34 @@
+// The LLVM and MLIR backends insert no drops (2026-09-17 finding): an owned
+// `String` they accept is never freed, while the C backend frees it. This
+// fixture is the shape both IR backends lower today: an owned `let` from a
+// call, and an owned `var` reassigned from a call. Three owning strings per
+// call, 1000 calls.
+//
+// Pinned: C 0 on both witnesses; LLVM and MLIR 3000 on the malloc counter
+// (the only witness an IR build can carry, see tools/check.sh). A DROP in an
+// IR pin means an IR drop pass landed; update the pin and
+// docs/OWNERSHIP.md together.
+//
+// Status: parses, passes `cell check`; C, LLVM and MLIR; lives under
+// examples/leaks/.
+
+pub fn print_int(copy value: Int);
+pub fn str_from_int(copy v: Int) -> String;
+pub fn str_len(shared s: String) -> Int;
+
+pub fn once(copy i: Int) -> Int {
+    let owned s = str_from_int(i)
+    var owned t = str_from_int(7)
+    t = str_from_int(99)
+    return str_len(s) + str_len(t)
+}
+
+pub fn main() {
+    var i = 0
+    var n = 0
+    while i < 1000 {
+        n = n + once(i)
+        i = i + 1
+    }
+    print_int(n)
+}

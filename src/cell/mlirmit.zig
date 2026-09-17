@@ -60,9 +60,10 @@
 //! struct literals and field reads, `owned String` parameters, and, since
 //! `a6c41e8`, `exclusive String`/`[T]`/`T?` parameters and whole-value writes
 //! through them. STILL REFUSED with `cannot lower to MLIR`: the borrowed-view
-//! to owning-`String` conversion (because no backend here can call a
-//! `static inline` runtime helper), non-empty list literals, and `arc`
-//! locals.
+//! to owning-`String` conversion (a scope choice while there is no IR drop
+//! pass; `cell_string_from_str` is a real symbol, and the earlier "cannot
+//! call a `static inline` helper" reason was wrong, corrected 2026-09-17),
+//! non-empty list literals, and `arc` locals.
 //!
 //! So the boundary is a list of operations that shrinks, not a property of
 //! the types. Probe the emitter rather than trusting this paragraph, and
@@ -280,8 +281,8 @@ const Emitter = struct {
         body_buf = body_writer.toArrayList();
         self.out = saved;
 
-        // memcmp is real libc, unlike cell_str_eq which is `static inline`
-        // and has no symbol.
+        // memcmp is real libc. `cell_str_eq` is ALSO a real symbol
+        // (runtime/cell_rt.c); the comparison stays inline with memcmp.
         if (self.uses_memcmp) {
             try self.out.writeAll("  func.func private @memcmp(!llvm.ptr, !llvm.ptr, i64) -> i32\n");
         }
@@ -529,7 +530,7 @@ const Emitter = struct {
             std.mem.eql(u8, dest_ty, "!llvm.struct<(ptr, i64, i64)>");
         const why: []const u8 = if (string_pair)
             " (converting a borrowed view into an owning value needs" ++
-                " cell_string_from_str, which this backend cannot call)"
+                " cell_string_from_str, which this backend does not emit yet: it has no drop pass to free the result)"
         else
             "";
         try self.unsupported(span, try std.fmt.allocPrint(

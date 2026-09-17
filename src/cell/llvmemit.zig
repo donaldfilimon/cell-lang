@@ -17,6 +17,14 @@
 //!      `cell_ok_*`. A `static inline` function has no symbol, so this backend
 //!      cannot call any of them. It would have to materialize those structs
 //!      itself, from layouts derived from the header rather than guessed.
+//!      **Corrected 2026-09-17:** that holds for the helpers named here, but
+//!      not for every runtime entry point. `cell_string_from_str` and
+//!      `cell_str_eq` are real symbols in `runtime/cell_rt.c`, and a declared
+//!      prelude call to them already lowers. The view-to-owning refusal below
+//!      is a scope choice while this backend has no drop pass (an owned
+//!      String it builds would never be freed; `examples/leaks/ir_owned_string.cell`
+//!      pins that leak for the owned Strings it already accepts), not an
+//!      inability to call.
 //!
 //! So this slice crosses the C boundary only through SCALAR-ABI symbols:
 //! `cell_print_int(int64_t)`, `cell_assert(bool)`, `cell_panic(cell_str_t)`,
@@ -244,9 +252,9 @@ const Emitter = struct {
         if (self.uses_panic and self.module.findFn("panic") == null) {
             try self.out.writeAll("declare void @cell_panic([2 x i64])\n");
         }
-        // memcmp is real libc, unlike cell_str_eq which is `static inline`
-        // and has no symbol. It is the one runtime helper this backend can
-        // actually call.
+        // memcmp is real libc. `cell_str_eq` is ALSO a real symbol
+        // (runtime/cell_rt.c; this comment used to call it `static inline`),
+        // so either works; the comparison stays inline with memcmp.
         if (self.uses_memcmp) {
             try self.out.writeAll("declare i32 @memcmp(ptr, ptr, i64)\n");
         }
@@ -484,10 +492,10 @@ const Emitter = struct {
     /// are two different runtime types: a literal is the 16-byte borrowed view
     /// `%cell_str`, an owned `String` is the 24-byte owning `%cell_string`, and
     /// turning the first into the second is a real call to
-    /// `cell_string_from_str` that copies the characters. This backend cannot
-    /// make that call (see the header: every aggregate constructor in
-    /// `runtime/cell_rt.h` is `static inline` and has no symbol), so it must
-    /// refuse. It did not. It ACCEPTED the conversion at six separate
+    /// `cell_string_from_str` that copies the characters. This backend does
+    /// not make that call yet (it is a real symbol; see the corrected header
+    /// note: the refusal is a scope choice while there is no IR drop pass), so
+    /// it must refuse. It did not. It ACCEPTED the conversion at six separate
     /// positions and emitted a 16-byte store into 24 bytes of storage, leaving
     /// `cap` uninitialized and `.ptr` aimed at a static literal that the drop
     /// path would eventually free.
@@ -525,7 +533,7 @@ const Emitter = struct {
             std.mem.eql(u8, dest_ty, "%cell_string");
         const why: []const u8 = if (string_pair)
             " (converting a borrowed view into an owning value needs" ++
-                " cell_string_from_str, which this backend cannot call)"
+                " cell_string_from_str, which this backend does not emit yet: it has no drop pass to free the result)"
         else
             "";
         try self.unsupported(span, try std.fmt.allocPrint(
