@@ -10,19 +10,22 @@
 // finally has a printing program on all three backends.
 //
 // WHAT IT PRINTS, and how to read a wrong answer. One integer,
-// `buf.len * 10 + o.inner.step`:
+// `buf.len * 100 + o.inner.step * 10 + o.inner.len`:
 //
 //   `buf.len` starts at 37; each of the two borrow spellings adds
 //   `buf.step` (1) through the CALLEE's field write, and the local write
 //   adds 100, so 139. A lost callee write shows as 138 or 137. `o.inner.step`
 //   is set through a two-level path to 7; a write that lands on the wrong
-//   field or level leaves it 0. So 1397 is the only correct answer.
+//   field or level leaves it 0. `bump(exclusive o.inner)` then adds that
+//   step to `o.inner.len` through a FIELD argument, so a callee handed a
+//   copy of the field (MLIR did, until 2026-09-17) leaves it 0 instead of 7.
+//   So 13977 is the only correct answer.
 //
 // `step` is a second field, read at an offset past the first, for the
 // reason write_through_whole.cell gives: at offset 0 a wrong base and a
 // right base can coincide.
 //
-// EXPECT-OUTPUT: 1397
+// EXPECT-OUTPUT: 13977
 
 pub struct Buffer {
     copy len: Int,
@@ -47,5 +50,6 @@ pub fn main() {
     buf.len = buf.len + 100
     var owned o = Outer { tag: 1, inner: Buffer { len: 0, step: 0 } }
     o.inner.step = 7
-    print_int(buf.len * 10 + o.inner.step)
+    bump(exclusive o.inner)
+    print_int(buf.len * 100 + o.inner.step * 10 + o.inner.len)
 }

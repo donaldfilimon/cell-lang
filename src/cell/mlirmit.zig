@@ -1195,6 +1195,51 @@ const Emitter = struct {
         }
     }
 
+    /// The address of a field path rooted at a place with an address (an
+    /// aggregate local's llvm.alloca, or a borrow's loaded pointer), walked
+    /// with llvm.getelementptr. Null, having emitted nothing, for any other
+    /// shape or when the field's type is not the pointee the callee reads.
+    fn fieldAddress(self: *Emitter, e: *const hir.Expr, pointee: ?[]const u8) EmitError!?[]const u8 {
+        var current = e;
+        while (current.kind == .unary) {
+            const u = current.kind.unary;
+            if (u.op != .ref_shared and u.op != .ref_exclusive) return null;
+            current = u.operand;
+        }
+        if (current.kind != .field) return null;
+        const last = current.kind.field.sel;
+        const want = pointee orelse return null;
+        const field_ty = self.mlirTypeOwned(last.ty, last.ownership) orelse return null;
+        if (!std.mem.eql(u8, field_ty, want)) return null;
+        var path: std.ArrayList(hir.FieldSel) = .empty;
+        var base = current;
+        while (base.kind == .field) {
+            const fe = base.kind.field;
+            if (self.structType(fe.sel.struct_name) == null) return null;
+            try path.append(self.arena, fe.sel);
+            base = fe.base;
+        }
+        if (base.kind != .ref) return null;
+        const slot = base.kind.ref;
+        if (slot >= self.slots.items.len) return null;
+        const borrowed = slot < self.slot_ptr_to.items.len and self.slot_ptr_to.items[slot] != null;
+        const local = slot < self.slot_is_llvm.items.len and self.slot_is_llvm.items[slot];
+        if (!borrowed and !local) return null;
+        var addr = if (borrowed) try self.loadSlot(slot, "!llvm.ptr") else self.slots.items[slot];
+        var i = path.items.len;
+        while (i > 0) {
+            i -= 1;
+            const sel = path.items[i];
+            const next = try self.nextSsa();
+            try self.line(
+                "{s} = llvm.getelementptr inbounds {s}[0, {d}] : (!llvm.ptr) -> !llvm.ptr, {s}",
+                .{ next, addr, sel.index, self.structType(sel.struct_name).? },
+            );
+            addr = next;
+        }
+        return addr;
+    }
+
     /// Emit one call argument, already shaped for the parameter it will fill.
     /// `want` is null for a callee with no signature, where there is nothing to
     /// shape it to and the natural value is all there is.
@@ -1209,6 +1254,12 @@ const Emitter = struct {
             if (std.mem.eql(u8, w, "!llvm.ptr")) {
                 if (self.placeSlot(arg)) |slot| {
                     return .{ .text = self.slots.items[slot], .ty = "!llvm.ptr" };
+                }
+                // A FIELD of a place has an address too. Extracting it and
+                // spilling the copy lost the callee's write (2026-09-17: C and
+                // LLVM printed 42, this backend 7).
+                if (try self.fieldAddress(arg, spill_ty)) |addr| {
+                    return .{ .text = addr, .ty = "!llvm.ptr" };
                 }
             }
         }
@@ -2890,6 +2941,33 @@ test "assignment through a field path writes the field, through a borrow too" {
     const out = try runThroughMlir(gpa, e.text);
     defer gpa.free(out);
     try std.testing.expectEqualStrings("142\n7\n", out);
+}
+
+test "an exclusive FIELD argument passes the field's address, so the write lands" {
+    // Found 2026-09-17 while grounding IR String step (c): `put(exclusive
+    // t.name)` extracted the field, spilled it to a fresh alloca and passed
+    // that, so the callee's write was lost (C and LLVM printed 42, MLIR 7).
+    // The same shape with a nested struct field and a borrowed root.
+    const gpa = std.testing.allocator;
+    var e = try emitSource(
+        \\pub struct In { copy a: Int, copy b: Int }
+        \\pub struct Out { copy tag: Int, copy inner: In }
+        \\pub fn print_int(copy value: Int);
+        \\pub fn bump(exclusive v: In) { v.b = v.b + 1 }
+        \\pub fn relay(exclusive o: Out) { bump(exclusive o.inner) }
+        \\pub fn main() {
+        \\  var owned o = Out { tag: 5, inner: In { a: 1, b: 40 } }
+        \\  bump(exclusive o.inner)
+        \\  relay(exclusive o)
+        \\  print_int(o.inner.b)
+        \\}
+    );
+    defer e.deinit();
+    for (e.bag.list.items) |d| std.debug.print("diag: {s}\n", .{d.message});
+    try std.testing.expect(!e.bag.hasErrors());
+    const out = try runThroughMlir(gpa, e.text);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("42\n", out);
 }
 
 test "an owned String field write converts and runs, the field_revival shape" {
