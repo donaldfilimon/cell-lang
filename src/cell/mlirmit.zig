@@ -3300,3 +3300,21 @@ test "a declared String? is the owning 32-byte optional C declares" {
     try expectContains(e.text, "func.func private @cell_find(!llvm.ptr {llvm.sret = !llvm.struct<(i8, !llvm.struct<(ptr, i64, i64)>)>})");
     try expectContains(e.text, "func.func private @cell_take(!llvm.ptr) -> i64");
 }
+
+test "an arc aggregate parameter is refused, never passed as the raw value" {
+    const shapes = [_][]const u8{
+        "pub fn h(arc v: [Int]) -> Int;",
+        "pub fn h(arc v: Int?) -> Int;",
+        "pub struct P { copy x: Int }\npub fn h(arc v: P) -> Int;",
+        "pub fn h(arc v: Result<Int, Int32>) -> Int;",
+        "pub fn g(arc v: [Int]) -> Int { return 1 }",
+    };
+    for (shapes) |src| {
+        var e = try emitSource(src);
+        defer e.deinit();
+        if (!e.bag.hasErrors()) {
+            std.debug.print("accepted:\n{s}\n", .{src});
+            return error.TestUnexpectedResult;
+        }
+    }
+}

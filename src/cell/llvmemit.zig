@@ -3427,3 +3427,26 @@ test "a declared String? is the owning 32-byte optional C declares" {
     try expectContains(e.text, "declare i64 @cell_take(ptr)");
     try std.testing.expect(std.mem.indexOf(u8, e.text, "%cell_opt_str ") == null);
 }
+
+test "an arc aggregate parameter is refused, never passed as the raw value" {
+    // C passes each of these as a boxed cell_arc_t; the IR used to pass the
+    // raw list/optional/struct/Result and LLVM crashed calling a C host.
+    const shapes = [_][]const u8{
+        "pub fn h(arc v: [Int]) -> Int;",
+        "pub fn h(arc v: Int?) -> Int;",
+        "pub struct P { copy x: Int }\npub fn h(arc v: P) -> Int;",
+        "pub fn h(arc v: Result<Int, Int32>) -> Int;",
+        "pub fn g(arc v: [Int]) -> Int { return 1 }",
+    };
+    for (shapes) |src| {
+        var e = try emitSource(src);
+        defer e.deinit();
+        if (!e.bag.hasErrors()) {
+            std.debug.print("accepted:\n{s}\n", .{src});
+            return error.TestUnexpectedResult;
+        }
+    }
+    var ok = try emitSource("pub fn h(arc v: Int) -> Int;");
+    defer ok.deinit();
+    try std.testing.expect(!ok.bag.hasErrors());
+}

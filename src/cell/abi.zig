@@ -27,6 +27,16 @@ pub const Layout = struct {
 /// Null is not an error. It means the caller must refuse rather than guess,
 /// which is the discipline both new backends already follow.
 pub fn layoutOf(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) ?Layout {
+    // `arc` over an aggregate is a cell_arc_t box in C (codegen boxes the
+    // value at the call), not the value itself. Laying it out as the value
+    // made both IR backends pass a raw list/optional/struct/Result where C
+    // passes the box: an LLVM crash calling a C host (2026-09-17). There is
+    // no arc retain/release in the IR backends, so refuse rather than place
+    // half a feature. A scalar `arc` is the scalar in C as well.
+    if (own == .arc) switch (ty) {
+        .string, .list, .optional, .struct_type, .result => return null,
+        else => {},
+    };
     return switch (ty) {
         .int, .uint, .float => .{ .size = 8, .alignment = 8 },
         .int16, .uint16 => .{ .size = 2, .alignment = 2 },
@@ -610,6 +620,25 @@ test "a struct is laid out with C padding rules" {
 test "an out-of-scope type has no layout yet" {
     const m = emptyModule();
     try std.testing.expect(layoutOf(&m, types.t_string, .arc) == null);
+}
+
+test "an arc aggregate has no layout: C boxes it in a cell_arc_t" {
+    // C passes `arc [T]`, `arc T?` and `arc Result<..>` as a cell_arc_t,
+    // but this function laid them out as the raw value, so both IR backends
+    // passed `ptr` or `[2 x i64]` where C passed the box. LLVM crashed
+    // (exit 139) calling a C host with an `arc [Int]` (2026-09-17, F2 of
+    // the IR indexing spec). A scalar `arc` is the scalar in C too.
+    const m = emptyModule();
+    const int_ty: hir.Ty = .int;
+    const i32_ty: hir.Ty = .int32;
+    const list: hir.Ty = .{ .list = &int_ty };
+    const opt: hir.Ty = .{ .optional = &int_ty };
+    const res = resultOf(&int_ty, &i32_ty);
+    try std.testing.expect(layoutOf(&m, list, .arc) == null);
+    try std.testing.expect(layoutOf(&m, opt, .arc) == null);
+    try std.testing.expect(layoutOf(&m, res, .arc) == null);
+    try std.testing.expect(layoutOf(&m, list, .owned) != null);
+    try std.testing.expectEqual(@as(u64, 8), layoutOf(&m, int_ty, .arc).?.size);
 }
 
 fn resultOf(ok: *const hir.Ty, err: *const hir.Ty) hir.Ty {
