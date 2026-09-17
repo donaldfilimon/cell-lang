@@ -1539,7 +1539,7 @@ const Emitter = struct {
         var dest: []const u8 = "";
         var dest_ty: []const u8 = "";
         if (produces_value) {
-            dest_ty = self.llType(e.ty) orelse "i64";
+            dest_ty = self.valueSlotType(e);
             dest = try self.nextTemp();
             try self.out.print("  {s} = alloca {s}\n", .{ dest, dest_ty });
         }
@@ -1656,7 +1656,7 @@ const Emitter = struct {
         var dest: []const u8 = "";
         var dest_ty: []const u8 = "";
         if (produces_value) {
-            dest_ty = self.llType(e.ty) orelse "i64";
+            dest_ty = self.valueSlotType(e);
             dest = try self.nextTemp();
             try self.out.print("  {s} = alloca {s}\n", .{ dest, dest_ty });
         }
@@ -1896,6 +1896,17 @@ const Emitter = struct {
             },
             .func, .unknown => null,
         };
+    }
+
+    /// The type of the slot an `if` or `match` writes its value into. It is
+    /// the representation `e.own` records, which hir.lower stamps from the
+    /// destination (or the first arm), and never the bare `llType`, which
+    /// calls every String a view. No recorded fact means a view. The `i64`
+    /// fallback for an unnameable type is the old behaviour, and harmless:
+    /// every arm's store goes through `storeValue`, whose guard refuses a
+    /// value that does not match.
+    fn valueSlotType(self: *Emitter, e: *const hir.Expr) []const u8 {
+        return self.llTypeOwned(e.ty, e.own orelse .shared) orelse "i64";
     }
 
     /// The in-memory LLVM type of a binding, which for a String depends on
@@ -3239,4 +3250,66 @@ test "owned String places, fields and exclusive borrows are viewed and matched c
     const out = try runEmitted(e.text);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("23\n", out);
+}
+
+test "a String-valued match or if gets a slot of the representation it was stamped with" {
+    // A value slot used to take `llType(e.ty)`, the view, whatever the arms
+    // produced, so `let owned a: String = match n { .. => mk(), .. }` wrote
+    // 24-byte arms into a 16-byte slot and was refused. It reads `e.own` now,
+    // which hir.lower stamps from the destination.
+    var e = try emitSource(
+        \\pub fn mk() -> String;
+        \\pub fn f(copy n: Int) {
+        \\  let owned a: String = match n { 0 => mk(), _ => mk(), }
+        \\  let owned b: String = if n == 0 { mk() } else { mk() }
+        \\  let shared v: String = match n { 0 => "ab", _ => "abc", }
+        \\}
+    );
+    defer e.deinit();
+    if (e.bag.hasErrors()) {
+        for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
+        return error.Refused;
+    }
+    var owning: usize = 0;
+    var views: usize = 0;
+    var it = std.mem.splitScalar(u8, e.text, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, "%slot") != null) continue;
+        if (std.mem.endsWith(u8, line, "= alloca %cell_string")) owning += 1;
+        if (std.mem.endsWith(u8, line, "= alloca %cell_str")) views += 1;
+    }
+    // Exactly one view slot, the `let shared` match's. Before this change
+    // all three value slots were views. The owning count also includes the
+    // sret buffers of the four calls, so it is only a lower bound.
+    try std.testing.expectEqual(@as(usize, 1), views);
+    try std.testing.expect(owning >= 2);
+}
+
+test "String-valued matches and ifs compute the right lengths" {
+    // 4 + 3 + 5 + 3 = 15: an owned match, an owned if, an owned match
+    // returned from a function, and a view-valued match.
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn str_from_int(copy v: Int) -> String;
+        \\pub fn str_len(shared s: String) -> Int;
+        \\pub fn pick(copy n: Int) -> String {
+        \\  return match n { 0 => str_from_int(7), _ => str_from_int(12345), }
+        \\}
+        \\pub fn main() {
+        \\  let copy n = 1
+        \\  let owned a: String = match n { 0 => str_from_int(1), _ => str_from_int(1234), }
+        \\  let owned b: String = if n == 0 { str_from_int(1) } else { str_from_int(123) }
+        \\  let owned c: String = pick(copy n)
+        \\  let shared v: String = match n { 0 => "ab", _ => "abc", }
+        \\  print_int(str_len(shared a) + str_len(shared b) + str_len(shared c) + str_len(shared v))
+        \\}
+    );
+    defer e.deinit();
+    if (e.bag.hasErrors()) {
+        for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
+        return error.Refused;
+    }
+    const out = try runEmitted(e.text);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("15\n", out);
 }

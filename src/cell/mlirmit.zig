@@ -1347,13 +1347,8 @@ const Emitter = struct {
         else_e: ?*const hir.Expr,
     ) EmitError!Value {
         const produces = else_e != null and e.ty.tag() != .unit;
-        var slot: []const u8 = "";
-        var slot_ty: []const u8 = "";
-        if (produces) {
-            slot_ty = self.mlirType(e.ty) orelse "i64";
-            slot = try self.nextSsa();
-            try self.line("{s} = memref.alloca() : memref<{s}>", .{ slot, slot_ty });
-        }
+        var slot: ValueSlot = .{};
+        if (produces) slot = try self.allocValueSlot(e);
 
         const cond = try self.emitExpr(cond_e);
         if (cond.isNone()) return Value.none;
@@ -1371,9 +1366,7 @@ const Emitter = struct {
         try self.block_label(then_b);
         const then_val = try self.emitExpr(then_e);
         if (produces and !then_val.isNone()) {
-            if (try self.fits(then_e.span, then_val.ty, slot_ty, "an if branch's value")) {
-                try self.line("memref.store {s}, {s}[] : memref<{s}>", .{ then_val.text, slot, slot_ty });
-            }
+            try self.storeValueSlot(then_e.span, slot, then_val, "an if branch's value");
         }
         if (!self.returned) try self.line("cf.br {s}", .{end_b});
 
@@ -1381,9 +1374,7 @@ const Emitter = struct {
             try self.block_label(else_b);
             const else_val = try self.emitExpr(eb);
             if (produces and !else_val.isNone()) {
-                if (try self.fits(eb.span, else_val.ty, slot_ty, "an else branch's value")) {
-                    try self.line("memref.store {s}, {s}[] : memref<{s}>", .{ else_val.text, slot, slot_ty });
-                }
+                try self.storeValueSlot(eb.span, slot, else_val, "an else branch's value");
             }
             if (!self.returned) try self.line("cf.br {s}", .{end_b});
         }
@@ -1391,9 +1382,55 @@ const Emitter = struct {
         try self.block_label(end_b);
 
         if (!produces) return Value.none;
+        return self.loadValueSlot(slot);
+    }
+
+    /// The slot an `if` or `match` writes its value into.
+    const ValueSlot = struct {
+        name: []const u8 = "",
+        ty: []const u8 = "",
+        /// An `llvm.alloca` rather than a `memref.alloca`. A memref cannot
+        /// hold an `!llvm.struct` (mlir-opt: "invalid memref element type"),
+        /// so an aggregate value slot uses the llvm dialect, as a binding's
+        /// slot already does.
+        is_llvm: bool = false,
+    };
+
+    /// Allocate `e`'s value slot, typed by the representation `e.own`
+    /// records (hir.lower stamps it from the destination or the first arm),
+    /// never by the bare `mlirType`, which calls every String a view. The
+    /// `i64` fallback is the old behaviour and harmless: every store goes
+    /// through the guard.
+    fn allocValueSlot(self: *Emitter, e: *const hir.Expr) EmitError!ValueSlot {
+        const ty = self.mlirTypeOwned(e.ty, e.own orelse .shared) orelse "i64";
+        const name = try self.nextSsa();
+        if (isAggregate(e.ty)) {
+            const one = try self.nextSsa();
+            try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
+            try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ name, one, ty });
+            return .{ .name = name, .ty = ty, .is_llvm = true };
+        }
+        try self.line("{s} = memref.alloca() : memref<{s}>", .{ name, ty });
+        return .{ .name = name, .ty = ty };
+    }
+
+    fn storeValueSlot(self: *Emitter, span: hir.Span, slot: ValueSlot, val: Value, what: []const u8) EmitError!void {
+        if (!try self.fits(span, val.ty, slot.ty, what)) return;
+        if (slot.is_llvm) {
+            try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ val.text, slot.name, slot.ty });
+        } else {
+            try self.line("memref.store {s}, {s}[] : memref<{s}>", .{ val.text, slot.name, slot.ty });
+        }
+    }
+
+    fn loadValueSlot(self: *Emitter, slot: ValueSlot) EmitError!Value {
         const out = try self.nextSsa();
-        try self.line("{s} = memref.load {s}[] : memref<{s}>", .{ out, slot, slot_ty });
-        return .{ .text = out, .ty = slot_ty };
+        if (slot.is_llvm) {
+            try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ out, slot.name, slot.ty });
+        } else {
+            try self.line("{s} = memref.load {s}[] : memref<{s}>", .{ out, slot.name, slot.ty });
+        }
+        return .{ .text = out, .ty = slot.ty };
     }
 
     /// A borrowed view of an owning String place, the twin of
@@ -1575,13 +1612,8 @@ const Emitter = struct {
         arms: []const hir.Arm,
     ) EmitError!Value {
         const produces = e.ty.tag() != .unit;
-        var slot: []const u8 = "";
-        var slot_ty: []const u8 = "";
-        if (produces) {
-            slot_ty = self.mlirType(e.ty) orelse "i64";
-            slot = try self.nextSsa();
-            try self.line("{s} = memref.alloca() : memref<{s}>", .{ slot, slot_ty });
-        }
+        var slot: ValueSlot = .{};
+        if (produces) slot = try self.allocValueSlot(e);
 
         const scrutinee = try self.emitExpr(scrutinee_e);
         if (scrutinee.isNone()) return Value.none;
@@ -1699,9 +1731,7 @@ const Emitter = struct {
             }
             const body_val = try self.emitExpr(arm.body);
             if (produces and !body_val.isNone()) {
-                if (try self.fits(arm.body.span, body_val.ty, slot_ty, "a match arm's value")) {
-                    try self.line("memref.store {s}, {s}[] : memref<{s}>", .{ body_val.text, slot, slot_ty });
-                }
+                try self.storeValueSlot(arm.body.span, slot, body_val, "a match arm's value");
             }
             if (!self.returned) try self.line("cf.br {s}", .{end_b});
 
@@ -1733,9 +1763,7 @@ const Emitter = struct {
         try self.block_label(end_b);
 
         if (!produces) return Value.none;
-        const out = try self.nextSsa();
-        try self.line("{s} = memref.load {s}[] : memref<{s}>", .{ out, slot, slot_ty });
-        return .{ .text = out, .ty = slot_ty };
+        return self.loadValueSlot(slot);
     }
 
     // -- helpers ------------------------------------------------------------
@@ -3027,4 +3055,38 @@ test "owned String places, fields and exclusive borrows are viewed and matched c
     const out = try runThroughMlir(gpa, e.text);
     defer gpa.free(out);
     try std.testing.expectEqualStrings("23\n", out);
+}
+
+test "String-valued matches and ifs get llvm.alloca slots and compute the right lengths" {
+    // A memref cannot hold an !llvm.struct, so a String-valued match used to
+    // emit `memref<!llvm.struct<...>>`, which mlir-opt rejects, and its slot
+    // was the view whatever the arms produced. Both are fixed together: the
+    // slot takes `e.own`'s representation and an aggregate slot is an
+    // `llvm.alloca`. Same program and answer as llvmemit.zig's twin.
+    const gpa = std.testing.allocator;
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn str_from_int(copy v: Int) -> String;
+        \\pub fn str_len(shared s: String) -> Int;
+        \\pub fn pick(copy n: Int) -> String {
+        \\  return match n { 0 => str_from_int(7), _ => str_from_int(12345), }
+        \\}
+        \\pub fn main() {
+        \\  let copy n = 1
+        \\  let owned a: String = match n { 0 => str_from_int(1), _ => str_from_int(1234), }
+        \\  let owned b: String = if n == 0 { str_from_int(1) } else { str_from_int(123) }
+        \\  let owned c: String = pick(copy n)
+        \\  let shared v: String = match n { 0 => "ab", _ => "abc", }
+        \\  print_int(str_len(shared a) + str_len(shared b) + str_len(shared c) + str_len(shared v))
+        \\}
+    );
+    defer e.deinit();
+    if (e.bag.hasErrors()) {
+        for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
+        return error.Refused;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "memref<!llvm.struct") == null);
+    const out = try runThroughMlir(gpa, e.text);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("15\n", out);
 }
