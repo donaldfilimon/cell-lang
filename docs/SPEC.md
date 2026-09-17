@@ -921,8 +921,10 @@ leak (a value moved on only one path; a `var` revived after a move is
 released at a block end or `return` since 2026-09-16, and an outer var
 revived across a `while` is released after that loop since the same day;
 a field revived after it was moved is released at scope end since the same
-day; a skip-revival `break`/`continue` and a `return` inside a loop still
-leak). It also inserts R11's `arc` retains, with R11's own
+day; a skip-revival `break` with no later use and a `return` inside a loop
+still leak, while a skip-revival `continue` of an outer place, and a
+skip-revival `break` followed by a use, are refused by R2.a since
+2026-09-16 and were live double frees before). It also inserts R11's `arc` retains, with R11's own
 list of what still leaks. See 0.6 and 0.7.
 
 ### 4.1 The five annotations
@@ -1558,7 +1560,10 @@ iteration protocol, no range value, and no indexing operator (section 3.3), so
 **Loops interact with ownership, and that interaction is a rule, not a
 detail.** See `docs/OWNERSHIP.md` R2.a: a place declared outside a loop and
 moved inside it is rejected, because the next iteration would use it after the
-move. `examples/rejected/move_in_loop.cell` is the worked case.
+move. `examples/rejected/move_in_loop.cell` is the worked case. The rule
+covers every path, not only the end of the body: a `continue`, a `break`,
+and the condition (see 7.7), with
+`examples/rejected/skip_revival_jump.cell` as the worked case.
 
 ### 7.7 `break` and `continue`
 
@@ -1577,6 +1582,22 @@ rather than at emitted C:
 
 Neither carries a value and neither takes a label. Labelled loops are not
 designed.
+
+**Both carry an ownership rule** (`docs/OWNERSHIP.md` R2.a, jump clause,
+2026-09-16). A `continue` reached while a place declared outside the loop is
+moved and not yet revived is refused, because the next iteration would use
+it after the move:
+
+> `err: 'v' is moved inside a loop, so the next iteration would use it after the move`
+> `note: this 'continue' is reached before 'v' is assigned again`
+
+A `break` taken in that state is accepted, but the place is dead after the
+loop, so a later use is an ordinary use-after-move (R2). A move in the
+`while` condition counts as a move inside the loop, and a place is dead after
+the loop when it is dead on any path out, including a body that runs zero
+times. Before 2026-09-16 all of these were accepted and ran as double frees.
+The rule is conservative: a `continue` taken after a move is refused even
+when the next iteration assigns the place before reading it.
 
 ## 8. Items
 
@@ -2120,7 +2141,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | R14 second clause: a borrow-holding binding may not be reassigned | implemented in `borrowck.zig`. `let` was already covered by immutability; `var` was not, and the gap was that the statement has two meanings: borrowck read `e = &mut b` as a retarget (creating a TEMPORARY loan that died with the statement, leaving a loan on the old referent and none on the new one) while the C backend emits `*e = *&b;`, a write through. Measured as an AddressSanitizer double free at exit 134 with heap values, plus a leak of the old referent's buffer in the same statement. Refused rather than modelled, because a retarget means killing a NAME-keyed loan (the unsafe direction) and a write-through means a place for `*e`, which "places, not names" does not have. Scoped to an empty target path and to a value `borrowSource` proves is a borrow, so a field write through an `exclusive` parameter and a whole-value write through a borrow both stay legal |
 | Retain / release insertion for `arc` | partially implemented, C backend only: all four R11 retain sites, the `shared`-parameter non-retain, a retain for every returned `arc` place (a PARAMETER returned directly was exempt until R11 row 1 closed on 2026-09-16; a match-arm binding returned from a block arm body is retained, and spelling that old exception as "not droppable" instead of "not a parameter" reopened a use-after-free once), and a retain for an `arc` place flowing out of an `if` branch, a `match` arm, or a block's trailing expression; release is the drop pass, scoped per block, and it releases `owned` and `arc` parameters too. **Six** leaks were tabled, and `docs/OWNERSHIP.md` R11 carries each with a `leaks` measurement; five are closed and pinned at 0 in the gate as of 2026-09-16, and the sixth, an `owned` place bound as `arc`, was refused at five positions and is implemented at `let` for a whole `String` or list binding (the source moves into the box), which empties the table. The closed ones, kept here so the list still reads: an `arc` parameter was never released by a Cell body (closed 2026-09-16), a struct with an `arc` field was never dropped (per-struct drop glue), an unbound `arc` temporary unboxed for a `shared` parameter drops its handle, a block-scoped `arc` local is never released (unbounded in a `while` body), reassigning an `arc` `var` leaks the previous box, and an `owned` place bound as `arc` is not boxed because R10's move-into-`arc` is unimplemented. NINE use-after-frees were found under earlier "leaks, never dangling" claims and are fixed with tests: a returned `arc` FIELD handed out unretained, a SHADOWED `arc` local released twice because drops are spelled by name, an `arc` place flowing out of an `if` branch, one flowing out of a `match` arm in return position, an `arc` place passed to an `owned` parameter, an `arc` match-arm binding returned from a BLOCK arm body (which the round that removed `Local.is_param` had derived to be unreachable), `let owned ys: [Int] = xs`, a double free of the buffer that the parameter-position guard did not reach, R10's refusal being place-only so every VALUE position escaped it, and `take(owned fresh())` over an `arc`-returning callee, the one that was a LIVE ASan double free rather than masked. The last four are refused by R10 rather than retained, since no retain can fix a double free of the buffer. Do not restate the categorical, and note that each of the three rounds was falsified by a FORM of a construct the previous round had not written out |
 | Atomic refcounts in the runtime | implemented |
-| Drop insertion for `owned` | partially implemented: unmoved `owned`/`arc` `let`/`var` locals, block-scoped for statement-position scopes and value-position blocks, conservative on moves; structs through per-struct drop glue (a nested field whose sibling was moved is released by recursing the partial drop; a field moved on only one branch is released on the keeping path from per-field exit liveness; a field revived after it was moved is released at scope end); `owned`/`arc` parameters; a `var` revived after a move at a block end, `return`, `break`/`continue`, value-block end, a revived record, and an outer var revived across a `while` (`after_loop`; see `docs/OWNERSHIP.md` R16). A skip-revival `break`/`continue` and a `return` inside a loop still leak |
+| Drop insertion for `owned` | partially implemented: unmoved `owned`/`arc` `let`/`var` locals, block-scoped for statement-position scopes and value-position blocks, conservative on moves; structs through per-struct drop glue (a nested field whose sibling was moved is released by recursing the partial drop; a field moved on only one branch is released on the keeping path from per-field exit liveness; a field revived after it was moved is released at scope end); `owned`/`arc` parameters; a `var` revived after a move at a block end, `return`, `break`/`continue`, value-block end, a revived record, and an outer var revived across a `while` (`after_loop`; see `docs/OWNERSHIP.md` R16). A skip-revival `break` with no later use and a `return` inside a loop still leak; a skip-revival `continue` of an outer place is refused by R2.a (2026-09-16) |
 | Copyability derivation | designed, not implemented |
 
 ### Expressions

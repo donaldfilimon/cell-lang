@@ -1,15 +1,15 @@
-// EXPECT: currently-accepted
+// EXPECT: currently-rejected
 // Violates: docs/OWNERSHIP.md R2.a (a move inside a loop is a use-after-move
 // on the next iteration, or after the loop), on paths the body-end check
 // never saw.
 //
-// THIS FILE PINS A LIVE HOLE. Every function below is ACCEPTED by
-// `cell check` (exit 0) at 05116dc and aborts under AddressSanitizer with
+// THIS FILE PINS A HOLE THAT WAS LIVE. Every function below was ACCEPTED by
+// `cell check` (exit 0) at 05116dc and aborted under AddressSanitizer with
 // `attempting double-free` (exit 134) when run through `cell run` with
 // `CC` set to a `cc -fsanitize=address -g` wrapper. For the first shape both
-// frees happen inside `cell_take`, and the emitted C has no
-// `cell_string_free(&v)` at all, so the fault is in borrowck, not in the drop
-// pass.
+// frees happened inside `cell_take`, and the emitted C had no
+// `cell_string_free(&v)` at all, so the fault was in borrowck, not in the
+// drop pass.
 //
 // R2.a used to be checked at exactly one point, the fall-through end of the
 // body, against an index range of the `dead` list. Five paths escaped it:
@@ -26,8 +26,28 @@
 //   zero_iter       a body that revives `v` may run zero times, so after the
 //                   loop `v` is still the value moved before it.
 //
-// The flip to currently-rejected lands with the fix, together with the
-// diagnostics it prints.
+// The first three came from a design brief; the last two were found by
+// measurement while fixing them. Measured after the fix, one error per
+// function:
+//
+//   skip_continue   error: 'v' is moved inside a loop, so the next iteration
+//                          would use it after the move          (at take(v))
+//                   note: this 'continue' is reached before 'v' is assigned
+//                         again
+//   skip_break_use  error: use of 'v' after it was moved  (at the final take)
+//                   note: 'v' was moved here by the call to 'take'
+//   cond_move       error: use of 'v' after it was moved  (at the final take)
+//                   note: 'v' was moved here by the call to 'consume'
+//   swap_hide       error: 'b' is moved inside a loop, so the next iteration
+//                          would use it after the move          (at take(b))
+//                   note: 'b' is declared outside this loop; assign to it
+//                         before the end of the body to revive it
+//   zero_iter       error: use of 'v' after it was moved  (at the final take)
+//                   note: 'v' was moved here by the call to 'take' (the move
+//                         before the loop)
+//
+// The fix is conservative: a `continue` taken after a move is refused even
+// when the next iteration assigns the place before reading it.
 
 pub fn take(owned s: String) { }
 

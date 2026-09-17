@@ -79,8 +79,12 @@
 //! the merge, never by dropping the whole record (that double-frees the
 //! unmoved sibling with the later partial drop); a field revived after it
 //! was moved is released at scope end (2026-09-16) because R3a retracts
-//! that path from `fieldWasMoved`; a skip-revival `break`/`continue` and
-//! a `return` inside a loop still leak; and a local declared
+//! that path from `fieldWasMoved`; a skip-revival `break` with no later
+//! use and a `return` inside a loop still leak (a skip-revival `continue`
+//! of an outer place, and a skip-revival `break` followed by a use, are
+//! refused by borrowck's R2.a since 2026-09-16; before that they were
+//! accepted and ran as double frees, which no drop decision here caused);
+//! and a local declared
 //! inside a VALUE-position block (`emitValueInto`) is not released at
 //! that block's exit, because it may be the value flowing out.
 //! Why block-scoped release is safe for a local whose initializer moves an
@@ -6907,6 +6911,7 @@ test "a revived var stays unreleased where the path may not hold a value" {
         \\    v = "b"
         \\  }
         \\}
+        // back_edge is refused by `cell check` since 2026-09-16 (R2.a at a `continue`); kept only for the drop decision.
         \\pub fn back_edge() {
         \\  var owned v: String = "a"
         \\  var i = 0
@@ -7057,6 +7062,7 @@ test "a store inside a while body that also moves its target keeps no pre-drop" 
     // followed by `continue`, to a store earlier in the next iteration.
     // Without the loop invalidation this exact program was an
     // AddressSanitizer double free (exit 134), measured.
+    // loopy is refused by `cell check` since 2026-09-16 (R2.a at a `continue`); kept only for the drop decision.
     var e = try emitSource(
         \\pub fn take(owned s: String);
         \\pub fn loopy() {

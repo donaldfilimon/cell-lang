@@ -389,6 +389,72 @@ while i < 3 {
 A place declared **inside** the body is fresh each iteration and is never
 subject to this rule.
 
+**Jumps, the condition, and every path out of the loop (2026-09-16).** Until
+this date R2.a was checked at ONE point, the fall-through end of the body.
+That enumerated one back-edge source and asserted a property of all of them,
+and five shapes escaped it. Each was accepted by `cell check` (exit 0) and ran
+as an AddressSanitizer double free (exit 134) at `05116dc`:
+
+| Shape | What escaped |
+|---|---|
+| `take(v); if d { continue }; v = make()` | a `continue` between the move and the revival reaches the next iteration with `v` moved |
+| `take(v); if d { break }; v = make()`, then `take(v)` after the loop | a `break` leaves the loop with `v` moved |
+| `while consume(v) { v = make() }`, then `take(v)` | the final, failing condition moves `v` |
+| `take(a)` before the loop, then `take(b); a = make()` in the body | reviving `a` removed its dead-list entry with `swapRemove`, which moved `b`'s entry below the index the body-end check started from |
+| `take(v)` before the loop, `v = make()` in the body, then `take(v)` | a body may run zero times, so after the loop `v` is still moved |
+
+The brief for this fix named the first three plus nested forms of the first
+two, and a condition move with no revival. The last two rows were found by
+measurement while fixing the first three. R2.a now asks the same question at
+every point that reaches a next iteration or the code after the loop:
+
+- **At a `continue`.** A place declared outside the loop, moved in its
+  condition or body and not revived, is refused with R2.a's text and a note
+  at the jump:
+
+  > `err: 'v' is moved inside a loop, so the next iteration would use it after the move`
+  > `note: this 'continue' is reached before 'v' is assigned again`
+
+- **At the end of the body.** The same test applies, and a move already
+  reported at a `continue` is not reported twice.
+- **In the condition.** The condition is part of the loop. A move in it that
+  the body does not revive is refused at the body end, because the next
+  evaluation reads the moved place.
+- **After the loop.** A place is dead when it is dead on ANY path out: the
+  body end, any `break`, or a failing condition. The failing-condition state
+  includes the state before the loop. A later use is then plain R2.
+- **What "moved in the loop" means.** The place was not already dead when the
+  loop was entered. The checker compares against a copy of the entry state,
+  not an index, so a revival's reordering cannot hide a move. A place already
+  moved before the loop and still moved at a `continue` restarts the body in
+  the state the walk checked, so it is not reported.
+
+Only the innermost loop is consulted, since a jump targets the innermost
+`while` (SPEC 7.7). An inner loop's `break` state reaches the outer body
+through the inner loop's own union, so a skip-revival `break` in an inner loop
+is refused at the outer body end. Corpus:
+`examples/rejected/skip_revival_jump.cell`, which carries the measurements.
+
+**This rejects some safe programs, by decision.** Take a place that is
+assigned at the top of the body before any use, then moved before a
+`continue`. That program is refused:
+
+```cell
+while c {
+    v = make()
+    if d { take(v); continue }
+    v = make()
+}
+```
+
+The program is safe, because the next iteration assigns `v` before reading
+it. This rule does not track which statements a path reaches before its
+first read. The same was already true of a body that moves at the end and
+revives at the top. Donald ruled on 2026-09-16 to take the conservative fix
+now and relax it later with a precise walk that knows a path ends at a jump.
+That walk must not re-walk the body, because a second walk breaks the
+binding-id lockstep with codegen (see R16).
+
 ### R2.b. An `owned` position is asked of the EXPRESSION, and an undecidable one is refused
 
 R2's list above names the forms that move a **place**. Every consumption site
@@ -500,12 +566,17 @@ return copy r
 Corpus: `examples/rejected/owned_move_through_match.cell`, which carries the
 measurements.
 
-**Where it is conservative, stated plainly.** A body that always `break`s
-before reaching the move is rejected anyway, because this rule does not track
-which paths reach the end of the body. That is the same trade section 0.3
-already made, and it carries the same guarantee: every program accepted under
-this rule is still accepted under a real control-flow analysis, so tightening
-now and relaxing later never breaks source compatibility.
+**Where R2.a is conservative, stated plainly.** A body that always `break`s
+before reaching the move is rejected anyway, because R2.a does not track
+which paths reach the end of the body, and neither does its `continue`
+clause (see the `v = make()` example under R2.a). That is the same trade
+section 0.3 already made, and it carries the same guarantee: every program
+accepted under this rule is still accepted under a real control-flow
+analysis, so tightening now and relaxing later never breaks source
+compatibility. **Until 2026-09-16 this paragraph implied the rule was also
+sound, and it was not:** a `break`, a `continue`, a condition move, a
+revival's reordering of the dead list, or a zero-iteration body could carry
+a move past the one point R2.a checked. See R2.a's jump clause.
 
 ### R3a. A moved-from place may be revived by assignment
 
@@ -1432,7 +1503,9 @@ field is assigned (that would drop a wholly moved record after
 then returns false for `a`, so `emitPartialRecordDrop` frees the revived
 value; the moved-and-never-revived case still skips. An outer field whose
 binding is `loop_moved` stays skipped, so a skip-revival `continue` does
-not become a double free.
+not become a double free. Since 2026-09-16 R2.a refuses that program
+outright (its jump clause), so the skip is defence in depth rather than the
+only guard.
 `examples/leaks/field_revival.cell` measured 1000 before on both witnesses
 and 0 after, pinned in the gate. Falsified: retracting `path == ""` on a
 field store then dropping the whole record after `let owned q = p`;
@@ -2202,8 +2275,16 @@ ways, and each is a real, documented gap rather than an oversight:
   `.jump` still holding a value. Codegen releases that binding after the
   closing `}`, moved-only. `examples/leaks/loop_cross.cell` measured 1000
   on both witnesses before and 0 after, pinned in the gate; ASan clean.
-  What still leaks, by design: a skip-revival `break`/`continue`, and a
-  `return` inside the loop.
+  What still leaks, by design: a skip-revival `break` whose place is never
+  used after the loop (the value revived on the other exits is not
+  released), and a `return` inside the loop. **Corrected 2026-09-16: this
+  sentence used to say a skip-revival `break`/`continue` only LEAKED.** The
+  drop side was right, but the same programs were ACCEPTED when a later use
+  made them double frees: a skip-revival `continue` of a place declared
+  outside the loop, and a skip-revival `break` followed by a use after the
+  loop, each ran as an AddressSanitizer double free (exit 134) with no
+  `cell_string_free` of that place in the emitted C. The fault was
+  borrowck's, and R2.a's jump clause now refuses both; see R2.a.
   **CLOSED 2026-09-16: a nested field whose sibling was moved.**
   `emitPartialRecordDrop` recurses into a partly moved record field
   (skip `inner.a`, free `inner.b`); `examples/leaks/partial_nested_field.cell`
@@ -2222,8 +2303,9 @@ ways, and each is a real, documented gap rather than an oversight:
   matching field paths from `moved_paths` drop queries; `fieldWasMoved`
   is false for the revived field so the new value is released at scope
   end. `examples/leaks/field_revival.cell` measured 1000 before and 0
-  after, pinned in the gate. A skip-revival `break`/`continue` and a
-  `return` inside a loop still leak.
+  after, pinned in the gate. A skip-revival `break` with no later use and a
+  `return` inside a loop still leak; a skip-revival `continue` of a place
+  declared outside the loop is refused by R2.a since 2026-09-16.
 
 Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released, and a nested field whose sibling was moved is released by recursing that same partial drop. A field moved on only one branch is closed the same day (`branch_field.cell`): it is released on the keeping path from per-field exit liveness, not by drop flags. A field revived after it was moved is closed the same day (`field_revival.cell`): R3a retracts that path from `fieldWasMoved`.
 

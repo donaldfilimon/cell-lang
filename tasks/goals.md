@@ -1,5 +1,12 @@
 # Goals
 
+## R2.a on every path out of a loop (skip-revival jumps)
+status: done
+- Reclassified from a deferred leak residual: skip-revival `break`/`continue` was a borrowck soundness hole. At `05116dc`, `cell check` accepted eight probes and ASan aborted each with a double free (exit 134): `skip_continue`, `skip_break_use`, `cond_move`, `nested_continue`, `break_then_outer`, `cond_twice`, and two found while fixing, `swap_hide` (a revival's `swapRemove` hid a body move from the index-based body-end scan) and `zero_iter` (a zero-iteration body left a pre-loop move invisible after the loop).
+- Fix, borrowck only: a `LoopFrame` stack; R2.a at `continue`; `break` states and the failing-condition state (a copy of `dead` after the condition, which includes the entry state) unioned into `dead` after the loop, after `after_held` and the body-end R2.a; "moved in the loop" compared against a copy of the entry state rather than an index. No new rule ID, no codegen change, no gate constant change.
+- Conservative by Donald's ruling: `loopy`-shaped programs (`v = "x"` at the top, `take(v); continue` later) are now refused. The precise divergence walk, early-`return` divergence and the return-in-loop drop remain open.
+- Evidence: 13 new borrowck tests; eight guard mutations, each failing a named test; `examples/rejected/skip_revival_jump.cell` flipped to currently-rejected; all eight probes refused. Full gate: `/private/tmp/cell-gate-skiprev.log`, run after this entry was written, with its verdict in the commit message. Not pushed.
+
 ## Project Grok bots follow Cell's gate
 status: done
 - Also: project `computer-control` skill (Grok Bot Agent Computer, not Claude/Orca); `reviewer` and `test-writer` overlays so those agents stop reviewing as Rust. `grok inspect` lists all three agents and both skills as project.

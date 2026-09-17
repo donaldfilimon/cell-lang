@@ -25,6 +25,14 @@
 //! widenings so far were three different axes and each escaped through the
 //! same permissive default.
 //!
+//! **R2.a is asked on every path out of a loop body** (2026-09-16), not only
+//! at the fall-through end: at each `continue`, and after the loop through
+//! the union of every `break` state and the failing-condition state (which
+//! includes the entry state). Before that, five accepted shapes ran as
+//! AddressSanitizer double frees; `checkWhile` and `docs/OWNERSHIP.md` R2.a
+//! list them. It is the file's recurring defect again: one back-edge source
+//! was enumerated and a property of all of them asserted.
+//!
 //! **R2.b** is the general rule that one clause of R10 was a special case of:
 //! an `owned` consumption position is asked of the EXPRESSION, not of a place.
 //! Every site used to call `placeOf` first and fall through to `checkExpr`,
@@ -483,9 +491,12 @@ pub const Checker = struct {
     /// WHY THE LOOP INVALIDATION. `dead` is lexical, and a `continue` (or the
     /// back edge after any path) can carry a move made LATER in a `while`
     /// body to a store EARLIER in the next iteration without `dead` ever
-    /// showing it: `while c { v = "x" \n if d { take(v) \n continue } \n
-    /// v = "y" }` is accepted, and at `v = "x"` on the third iteration the
-    /// value was already handed to `take`. So `checkWhile` clears `live`
+    /// showing it: in `while c { v = "x" \n if d { take(v) \n continue } \n
+    /// v = "y" }`, at `v = "x"` on the third iteration the value was already
+    /// handed to `take`. (That program was accepted until 2026-09-16 and is
+    /// now refused by R2.a at the `continue`; the invalidation stays, because
+    /// codegen emits C for a rejected module too and the back edge from the
+    /// body end reaches the store the same way.) So `checkWhile` clears `live`
     /// on every entry recorded inside its body whose binding was moved
     /// anywhere in that body (`moved_paths` is append-only, so "anywhere in
     /// the body" is a range). `while` is the only back edge Cell has.
@@ -501,11 +512,14 @@ pub const Checker = struct {
     /// state and union the results, so a move on one branch, or a revival on
     /// only one, leaves the place dead after the merge.
     ///
-    /// WHY THE LOOP GUARDS. `while` is the only back edge, and R2.a checks
-    /// only the path that reaches the end of the body. A `break` or
+    /// WHY THE LOOP GUARDS. `while` is the only back edge. A `break` or
     /// `continue` taken between a move and its revival leaves the loop, or
     /// reaches the next iteration, with the place moved while every exit the
-    /// checker walked saw it revived. So a binding declared outside a loop
+    /// checker walked saw it revived. R2.a now refuses the `continue` form
+    /// and makes the place dead after the loop for the `break` form (since
+    /// 2026-09-16), but a skip-revival `break` with no later use is still
+    /// accepted, and codegen emits C for rejected modules too, so the guards
+    /// stay. So a binding declared outside a loop
     /// and moved anywhere in it (the condition included) is never live at an
     /// exit recorded inside that loop (cleared by `checkWhile` once the body
     /// is walked) or at any exit after it (`loop_moved`). Bindings declared inside the loop body are
@@ -978,9 +992,25 @@ pub const Checker = struct {
     /// "still dead at the end of the body" is precisely "moved and not
     /// revived". No new machinery, and revival keeps working for free.
     ///
+    /// EVERY PATH, NOT ONE POINT (2026-09-16). The body end is only one of the
+    /// points that reach a next iteration or the code after the loop, and
+    /// checking it alone was a live double free five ways (the table in
+    /// `docs/OWNERSHIP.md` R2.a). So: a `continue` asks the same question
+    /// (`checkContinue`); the condition's moves count as loop moves, because
+    /// `entry_dead` is copied before it; and after the loop `dead` also holds
+    /// every `break` state (`saveBreakState`) and the failing-condition state,
+    /// which includes the entry state for a body that runs zero times.
+    /// "Moved in this loop" is "dead now and not dead on entry", asked of a
+    /// COPY of the entry state: an index into `dead` is not stable, because
+    /// `revive` uses `swapRemove`.
+    ///
     /// WHERE IT IS CONSERVATIVE, STATED RATHER THAN HIDDEN. A body that always
     /// `break`s before reaching the move is rejected anyway, because this does
-    /// not track which paths reach the end. That is the same trade section 0.3
+    /// not track which paths reach the end. Likewise a `continue` taken after
+    /// a move is refused even when the next iteration assigns the place
+    /// before reading it (`while c { v = "x" \n if d { take(v) \n continue }
+    /// \n v = "y" }`), by Donald's 2026-09-16 ruling; a later divergence walk
+    /// may relax it. That is the same trade section 0.3
     /// already made, and the same guarantee applies: every program accepted
     /// under this rule is still accepted under a real control-flow analysis,
     /// so tightening now and relaxing later never breaks source compatibility.
@@ -1219,9 +1249,10 @@ pub const Checker = struct {
 
         switch (stmt.kind) {
             .while_stmt => try self.checkWhile(stmt),
-            // A `break` or `continue` moves nothing and borrows nothing. It
-            // does change which paths reach the end of the body, which R2.a
-            // below deliberately ignores; see the note there.
+            // A `break` or `continue` moves nothing and borrows nothing, but
+            // each is a path the body end never sees. R2.a is asked at a
+            // `continue` (the next iteration), and a `break`'s state is
+            // unioned into `dead` after the loop. See `checkWhile`.
             .break_stmt => {
                 try self.saveBreakState();
                 try self.recordExit(.jump, @intFromPtr(stmt));

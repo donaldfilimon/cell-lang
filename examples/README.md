@@ -297,6 +297,12 @@ fail for opposite reasons, so keep both:
   aggregate transfer and partial-move drop state exist. Copy String/list fields
   are rejected structurally at declaration time for the same two-owner hazard.
 
+`skip_revival_jump.cell` carries R2.a's jump clause (2026-09-16): five loop
+shapes that the body-end check never saw (a `continue` or `break` between a
+move and its revival, a condition move, a revival that reordered the dead
+list, and a body that may run zero times). Each was accepted and ran as an
+AddressSanitizer double free at exit 134. Its header lists the diagnostics.
+
 Two other files are not ownership bugs at all:
 
 - `hex_float.cell`: currently-rejected. Hexadecimal floats (`0x1p1`) are not
