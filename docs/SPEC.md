@@ -242,7 +242,7 @@ ownership model and the C ABI are not up for negotiation. What has landed:
 | `const Foo = struct { }` | A second item grammar for a meaning the existing one already expresses. The genuinely missing feature underneath it, a top-level `const` value binding, is worth having on its own and is not this. |
 | macros | The other implementation states outright that its expander is not hygienic. A construct that can invisibly introduce a binding can silently change which place a move kills, and the diagnostic would point into expanded source. That is not deferrable in a language whose claim is that ownership is checkable. |
 | `.bod` as a package manifest | Section 1.2 is normative: `.bod` is a body file. See below. |
-| error unions, `!T` and `E!T` | A second spelling of `Result<T, E>` (section 3.4). The other implementation lowers an error union to a tagged `{ok, code, value}` struct; `runtime/cell_rt.h` already defines `cell_result_t { bool ok; int32_t error_code; cell_value_t value; }` for `Result`, the same three fields and the same choice to narrow the error to an integer code. Admitting both is a pure synonym, refused on the `i32`/`f64` grounds above. `Result<T, E>` parses and constructs since 2026-09-16 (`Ok`/`Err`, C backend; FEATURES TYPE-06). |
+| error unions, `!T` and `E!T` | A second spelling of `Result<T, E>` (section 3.4). The other implementation lowers an error union to a tagged `{ok, code, value}` struct; `runtime/cell_rt.h` already defined `cell_result_t { bool ok; int32_t error_code; cell_value_t value; }` for `Result`, the same three fields and the same choice to narrow the error to an integer code; since ABI 2 (2026-09-17) the runtime carries each scalar pair in its own struct instead. Admitting both is a pure synonym, refused on the `i32`/`f64` grounds above. `Result<T, E>` parses and constructs since 2026-09-16 (`Ok`/`Err`, C backend; FEATURES TYPE-06). |
 | postfix `?` on an expression, for error propagation | Postfix `?` already means optional in a type (section 3.2, `T?`). Different positions, so a parser could tell them apart, but one glyph would carry two unrelated meanings. Whether Cell wants propagation at all is a separate question; `Result` already parses and constructs, so the remaining question is whether a second glyph should mean `match` on `Err`. |
 
 **The `.bod` collision, stated normatively.** Another implementation reads
@@ -808,38 +808,46 @@ says generic types are not implemented, and `Result<T>` or three arguments is
 a parse error too.
 
 Constructors are `Ok(e)` and `Err(e)`. Patterns are `Ok(x)` and `Err(x)` (or
-`_`). Payloads this slice admits are the scalar primitives for `T`; `E` is an
-`Int32` code or a payload-free enum. `Ok`/`Err` need a declared Result slot
-(`let r: Result<Int, E> = Ok(1)`, a parameter, or a `return`). All three
-backends lower the type to `cell_result_t`; LLVM and MLIR build it the way
-`cell_ok_*` does (zeroed, `ok` byte, payload widened into the union's 64-bit
-slot, a C `bool` as one byte) and pass and return it indirectly, as clang does
-for a 24-byte struct. They refuse, together and with `cannot lower`, a `Byte`
-or non-scalar `T` and a constructor with no declared Result destination. A `Result` has no drop spelling, and none is needed while its payloads
+`_`). Payloads this slice admits are the scalar primitives (or unit) for `T`,
+and for `E` any scalar primitive or a payload-free enum. `Ok`/`Err` need a
+declared Result slot (`let r: Result<Int, E> = Ok(1)`, a parameter, or a
+`return`). Since 2026-09-17 (cell_rt.h ABI 2) such a pair lowers to its own
+struct, `cell_res_<ok>_<err>_t { bool ok; union { T ok; E err; } as; }`, with
+both payloads stored at their own width (a payload-free enum as `int32_t`, a
+C `bool` as one byte). Every such struct is at most 16 bytes, so all three
+backends pass and return it in registers, as clang does. LLVM and MLIR build
+it zeroed, set the `ok` byte, and store the payload at field 1. Any other pair
+(an owning or aggregate side) keeps the deprecated `cell_result_t` spelling in
+C as an opaque pass-through, and LLVM and MLIR refuse it, together and with
+`cannot lower`, as they refuse a constructor with no declared Result
+destination. A `Result` has no drop spelling, and none is needed while its payloads
 are what they are: a scalar `T` and an `int32_t` code own no memory, so an
 `owned` Result releases nothing and leaks nothing
 (`examples/leaks/owned_scalar_wrappers.cell` pins that at 0, together with
-scalar optionals). A resource-bearing `T` or `E` is the stated boundary: its
-payload layout in `cell_value_t` and its drop glue are not designed.
-`let arc r: Result<Int, Int> = read()` is a loud C type error (a
-`cell_result_t` does not initialize a `cell_arc_t`), the same refusal as other
-unboxable `arc` shapes.
+scalar optionals). A resource-bearing `T` or `E` is the stated boundary: owning
+payloads in a per-pair struct, their drop glue, and the `Ok(owned s)` /
+`Ok(shared s)` pattern modes are sub-projects 2-4 of
+`docs/superpowers/specs/2026-09-17-per-instantiation-results-design.md`.
+`let arc r: Result<Int, Int> = read()` is a loud C type error (a Result struct
+does not initialize a `cell_arc_t`), the same refusal as other unboxable `arc`
+shapes.
 
-The runtime defines the target layout:
+The runtime predefines one struct per in-scope pair:
 
 ```c
-typedef struct cell_result {
+#define CELL_RT_ABI_VERSION 2
+typedef struct cell_res_i64_i32_s {
     bool ok;
-    int32_t error_code;
-    cell_value_t value;   /* union of the scalar shapes */
-} cell_result_t;
+    union { int64_t ok; int32_t err; } as;
+} cell_res_i64_i32_t;   /* 16 bytes, align 8: [2 x i64] each way */
 ```
 
-One inherited limitation to live with: **`E` is narrowed to an `int32_t` code**
-at the C boundary regardless of what `E` is in Cell. A rich error payload would
-need a union on the error side too, which this layout does not model. The ok
-side does carry its payload inline through `cell_value_t`, so `Result<Int, E>`
-needs no allocation; aggregate `T` still travels through `value.ptr`.
+Slugs are `i64 i32 i16 i8 u64 u32 u16 u8 f64 f32 bool byte`, plus `unit` for
+`T`. **`E` is no longer narrowed**: before 2026-09-17 the C backend squeezed
+every error into an `int32_t` code (`5000000000` became `705032704`);
+`examples/results_wide.cell` pins a 64-bit error on all three backends. The
+ABI-1 names `cell_result_t`, `cell_value_t`, `cell_ok_*` and `cell_err` stay in
+the header, deprecated, for one runtime version.
 
 Generic types in general (user-written `Vec<T>`, type parameters on `fn`) are
 **designed, not implemented**.
@@ -1945,7 +1953,7 @@ for primitives, strings, slices, optionals, structs, payload-free enums, and
 | `copy String` | `cell_string_t` from `cell_string_clone` | `cell_string_t` (no clone call) |
 | `[T]` | `cell_slice_t { ptr, len, cap }`, type-erased, `elem_size` at each call site | `cell_slice_t` |
 | `T?` | tagged `{ bool has_value; T value; }` | `CELL_DEFINE_OPTIONAL` instance |
-| `Result<T, E>` | `cell_result_t { ok, error_code, cell_value_t value }` | scalar `Ok`/`Err` construct and match in C, LLVM and MLIR; no drop (3.4) |
+| `Result<T, E>` | `cell_res_<ok>_<err>_t { bool ok; union { T ok; E err; } as; }` (ABI 2) for scalar pairs; the deprecated `cell_result_t` for any other pair | scalar `Ok`/`Err` construct and match in C, LLVM and MLIR; no drop (3.4) |
 | struct | C struct, same field order, each field lowered by its own ownership | `cell_<Name>` |
 | payload-free enum | distinct integer type of width `int32_t` | `typedef int32_t cell_<Name>` |
 
@@ -2024,7 +2032,7 @@ real and cross-language by construction: `runtime/cell_rt.h` has an
 specifically so it compiles as C11, as C++20, and through Swift's importer, and
 `src/main.zig` links and calls `cell_rt_version`, `cell_cxx_probe`, and
 `cell_swift_probe` as externs. Measured: `cell version` prints
-`cell-rt 0.1.0 (c11)` and `cxx probe: 11`.
+`runtime: cell-rt 0.3.0 (c11, atomic arc)` and `cxx probe: 11` (2026-09-17).
 
 But there is no generated header for a Cell module, so a C or Swift caller has
 nothing to include and no prototype to import. Producing one is the first piece
@@ -2273,7 +2281,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Ownership lowering at the boundary | implemented for all five modes in the C backend (see 10.4) |
 | `const` for `shared` aggregates | implemented |
 | `arc` as `cell_arc_t` | implemented in the C backend, in every position including an un-annotated `let` |
-| `cell_result_t` emission | implemented (C backend; LLVM/MLIR refuse Result) |
+| Result emission | implemented: per-pair `cell_res_*` structs for scalar pairs in C, LLVM and MLIR (ABI 2, 2026-09-17); other pairs pass through as the deprecated `cell_result_t` in C only |
 | Return-value mapping | implemented |
 | Emitted C compiles for declaration-only files | implemented |
 | Emitted C compiles for hello / control_flow / ownership | implemented |

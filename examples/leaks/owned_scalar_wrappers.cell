@@ -1,7 +1,8 @@
 // Owned scalar `Result<T, E>` and `T?` values hold no heap memory, so the
 // "no drop" row in docs/FEATURES.md (TYPE-06) cannot leak today: `T` is a
-// scalar primitive and `E` is narrowed to an int32_t code, so cell_result_t
-// and cell_opt_*_t are plain values with nothing to release. This fixture
+// scalar primitive and so is `E` (or a payload-free enum), so the per-pair
+// cell_res_*_t (ABI 2) and cell_opt_*_t are plain values with nothing to
+// release. This fixture
 // pins that at 0 on both witnesses, so a future resource-bearing payload
 // (which would need real drop glue) shows up here as a nonzero count rather
 // than as a silent leak.

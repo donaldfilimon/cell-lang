@@ -106,12 +106,14 @@ symbol for LLVM IR or MLIR to call, so both refuse with `cannot lower`. They
 refuse TOGETHER, which is why the agreement contract below still holds while
 the three backends disagree about the program.
 
-`optionals.cell` (prints 43) and `results.cell` (prints 9) run on all three
+`optionals.cell` (prints 43), `results.cell` (prints 9) and
+`results_wide.cell` (prints -8999999983, a 64-bit error) run on all three
 backends since 2026-09-17: scalar `Some`/`None`/`Ok`/`Err` payloads only.
 
-`index.cell` (prints 125) is C only by the same contract: postfix `a[i]` for
+`index.cell` (prints 1142125) is C only by the same contract: postfix `a[i]` for
 `String` and `[Byte]` lowers through `cell_str_byte_at` / `cell_bytes_at`,
-and LLVM and MLIR refuse indexing together with `cannot lower`.
+and for `[Int]`/`[Int32]`/`[Float]`/`[Bool]` through `cell_list_*_at`; LLVM and
+MLIR refuse indexing together with `cannot lower`.
 
 `prelude.cell` (prints 123) runs on all three backends since 2026-09-17. It
 calls prelude functions that return `Byte?`, a 2-byte optional clang returns
@@ -180,8 +182,8 @@ Still not implemented: loops other than `while`, generics, enum
 payloads, Unicode identifiers, hexadecimal floats, and raw / interpolated /
 multi-line strings. Hex / binary / octal integers, underscore separators,
 and exponent floats are implemented; see `silent_literals.cell`. Scalar
-`Result<T, E>` constructs and matches in C; LLVM and MLIR refuse those
-programs. `arc` retain/release is implemented in the C backend, with the gaps
+`Result<T, E>` constructs and matches on all three backends (`results.cell`,
+`results_wide.cell`). `arc` retain/release is implemented in the C backend, with the gaps
 `docs/OWNERSHIP.md` R11 names.
 Stem pairing and `while`/`break`/`continue` are implemented; `for` and `loop`
 are not.
@@ -209,7 +211,7 @@ are not.
 | `unit_type.cell` | explicit `()` in type position: `-> ()` is the same unit as an omitted `->`; a `let` of `()` is refused |
 | `escapes.cell` | SPEC 2.8 simple escapes: `"\n"` is one newline byte and `"\\"` is one backslash; prints 11 through all three backends |
 | `silent_literals.cell` | SPEC 2.6/2.7: `0x1F` is 31, `1_000` is 1000, `1e9` is a Float; prints 31 through all three backends |
-| `index.cell` | postfix `a[i]` for `String` and `[Byte]` as `Byte?`; prints 125 through C; LLVM and MLIR refuse together |
+| `index.cell` | postfix `a[i]` for `String` and `[Byte]` as `Byte?`, and for `[Int]`/`[Float]`/`[Bool]` as the element's optional; prints 1142125 through C; LLVM and MLIR refuse together |
 
 ## Running `arc.cell`, the one example with a C host
 

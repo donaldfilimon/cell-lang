@@ -1,0 +1,47 @@
+// Per-instantiation Results (cell_rt.h ABI 2): E is carried at its own
+// width, so an error above 32 bits round-trips, and a Float or Bool payload
+// is stored exactly. Before 2026-09-17 the C backend narrowed E to an
+// int32_t code (5000000000 became 705032704) and the IR backends refused an
+// Int error outright.
+//
+// Status: parses, passes `cell check`, and runs on the C, LLVM and MLIR
+// backends, printing the same answer on each (see EXPECT-OUTPUT).
+// EXPECT-OUTPUT: -8999999983
+
+pub fn print_int(copy value: Int);
+
+pub fn half(copy x: Float) -> Result<Float, Int> {
+    if x < 0.0 {
+        return Err(5000000000)
+    }
+    return Ok(x / 2.0)
+}
+
+pub fn check(copy n: Int) -> Result<Bool, Int> {
+    if n > 3 {
+        return Ok(true)
+    }
+    return Err(n - 9000000000)
+}
+
+pub fn f_score(copy r: Result<Float, Int>) -> Int {
+    return match r {
+        Ok(v) => if v > 1.0 { 1 } else { 2 },
+        Err(e) => e / 1000000000,
+    }
+}
+
+pub fn b_score(copy r: Result<Bool, Int>) -> Int {
+    return match r {
+        Ok(v) => if v { 10 } else { 20 },
+        Err(e) => e,
+    }
+}
+
+pub fn main() {
+    let copy a = f_score(half(3.0))
+    let copy b = f_score(half(-1.0))
+    let copy c = b_score(check(5))
+    let copy d = b_score(check(1))
+    print_int(a + b + c + d)
+}

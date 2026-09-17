@@ -1,5 +1,6 @@
 // Result values: construction with Ok/Err and inspection in match. E is a
-// payload-free enum, carried as an int32_t code at the C boundary (SPEC 3.4).
+// payload-free enum, carried as an int32_t at the C boundary in the per-pair
+// struct `cell_res_i64_i32_t` (SPEC 3.4).
 //
 // Status: parses, passes `cell check`, and runs on the C, LLVM and MLIR
 // backends, printing 9 on each (scalar payloads only).

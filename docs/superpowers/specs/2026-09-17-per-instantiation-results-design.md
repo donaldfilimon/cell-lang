@@ -1,7 +1,9 @@
 # Per-instantiation Result layouts
 
-Status: design for review, 2026-09-17, from Donald's `/superpowers:brainstorming`
-session. Not yet approved for implementation.
+Status: approved by Donald 2026-09-17 and implemented the same day by
+`docs/superpowers/plans/2026-09-17-per-instantiation-results.md` (see its
+Deviations section: predefined instances, structural LLVM types, and a
+pass-through for out-of-scope pairs).
 
 ## Decisions already taken (Donald, 2026-09-17)
 
