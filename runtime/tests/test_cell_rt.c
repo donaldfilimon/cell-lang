@@ -731,6 +731,38 @@ static void test_prelude_strings(void) {
     cell_string_free(&v);
 }
 
+static void test_list_scalar_at(void) {
+    cell_slice_t xs = cell_slice_alloc(sizeof(int64_t), 2);
+    int64_t a = 40, b = -2;
+    CHECK(cell_slice_push(&xs, sizeof(int64_t), &a));
+    CHECK(cell_slice_push(&xs, sizeof(int64_t), &b));
+    CHECK(cell_list_i64_at(xs, 0).has_value && cell_list_i64_at(xs, 0).value == 40);
+    CHECK(cell_list_i64_at(xs, 1).value == -2);
+    CHECK(!cell_list_i64_at(xs, 2).has_value);
+    CHECK(!cell_list_i64_at(xs, -1).has_value);
+    cell_slice_free(&xs);
+
+    cell_slice_t fs = cell_slice_alloc(sizeof(double), 1);
+    double f = 2.5;
+    CHECK(cell_slice_push(&fs, sizeof(double), &f));
+    CHECK(cell_list_f64_at(fs, 0).value == 2.5);
+    CHECK(!cell_list_f64_at(fs, 1).has_value);
+    cell_slice_free(&fs);
+
+    cell_slice_t is = cell_slice_alloc(sizeof(int32_t), 1);
+    int32_t i = 7;
+    CHECK(cell_slice_push(&is, sizeof(int32_t), &i));
+    CHECK(cell_list_i32_at(is, 0).value == 7);
+    cell_slice_free(&is);
+
+    cell_slice_t bs = cell_slice_alloc(sizeof(bool), 1);
+    bool t = true;
+    CHECK(cell_slice_push(&bs, sizeof(bool), &t));
+    CHECK(cell_list_bool_at(bs, 0).has_value && cell_list_bool_at(bs, 0).value);
+    CHECK(!cell_list_bool_at(bs, 9).has_value);
+    cell_slice_free(&bs);
+}
+
 static void test_prelude_bytes_and_arc(void) {
     cell_slice_t xs = cell_bytes_empty();
     CHECK(cell_bytes_len(xs) == 0);
@@ -781,6 +813,7 @@ int main(void) {
     test_weak_bridge_fallbacks();
     test_prelude_numeric();
     test_prelude_strings();
+    test_list_scalar_at();
     test_prelude_bytes_and_arc();
 
     if (g_failures != 0) {

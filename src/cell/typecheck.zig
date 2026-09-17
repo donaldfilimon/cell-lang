@@ -745,18 +745,25 @@ pub const Checker = struct {
             });
         }
         if (base.isUnknown()) return try self.optionalOf(types.t_byte);
-        const indexable = switch (base) {
-            .string => true,
-            .list => |elem| elem.tag() == .byte,
-            else => false,
+        // `String` yields a Byte. A list yields its element for the scalar
+        // elements the C runtime has a bounds-checked reader for
+        // (2026-09-17). `[String][i]` and other owning elements stay
+        // refused: what the result owns is an open design question.
+        const element: ?Type = switch (base) {
+            .string => types.t_byte,
+            .list => |elem| switch (elem.tag()) {
+                .byte, .int, .int32, .float, .boolean => elem.*,
+                else => null,
+            },
+            else => null,
         };
-        if (!indexable) {
+        if (element == null) {
             try self.errf(span, "cannot index a value of type {s}", .{
                 try self.typeName(base),
             });
             return types.t_unknown;
         }
-        return try self.optionalOf(types.t_byte);
+        return try self.optionalOf(element.?);
     }
 
     fn checkStructLit(self: *Checker, span: ast.Span, sl: *const StructLitExpr) CheckError!Type {
@@ -1429,16 +1436,38 @@ test "String and [Byte] index as Byte?" {
     try t.expectClean();
 }
 
-test "indexing [Int] names the base type" {
+test "indexing a list of scalars yields the element's optional" {
+    // 2026-09-17: [Int], [Int32], [Float] and [Bool] join [Byte].
     var t: TestModule = .init();
     defer t.deinit();
     try t.check(
-        \\pub fn f(shared xs: [Int]) -> Byte? {
+        \\pub fn f(shared xs: [Int]) -> Int? {
+        \\    return xs[0]
+        \\}
+        \\pub fn g(shared xs: [Float]) -> Float? {
+        \\    return xs[1]
+        \\}
+        \\pub fn h(shared xs: [Bool]) -> Bool? {
+        \\    return xs[2]
+        \\}
+        \\pub fn k(shared xs: [Int32]) -> Int32? {
+        \\    return xs[3]
+        \\}
+    );
+    try t.expectClean();
+}
+
+test "indexing [String] names the base type" {
+    // What an indexed owning element would own is an open design question.
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f(shared xs: [String]) -> Byte? {
         \\    return xs[0]
         \\}
     );
     try t.expectCount(1);
-    try t.expectDiag(0, .err, 2, 12, "cannot index a value of type [Int]");
+    try t.expectDiag(0, .err, 2, 12, "cannot index a value of type [String]");
 }
 
 test "indexing a struct names the base type" {

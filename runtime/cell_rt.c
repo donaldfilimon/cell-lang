@@ -462,6 +462,17 @@ cell_opt_byte_t cell_bytes_at(cell_slice_t xs, int64_t index) {
     return cell_opt_byte_some(((const uint8_t *)xs.ptr)[index]);
 }
 
+#define CELL_LIST_AT(fn, base, T)                                               \
+    base##_t fn(cell_slice_t xs, int64_t index) {                               \
+        if (index < 0 || (uint64_t)index >= xs.len) return base##_none();       \
+        return base##_some(((const T *)xs.ptr)[index]);                         \
+    }
+CELL_LIST_AT(cell_list_i64_at, cell_opt_i64, int64_t)
+CELL_LIST_AT(cell_list_i32_at, cell_opt_i32, int32_t)
+CELL_LIST_AT(cell_list_f64_at, cell_opt_f64, double)
+CELL_LIST_AT(cell_list_bool_at, cell_opt_bool, bool)
+#undef CELL_LIST_AT
+
 void cell_bytes_push(cell_slice_t *xs, uint8_t value) {
     if (!cell_slice_push(xs, sizeof(uint8_t), &value))
         cell_panic(cell_str_from_cstr("cell_bytes_push: out of memory"));

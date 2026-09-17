@@ -534,6 +534,13 @@ cell_opt_byte_t cell_bytes_at(cell_slice_t xs, int64_t index);
 void cell_bytes_push(cell_slice_t *xs, uint8_t value);
 cell_opt_byte_t cell_bytes_pop(cell_slice_t *xs);
 void cell_bytes_clear(cell_slice_t *xs);
+/* `xs[i]` for lists of scalars (2026-09-17). Bounds-checked like
+ * `cell_bytes_at`: a negative or out-of-range index is none. The list must
+ * have been built with the matching element stride. */
+cell_opt_i64_t cell_list_i64_at(cell_slice_t xs, int64_t index);
+cell_opt_i32_t cell_list_i32_at(cell_slice_t xs, int64_t index);
+cell_opt_f64_t cell_list_f64_at(cell_slice_t xs, int64_t index);
+cell_opt_bool_t cell_list_bool_at(cell_slice_t xs, int64_t index);
 cell_slice_t cell_bytes_empty(void);
 cell_slice_t cell_bytes_with_capacity(int64_t cap);
 cell_arc_t cell_arc_retain_string(cell_arc_t value);

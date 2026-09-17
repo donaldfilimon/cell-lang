@@ -2520,8 +2520,12 @@ pub const Generator = struct {
         }
     }
 
-    /// `a[i]` for String and `[Byte]`. Bounds-checked runtime helpers return
-    /// `cell_opt_byte_t`; never an unchecked `xs.ptr[i]`.
+    /// `a[i]` for String and lists of scalars. Bounds-checked runtime
+    /// helpers return the element's optional; never an unchecked
+    /// `xs.ptr[i]`. The list reader is picked from the element C type the
+    /// list was BUILT with (`cell_slice_t` is type-erased), and an element
+    /// this backend cannot name is spelled as an undeclared function so cc
+    /// refuses it instead of reading the wrong stride.
     fn emitIndex(self: *Generator, ix: anytype, indent: usize) EmitError!void {
         const out = self.writer;
         const base_ty = try self.inferExpr(ix.base);
@@ -2529,7 +2533,7 @@ pub const Generator = struct {
             try out.writeAll("cell_str_byte_at(");
             try self.emitArgLike(ix.base, CType.str, indent);
         } else {
-            try out.writeAll("cell_bytes_at(");
+            try out.print("{s}(", .{listReader(base_ty.elem)});
             try self.emitArgLike(ix.base, CType.slice, indent);
         }
         try out.writeAll(", ");
@@ -3531,13 +3535,30 @@ pub const Generator = struct {
                 }
                 return CType.unknown;
             },
-            .index => {
+            .index => |ix| {
+                const base = try self.inferExpr(ix.base);
                 const p = try self.arena.create(CType);
-                p.* = .{ .text = "uint8_t", .shape = .byte };
-                return .{ .text = "cell_opt_byte_t", .shape = .optional, .payload = p };
+                if (base.shape == .str or base.shape == .string) {
+                    p.* = .{ .text = "uint8_t", .shape = .byte };
+                    return .{ .text = "cell_opt_byte_t", .shape = .optional, .payload = p };
+                }
+                const elem = base.elem orelse return CType.unknown;
+                const opt = listOptional(elem.text) orelse return CType.unknown;
+                p.* = elem.*;
+                return .{ .text = opt, .shape = .optional, .payload = p };
             },
             .struct_lit => |sl| return try self.namedType(sl.name),
-            .list_lit => return CType.slice,
+            .list_lit => |items| {
+                // Carry the element the literal will be BUILT with, by the
+                // same rule `emitListLit` applies, so an inferred `let` can
+                // be indexed with the right stride.
+                if (items.len == 0) return CType.slice;
+                var elem = try self.inferExpr(&items[0]);
+                if (elem.shape == .unknown or elem.shape == .unit) elem = CType.int64;
+                const p = try self.arena.create(CType);
+                p.* = elem;
+                return .{ .text = CType.slice.text, .shape = .slice, .elem = p };
+            },
             .block => |stmts| {
                 if (stmts.len == 0) return CType.void_type;
                 // The tail may name a `let` the block itself declares, and
@@ -4001,6 +4022,27 @@ fn endsInReturn(body: []const ast.Stmt) bool {
         .return_stmt => true,
         else => false,
     };
+}
+
+/// The bounds-checked runtime reader for a list built with `elem`.
+fn listReader(elem: ?*const CType) []const u8 {
+    const e = elem orelse return "cell_index_of_unknown_element";
+    if (eq(e.text, "uint8_t")) return "cell_bytes_at";
+    if (eq(e.text, "int64_t")) return "cell_list_i64_at";
+    if (eq(e.text, "int32_t")) return "cell_list_i32_at";
+    if (eq(e.text, "double")) return "cell_list_f64_at";
+    if (eq(e.text, "bool")) return "cell_list_bool_at";
+    return "cell_index_of_unsupported_element";
+}
+
+/// The optional C type `listReader` returns for `elem_text`.
+fn listOptional(elem_text: []const u8) ?[]const u8 {
+    if (eq(elem_text, "uint8_t")) return "cell_opt_byte_t";
+    if (eq(elem_text, "int64_t")) return "cell_opt_i64_t";
+    if (eq(elem_text, "int32_t")) return "cell_opt_i32_t";
+    if (eq(elem_text, "double")) return "cell_opt_f64_t";
+    if (eq(elem_text, "bool")) return "cell_opt_bool_t";
+    return null;
 }
 
 /// True when the block's last statement leaves it by a jump that has
@@ -7241,6 +7283,29 @@ test "a return inside a loop releases an outer var only where it holds a value" 
     }
     const between = try fnDef(e.text, "between");
     try expectLineBefore(between, "return;", "if (i > n) {");
+    try expectCompiles(e.text);
+}
+
+test "indexing a list reads with the stride the list was built with" {
+    // 2026-09-17. Declared, inferred and borrowed lists each pick the
+    // bounds-checked reader for their element type.
+    var e = try emitSource(
+        \\pub fn first(shared xs: [Float]) -> Float? {
+        \\  return xs[0]
+        \\}
+        \\pub fn main() {
+        \\  let owned ns = [40, 2]
+        \\  let copy a = ns[1]
+        \\  let owned bs: [Bool] = [true]
+        \\  let copy b = bs[0]
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(try fnDef(e.text, "first"), "cell_list_f64_at(");
+    const main_body = try fnDef(e.text, "main");
+    try expectContains(main_body, "cell_opt_i64_t a = cell_list_i64_at(ns, 1);");
+    try expectContains(main_body, "cell_opt_bool_t b = cell_list_bool_at(bs, 0);");
+    try expectAbsent(e.text, "cell_index_of_");
     try expectCompiles(e.text);
 }
 

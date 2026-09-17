@@ -768,9 +768,8 @@ optionals (`T??`) also do not parse. Both are **designed, not implemented**.
 ```
 
 `[T]` denotes a homogeneous sequence. Nesting works in the type grammar
-(`[[Int]]`, `[Int?]` both parse). There is no indexing operator and no
-iteration, so like optionals, a list can be named in a signature and
-constructed as an empty literal but not otherwise used.
+(`[[Int]]`, `[Int?]` both parse). There is no iteration. Indexing a list of
+scalars is implemented in the C backend (section 6.11).
 
 **CORRECTED 2026-09-07.** This section previously said "Codegen maps every list
 to `void*`" and "Codegen does not emit it". Both were false and had been for
@@ -1342,7 +1341,7 @@ literal really is wanted in a condition, parentheses restore it:
 `Expr.list_lit` carries the element expressions. An empty list emits
 `cell_slice_empty()`. A populated list lowers to a GNU statement expression
 that `cell_slice_alloc`s a buffer and `cell_slice_push`es each element.
-Indexing `a[i]` is implemented for `String` and `[Byte]` only (section 6.11).
+Indexing `a[i]` is implemented for `String` and lists of `Byte`, `Int`, `Int32`, `Float` and `Bool` (section 6.11).
 
 ### 6.9 `if` expressions
 
@@ -1385,7 +1384,8 @@ loop-shaped program parses and does nothing.
 ### 6.11 Indexing
 
 **Status: implemented for `String` and `[Byte]` in expression position
-(2026-09-16).** `parsePostfix` accepts `[ expr ]` after a primary, so `s[0]`
+(2026-09-16), and for `[Int]`, `[Int32]`, `[Float]` and `[Bool]` in the C
+backend (2026-09-17).** `parsePostfix` accepts `[ expr ]` after a primary, so `s[0]`
 and `xs[i]` parse as an index expression, not a list literal. `[` still
 begins a list literal when it is a primary.
 
@@ -1400,8 +1400,15 @@ let copy c: Byte? = xs[i]
   a truncation, never an unchecked `xs.ptr[i]`.
 - The index must be `Int`. Other integer widths are refused rather than
   silently truncated.
-- `[Int][i]`, a struct `[i]`, and every other base type are refused with a
-  diagnostic that names the base type.
+- `[Int][i]`, `[Int32][i]`, `[Float][i]` and `[Bool][i]` type as the
+  element's optional. The C backend calls `cell_list_i64_at`,
+  `cell_list_i32_at`, `cell_list_f64_at` or `cell_list_bool_at`, picked from
+  the element C type the list was built with, with the same bounds rule. An
+  element type the backend cannot name is emitted as an undeclared function,
+  so cc refuses it rather than reading the wrong stride.
+- `[String][i]`, a struct `[i]`, and every other base type are refused with
+  a diagnostic that names the base type. What an indexed owning element
+  would own is an open design question.
 - Indexing reads the base; it does not move it. A move of `a` then `a[i]`
   is use-after-move.
 - Indexed assignment `a[i] = x` parses and is refused. General `[T]`
@@ -2190,7 +2197,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Block expression parsing | implemented |
 | Block expression lowering | implemented |
 | Block expression typing (tail expression is the value; `if` branches must agree) | implemented 2026-09-15 |
-| Indexing `a[i]` | implemented for `String` and `[Byte]` as `Byte?` (C); LLVM/MLIR refuse; `[Int]` and indexed assignment refused |
+| Indexing `a[i]` | implemented for `String` and `[Byte]` as `Byte?`, and for `[Int]`/`[Int32]`/`[Float]`/`[Bool]` as the element's optional (C, 2026-09-17); LLVM/MLIR refuse; `[String]` and indexed assignment refused |
 
 ### Statements
 

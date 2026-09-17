@@ -1,11 +1,13 @@
-// Postfix indexing a[i] for String and [Byte] returns Byte?.
-// Out of bounds, including a negative index, is None; never a panic.
+// Postfix indexing a[i]: String and [Byte] return Byte?, and since
+// 2026-09-17 [Int], [Int32], [Float] and [Bool] return their element's
+// optional. Out of bounds, including a negative index, is None; never a
+// panic. [String][i] stays refused.
 //
 // Status: parses, passes `cell check`, and the emitted C compiles, links and
-// runs, printing 125 (see EXPECT-OUTPUT). C backend only: LLVM and MLIR refuse
+// runs, printing 1142125 (see EXPECT-OUTPUT). C backend only: LLVM and MLIR refuse
 // indexing together with `cannot lower`, so the agreement contract holds.
-// [Int] indexing and indexed assignment `a[i] = x` are not implemented.
-// EXPECT-OUTPUT: 125
+// Indexed assignment `a[i] = x` is not implemented.
+// EXPECT-OUTPUT: 1142125
 
 pub fn print_int(copy value: Int);
 
@@ -14,6 +16,17 @@ pub fn present(copy o: Byte?) -> Int {
         Some(_) => 1,
         None => 0,
     }
+}
+
+pub fn or_zero(copy o: Int?) -> Int {
+    return match o {
+        Some(v) => v,
+        None => 0,
+    }
+}
+
+pub fn second(shared ns: [Int]) -> Int {
+    return or_zero(ns[1])
 }
 
 pub fn main() {
@@ -43,5 +56,17 @@ pub fn main() {
     let copy e = present(xs[0])
     let copy f = present(xs[1])
     let copy g = present(xs[2])
-    print_int(a + b + c + d + e * 100 + f * 10 + g)
+    let owned ns = [40, 2]
+    let copy h = or_zero(ns[0]) + second(ns) + or_zero(ns[2]) + or_zero(ns[-1])
+    let owned fs: [Float] = [2.5]
+    let copy j = match fs[0] {
+        Some(x) => if x > 2.0 { 1 } else { 0 },
+        None => 0,
+    }
+    let owned bs: [Bool] = [true]
+    let copy k = match bs[0] {
+        Some(t) => if t { 1 } else { 0 },
+        None => 0,
+    }
+    print_int(a + b + c + d + e * 100 + f * 10 + g + h * 1000 + j * 100000 + k * 1000000)
 }
