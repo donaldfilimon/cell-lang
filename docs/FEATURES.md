@@ -4,7 +4,7 @@ This is the current-status entry point. SPEC.md defines intended semantics;
 OWNERSHIP.md defines ownership rules and retains historical defect evidence.
 Their dated snapshot tables are not current qualification results.
 
-Source inspected: compiler revision `d3cf2ae`, 2026-09-16. This matrix records
+Source inspected: compiler revision `59a42b7`, 2026-09-17. This matrix records
 static source and fixture evidence, not freshly qualified execution. No row is
 release-qualified on macOS, Linux or Windows. Gate reports qualify particular
 revisions and cases, not every possible program using a feature.
@@ -34,7 +34,7 @@ operation on the named type. M1-M10 refer to the approved completion program.
 | OWN-04 ARC retain/release and transfer | partial | partial | partial | partial | C cleanup gaps; IR preserves return ownership and refuses nonprimitive ARC returns | [ARC](../examples/arc.cell), [ARC return signature](../examples/signatures/arc_string_return.cell) | M2/M4 |
 | OWN-05 scope/aggregate/parameter destruction | partial | partial | absent | absent | Nonzero disclosed leak baselines remain | [leak contracts](../examples/leaks/README.md), [C emitter](../src/cell/codegen.zig) | M4 |
 | FLOW-01 if/block/match values | checked | lowered | partial | partial | Owning branches constrained by move checker | [control flow](../examples/control_flow.cell) | M3/M4 |
-| FLOW-02 while/break/continue | checked | lowered | lowered | lowered | Loop moves checked on every path out of the body (R2.a at `continue`, `break` and condition states unioned after the loop) since 2026-09-16. This row read `checked` while five accepted shapes ran as double frees; conservative (a `continue` after a move is refused even when the next iteration reassigns first). Broader cleanup incomplete | [loops](../examples/loops.cell), [skip-revival jumps](../examples/rejected/skip_revival_jump.cell) | M4/M5 |
+| FLOW-02 while/break/continue | checked | lowered | lowered | lowered | Loop moves checked on every path out of the body (R2.a at `continue`, `break` and condition states unioned after the loop) since 2026-09-16. This row read `checked` while five accepted shapes ran as double frees; conservative (a `continue` after a move is refused even when the next iteration reassigns first). A skip-revival `break` is released on the other exits since 2026-09-17 (`after_loop_skip`, leak fixture pinned at 0); a `return` inside a loop still leaks | [loops](../examples/loops.cell), [skip-revival jumps](../examples/rejected/skip_revival_jump.cell) | M4/M5 |
 | FLOW-03 for/loop/labels/defer | reserved | absent | absent | absent | Must share CFG cleanup | [parser](../src/cell/parser.zig), [lexer](../src/cell/lexer.zig) | M4/M5 |
 | EXPR-01 named calls, fields, struct/list literals | checked | partial | partial | partial | Aggregate construction/moves remain restricted | [expressions](../examples/expressions.cell) | M3/M4 |
 | EXPR-02 indexing, casts, remaining operators | partial | partial | refused | refused | `a[i]` for `String` and `[Byte]` as `Byte?` (OOB is None). C calls the runtime helpers; LLVM/MLIR refuse together. Casts and remaining operators still absent. Indexed assignment refused | [index](../examples/index.cell), [parser](../src/cell/parser.zig) | M5 |

@@ -283,6 +283,20 @@ pub const ExitKind = enum {
     /// like a jump. Recorded AFTER `loop_moved` poisons the in-loop exits,
     /// so those stay skipped. Missing or `live = false` keeps the leak.
     after_loop,
+    /// After a `while` whose outer binding is revived on every path out
+    /// EXCEPT some of this loop's own `break`s, where it is dead (a
+    /// skip-revival `break`, 2026-09-17). Keyed like `after_loop`. Only
+    /// sound together with `skip_breaks`: codegen releases the binding
+    /// after the loop and turns each listed `break` into a jump past that
+    /// release, because a plain C `break` would run it on a moved buffer.
+    after_loop_skip,
+};
+
+/// A `break` that must jump past the releases after its loop, recorded
+/// with `ExitKind.after_loop_skip`. See `Checker.skip_breaks`.
+const SkipBreak = struct {
+    break_key: usize,
+    loop_key: usize,
 };
 
 /// See `Checker.exit_liveness`.
@@ -393,6 +407,9 @@ const LoopFrame = struct {
     /// The outer part of `dead` at every `break`, unioned into `dead` after
     /// the loop.
     break_dead: std.ArrayListUnmanaged(Dead) = .empty,
+    /// The address of every `break` that leaves THIS loop (not a nested
+    /// one), for the skip-revival rule in `checkWhile`.
+    breaks: std.ArrayListUnmanaged(usize) = .empty,
     /// Moves R2.a already reported at a `continue`, so the body end does not
     /// report the same move twice.
     reported: std.ArrayListUnmanaged(Dead) = .empty,
@@ -406,6 +423,7 @@ const LoopFrame = struct {
 
     fn deinit(self: *LoopFrame, allocator: std.mem.Allocator) void {
         self.break_dead.deinit(allocator);
+        self.breaks.deinit(allocator);
         self.reported.deinit(allocator);
     }
 };
@@ -525,6 +543,10 @@ pub const Checker = struct {
     /// is walked) or at any exit after it (`loop_moved`). Bindings declared inside the loop body are
     /// fresh on every iteration, so the back edge carries none of their moves.
     exit_liveness: std.ArrayListUnmanaged(ExitLiveness) = .empty,
+    /// Every `break` codegen must lower as a jump past its loop's
+    /// `after_loop_skip` releases. Empty unless `checkWhile` proved the
+    /// skip-revival shape; a missing entry keeps the leak.
+    skip_breaks: std.ArrayListUnmanaged(SkipBreak) = .empty,
     /// Per-field sibling of `exit_liveness`. One entry per (exit, visible
     /// binding, path in `moved_paths`): whether that field still held a
     /// value on the path being walked. Filled from `dead` at `recordExit`
@@ -603,6 +625,7 @@ pub const Checker = struct {
         self.moved_paths.deinit(self.allocator);
         self.assign_liveness.deinit(self.allocator);
         self.exit_liveness.deinit(self.allocator);
+        self.skip_breaks.deinit(self.allocator);
         self.exit_field_liveness.deinit(self.allocator);
         self.loop_moved.deinit(self.allocator);
         self.names.deinit(self.allocator);
@@ -797,6 +820,24 @@ pub const Checker = struct {
     /// found it holding a value that no loop could have moved. False for an
     /// exit the checker did not record, so a drop point it did not vouch for
     /// keeps the leak. See `exit_liveness`.
+    /// The `while` whose `after_loop_skip` releases this `break` must jump
+    /// past, or null for an ordinary `break`.
+    pub fn skipBreakLoop(self: *const Checker, break_key: usize) ?usize {
+        for (self.skip_breaks.items) |sb| {
+            if (sb.break_key == break_key) return sb.loop_key;
+        }
+        return null;
+    }
+
+    /// True when some `break` of this `while` jumps past its releases, so
+    /// codegen places a label after them.
+    pub fn loopHasSkipBreaks(self: *const Checker, loop_key: usize) bool {
+        for (self.skip_breaks.items) |sb| {
+            if (sb.loop_key == loop_key) return true;
+        }
+        return false;
+    }
+
     pub fn liveAtExit(self: *const Checker, kind: ExitKind, key: usize, binding: u32) bool {
         var found = false;
         for (self.exit_liveness.items) |entry| {
@@ -1084,6 +1125,17 @@ pub const Checker = struct {
             try after_held.append(self.allocator, m.binding);
         }
 
+        // Skip-revival `break` (2026-09-17). Only when no binding qualified
+        // for a plain `after_loop`: a `break` live for one and dead for
+        // another cannot both run and skip the releases after the loop.
+        var skip_held: std.ArrayListUnmanaged(u32) = .empty;
+        defer skip_held.deinit(self.allocator);
+        var skip_set: std.ArrayListUnmanaged(usize) = .empty;
+        defer skip_set.deinit(self.allocator);
+        if (after_held.items.len == 0) {
+            try self.collectSkipRevival(&frame, moved_before, moved_after_cond, exits_before, first_loop_id, &skip_held, &skip_set);
+        }
+
         // See `exit_liveness`: the back edge and every `break` can carry a
         // move of an outer binding past the revival the walk saw.
         for (self.moved_paths.items[moved_before..]) |m| {
@@ -1136,6 +1188,75 @@ pub const Checker = struct {
                 .live = true,
             });
         }
+        for (skip_held.items) |binding| {
+            try self.exit_liveness.append(self.allocator, .{
+                .kind = .after_loop_skip,
+                .key = after_key,
+                .binding = binding,
+                .live = true,
+            });
+        }
+        for (skip_set.items) |break_key| {
+            try self.skip_breaks.append(self.allocator, .{ .break_key = break_key, .loop_key = after_key });
+        }
+    }
+
+    /// The skip-revival rule, read off the walk BEFORE invalidation. A
+    /// candidate is an outer binding of the current block, moved only as a
+    /// whole in this loop, not moved by the condition, holding a value at
+    /// body end, whose every in-loop jump record is live except for this
+    /// loop's own `break`s. Every candidate must be dead at exactly the same
+    /// non-empty set of `break`s, so each `break` either skips all the
+    /// releases or none. Anything else leaves both lists empty (the leak).
+    fn collectSkipRevival(
+        self: *const Checker,
+        frame: *const LoopFrame,
+        moved_before: usize,
+        moved_after_cond: usize,
+        exits_before: usize,
+        first_loop_id: u32,
+        held: *std.ArrayListUnmanaged(u32),
+        set: *std.ArrayListUnmanaged(usize),
+    ) Error!void {
+        var have_set = false;
+        for (self.moved_paths.items[moved_before..]) |m| {
+            if (m.binding >= first_loop_id) continue;
+            if (std.mem.indexOfScalar(u32, held.items, m.binding) != null) continue;
+            if (!self.bindingInCurrentBlock(m.binding)) continue;
+            for (self.moved_paths.items[moved_before..]) |other| {
+                if (other.binding == m.binding and other.path.len != 0) return self.clearSkip(held, set);
+            }
+            for (self.moved_paths.items[moved_before..moved_after_cond]) |c| {
+                if (c.binding == m.binding) return self.clearSkip(held, set);
+            }
+            for (self.dead.items) |d| {
+                if (d.binding == m.binding) return self.clearSkip(held, set);
+            }
+            var dead_here: std.ArrayListUnmanaged(usize) = .empty;
+            defer dead_here.deinit(self.allocator);
+            for (self.exit_liveness.items[exits_before..]) |entry| {
+                if (entry.kind != .jump or entry.binding != m.binding or entry.live) continue;
+                if (std.mem.indexOfScalar(usize, frame.breaks.items, entry.key) == null) return self.clearSkip(held, set);
+                if (std.mem.indexOfScalar(usize, dead_here.items, entry.key) == null) {
+                    try dead_here.append(self.allocator, entry.key);
+                }
+            }
+            if (dead_here.items.len == 0) return self.clearSkip(held, set);
+            if (have_set) {
+                if (!sameKeys(set.items, dead_here.items)) return self.clearSkip(held, set);
+            } else {
+                try set.appendSlice(self.allocator, dead_here.items);
+                have_set = true;
+            }
+            try held.append(self.allocator, m.binding);
+        }
+        // A `break` live for every candidate is an ordinary `break`; one
+        // dead for some but not all was refused above by `sameKeys`.
+    }
+
+    fn clearSkip(_: *const Checker, held: *std.ArrayListUnmanaged(u32), set: *std.ArrayListUnmanaged(usize)) void {
+        held.clearRetainingCapacity();
+        set.clearRetainingCapacity();
     }
 
     /// True when `binding` was declared in the block that contains the
@@ -1255,6 +1376,10 @@ pub const Checker = struct {
             // unioned into `dead` after the loop. See `checkWhile`.
             .break_stmt => {
                 try self.saveBreakState();
+                if (self.loop_frames.items.len > 0) {
+                    const frame = &self.loop_frames.items[self.loop_frames.items.len - 1];
+                    try frame.breaks.append(self.allocator, @intFromPtr(stmt));
+                }
                 try self.recordExit(.jump, @intFromPtr(stmt));
             },
             .continue_stmt => {
@@ -4878,6 +5003,14 @@ fn findField(def: ast.StructDef, name: []const u8) ?ast.Field {
         if (std.mem.eql(u8, f.name, name)) return f;
     }
     return null;
+}
+
+fn sameKeys(a: []const usize, b: []const usize) bool {
+    if (a.len != b.len) return false;
+    for (a) |k| {
+        if (std.mem.indexOfScalar(usize, b, k) == null) return false;
+    }
+    return true;
 }
 
 fn containsDead(list: []const Dead, d: Dead) bool {
@@ -8674,6 +8807,59 @@ test "after_loop is absent when a break is taken while the outer var is dead" {
     const v = h.binding("v");
     const key = h.firstWhile("f");
     try std.testing.expect(!h.checker.liveAtExit(.after_loop, key, v));
+}
+
+test "after_loop_skip is live for a skip-revival break, and names that break" {
+    // Same program as the test above. `after_loop` stays absent; the new
+    // kind vouches for the release only together with the skip record.
+    var h: LiveHarness = try .init(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    const v = h.binding("v");
+    const key = h.firstWhile("f");
+    try std.testing.expect(!h.checker.liveAtExit(.after_loop, key, v));
+    try std.testing.expect(h.checker.liveAtExit(.after_loop_skip, key, v));
+    try std.testing.expectEqual(@as(?usize, key), h.checker.skipBreakLoop(h.firstJump("f")));
+    try std.testing.expect(h.checker.loopHasSkipBreaks(key));
+}
+
+test "after_loop_skip is absent for a field move" {
+    // A field move is released per field elsewhere (`exit_field_liveness`),
+    // never by a whole-binding release after the loop. (A dead `continue`
+    // never reaches this rule: R2.a refuses it.)
+    var h: LiveHarness = try .init(
+        \\pub struct P { a: String, b: String }
+        \\pub fn take(owned s: String) { }
+        \\pub fn field(copy n: Int, owned p: P) {
+        \\    var owned q: P = p
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(q.a)
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\        q.a = "b"
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    const key = h.firstWhile("field");
+    try std.testing.expect(!h.checker.liveAtExit(.after_loop_skip, key, h.binding("q")));
+    try std.testing.expect(!h.checker.loopHasSkipBreaks(key));
 }
 
 test "after_loop is absent when the condition moves the outer var" {

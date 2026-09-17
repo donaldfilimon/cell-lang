@@ -2275,9 +2275,20 @@ ways, and each is a real, documented gap rather than an oversight:
   `.jump` still holding a value. Codegen releases that binding after the
   closing `}`, moved-only. `examples/leaks/loop_cross.cell` measured 1000
   on both witnesses before and 0 after, pinned in the gate; ASan clean.
-  What still leaks, by design: a skip-revival `break` whose place is never
-  used after the loop (the value revived on the other exits is not
-  released), and a `return` inside the loop. **Corrected 2026-09-16: this
+  What still leaks, by design: a `return` inside the loop.
+  **CLOSED 2026-09-17: a skip-revival `break` whose place is never used
+  after the loop.** borrowck records `ExitKind.after_loop_skip` when an
+  outer binding of the current block is moved only as a whole, not by the
+  condition, holds at body end, and is dead only at this loop's own
+  `break`s, with every candidate dead at the same set of them (and no
+  plain `after_loop` binding in the same loop). It lists those `break`s in
+  `skip_breaks`. Codegen releases the binding after the loop and lowers
+  each listed `break` as `goto cell_skip_N;` to a label placed after the
+  release; a `break` that still holds the value stays a `break` and runs
+  it. Anything else keeps the leak. `examples/leaks/skip_revival_break.cell`
+  measured 500 on both witnesses before and 0 after, pinned in the gate;
+  AddressSanitizer clean. Falsified: the same C with the `goto` put back
+  to `break` is an AddressSanitizer double free (exit 134). **Corrected 2026-09-16: this
   sentence used to say a skip-revival `break`/`continue` only LEAKED.** The
   drop side was right, but the same programs were ACCEPTED when a later use
   made them double frees: a skip-revival `continue` of a place declared
@@ -2303,8 +2314,9 @@ ways, and each is a real, documented gap rather than an oversight:
   matching field paths from `moved_paths` drop queries; `fieldWasMoved`
   is false for the revived field so the new value is released at scope
   end. `examples/leaks/field_revival.cell` measured 1000 before and 0
-  after, pinned in the gate. A skip-revival `break` with no later use and a
-  `return` inside a loop still leak; a skip-revival `continue` of a place
+  after, pinned in the gate. A `return` inside a loop still leaks (a
+  skip-revival `break` with no later use is released since 2026-09-17,
+  see the after-loop entry above); a skip-revival `continue` of a place
   declared outside the loop is refused by R2.a since 2026-09-16.
 
 Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released, and a nested field whose sibling was moved is released by recursing that same partial drop. A field moved on only one branch is closed the same day (`branch_field.cell`): it is released on the keeping path from per-field exit liveness, not by drop flags. A field revived after it was moved is closed the same day (`field_revival.cell`): R3a retracts that path from `fieldWasMoved`.

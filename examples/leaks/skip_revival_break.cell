@@ -1,0 +1,43 @@
+// R16 residual: a skip-revival `break`. The loop moves an outer var and
+// revives it only after a `break` that can be taken while it is dead, so
+// the `break` path holds nothing and the condition-false path holds the
+// revived value. `after_loop` is refused (a plain drop after `}` would run
+// on the `break` path too and double-free), so the revived value leaked.
+//
+// `once(0)` breaks at the first iteration with `s` already taken: nothing
+// to release. `once(5)` runs both iterations and leaves the loop through
+// the condition holding the second revival: one leak per call before the
+// fix. 500 calls of each => 500. Measured before the fix: leaks 500,
+// counter LIVE=500. AFTER: 0.
+// CLOSED 2026-09-17 by after_loop_skip releases (the dead `break` becomes
+// a `goto` past the release).
+//
+// Status: parses, passes `cell check`; C only; lives under examples/leaks/.
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn once(copy n: Int) {
+    var owned s: String = "aaaaaaaa"
+    var i = 0
+    while i < 2 {
+        i = i + 1
+        take(s)
+        if i > n {
+            break
+        }
+        s = "bbbbbbbb"
+    }
+}
+
+pub fn main() {
+    var i = 0
+    while i < 500 {
+        once(0)
+        once(5)
+        i = i + 1
+    }
+    print_int(i)
+}

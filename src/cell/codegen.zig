@@ -80,7 +80,10 @@
 //! unmoved sibling with the later partial drop); a field revived after it
 //! was moved is released at scope end (2026-09-16) because R3a retracts
 //! that path from `fieldWasMoved`; a skip-revival `break` with no later
-//! use and a `return` inside a loop still leak (a skip-revival `continue`
+//! use is released after the loop (`after_loop_skip`, 2026-09-17), the
+//! dead `break` lowered as a `goto` past that release, because a C
+//! `break` there runs it on a moved buffer (ASan exit 134, measured);
+//! a `return` inside a loop still leaks (a skip-revival `continue`
 //! of an outer place, and a skip-revival `break` followed by a use, are
 //! refused by borrowck's R2.a since 2026-09-16; before that they were
 //! accepted and ran as double frees, which no drop decision here caused);
@@ -389,6 +392,11 @@ pub const Generator = struct {
     /// local declared since the LOOP's mark, not since the innermost
     /// block's: `emitLoopExitDrops` reads the top of this stack.
     loop_marks: std.ArrayList(usize) = .empty,
+    /// Every `while` being emitted whose skip-revival `break`s jump to a
+    /// label after its releases (`after_loop_skip`), innermost last.
+    skip_labels: std.ArrayList(SkipLabel) = .empty,
+    /// The next skip label's number, unique within the translation unit.
+    next_skip_label: usize = 0,
     /// The enclosing statement list's block-end exit, for branch-end drops
     /// that ask "live here, dead after the merge".
     current_after: ?Exit = null,
@@ -799,6 +807,14 @@ pub const Generator = struct {
         const out = self.writer;
         switch (stmt.kind) {
             .while_stmt => |w| {
+                const loop_key = @intFromPtr(stmt);
+                const skips = if (self.checker) |c| c.loopHasSkipBreaks(loop_key) else false;
+                var skip_id: usize = 0;
+                if (skips) {
+                    skip_id = self.next_skip_label;
+                    self.next_skip_label += 1;
+                    try self.skip_labels.append(self.arena, .{ .loop_key = loop_key, .id = skip_id });
+                }
                 try self.writeIndent(indent);
                 try out.writeAll("while (");
                 try self.emitCond(&w.cond, indent);
@@ -812,12 +828,23 @@ pub const Generator = struct {
                 // revived on every path out. Moved-only: emitDropsSince
                 // would also free unmoved locals and double-free them at
                 // function end (ASan exit 134, measured).
-                try self.emitAfterLoopDrops(@intFromPtr(stmt), indent);
+                try self.emitAfterLoopDrops(loop_key, indent);
+                if (skips) {
+                    _ = self.skip_labels.pop();
+                    // A skip-revival `break` lands here, past the releases
+                    // above: its path already handed the value away.
+                    try self.writeIndent(indent);
+                    try out.print("cell_skip_{d}:;\n", .{skip_id});
+                }
             },
             .break_stmt => {
                 try self.emitLoopExitDrops(.{ .kind = .jump, .key = @intFromPtr(stmt) }, indent);
                 try self.writeIndent(indent);
-                try out.writeAll("break;\n");
+                if (self.skipLabelFor(@intFromPtr(stmt))) |id| {
+                    try out.print("goto cell_skip_{d};\n", .{id});
+                } else {
+                    try out.writeAll("break;\n");
+                }
             },
             .continue_stmt => {
                 try self.emitLoopExitDrops(.{ .kind = .jump, .key = @intFromPtr(stmt) }, indent);
@@ -1368,6 +1395,19 @@ pub const Generator = struct {
     /// in-loop invalidation stays; treating a condition move as live
     /// (`while consume(v) { v = make() }`) double-frees, because the last
     /// failing condition already took `v`.
+    /// The label a skip-revival `break` jumps to, or null for a plain
+    /// `break`. Only the innermost loop can own it: borrowck records a
+    /// `break` only for the loop it leaves.
+    fn skipLabelFor(self: *const Generator, break_key: usize) ?usize {
+        const checker = self.checker orelse return null;
+        const loop_key = checker.skipBreakLoop(break_key) orelse return null;
+        const n = self.skip_labels.items.len;
+        if (n == 0) return null;
+        const top = self.skip_labels.items[n - 1];
+        if (top.loop_key != loop_key) return null;
+        return top.id;
+    }
+
     fn emitAfterLoopDrops(self: *Generator, key: usize, indent: usize) EmitError!void {
         const checker = self.checker orelse return;
         const here: Exit = .{ .kind = .after_loop, .key = key };
@@ -1388,7 +1428,10 @@ pub const Generator = struct {
                 }
             } else {
                 if (!checker.wasMoved(local.id)) continue;
-                if (!checker.liveAtExit(here.kind, here.key, local.id)) continue;
+                // `after_loop_skip` is sound only because each dead `break`
+                // is lowered as a jump past this release (`skipLabelFor`).
+                if (!checker.liveAtExit(here.kind, here.key, local.id) and
+                    !checker.liveAtExit(.after_loop_skip, here.key, local.id)) continue;
                 if (after) |a| {
                     if (checker.liveAtExit(a.kind, a.key, local.id)) continue;
                 }
@@ -3973,6 +4016,11 @@ fn endsInJump(body: []const ast.Stmt) bool {
 const Exit = struct {
     kind: borrowck.ExitKind,
     key: usize,
+};
+
+const SkipLabel = struct {
+    loop_key: usize,
+    id: usize,
 };
 
 /// The fall-through end of `body`. Null for an empty block, which borrowck
@@ -6932,10 +6980,17 @@ test "a revived var stays unreleased where the path may not hold a value" {
     // one_branch: revival on the then path is released at that branch's end.
     const one = try fnDef(e.text, "one_branch");
     try expectOccurrences(one, "cell_string_free(&v);", 1);
-    for ([_][]const u8{ "moved_again", "break_after", "back_edge" }) |name| {
+    for ([_][]const u8{ "moved_again", "back_edge" }) |name| {
         const body = try fnDef(e.text, name);
         try expectAbsent(body, "cell_string_free(&v);");
     }
+    // break_after is the skip-revival `break` (after_loop_skip, 2026-09-17):
+    // released after the loop only behind the jump that keeps the dead
+    // `break` path away from it. A plain `break` would reach the release.
+    const after = try fnDef(e.text, "break_after");
+    try expectOccurrences(after, "cell_string_free(&v);", 1);
+    try expectAbsent(after, "break;");
+    try expectLineBefore(after, "cell_skip_0:;", "cell_string_free(&v);");
     try expectCompiles(e.text);
 }
 
@@ -7001,12 +7056,114 @@ test "an outer var revived across a while is released after the loop" {
     try expectOccurrences(revival_break, "cell_string_free(&v);", 1);
     try expectContains(revival_break, "}\n  cell_string_free(&v);\n}");
     try expectAbsent(revival_break, "cell_string_free(&v);\n      break;");
-    // skip-revival break does not satisfy P_exit: the jump is dead, so no
-    // after_loop record. Same as break_after; the leak stays.
-    try expectAbsent(try fnDef(e.text, "skip_revival_break"), "cell_string_free(&v);");
+    // skip-revival break (after_loop_skip, 2026-09-17): released after the
+    // loop, and the dead `break` jumps past that release. A plain `break`
+    // there was an AddressSanitizer double free (exit 134), measured.
+    const skip = try fnDef(e.text, "skip_revival_break");
+    try expectOccurrences(skip, "cell_string_free(&v);", 1);
+    try expectContains(skip, "goto cell_skip_");
+    try expectAbsent(skip, "break;");
+    try expectContains(skip, "}\n  cell_string_free(&v);\n  cell_skip_");
     // Unmoved: function-end drops it. after_loop must not, or this is a
     // double free with the scope-end drop (measured, exit 134).
     try expectOccurrences(try fnDef(e.text, "untouched"), "cell_string_free(&v);", 1);
+    try expectCompiles(e.text);
+}
+
+test "a skip-revival break is lowered as a jump only where every release agrees" {
+    // after_loop_skip guards, 2026-09-17. Each negative keeps the leak (no
+    // release, no goto): the var belongs to an enclosing loop's block and
+    // the inner `break` is dead (`nested`; the outer loop sees a dead jump
+    // that is not its own `break`), two vars are dead at different breaks
+    // (`mixed`), or the loop also has a var released on every path
+    // (`with_plain`); in the last two no single label serves every break.
+    // `live_and_dead` is the positive: a `break` that still holds the
+    // value stays a `break` and runs the release.
+    var e = try emitSource(
+        \\pub fn take(owned s: String);
+        \\pub fn nested(copy n: Int) {
+        \\  var owned v: String = "a"
+        \\  var j = 0
+        \\  while j < 2 {
+        \\    j = j + 1
+        \\    var i = 0
+        \\    while i < 3 {
+        \\      i = i + 1
+        \\      take(v)
+        \\      if i > n {
+        \\        break
+        \\      }
+        \\      v = "b"
+        \\    }
+        \\    v = "c"
+        \\  }
+        \\}
+        \\pub fn live_and_dead(copy n: Int) {
+        \\  var owned v: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    i = i + 1
+        \\    if i > 5 {
+        \\      break
+        \\    }
+        \\    take(v)
+        \\    if i > n {
+        \\      break
+        \\    }
+        \\    v = "b"
+        \\  }
+        \\}
+        \\pub fn mixed(copy n: Int) {
+        \\  var owned v: String = "a"
+        \\  var owned w: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    i = i + 1
+        \\    take(v)
+        \\    if i > n {
+        \\      break
+        \\    }
+        \\    v = "b"
+        \\    take(w)
+        \\    if i > 1 {
+        \\      break
+        \\    }
+        \\    w = "b"
+        \\  }
+        \\}
+        \\pub fn with_plain(copy n: Int) {
+        \\  var owned v: String = "a"
+        \\  var owned w: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    i = i + 1
+        \\    take(w)
+        \\    w = "b"
+        \\    take(v)
+        \\    if i > n {
+        \\      break
+        \\    }
+        \\    v = "b"
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    const nested = try fnDef(e.text, "nested");
+    try expectAbsent(nested, "goto");
+    try expectAbsent(nested, "cell_string_free(&v);");
+    // A `break` still holding the value is ordinary and runs the release;
+    // only the dead one jumps past it.
+    const both = try fnDef(e.text, "live_and_dead");
+    try expectOccurrences(both, "cell_string_free(&v);", 1);
+    try expectOccurrences(both, "break;", 1);
+    try expectOccurrences(both, "goto cell_skip_", 1);
+    const mixed = try fnDef(e.text, "mixed");
+    try expectAbsent(mixed, "goto");
+    try expectAbsent(mixed, "cell_string_free(&v);");
+    try expectAbsent(mixed, "cell_string_free(&w);");
+    const plain = try fnDef(e.text, "with_plain");
+    try expectAbsent(plain, "goto");
+    try expectAbsent(plain, "cell_string_free(&v);");
     try expectCompiles(e.text);
 }
 
