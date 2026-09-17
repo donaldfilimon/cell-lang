@@ -2681,7 +2681,7 @@ pub const Checker = struct {
                     // means nothing, so a mode here names a String payload.
                     // Without a mode the payload is a scalar copied out of
                     // the scrutinee (spec B.2): it aliases and owns nothing.
-                    const mode: ?Ownership = if (wp.ctor == .ok or wp.ctor == .err) wp.mode else null;
+                    const mode: ?Ownership = if (wp.ctor != .none) wp.mode else null;
                     const owning = mode != null and (mode.? == .owned or mode.? == .shared);
                     _ = try self.declare(.{
                         .id = 0,
@@ -2702,7 +2702,7 @@ pub const Checker = struct {
                             try self.diagnostics.err(
                                 self.allocator,
                                 arm.body.span,
-                                try self.msg("yielding the '{s}(owned {s})' binding directly from its arm is not implemented", .{ if (wp.ctor == .ok) "Ok" else "Err", name }),
+                                try self.msg("yielding the '{s}(owned {s})' binding directly from its arm is not implemented", .{ ctorName(wp.ctor), name }),
                             );
                             try self.diagnostics.note(
                                 self.allocator,
@@ -2711,7 +2711,7 @@ pub const Checker = struct {
                             );
                         }
                         if (scrutinee_place) |sp| {
-                            try self.movePlace(sp, try self.msg("'{s}' was moved here by '{s}(owned {s})'", .{ sp.display, if (wp.ctor == .ok) "Ok" else "Err", name }));
+                            try self.movePlace(sp, try self.msg("'{s}' was moved here by '{s}(owned {s})'", .{ sp.display, ctorName(wp.ctor), name }));
                         }
                     } else if (owning) {
                         if (scrutinee_place) |sp| try self.createLoan(sp, .shared, true, name);
@@ -2754,8 +2754,9 @@ pub const Checker = struct {
     /// resource is refused, as at every other consumption site.
     fn checkWrap(self: *Checker, w: @FieldType(ast.Expr.Kind, "wrap")) Error!void {
         const o = w.operand orelse return;
-        // `Ok` and, since sub-project 3, `Err` can carry an owning String.
-        if (w.ctor != .ok and w.ctor != .err) return self.checkExpr(o);
+        // `Ok`, `Err` (sub-project 3) and `Some` (sub-project 4) can carry an
+        // owning String; `None` has no operand.
+        _ = w.ctor;
         switch (try self.ownedMoveSource(o)) {
             .place => |pl| {
                 const b = self.bindingById(pl.binding) orelse return self.checkExpr(o);
@@ -5198,6 +5199,15 @@ fn findField(def: ast.StructDef, name: []const u8) ?ast.Field {
         if (std.mem.eql(u8, f.name, name)) return f;
     }
     return null;
+}
+
+fn ctorName(c: ast.Ctor) []const u8 {
+    return switch (c) {
+        .ok => "Ok",
+        .err => "Err",
+        .some => "Some",
+        .none => "None",
+    };
 }
 
 fn sameKeys(a: []const usize, b: []const usize) bool {
@@ -9412,6 +9422,42 @@ test "Err moves an owning String and Err(owned ..) consumes on its arm only" {
         \\}
         \\
     , "the scrutinee still owns the value");
+}
+
+test "Some moves an owning String and Some(owned ..) consumes on its arm only" {
+    // Sub-project 4 (2026-09-17).
+    try expectRejectedWith(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(owned s: String) -> String? {
+        \\    let o: String? = Some(s)
+        \\    take(s)
+        \\    return o
+        \\}
+        \\
+    , "use of 's' after it was moved");
+    try expectRejectedWith(
+        \\pub fn take(owned s: String) { }
+        \\pub fn keepo(owned o: String?) { }
+        \\pub fn f(owned o: String?) {
+        \\    match o {
+        \\        Some(owned x) => take(x),
+        \\        None => {},
+        \\    }
+        \\    keepo(o)
+        \\}
+        \\
+    , "use of 'o' after it was moved");
+    try expectAccepted(
+        \\pub fn take(owned s: String) { }
+        \\pub fn keepo(owned o: String?) { }
+        \\pub fn f(owned o: String?) {
+        \\    match o {
+        \\        Some(owned x) => take(x),
+        \\        None => keepo(o),
+        \\    }
+        \\}
+        \\
+    );
 }
 
 test "Ok of a scalar match alias is still only a read" {
