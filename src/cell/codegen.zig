@@ -1008,11 +1008,11 @@ pub const Generator = struct {
             i -= 1;
             const local = self.locals.items[i];
             if (!eq(local.name, name)) continue;
-            if (!local.droppable or !(hasDropCall(local.ty.shape) or isOwningResult(local.ty))) return null;
+            if (!local.droppable or !(hasDropCall(local.ty.shape) or hasOwningGlue(local.ty))) return null;
             switch (local.ownership) {
                 .arc => return local,
                 .owned => {
-                    if (local.ty.shape != .string and local.ty.shape != .slice and !isOwningResult(local.ty)) return null;
+                    if (local.ty.shape != .string and local.ty.shape != .slice and !hasOwningGlue(local.ty)) return null;
                     // No checker means no move facts, and without them the
                     // pre-drop cannot be proven safe: keep the leak. The
                     // checker answers per store, not per binding: whether
@@ -1050,7 +1050,7 @@ pub const Generator = struct {
     /// which `recordNeedsDrop` decides from its fields.
     fn needsDrop(self: *Generator, ty: CType) Alloc!bool {
         if (hasDropCall(ty.shape)) return true;
-        if (ty.shape == .result) return isOwningResult(ty);
+        if (ty.shape == .result or ty.shape == .optional) return hasOwningGlue(ty);
         if (ty.shape != .record) return false;
         return self.recordNeedsDrop(ty.name, 0);
     }
@@ -1159,6 +1159,12 @@ pub const Generator = struct {
         }
         try out.writeAll("\n");
         for (seen.items) |base| {
+            if (eq(base, "cell_opt_string")) {
+                try out.writeAll("// Owning String? (2026-09-17): release the payload only when present.\n");
+                try out.writeAll("static inline __attribute__((unused)) void cell_drop_opt_string(cell_opt_string_t *r) {\n");
+                try out.writeAll("  if (r->has_value) cell_string_free(&r->value);\n}\n\n");
+                continue;
+            }
             const ok_owns = std.mem.startsWith(u8, base, "cell_res_string_");
             const err_owns = std.mem.endsWith(u8, base, "_string");
             try out.print("// Owning String Result (2026-09-17): release the side that is present.\n", .{});
@@ -1186,7 +1192,17 @@ pub const Generator = struct {
                 try self.collectOwningResults(r.ok, seen);
                 try self.collectOwningResults(r.err, seen);
             },
-            .optional, .list => |inner| try self.collectOwningResults(inner, seen),
+            .optional => |inner| {
+                const t = try self.lowerType(ty, .owned);
+                if (isOwningOptional(t)) {
+                    const base = t.text[0 .. t.text.len - "_t".len];
+                    for (seen.items) |b| {
+                        if (eq(b, base)) break;
+                    } else try seen.append(self.arena, base);
+                }
+                try self.collectOwningResults(inner, seen);
+            },
+            .list => |inner| try self.collectOwningResults(inner, seen),
             .ref => |r| try self.collectOwningResults(r.inner, seen),
             .name, .unit => {},
         }
@@ -1251,7 +1267,7 @@ pub const Generator = struct {
                 }
             },
             // An owning Result (2026-09-17), through its per-module glue.
-            .result => try self.writer.print("cell_drop_{s}(&{s});\n", .{ resultBase(local.ty).?["cell_".len..], local.name }),
+            .result, .optional => try self.writer.print("cell_drop_{s}(&{s});\n", .{ glueStem(local.ty), local.name }),
             else => unreachable, // needsDrop already filtered these out.
         }
     }
@@ -2214,9 +2230,14 @@ pub const Generator = struct {
             const wp = arm.pattern.kind.wrap_pattern;
             if (wp.binding) |name| {
                 const owning_side = (wp.ctor == .ok and resultOkOwning(scrut_ty)) or
-                    (wp.ctor == .err and resultErrOwning(scrut_ty));
+                    (wp.ctor == .err and resultErrOwning(scrut_ty)) or
+                    (wp.ctor == .some and isOwningOptional(scrut_ty));
                 const owning_mode: ?ast.Ownership = if (owning_side) wp.mode else null;
-                const side = if (wp.ctor == .ok) "ok" else "err";
+                const payload_field: []const u8 = switch (wp.ctor) {
+                    .ok => "as.ok",
+                    .err => "as.err",
+                    .some, .none => "value",
+                };
                 const payload_ty: CType = switch (wp.ctor) {
                     .some, .none => if (scrut_ty.payload) |p| p.* else CType.unknown,
                     .ok => if (scrut_ty.payload) |p| p.* else CType.unknown,
@@ -2228,9 +2249,9 @@ pub const Generator = struct {
                 try self.writeDecl(ty, name);
                 if (owning_mode) |mode| {
                     if (mode == .shared) {
-                        try self.writer.print(" = cell_string_as_str(&{s}.as.{s});\n", .{ temp, side });
+                        try self.writer.print(" = cell_string_as_str(&{s}.{s});\n", .{ temp, payload_field });
                     } else {
-                        try self.writer.print(" = {s}.as.{s};\n", .{ temp, side });
+                        try self.writer.print(" = {s}.{s};\n", .{ temp, payload_field });
                     }
                     // `owned` takes the payload's buffer and is released like
                     // any owned local; `shared` never is.
@@ -2278,14 +2299,15 @@ pub const Generator = struct {
         // An outer owner this arm kept while another arm moved it.
         try self.emitBranchEndDrops(key, arm_outer_mark, outer_after, indent);
         // A temporary owning scrutinee no arm binding took.
-        if (scrut_is_temp and isOwningResult(scrut_ty)) {
+        if (scrut_is_temp and hasOwningGlue(scrut_ty)) {
             const took = arm.pattern.kind == .wrap_pattern and
                 arm.pattern.kind.wrap_pattern.mode == .owned and
                 ((arm.pattern.kind.wrap_pattern.ctor == .ok and resultOkOwning(scrut_ty)) or
-                    (arm.pattern.kind.wrap_pattern.ctor == .err and resultErrOwning(scrut_ty)));
+                    (arm.pattern.kind.wrap_pattern.ctor == .err and resultErrOwning(scrut_ty)) or
+                    (arm.pattern.kind.wrap_pattern.ctor == .some and isOwningOptional(scrut_ty)));
             if (!took) {
                 try self.writeIndent(indent);
-                try self.writer.print("cell_drop_{s}(&{s});\n", .{ resultBase(scrut_ty).?["cell_".len..], temp });
+                try self.writer.print("cell_drop_{s}(&{s});\n", .{ glueStem(scrut_ty), temp });
             }
         }
     }
@@ -2700,15 +2722,34 @@ pub const Generator = struct {
             .some => {
                 const operand = w.operand.?;
                 const dest: ?CType = if (want) |d| (if (d.shape == .optional) d else null) else null;
+                // An owning String payload (sub-project 4): moved when
+                // borrowck moved the place, copied when it only read it.
+                const inner_op = unwrapAnnotated(operand);
+                const moved = if (self.checker) |c| c.wrapMoved(@intFromPtr(operand)) else false;
+                const is_place = inner_op.kind == .ident or inner_op.kind == .field;
+                const op_ty = if (is_place) try self.inferExpr(inner_op) else CType.unknown;
+                const copy_it = is_place and !moved and op_ty.shape == .string;
                 if (dest) |d| {
                     try out.print("{s}_some(", .{optBase(d)});
-                    try self.emitArgLike(operand, d.payload.?.*, indent);
+                    if (copy_it and d.payload.?.shape == .string) {
+                        try out.writeAll(if (op_ty.pointer) "cell_string_clone(" else "cell_string_clone(&");
+                        try self.emitExpr(inner_op, indent);
+                        try out.writeAll(")");
+                    } else {
+                        try self.emitArgLike(operand, d.payload.?.*, indent);
+                    }
                     try out.writeAll(")");
                 } else {
                     const inner = try self.inferExpr(operand);
                     const base = optBaseForPayload(inner) orelse return error.WriteFailed;
                     try out.print("{s}_some(", .{base});
-                    try self.emitExpr(operand, indent);
+                    if (copy_it) {
+                        try out.writeAll(if (op_ty.pointer) "cell_string_clone(" else "cell_string_clone(&");
+                        try self.emitExpr(inner_op, indent);
+                        try out.writeAll(")");
+                    } else {
+                        try self.emitExpr(operand, indent);
+                    }
                     try out.writeAll(")");
                 }
             },
@@ -3646,7 +3687,9 @@ pub const Generator = struct {
                 if (eq(n, "Float") or eq(n, "Float64")) return .{ .base = "cell_opt_f64", .elem = "double", .generated = false };
                 if (eq(n, "Bool")) return .{ .base = "cell_opt_bool", .elem = "bool", .generated = false };
                 if (eq(n, "Byte")) return .{ .base = "cell_opt_byte", .elem = "uint8_t", .generated = false };
-                if (eq(n, "String")) return .{ .base = "cell_opt_str", .elem = "cell_str_t", .generated = false };
+                // An owning String? (sub-project 4, 2026-09-17); the view
+                // optional `cell_opt_str` stays in the header for hosts.
+                if (eq(n, "String")) return .{ .base = "cell_opt_string", .elem = "cell_string_t", .generated = false };
                 const base = try self.namedType(n);
                 if (base.shape == .unknown) return .{ .base = "cell_opt_ptr", .elem = "void *", .generated = false };
                 return .{
@@ -4064,7 +4107,7 @@ fn optBaseForPayload(t: CType) ?[]const u8 {
         .{ "int32_t", "cell_opt_i32" },   .{ "uint16_t", "cell_opt_u16" },
         .{ "uint32_t", "cell_opt_u32" },  .{ "double", "cell_opt_f64" },
         .{ "bool", "cell_opt_bool" },     .{ "uint8_t", "cell_opt_byte" },
-        .{ "float", "cell_opt_Float32" },
+        .{ "float", "cell_opt_Float32" },     .{ "cell_string_t", "cell_opt_string" },
     };
     inline for (map) |row| if (std.mem.eql(u8, t.text, row[0])) return row[1];
     return null;
@@ -4212,6 +4255,23 @@ fn scalarSlug(n: []const u8) ?[]const u8 {
 fn resultBase(t: CType) ?[]const u8 {
     if (!std.mem.startsWith(u8, t.text, "cell_res_")) return null;
     return t.text[0 .. t.text.len - 2];
+}
+
+/// An owning String? (sub-project 4, 2026-09-17).
+fn isOwningOptional(t: CType) bool {
+    return t.shape == .optional and std.mem.eql(u8, t.text, "cell_opt_string_t");
+}
+
+/// Whether a value of this aggregate type owns heap memory and is released
+/// through per-module glue (`cell_drop_<stem>`).
+fn hasOwningGlue(t: CType) bool {
+    return isOwningResult(t) or isOwningOptional(t);
+}
+
+/// `res_i64_string` for `cell_res_i64_string_t`, `opt_string` for
+/// `cell_opt_string_t`: the part after `cell_drop_`.
+fn glueStem(t: CType) []const u8 {
+    return t.text["cell_".len .. t.text.len - "_t".len];
 }
 
 /// A Result with an owning String side (sub-projects 2 and 3, 2026-09-17):
@@ -7702,6 +7762,66 @@ test "an owning String error is bound, released per side, and copied when unreso
     try expectOccurrences(tw, "cell_drop_res_string_string(&_cell_t", 1);
     const ur = try fnDef(e.text, "unresolved");
     try expectContains(ur, "cell_res_i64_string_err(cell_string_clone(&s))");
+    try expectCompiles(e.text);
+}
+
+test "an owning String? is its own instance, bound, released and copied when unresolved" {
+    // Sub-project 4 (2026-09-17).
+    var e = try emitSource(
+        \\pub fn take(owned s: String);
+        \\pub fn view(shared s: String) -> Int;
+        \\pub fn make() -> String;
+        \\pub fn find() -> String?;
+        \\pub fn wrap(owned s: String) -> String? {
+        \\  return Some(s)
+        \\}
+        \\pub fn owned_arm(owned o: String?) -> Int {
+        \\  return match o {
+        \\    Some(owned x) => view(x),
+        \\    None => 0,
+        \\  }
+        \\}
+        \\pub fn shared_arm(owned o: String?) -> Int {
+        \\  return match o {
+        \\    Some(shared x) => view(x),
+        \\    None => 0,
+        \\  }
+        \\}
+        \\pub fn temp() -> Int {
+        \\  return match find() {
+        \\    Some(shared x) => view(x),
+        \\    None => 0,
+        \\  }
+        \\}
+        \\pub fn reassign() {
+        \\  var owned o: String? = find()
+        \\  o = find()
+        \\}
+        \\pub fn unresolved(copy c: Int) -> String? {
+        \\  let owned s = if c > 0 { make() } else { make() }
+        \\  return Some(s)
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_opt_string_t cell_find(void);");
+    try expectOccurrences(e.text, "static inline __attribute__((unused)) void cell_drop_opt_string(cell_opt_string_t *r);", 1);
+    try expectContains(e.text, "if (r->has_value) cell_string_free(&r->value);");
+    const w = try fnDef(e.text, "wrap");
+    try expectContains(w, "cell_opt_string_some(s)");
+    try expectAbsent(w, "cell_string_free(&s);");
+    const oa = try fnDef(e.text, "owned_arm");
+    try expectContains(oa, "cell_string_t x = _cell_t");
+    try expectContains(oa, ".value;");
+    try expectOccurrences(oa, "cell_string_free(&x);", 1);
+    try expectOccurrences(oa, "cell_drop_opt_string(&o);", 1);
+    const sa = try fnDef(e.text, "shared_arm");
+    try expectContains(sa, "cell_str_t x = cell_string_as_str(&_cell_t");
+    try expectOccurrences(sa, "cell_drop_opt_string(&o);", 1);
+    // Neither arm takes the payload, so both release the temporary (the
+    // glue is a no-op on `None`).
+    try expectOccurrences(try fnDef(e.text, "temp"), "cell_drop_opt_string(&_cell_t", 2);
+    try expectOccurrences(try fnDef(e.text, "reassign"), "cell_drop_opt_string(&o);", 2);
+    try expectContains(try fnDef(e.text, "unresolved"), "cell_opt_string_some(cell_string_clone(&s))");
     try expectCompiles(e.text);
 }
 
