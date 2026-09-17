@@ -529,8 +529,8 @@ const Emitter = struct {
         const string_pair = std.mem.eql(u8, val_ty, "!llvm.struct<(ptr, i64)>") and
             std.mem.eql(u8, dest_ty, "!llvm.struct<(ptr, i64, i64)>");
         const why: []const u8 = if (string_pair)
-            " (converting a borrowed view into an owning value needs" ++
-                " cell_string_from_str, which this backend does not emit yet: it has no drop pass to free the result)"
+            " (hir.lower inserted no conversion here: a borrowed view becomes an owning" ++
+                " value only through the cell_string_from_str call it inserts at a declared destination)"
         else
             "";
         try self.unsupported(span, try std.fmt.allocPrint(
@@ -1152,7 +1152,7 @@ const Emitter = struct {
     /// Emit one call argument, already shaped for the parameter it will fill.
     /// `want` is null for a callee with no signature, where there is nothing to
     /// shape it to and the natural value is all there is.
-    fn emitArg(self: *Emitter, arg: *const hir.Expr, want: ?[]const u8) EmitError!Value {
+    fn emitArg(self: *Emitter, arg: *const hir.Expr, want: ?[]const u8, spill_ty: ?[]const u8) EmitError!Value {
         // A place passed to a pointer parameter is answered BEFORE the value is
         // emitted, because emitting it would `llvm.load` an aggregate nothing
         // then reads. Its slot IS the object's address, an `llvm.alloca`, which
@@ -1179,6 +1179,14 @@ const Emitter = struct {
             // A temporary with no home of its own. Give it one and hand over
             // its address. Nothing can observe a write back through it, so the
             // copy costs no correctness the way it would for a place.
+            //
+            // It must be the POINTEE's type, `spill_ty`, though: the callee
+            // reads one through the address. Unguarded, `g(exclusive "ab")`
+            // spilled a 16-byte view where a 24-byte `cell_string_t` is read,
+            // an accept llvmemit.zig's natural-type guard refused.
+            if (spill_ty) |pt| {
+                if (!try self.fits(arg.span, v.ty, pt, "a call argument")) return Value.none;
+            }
             const one = try self.nextSsa();
             try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
             const tmp = try self.nextSsa();
@@ -1245,7 +1253,7 @@ const Emitter = struct {
                         // Always a fresh copy, never the caller's own slot.
                         // emitArg yields the natural value, loading through a
                         // borrow consumed by value (`read(copy s)`).
-                        const v = try self.emitArg(&a, nat);
+                        const v = try self.emitArg(&a, nat, null);
                         if (v.isNone()) return Value.none;
                         const one = try self.nextSsa();
                         try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
@@ -1256,7 +1264,7 @@ const Emitter = struct {
                         continue;
                     },
                     .coerced => |c| {
-                        const v = try self.emitArg(&a, c.natural);
+                        const v = try self.emitArg(&a, c.natural, null);
                         if (v.isNone()) return Value.none;
                         const one = try self.nextSsa();
                         try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
@@ -1270,7 +1278,8 @@ const Emitter = struct {
                     },
                 }
             }
-            vals[i] = try self.emitArg(&a, want);
+            const spill_ty: ?[]const u8 = if (i < modes.len) self.mlirTypeOwned(a.ty, modes[i].param) else null;
+            vals[i] = try self.emitArg(&a, want, spill_ty);
             if (vals[i].isNone()) return Value.none;
         }
 
@@ -2909,60 +2918,151 @@ test "an sret round trip computes the right answer through the whole pipeline" {
     try std.testing.expectEqualStrings("21\n", out);
 }
 
-test "the borrowed-view to owning-String conversion is refused at EVERY position" {
-    // The twin of `llvmemit.zig`'s table, with the same seven programs, in the
-    // same commit. That is the point rather than a courtesy: `tools/check.sh`
-    // compares the two backends' emit VERDICTS, so a conversion refused here
-    // and accepted there is a gate failure, and a conversion accepted in both
-    // is silent wrong code in both.
-    //
-    // Measured at 2298fa9: this backend already refused case 4, because
-    // `emitArg` compared the argument against `paramType`'s 24-byte owning
-    // struct and had something to catch. The other six positions had no
-    // comparison at all, so `let owned s: String = "ab"` emitted a 16-byte
-    // `llvm.store` into a 24-byte `llvm.alloca` and nothing in the module
-    // contradicted anything. `storeSlot` wrote with the VALUE's type, so it
-    // could not.
-    const cases = [_][]const u8{
-        \\pub fn f() -> String { return "ab" }
-        ,
-        \\pub fn f() { let owned s: String = "ab" }
-        ,
-        \\pub fn f() { var owned s: String = "ab" }
-        ,
-        \\pub fn g(owned s: String);
-        \\pub fn f() { g(owned "ab") }
-        ,
-        \\pub struct B { owned name: String }
-        \\pub fn f() { let owned b = B { name: "ab" } }
-        ,
-        \\pub fn make() -> String;
-        \\pub fn f() { var owned s: String = make() s = "cd" }
-        ,
-        \\pub fn f() -> arc String { return "ab" }
-        ,
-    };
-    for (cases, 0..) |src, i| {
-        var e = try emitSource(src);
-        defer e.deinit();
-        if (!e.bag.hasErrors()) {
-            std.debug.print("case {d} was ACCEPTED:\n{s}\nemitted:\n{s}\n", .{ i + 1, src, e.text });
-            return error.ConversionAccepted;
+/// A failure if a 16-byte view reaches 24 bytes of owning storage: an
+/// `llvm.store` typed as the view into an `llvm.alloca` of an owning String,
+/// or one typed as the owning String whose value this function defined as a
+/// view. The twin of llvmemit.zig's helper, one ordered pass reset at each
+/// `func.func`.
+fn expectNoViewStoredIntoOwningSlot(text: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const view = "!llvm.struct<(ptr, i64)>";
+    const owning_ty = "!llvm.struct<(ptr, i64, i64)>";
+    var owning: std.ArrayList([]const u8) = .empty;
+    defer owning.deinit(gpa);
+    var views: std.ArrayList([]const u8) = .empty;
+    defer views.deinit(gpa);
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " ");
+        if (std.mem.startsWith(u8, t, "func.func ")) {
+            owning.clearRetainingCapacity();
+            views.clearRetainingCapacity();
         }
-        var named = false;
-        for (e.bag.list.items) |d| {
-            if (std.mem.indexOf(
-                u8,
-                d.message,
-                "!llvm.struct<(ptr, i64)> where !llvm.struct<(ptr, i64, i64)>",
-            ) != null or (i == 6 and std.mem.indexOf(u8, d.message, "arc return type") != null)) named = true;
+        if (std.mem.indexOf(u8, t, " = ")) |eq| {
+            const rhs = t[eq + 3 ..];
+            if (std.mem.startsWith(u8, rhs, "llvm.alloca ") and
+                std.mem.endsWith(u8, rhs, " x " ++ owning_ty ++ " : (i64) -> !llvm.ptr")) try owning.append(gpa, t[0..eq]);
+            if ((std.mem.startsWith(u8, rhs, "llvm.insertvalue ") or std.mem.startsWith(u8, rhs, "llvm.load ")) and
+                std.mem.endsWith(u8, rhs, " " ++ view)) try views.append(gpa, t[0..eq]);
+            continue;
         }
-        if (!named) {
-            std.debug.print("case {d} refused without naming the conversion:\n", .{i + 1});
-            for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
-            return error.RefusalDoesNotNameTheConversion;
+        if (!std.mem.startsWith(u8, t, "llvm.store ")) continue;
+        const comma = std.mem.indexOf(u8, t, ", ") orelse continue;
+        const colon = std.mem.indexOf(u8, t, " : ") orelse continue;
+        const value = t["llvm.store ".len..comma];
+        const dest = t[comma + 2 .. colon];
+        const bad = blk: {
+            if (std.mem.endsWith(u8, t, " : " ++ view ++ ", !llvm.ptr")) {
+                for (owning.items) |slot| if (std.mem.eql(u8, slot, dest)) break :blk true;
+            }
+            if (std.mem.endsWith(u8, t, " : " ++ owning_ty ++ ", !llvm.ptr")) {
+                for (views.items) |v| if (std.mem.eql(u8, v, value)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (bad) {
+            std.debug.print("a view is stored into owning storage:\n{s}\nin:\n{s}\n", .{ t, text });
+            return error.ViewStoredIntoOwningSlot;
         }
     }
+}
+
+test "the borrowed-view to owning-String conversion is CONVERTED at every position" {
+    // The twin of `llvmemit.zig`'s table, flipped in the same commit, because
+    // `tools/check.sh`'s agreement stage compares the two backends' verdicts.
+    // Each position calls `cell_string_from_str` exactly once, through one
+    // declaration that carries the sret buffer and the coerced view.
+    const cases = [_]struct { src: []const u8, calls: usize }{
+        .{ .src = "pub fn f() -> String { return \"ab\" }", .calls = 1 },
+        .{ .src = "pub fn f() { let owned s: String = \"ab\" }", .calls = 1 },
+        .{ .src = "pub fn f() { var owned s: String = \"ab\" }", .calls = 1 },
+        .{ .src = "pub fn g(owned s: String);\npub fn f() { g(owned \"ab\") }", .calls = 1 },
+        .{ .src = "pub struct B { owned name: String }\npub fn f() { let owned b = B { name: \"ab\" } }", .calls = 1 },
+        .{ .src = "pub fn make() -> String;\npub fn f() { var owned s: String = make() s = \"cd\" }", .calls = 1 },
+        .{ .src = "pub fn f(exclusive s: String) { s = \"cd\" }", .calls = 1 },
+        .{ .src = "pub fn f(copy n: Int) { let owned s: String = match n { 0 => \"a\", _ => \"b\", } }", .calls = 2 },
+    };
+    for (cases, 0..) |c, i| {
+        var e = try emitSource(c.src);
+        defer e.deinit();
+        if (e.bag.hasErrors()) {
+            std.debug.print("case {d} was REFUSED:\n{s}\n", .{ i + 1, c.src });
+            for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
+            return error.ConversionRefused;
+        }
+        try expectContains(e.text, "func.func private @cell_string_from_str(!llvm.ptr {llvm.sret = !llvm.struct<(ptr, i64, i64)>}, !llvm.array<2 x i64>)\n");
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, e.text, "@cell_string_from_str(!llvm.ptr"));
+        try std.testing.expectEqual(c.calls, std.mem.count(u8, e.text, "call @cell_string_from_str("));
+        try expectNoViewStoredIntoOwningSlot(e.text);
+    }
+
+    var arc = try emitSource("pub fn f() -> arc String { return \"ab\" }");
+    defer arc.deinit();
+    try expectDiagnosticContains(&arc.bag, "arc return type");
+}
+
+test "a view that reaches an owning slot unconverted is still refused, and says why" {
+    const cases = [_][]const u8{
+        "pub fn f() { let owned s = \"ab\" }",
+        "pub fn f() -> Int { return match \"x\" { y => 1, } }",
+    };
+    for (cases) |src| {
+        var e = try emitSource(src);
+        defer e.deinit();
+        try expectDiagnosticContains(&e.bag, "!llvm.struct<(ptr, i64)> where !llvm.struct<(ptr, i64, i64)> is expected");
+        try expectDiagnosticContains(&e.bag, "hir.lower inserted no conversion here");
+    }
+}
+
+test "an exclusive String destination is a pointer, and a literal there is refused" {
+    // This backend used to ACCEPT it: `emitArg` spilled the 16-byte view to
+    // an alloca and passed its address to a callee that reads a 24-byte
+    // `cell_string_t` through it, while llvmemit.zig refused. The spill is
+    // now guarded against the pointee, so the two backends agree.
+    var e = try emitSource(
+        \\pub fn g(exclusive s: String);
+        \\pub fn f() { g(exclusive "ab") }
+    );
+    defer e.deinit();
+    try expectDiagnosticContains(&e.bag, "!llvm.struct<(ptr, i64)> where !llvm.struct<(ptr, i64, i64)> is expected, in a call argument");
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "cell_string_from_str") == null);
+}
+
+test "every conversion position runs and computes the owned lengths" {
+    // The same program and answer as llvmemit.zig's twin: 44.
+    const gpa = std.testing.allocator;
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn str_len(shared s: String) -> Int;
+        \\pub fn str_from_int(copy v: Int) -> String;
+        \\pub struct Tag { name: String }
+        \\pub fn take(owned s: String) -> Int { return str_len(shared s) }
+        \\pub fn make() -> String { return str_from_int(0) }
+        \\pub fn label() -> String { return "ab" }
+        \\pub fn pick(copy n: Int) -> String { return match n { 0 => make(), _ => "abcdefghi", } }
+        \\pub fn main() {
+        \\  let owned a: String = label()
+        \\  let owned b: String = "abc"
+        \\  var owned c: String = "abcd"
+        \\  let owned t: Tag = Tag { name: "abcdef" }
+        \\  var owned d: String = make()
+        \\  d = "abcdefg"
+        \\  let copy n = 1
+        \\  let owned g: String = match n { 0 => make(), _ => "abcdefgh", }
+        \\  let owned h: String = pick(copy n)
+        \\  print_int(str_len(shared a) + str_len(shared b) + str_len(shared c) + take(owned "abcde")
+        \\    + str_len(shared t.name) + str_len(shared d) + str_len(shared g) + str_len(shared h))
+        \\}
+    );
+    defer e.deinit();
+    if (e.bag.hasErrors()) {
+        for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
+        return error.Refused;
+    }
+    try expectNoViewStoredIntoOwningSlot(e.text);
+    const out = try runThroughMlir(gpa, e.text);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("44\n", out);
 }
 
 test "the guard does not refuse a matching String or a borrowed aggregate" {

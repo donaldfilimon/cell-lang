@@ -147,6 +147,14 @@ pub const Fn = struct {
     body: ?[]Stmt,
     is_public: bool,
     span: Span,
+    /// `.runtime` for a bodyless declaration `lower` synthesized because a
+    /// conversion it inserted calls into `runtime/cell_rt.c` (see
+    /// `runtime_callees`). Such a `Fn` is named `$rt.<name>`, which no Cell
+    /// identifier can spell, so `Module.findFn` never returns it for a
+    /// source name. The emitters declare it like any other bodyless `Fn`.
+    origin: Origin = .source,
+
+    pub const Origin = enum { source, runtime };
 
     pub fn params(self: *const Fn) []Binding {
         return self.bindings[0..self.param_count];
@@ -180,6 +188,51 @@ pub const Module = struct {
         return null;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Runtime callees
+// ---------------------------------------------------------------------------
+
+/// A `runtime/cell_rt.c` entry point that lowering itself may call, as a
+/// Cell signature. The emitters print its declaration through the ordinary
+/// bodyless-`Fn` path, so its ABI is whatever `abi.zig` says that signature
+/// is, and gate stage 10 compares it against clang's reading of the header.
+pub const RuntimeCallee = struct {
+    /// The synthesized `Fn`'s name. `$` starts no Cell identifier.
+    name: []const u8,
+    symbol: []const u8,
+    params: []const Param,
+    ret: Ty,
+    ret_ownership: Ownership,
+
+    pub const Param = struct { name: []const u8, ty: Ty, ownership: Ownership };
+};
+
+/// The runtime callees, indexed by `Runtime`. Step (b) of the IR String
+/// work adds the indexing helpers here.
+pub const Runtime = enum {
+    /// `cell_string_t cell_string_from_str(cell_str_t view)`: copies a
+    /// borrowed view into a fresh heap buffer the caller owns.
+    string_from_str,
+
+    pub fn callee(self: Runtime) RuntimeCallee {
+        return runtime_callees[@backingInt(self)];
+    }
+};
+
+pub const runtime_callees = [_]RuntimeCallee{
+    .{
+        .name = "$rt.string_from_str",
+        .symbol = "cell_string_from_str",
+        .params = &.{.{ .name = "view", .ty = types.t_string, .ownership = .shared }},
+        .ret = types.t_string,
+        .ret_ownership = .owned,
+    },
+};
+
+comptime {
+    std.debug.assert(runtime_callees.len == @typeInfo(Runtime).@"enum".field_names.len);
+}
 
 // ---------------------------------------------------------------------------
 // Expressions
@@ -398,6 +451,10 @@ const Lowerer = struct {
     /// destination for `convertTo`.
     ret_own: Ownership = .owned,
 
+    /// Which `runtime_callees` a conversion called, so `resolveRuntime` can
+    /// declare each exactly once.
+    runtime_used: [runtime_callees.len]bool = @splat(false),
+
     const ScopeEntry = struct { name: []const u8, slot: u32, depth: u32 };
     const Sig = struct {
         name: []const u8,
@@ -449,6 +506,7 @@ const Lowerer = struct {
                 else => {},
             }
         }
+        try self.resolveRuntime();
 
         return .{
             .path = self.module.path,
@@ -499,6 +557,91 @@ const Lowerer = struct {
             .is_public = f.is_public,
             .span = span,
         });
+    }
+
+    /// Declare each runtime callee a conversion used, once.
+    ///
+    /// A source function with the same SYMBOL is either the same declaration
+    /// (reused: the module then declares it once, from the source) or a
+    /// conflict: a body would define the runtime's own symbol, and a
+    /// different signature would give one symbol two ABIs in one module.
+    fn resolveRuntime(self: *Lowerer) LowerError!void {
+        for (runtime_callees, 0..) |c, i| {
+            if (!self.runtime_used[i]) continue;
+            var existing: ?*const Fn = null;
+            for (self.fns.items) |*f| {
+                if (std.mem.eql(u8, f.symbol, c.symbol)) existing = f;
+            }
+            if (existing) |f| {
+                if (f.body != null or !sameSignature(f, c)) {
+                    try self.cannotLower(f.span, try std.fmt.allocPrint(
+                        self.arena,
+                        "'{s}' conflicts with the runtime's {s}, which a String conversion in this module calls",
+                        .{ f.name, c.symbol },
+                    ));
+                }
+                continue;
+            }
+            var bindings = try self.arena.alloc(Binding, c.params.len);
+            for (c.params, 0..) |p, j| {
+                bindings[j] = .{
+                    .name = p.name,
+                    .ty = p.ty,
+                    .ownership = p.ownership,
+                    .mutable = false,
+                    .is_param = true,
+                    .slot = @intCast(j),
+                };
+            }
+            try self.fns.append(self.arena, .{
+                .name = c.name,
+                .symbol = c.symbol,
+                .param_count = @intCast(c.params.len),
+                .bindings = bindings,
+                .ret = c.ret,
+                .ret_ownership = c.ret_ownership,
+                .body = null,
+                .is_public = false,
+                .span = .none,
+                .origin = .runtime,
+            });
+        }
+    }
+
+    fn sameSignature(f: *const Fn, c: RuntimeCallee) bool {
+        if (f.param_count != c.params.len) return false;
+        for (f.params(), c.params) |p, want| {
+            if (p.ownership != want.ownership) return false;
+            if (!sameType(p.ty, want.ty)) return false;
+        }
+        return f.ret_ownership == c.ret_ownership and sameType(f.ret, c.ret);
+    }
+
+    /// Strict, unlike `types.compatible`, which lets `unknown` match anything.
+    fn sameType(a: Ty, b: Ty) bool {
+        return a.tag() == b.tag() and types.compatible(a, b);
+    }
+
+    /// A call to a runtime callee, recorded so `resolveRuntime` declares it.
+    fn runtimeCall(self: *Lowerer, id: Runtime, span: Span, args: []const Expr) LowerError!Expr {
+        const c = id.callee();
+        std.debug.assert(args.len == c.params.len);
+        self.runtime_used[@backingInt(id)] = true;
+        const lowered = try self.arena.dupe(Expr, args);
+        var modes = try self.arena.alloc(ArgMode, args.len);
+        for (c.params, 0..) |p, i| modes[i] = .{ .param = p.ownership, .written = null };
+        return .{
+            .ty = c.ret,
+            .span = span,
+            .own = c.ret_ownership,
+            .kind = .{ .call = .{
+                .symbol = c.symbol,
+                .callee = try self.box(self.lit(span, types.t_unit, .{ .int_const = 0 })),
+                .args = lowered,
+                .modes = modes,
+                .ret_ownership = c.ret_ownership,
+            } },
+        };
     }
 
     /// The C ABI symbol for a function. Mirrors `codegen.symbolFor`: a
@@ -1021,6 +1164,13 @@ const Lowerer = struct {
     /// position, so a position nobody listed inherits the answer by calling
     /// here rather than by being enumerated.
     ///
+    /// A borrowed view where an owning String is wanted becomes a call to
+    /// `cell_string_from_str` (`Runtime.string_from_str`). Any source is safe,
+    /// because the call COPIES: it takes no ownership from its operand and
+    /// makes no second owner of a buffer. The result is owned by the
+    /// destination; the IR backends have no drop pass yet, so it leaks, and
+    /// `examples/leaks/` pins how much.
+    ///
     /// An owning String PLACE where a view is wanted is wrapped in a
     /// `string_view`. An owning TEMPORARY is left alone: a view of it would
     /// outlive the value's only owner, so the emitters refuse it, which is
@@ -1065,16 +1215,15 @@ const Lowerer = struct {
         const have = stringRep(e.own) orelse return e;
         const want = stringRep(want_own) orelse return e;
         if (have == want) return e;
-        if (have == .owning) {
-            if (!isPlace(&e)) return e;
-            return .{
+        return switch (have) {
+            .view => try self.runtimeCall(.string_from_str, e.span, &.{e}),
+            .owning => if (isPlace(&e)) .{
                 .ty = e.ty,
                 .span = e.span,
                 .kind = .{ .string_view = try self.box(e) },
                 .own = .shared,
-            };
-        }
-        return e;
+            } else e,
+        };
     }
 
     const StringRep = enum { view, owning };
@@ -1709,4 +1858,156 @@ test "UInt8 and Byte stay distinct destination widths" {
     try std.testing.expectEqual(.uint8, body[0].kind.let.value.?.ty.tag());
     try std.testing.expectEqual(.byte, body[1].kind.let.value.?.ty.tag());
     try std.testing.expect(!types.compatible(body[0].kind.let.value.?.ty, body[1].kind.let.value.?.ty));
+}
+
+fn isStringFromStr(e: Expr) bool {
+    return e.kind == .call and e.kind.call.symbol != null and
+        std.mem.eql(u8, e.kind.call.symbol.?, "cell_string_from_str") and
+        e.kind.call.args.len == 1 and e.kind.call.args[0].own == .shared and
+        e.own == .owned;
+}
+
+fn countSymbol(m: Module, symbol: []const u8) usize {
+    var n: usize = 0;
+    for (m.fns) |f| {
+        if (std.mem.eql(u8, f.symbol, symbol)) n += 1;
+    }
+    return n;
+}
+
+test "a synthetic cell_string_from_str call is inserted at every conversion position" {
+    // The eight positions examples/owned_string.cell exercises, plus the
+    // write through an exclusive borrow and a `copy String` binding.
+    var l = try lowerSource(
+        \\pub struct Tag { owned name: String }
+        \\pub fn make() -> String;
+        \\pub fn take(owned s: String) -> Int;
+        \\pub fn label() -> String { return "ab" }
+        \\pub fn pick(copy n: Int) -> String { return match n { 0 => make(), _ => "abcdefghi", } }
+        \\pub fn reset(exclusive s: String) { s = "cd" }
+        \\pub fn main() {
+        \\    let owned b: String = "abc"
+        \\    var owned c: String = "abcd"
+        \\    let copy x = take(owned "abcde")
+        \\    let owned t: Tag = Tag { name: "abcdef" }
+        \\    var owned d: String = make()
+        \\    d = "abcdefg"
+        \\    let copy n = 1
+        \\    let owned e: String = match n { 0 => make(), _ => "abcdefgh", }
+        \\    let copy k: String = "ab"
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const m = l.module;
+    try std.testing.expect(isStringFromStr(m.findFn("label").?.body.?[0].kind.ret.?));
+    const pick = m.findFn("pick").?.body.?[0].kind.ret.?;
+    try std.testing.expectEqual(@as(?Ownership, .owned), pick.own);
+    try std.testing.expect(!isStringFromStr(pick.kind.match_expr.arms[0].body.*));
+    try std.testing.expect(isStringFromStr(pick.kind.match_expr.arms[1].body.*));
+    try std.testing.expect(isStringFromStr(m.findFn("reset").?.body.?[0].kind.assign.value));
+    const body = m.findFn("main").?.body.?;
+    try std.testing.expect(isStringFromStr(body[0].kind.let.value.?));
+    try std.testing.expect(isStringFromStr(body[1].kind.let.value.?));
+    try std.testing.expect(isStringFromStr(body[2].kind.let.value.?.kind.call.args[0]));
+    try std.testing.expect(isStringFromStr(body[3].kind.let.value.?.kind.struct_lit.fields[0]));
+    try std.testing.expect(!isStringFromStr(body[4].kind.let.value.?));
+    try std.testing.expect(isStringFromStr(body[5].kind.assign.value));
+    const e = body[7].kind.let.value.?;
+    try std.testing.expectEqual(@as(?Ownership, .owned), e.own);
+    try std.testing.expect(isStringFromStr(e.kind.match_expr.arms[1].body.*));
+    try std.testing.expect(isStringFromStr(body[8].kind.let.value.?));
+
+    // One bodyless declaration, whatever the number of calls, under a name
+    // `findFn` cannot return for a source name.
+    try std.testing.expectEqual(@as(usize, 1), countSymbol(m, "cell_string_from_str"));
+    const rt = m.findFn("$rt.string_from_str").?;
+    try std.testing.expectEqual(Fn.Origin.runtime, rt.origin);
+    try std.testing.expect(rt.body == null);
+    try std.testing.expectEqual(@as(u32, 1), rt.param_count);
+    try std.testing.expectEqual(Ownership.shared, rt.params()[0].ownership);
+    try std.testing.expectEqual(.string, rt.params()[0].ty.tag());
+    try std.testing.expectEqual(.string, rt.ret.tag());
+    try std.testing.expectEqual(Ownership.owned, rt.ret_ownership);
+    try std.testing.expect(m.findFn("string_from_str") == null);
+}
+
+test "a match with a destination stamps its ownership over a view first arm" {
+    var l = try lowerSource(
+        \\pub fn f(copy n: Int) {
+        \\    let owned s: String = match n { 0 => "a", _ => "b", }
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const v = l.module.findFn("f").?.body.?[0].kind.let.value.?;
+    try std.testing.expectEqual(@as(?Ownership, .owned), v.own);
+    for (v.kind.match_expr.arms) |arm| try std.testing.expect(isStringFromStr(arm.body.*));
+}
+
+test "the unannotated let, binding patterns and exclusive destinations are not converted" {
+    // C keeps an unannotated `let owned s = "ab"` a view, binding patterns
+    // bind the scrutinee as it is, and an `exclusive` destination wants an
+    // address a converted temporary does not have. All three are left for
+    // the emitters' backstop to refuse, and no runtime declaration appears.
+    var l = try lowerSource(
+        \\pub fn g(exclusive s: String);
+        \\pub fn f() -> Int {
+        \\    let owned s = "ab"
+        \\    g(exclusive "cd")
+        \\    return match "x" { y => 1, }
+        \\}
+    );
+    defer l.deinit();
+    const body = l.module.findFn("f").?.body.?;
+    try std.testing.expectEqual(.string_const, std.meta.activeTag(body[0].kind.let.value.?.kind));
+    try std.testing.expectEqual(.string_const, std.meta.activeTag(body[1].kind.expr.kind.call.args[0].kind));
+    try std.testing.expectEqual(.string_const, std.meta.activeTag(body[2].kind.ret.?.kind.match_expr.scrutinee.kind));
+    try std.testing.expectEqual(@as(usize, 0), countSymbol(l.module, "cell_string_from_str"));
+}
+
+test "a matching source declaration of the runtime symbol is reused" {
+    var l = try lowerSource(
+        \\pub fn string_from_str(shared v: String) -> String;
+        \\pub fn f() -> String { return "ab" }
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    try std.testing.expectEqual(@as(usize, 1), countSymbol(l.module, "cell_string_from_str"));
+    try std.testing.expectEqual(Fn.Origin.source, l.module.findFn("string_from_str").?.origin);
+    try std.testing.expect(l.module.findFn("$rt.string_from_str") == null);
+}
+
+test "a conflicting source declaration of the runtime symbol is refused" {
+    const cases = [_][]const u8{
+        // A body would DEFINE the runtime's symbol.
+        \\pub fn string_from_str(shared v: String) -> String { return v }
+        \\pub fn f() -> String { return "ab" }
+        ,
+        \\pub fn string_from_str(owned v: String) -> String;
+        \\pub fn f() -> String { return "ab" }
+        ,
+        \\pub fn string_from_str(shared v: String) -> Int;
+        \\pub fn f() -> String { return "ab" }
+        ,
+        \\pub fn string_from_str(shared v: String, copy n: Int) -> String;
+        \\pub fn f() -> String { return "ab" }
+        ,
+        \\pub fn string_from_str(shared v: String) -> arc String;
+        \\pub fn f() -> String { return "ab" }
+        ,
+    };
+    for (cases, 0..) |src, i| {
+        var l = try lowerSource(src);
+        defer l.deinit();
+        var found = false;
+        for (l.diagnostics.list.items) |d| {
+            if (std.mem.indexOf(u8, d.message, "conflicts with the runtime's cell_string_from_str") != null) found = true;
+        }
+        if (!found) {
+            std.debug.print("case {d} was not refused as a conflict:\n{s}\n", .{ i, src });
+            return error.MissingConflict;
+        }
+        try std.testing.expectEqual(@as(usize, 1), countSymbol(l.module, "cell_string_from_str"));
+    }
 }

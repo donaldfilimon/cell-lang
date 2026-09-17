@@ -532,8 +532,8 @@ const Emitter = struct {
         const string_pair = std.mem.eql(u8, val_ty, "%cell_str") and
             std.mem.eql(u8, dest_ty, "%cell_string");
         const why: []const u8 = if (string_pair)
-            " (converting a borrowed view into an owning value needs" ++
-                " cell_string_from_str, which this backend does not emit yet: it has no drop pass to free the result)"
+            " (hir.lower inserted no conversion here: a borrowed view becomes an owning" ++
+                " value only through the cell_string_from_str call it inserts at a declared destination)"
         else
             "";
         try self.unsupported(span, try std.fmt.allocPrint(
@@ -3050,78 +3050,174 @@ test "an exclusive String is a pointer, and a write through one LANDS" {
     try expectContains(ok.text, "%slot0 = alloca ptr");
 }
 
-test "the borrowed-view to owning-String conversion is refused at EVERY position" {
-    // THE FOURTH DEFECT, and the one this file's own contract forbade. A
-    // literal is a 16-byte borrowed `%cell_str`; an owned `String` is a
-    // 24-byte owning `%cell_string`; turning the first into the second is a
-    // call to `cell_string_from_str` that copies the characters. That symbol
-    // cannot be called from here, so the conversion has to be refused.
-    //
-    // It was not. Measured at 2298fa9, all six programs below passed
-    // `cell check` and emitted IR, and `pub fn f() { let owned s: String =
-    // "ab" }` produced:
-    //
-    //     %slot0 = alloca %cell_string     ; 24 bytes
-    //     store %cell_str %1, ptr %slot0   ; 16 bytes written
-    //
-    // leaving `cap` uninitialized and `.ptr` aimed at a static literal. The
-    // conversion HAD been noticed once, for `-> arc String`, and the same
-    // question was never asked of its siblings.
-    //
-    // THE TABLE IS EVIDENCE, NOT THE FIX. The fix is one predicate, `fits`,
-    // asked wherever a value meets a destination; six positional checks would
-    // have closed six holes and left the seventh. The seventh is here too:
-    // `-> arc String` is now refused earlier from its return contract, before
-    // this conversion can be considered.
-    const cases = [_][]const u8{
-        // 1. a literal returned from an owning-String function
-        \\pub fn f() -> String { return "ab" }
-        ,
-        // 2. a literal in a `let owned` initializer
-        \\pub fn f() { let owned s: String = "ab" }
-        ,
-        // 3. the same in a `var owned`
-        \\pub fn f() { var owned s: String = "ab" }
-        ,
-        // 4. a literal passed to an `owned String` parameter
-        \\pub fn g(owned s: String);
-        \\pub fn f() { g(owned "ab") }
-        ,
-        // 5. a literal in an owning-String struct field
-        \\pub struct B { owned name: String }
-        \\pub fn f() { let owned b = B { name: "ab" } }
-        ,
-        // 6. a literal ASSIGNED to an owning-String local. `make` is bodyless
-        //    on purpose: a literal in the initializer would refuse there and
-        //    mask the assignment, which is the position under test.
-        \\pub fn make() -> String;
-        \\pub fn f() { var owned s: String = make() s = "cd" }
-        ,
-        // 7. the seventh shape, the one that was half-handled.
-        \\pub fn f() -> arc String { return "ab" }
-        ,
-    };
-    for (cases, 0..) |src, i| {
-        var e = try emitSource(src);
-        defer e.deinit();
-        if (!e.bag.hasErrors()) {
-            std.debug.print("case {d} was ACCEPTED:\n{s}\nemitted:\n{s}\n", .{ i + 1, src, e.text });
-            return error.ConversionAccepted;
+/// A failure if a 16-byte view reaches 24 bytes of owning storage, in
+/// either spelling a store can take: `store %cell_str V` into a slot
+/// `alloca`ed as `%cell_string` (the defect's own text), or
+/// `store %cell_string V` of a V this function defined as a `%cell_str`
+/// (how `storeValue`, which names the destination's type, would spell it if
+/// its guard were bypassed; clang rejects that, but only later). One ordered
+/// pass, reset at each `define`, because names are per function and are
+/// defined before they are used.
+fn expectNoViewStoredIntoOwningSlot(text: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var owning: std.ArrayList([]const u8) = .empty;
+    defer owning.deinit(gpa);
+    var views: std.ArrayList([]const u8) = .empty;
+    defer views.deinit(gpa);
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " ");
+        if (std.mem.startsWith(u8, t, "define ")) {
+            owning.clearRetainingCapacity();
+            views.clearRetainingCapacity();
         }
-        // The diagnostic must name BOTH types. "cannot lower" alone would pass
-        // against a refusal for some unrelated reason, which is how a table
-        // like this stops testing what it claims to.
-        var named = false;
-        for (e.bag.list.items) |d| {
-            if (std.mem.indexOf(u8, d.message, "%cell_str where %cell_string") != null or
-                (i == 6 and std.mem.indexOf(u8, d.message, "arc return type") != null)) named = true;
+        if (std.mem.indexOf(u8, t, " = ")) |eq| {
+            const rhs = t[eq + 3 ..];
+            if (std.mem.eql(u8, rhs, "alloca %cell_string")) try owning.append(gpa, t[0..eq]);
+            if (std.mem.startsWith(u8, rhs, "insertvalue %cell_str ") or
+                std.mem.startsWith(u8, rhs, "load %cell_str,")) try views.append(gpa, t[0..eq]);
+            continue;
         }
-        if (!named) {
-            std.debug.print("case {d} refused without naming the conversion:\n", .{i + 1});
-            for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
-            return error.RefusalDoesNotNameTheConversion;
+        const bad = blk: {
+            const at = std.mem.lastIndexOf(u8, t, ", ptr ") orelse break :blk false;
+            if (std.mem.startsWith(u8, t, "store %cell_str ")) {
+                const dest = t[at + ", ptr ".len ..];
+                for (owning.items) |slot| if (std.mem.eql(u8, slot, dest)) break :blk true;
+            }
+            if (std.mem.startsWith(u8, t, "store %cell_string ")) {
+                const value = t["store %cell_string ".len..at];
+                for (views.items) |v| if (std.mem.eql(u8, v, value)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (bad) {
+            std.debug.print("a view is stored into owning storage:\n{s}\nin:\n{s}\n", .{ t, text });
+            return error.ViewStoredIntoOwningSlot;
         }
     }
+}
+
+test "the borrowed-view to owning-String conversion is CONVERTED at every position" {
+    // THE FOURTH DEFECT, and the flip of the test that pinned its refusal.
+    // A literal is a 16-byte borrowed `%cell_str`; an owned `String` is a
+    // 24-byte owning `%cell_string`; turning the first into the second is a
+    // call to `cell_string_from_str`, which copies the characters. Measured
+    // at 2298fa9 this backend wrote the 16 bytes straight into 24; it then
+    // refused all six positions; since hir.lower's `convertTo` it makes the
+    // call, and this table pins that each position does, exactly once.
+    //
+    // The count is the check that a position did not convert TWICE (a
+    // second owner of nothing, but a leak), and the declaration count is the
+    // check that the runtime table deduplicates. The scan is the check that
+    // no position writes 16 bytes into 24 by some other route.
+    const cases = [_]struct { src: []const u8, calls: usize, store: []const u8 }{
+        // 1. a literal returned from an owning-String function
+        .{ .src = "pub fn f() -> String { return \"ab\" }", .calls = 1, .store = "store %cell_string %5, ptr %sret" },
+        // 2. a literal in a `let owned` initializer
+        .{ .src = "pub fn f() { let owned s: String = \"ab\" }", .calls = 1, .store = ", ptr %slot0" },
+        // 3. the same in a `var owned`
+        .{ .src = "pub fn f() { var owned s: String = \"ab\" }", .calls = 1, .store = ", ptr %slot0" },
+        // 4. a literal passed to an `owned String` parameter
+        .{ .src = "pub fn g(owned s: String);\npub fn f() { g(owned \"ab\") }", .calls = 1, .store = "call void @cell_g(ptr" },
+        // 5. a literal in an owning-String struct field
+        .{ .src = "pub struct B { owned name: String }\npub fn f() { let owned b = B { name: \"ab\" } }", .calls = 1, .store = "insertvalue %cell_B undef, %cell_string" },
+        // 6. a literal ASSIGNED to an owning-String local. `make` is bodyless
+        //    so the literal is only on the assignment.
+        .{ .src = "pub fn make() -> String;\npub fn f() { var owned s: String = make() s = \"cd\" }", .calls = 1, .store = ", ptr %slot0" },
+        // 7. a write through an `exclusive String` borrow
+        .{ .src = "pub fn f(exclusive s: String) { s = \"cd\" }", .calls = 1, .store = "store %cell_string" },
+        // 8. both arms of a value-slot match, stamped owned by the `let`
+        .{ .src = "pub fn f(copy n: Int) { let owned s: String = match n { 0 => \"a\", _ => \"b\", } }", .calls = 2, .store = ", ptr %slot1" },
+    };
+    for (cases, 0..) |c, i| {
+        var e = try emitSource(c.src);
+        defer e.deinit();
+        if (e.bag.hasErrors()) {
+            std.debug.print("case {d} was REFUSED:\n{s}\n", .{ i + 1, c.src });
+            for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
+            return error.ConversionRefused;
+        }
+        try expectContains(e.text, "declare void @cell_string_from_str(ptr sret(%cell_string), [2 x i64])\n");
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, e.text, "declare void @cell_string_from_str("));
+        try std.testing.expectEqual(c.calls, std.mem.count(u8, e.text, "call void @cell_string_from_str(ptr sret(%cell_string) %"));
+        try expectContains(e.text, c.store);
+        try expectNoViewStoredIntoOwningSlot(e.text);
+    }
+
+    // `-> arc String` is still refused, from its return contract.
+    var arc = try emitSource("pub fn f() -> arc String { return \"ab\" }");
+    defer arc.deinit();
+    try expectDiagnosticContains(&arc.bag, "arc return type");
+}
+
+test "a view that reaches an owning slot unconverted is still refused, and says why" {
+    // THE BACKSTOP. hir.lower does not convert an unannotated `let` (C keeps
+    // it a view, so converting would split the backends), and a binding
+    // pattern binds its scrutinee as it is. Both reach `fits`, which refuses
+    // rather than writing 16 bytes into 24.
+    const cases = [_][]const u8{
+        "pub fn f() { let owned s = \"ab\" }",
+        "pub fn f() -> Int { return match \"x\" { y => 1, } }",
+    };
+    for (cases) |src| {
+        var e = try emitSource(src);
+        defer e.deinit();
+        try expectDiagnosticContains(&e.bag, "%cell_str where %cell_string is expected");
+        try expectDiagnosticContains(&e.bag, "hir.lower inserted no conversion here");
+    }
+}
+
+test "an exclusive String destination is a pointer, and a literal there is refused" {
+    // A converted value is a temporary with no address, so hir.lower leaves
+    // it alone (codegen's `want.pointer`), and the spill a temporary would
+    // otherwise get is guarded against the 24-byte pointee.
+    var e = try emitSource(
+        \\pub fn g(exclusive s: String);
+        \\pub fn f() { g(exclusive "ab") }
+    );
+    defer e.deinit();
+    try expectDiagnosticContains(&e.bag, "%cell_str where %cell_string is expected, in a call argument");
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "cell_string_from_str") == null);
+}
+
+test "every conversion position runs and computes the owned lengths" {
+    // examples/owned_string.cell with its host written in Cell, so the run
+    // needs only the runtime: 2+3+4+5+6+7+8+9 = 44, the length of each of the
+    // eight conversions. A position that produced an empty or mis-sized
+    // value changes the answer. Nothing here is freed: the IR backends have
+    // no drop pass, and examples/leaks pins that.
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn str_len(shared s: String) -> Int;
+        \\pub fn str_from_int(copy v: Int) -> String;
+        \\pub struct Tag { name: String }
+        \\pub fn take(owned s: String) -> Int { return str_len(shared s) }
+        \\pub fn make() -> String { return str_from_int(0) }
+        \\pub fn label() -> String { return "ab" }
+        \\pub fn pick(copy n: Int) -> String { return match n { 0 => make(), _ => "abcdefghi", } }
+        \\pub fn main() {
+        \\  let owned a: String = label()
+        \\  let owned b: String = "abc"
+        \\  var owned c: String = "abcd"
+        \\  let owned t: Tag = Tag { name: "abcdef" }
+        \\  var owned d: String = make()
+        \\  d = "abcdefg"
+        \\  let copy n = 1
+        \\  let owned g: String = match n { 0 => make(), _ => "abcdefgh", }
+        \\  let owned h: String = pick(copy n)
+        \\  print_int(str_len(shared a) + str_len(shared b) + str_len(shared c) + take(owned "abcde")
+        \\    + str_len(shared t.name) + str_len(shared d) + str_len(shared g) + str_len(shared h))
+        \\}
+    );
+    defer e.deinit();
+    if (e.bag.hasErrors()) {
+        for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
+        return error.Refused;
+    }
+    try expectNoViewStoredIntoOwningSlot(e.text);
+    const out = try runEmitted(e.text);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("44\n", out);
 }
 
 test "the guard does not refuse the ABI's own re-spellings, or a matching String" {
