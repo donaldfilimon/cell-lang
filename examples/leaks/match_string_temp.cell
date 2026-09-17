@@ -1,0 +1,28 @@
+// A `match` over an owned String TEMPORARY leaks the temporary in C
+// (2026-09-17, found while grounding IR String step (c), its defect 4).
+// The temporary-scrutinee release (`owning_temps`, fdf36ed) covers owning
+// Results and `String?` only, not a plain owned String matched against
+// string patterns. 1000 calls => 1000. The IR backends refuse a string
+// pattern on a temporary (it has no place to view), so this is C only.
+//
+// Status: parses, passes `cell check`; lives under examples/leaks/.
+
+pub fn print_int(copy value: Int);
+pub fn str_from_int(copy v: Int) -> String;
+
+pub fn once(copy i: Int) -> Int {
+    return match str_from_int(i) {
+        "1" => 1,
+        _ => 2,
+    }
+}
+
+pub fn main() {
+    var i = 0
+    var n = 0
+    while i < 1000 {
+        n = n + once(i)
+        i = i + 1
+    }
+    print_int(n)
+}

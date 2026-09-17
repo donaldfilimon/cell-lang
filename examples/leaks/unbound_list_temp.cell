@@ -1,0 +1,38 @@
+// An unbound owned list TEMPORARY passed to a `shared` position leaks in
+// C (2026-09-17, found while grounding IR String step (b), its F3). This
+// is the known "nothing drops a call temporary" residual, pinned here for
+// lists: `bytes_len(make())` and `bytes_at(make(), 0)` each build a heap
+// list nobody frees. 1000 calls, two lists each => 2000 before any fix.
+//
+// Status: parses, passes `cell check`; lives under examples/leaks/.
+
+pub fn print_int(copy value: Int);
+pub fn bytes_empty() -> owned [Byte];
+pub fn bytes_push(exclusive xs: [Byte], copy value: Byte);
+pub fn bytes_len(shared xs: [Byte]) -> Int;
+pub fn bytes_at(shared xs: [Byte], copy index: Int) -> Byte?;
+
+pub fn make() -> [Byte] {
+    var owned b = bytes_empty()
+    bytes_push(exclusive b, 7)
+    return b
+}
+
+pub fn once(copy i: Int) -> Int {
+    let copy n = bytes_len(make())
+    let copy got = match bytes_at(make(), 0) {
+        Some(v) => 1,
+        None => 0,
+    }
+    return n + got + i
+}
+
+pub fn main() {
+    var i = 0
+    var n = 0
+    while i < 1000 {
+        n = n + once(i)
+        i = i + 1
+    }
+    print_int(n)
+}

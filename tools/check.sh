@@ -496,6 +496,12 @@ LEAK_OWNED_STRING_ERR=0
 # Early-exit shapes added the same day: 0 (ALLOC=11000); with the
 # early-exit temporary releases disabled, 3000.
 LEAK_OWNED_STRING_OPTIONAL=0
+# Disclosed C leaks found 2026-09-17 while grounding IR String steps (b)
+# and (c). Measured before pinning; a drop means the gap closed.
+LEAK_DISCARDED_RESULT=2000
+LEAK_FIELD_STORE_OLD=1000
+LEAK_MATCH_STRING_TEMP=1000
+LEAK_UNBOUND_LIST_TEMP=2000
 # Early exits (2026-09-17): shapes refused before the divergence rule, so a
 # regression pin rather than a closed gap. Measured 0 on first run.
 LEAK_EARLY_RETURN=0
@@ -1039,6 +1045,10 @@ else
     run_c_leaks owned_string_result "" "$LEAK_OWNED_STRING_RESULT" "owning String Ok, 2026-09-17"
     run_c_leaks owned_string_err "" "$LEAK_OWNED_STRING_ERR" "owning String Err and both sides, 2026-09-17"
     run_c_leaks owned_string_optional "" "$LEAK_OWNED_STRING_OPTIONAL" "owning String?, 2026-09-17"
+    run_c_leaks discarded_result "" "$LEAK_DISCARDED_RESULT" "discarded owned String results, disclosed 2026-09-17"
+    run_c_leaks field_store_old "" "$LEAK_FIELD_STORE_OLD" "field store keeps the old value, disclosed 2026-09-17"
+    run_c_leaks match_string_temp "" "$LEAK_MATCH_STRING_TEMP" "match on an owned String temporary, disclosed 2026-09-17"
+    run_c_leaks unbound_list_temp "" "$LEAK_UNBOUND_LIST_TEMP" "unbound list temporaries, disclosed 2026-09-17"
     run_c_leaks early_return "" "$LEAK_EARLY_RETURN" "early exits keep moves out of the merge, 2026-09-17; regression pin"
     run_c_leaks partial_nested_field "" "$LEAK_PARTIAL_NESTED_FIELD" "R16 residual nested partial field, CLOSED 2026-09-16 by recursive emitPartialRecordDrop; 1000 -> 0"
     run_c_leaks branch_field "" "$LEAK_BRANCH_FIELD" "R16 residual 1 at field granularity, CLOSED 2026-09-16 by branch-end field releases; 1000 -> 0"

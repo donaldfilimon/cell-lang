@@ -1,6 +1,6 @@
 # `examples/leaks/`
 
-Twenty-seven fixtures, twenty-five measured on the C backend and two IR
+Thirty-one fixtures, twenty-nine measured on the C backend and two IR
 backend pins (below). The C ones are: R11's measurable gaps and their CLOSED
 pins (seven, including the value-block residual and the `owned` twin of row
 5); R16's revival leak (`revived_var.cell`, closed 2026-09-16) and ten closed
@@ -10,7 +10,9 @@ residuals (`branch_move`, `loop_jump_revival`, `value_block_revival`,
 pin; the owned scalar wrappers and the three owning-payload pins
 (`owned_string_result`, `owned_string_err`, `owned_string_optional`); and two
 regression pins for implemented features (`arc_box_move.cell` and
-`early_return.cell`, below). Each isolates exactly one
+`early_return.cell`, below); and four disclosed gaps found on 2026-09-17
+(`discarded_result`, `field_store_old`, `match_string_temp`,
+`unbound_list_temp`). Each isolates exactly one
 disclosed retain/release shape and loops it many times so a leak is a
 stable count, not noise.
 
@@ -58,6 +60,10 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `return_in_loop.cell` | R16 residual: a `return` taken inside a loop after the loop revived a moved var released nothing; **CLOSED 2026-09-17** by keeping an accepted loop's `return` records live, 500 -> 0 |
 | `skip_revival_break.cell` | R16 residual: a `break` that can be taken while the var is dead made the post-loop release unsafe, so the condition-false path leaked its revived value; **CLOSED 2026-09-17** by `after_loop_skip` releases, 500 -> 0 |
 | `early_return.cell` | not a gap: a branch that always leaves keeps its moves out of the code after the `if` (2026-09-17); these shapes were refused before, so this is a regression pin at 0 |
+| `discarded_result.cell` | not a numbered row: an owned String call result discarded in statement position is freed by no backend; 2000 (1000 calls, two results), disclosed 2026-09-17 |
+| `field_store_old.cell` | not a numbered row: a store to an owned String field keeps the old value unreleased in C; 1000, disclosed 2026-09-17 |
+| `match_string_temp.cell` | not a numbered row: a `match` with string patterns over an owned String temporary never releases it in C; 1000, disclosed 2026-09-17 |
+| `unbound_list_temp.cell` | not a numbered row: owned list temporaries passed to `shared` positions are never released in C; 2000 (1000 calls, two lists), disclosed 2026-09-17 |
 
 ## IR backend pins
 

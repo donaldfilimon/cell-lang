@@ -1,0 +1,33 @@
+// A store to an owned String FIELD leaks the field's old value in C
+// (2026-09-17, found while grounding IR String step (c), its defect 3).
+// A whole-binding reassignment pre-drops the old value when borrowck
+// vouches for the store; a field store has no such pre-drop yet. 1000
+// calls, one leaked old value each => 1000. The new value is released
+// with the record at scope end.
+//
+// Status: parses, passes `cell check`; lives under examples/leaks/.
+
+pub fn print_int(copy value: Int);
+pub fn str_from_int(copy v: Int) -> String;
+pub fn str_len(shared s: String) -> Int;
+
+pub struct Tag {
+    owned name: String
+    copy n: Int
+}
+
+pub fn once(copy i: Int) -> Int {
+    var owned t = Tag { name: str_from_int(i), n: i }
+    t.name = str_from_int(7)
+    return str_len(shared t.name)
+}
+
+pub fn main() {
+    var i = 0
+    var n = 0
+    while i < 1000 {
+        n = n + once(i)
+        i = i + 1
+    }
+    print_int(n)
+}

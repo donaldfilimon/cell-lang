@@ -1,0 +1,34 @@
+// A discarded owned String call result is never released (2026-09-17,
+// found while grounding IR String step (c), its defect 2). `once` calls a
+// runtime String producer and a Cell one for effect and drops both
+// results on the floor: nothing frees them on ANY backend. 1000 calls,
+// two allocations each => 2000.
+//
+// Measured before pinning, and pinned as a disclosed gap: whether to free
+// a discarded result now or keep the pin is open question 2 of the step
+// (c) spec. A drop means discarded results are released; update the pin.
+//
+// Status: parses, passes `cell check`; lives under examples/leaks/.
+
+pub fn print_int(copy value: Int);
+pub fn str_from_int(copy v: Int) -> String;
+
+pub fn label() -> String {
+    return "ab"
+}
+
+pub fn once(copy i: Int) -> Int {
+    str_from_int(i)
+    label()
+    return i
+}
+
+pub fn main() {
+    var i = 0
+    var n = 0
+    while i < 1000 {
+        n = n + once(i)
+        i = i + 1
+    }
+    print_int(n)
+}
