@@ -5309,13 +5309,22 @@ const Harness = struct {
 
 /// Parse and borrow-check `src`, keeping the checker so a test can ask
 /// `liveAtExit`. The module lives in the same arena as the checker.
+///
+/// The arena is heap-allocated on purpose. `arena.allocator()` captures the
+/// arena's ADDRESS, and the checker keeps that allocator, so an arena held
+/// by value would leave the checker pointing into `init`'s dead stack frame
+/// once the harness is returned. With one harness per test that stale slot
+/// happened to survive until `deinit`; a second harness in the same test
+/// overwrote it and `deinit` segfaulted inside `ArenaAllocator.free`.
 const LiveHarness = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: *std.heap.ArenaAllocator,
     checker: Checker,
     module: ast.Module,
 
     fn init(src: []const u8) !LiveHarness {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        const arena = try std.testing.allocator.create(std.heap.ArenaAllocator);
+        errdefer std.testing.allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(std.testing.allocator);
         errdefer arena.deinit();
         const gpa = arena.allocator();
         var lex = lexer.Lexer.init(src, "t.cell");
@@ -5338,6 +5347,7 @@ const LiveHarness = struct {
     fn deinit(self: *LiveHarness) void {
         self.checker.deinit();
         self.arena.deinit();
+        std.testing.allocator.destroy(self.arena);
     }
 
     fn binding(self: *const LiveHarness, name: []const u8) u32 {
@@ -8318,6 +8328,118 @@ test "R16 field live at the non-moving branch_end and dead after the merge" {
     // dead there) and false after the merge (any dead field path folds in).
     try std.testing.expect(h.checker.liveAtExit(.branch_end, else_key, p));
     try std.testing.expect(!h.checker.liveAtExit(.block_end, end_key, p));
+}
+
+test "branch ends record liveness before the merge" {
+    // Plan D Task 2 at whole-binding granularity (the test above is the
+    // field form). A var moved on the then-branch only: that branch end is
+    // dead, the else-branch end is live, and the function end after the
+    // merge is dead. Both branches are blocks, so both keys are the block's
+    // statement slice, which is what codegen asks with.
+    var h: LiveHarness = try .init(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy c: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    if c > 0 {
+        \\        take(v)
+        \\    } else {
+        \\        i = i + 1
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    const v = h.binding("v");
+    const if_expr = h.firstIf("f");
+    const then_body = if_expr.kind.if_expr.then_body;
+    const else_body = if_expr.kind.if_expr.else_body.?;
+    try std.testing.expect(then_body.kind == .block and else_body.kind == .block);
+    const then_key = Checker.branchKeyOf(then_body);
+    const else_key = Checker.branchKeyOf(else_body);
+    try std.testing.expect(then_key != else_key);
+    try std.testing.expect(!h.checker.liveAtExit(.branch_end, then_key, v));
+    try std.testing.expect(h.checker.liveAtExit(.branch_end, else_key, v));
+    try std.testing.expect(!h.checker.liveAtExit(.block_end, h.fnBodyKey("f"), v));
+}
+
+test "a jump records liveness at the jump" {
+    // Plan D Task 2: a LOOP-LOCAL var moved and revived before a `continue`
+    // holds a value at the jump. `loop_moved` poisons only vars declared
+    // outside the while (the after_loop tests above), so this record stays
+    // live and codegen releases `v` at the `continue`.
+    var h: LiveHarness = try .init(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var i = 0
+        \\    while i < n {
+        \\        i = i + 1
+        \\        var owned v: String = "a"
+        \\        take(v)
+        \\        v = "b"
+        \\        if i > 0 {
+        \\            continue
+        \\        }
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    const v = h.binding("v");
+    try std.testing.expect(h.checker.liveAtExit(.jump, h.firstJump("f"), v));
+}
+
+test "a jump taken while a loop-local is moved records it dead" {
+    // The converse of the test above: the `continue` sits between the move
+    // and the revival, so releasing `v` there would free a buffer `take`
+    // already owns.
+    var h: LiveHarness = try .init(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var i = 0
+        \\    while i < n {
+        \\        i = i + 1
+        \\        var owned v: String = "a"
+        \\        take(v)
+        \\        if i > 0 {
+        \\            continue
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    const v = h.binding("v");
+    try std.testing.expect(!h.checker.liveAtExit(.jump, h.firstJump("f"), v));
+}
+
+test "a record reassigned whole after a move is live at scope end" {
+    // Plan D Task 5. One harness per function, so `binding("b")` cannot
+    // pick the other function's `b`.
+    var hf: LiveHarness = try .init(
+        \\pub struct Box { owned s: String }
+        \\pub fn take(owned b: Box);
+        \\pub fn f() {
+        \\    var owned b = Box { s: "one" }
+        \\    take(b)
+        \\    b = Box { s: "two" }
+        \\}
+    );
+    defer hf.deinit();
+    try std.testing.expect(hf.checker.recordLiveAtExit(.block_end, hf.fnBodyKey("f"), hf.binding("b")));
+
+    // A field moved out AFTER the revival leaves a dead field path, so the
+    // record is not released whole; the partial path handles it instead.
+    var hg: LiveHarness = try .init(
+        \\pub struct Box { owned s: String }
+        \\pub fn take(owned b: Box);
+        \\pub fn g() {
+        \\    var owned b = Box { s: "one" }
+        \\    take(b)
+        \\    b = Box { s: "two" }
+        \\    let owned moved: String = b.s
+        \\}
+    );
+    defer hg.deinit();
+    try std.testing.expect(!hg.checker.recordLiveAtExit(.block_end, hg.fnBodyKey("g"), hg.binding("b")));
 }
 
 // ── R9: `arc` grants shared access only ─────────────────────────────────

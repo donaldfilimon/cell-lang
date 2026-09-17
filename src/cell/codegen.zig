@@ -8673,9 +8673,25 @@ test "a revived record is released whole at scope end" {
         \\  take(b)
         \\  b = Box { s: "two" }
         \\}
+        \\pub fn g() {
+        \\  var owned b = Box { s: "one" }
+        \\  take(b)
+        \\  b = Box { s: "two" }
+        \\  let owned moved: String = b.s
+        \\}
     );
     defer e.deinit();
     const f = try fnDef(e.text, "f");
     try expectOccurrences(f, "cell_drop_Box(&b);", 1);
+    // Released after the revival, not before it: a drop ahead of the store
+    // would free the buffer `take` already owns.
+    try expectBefore(f, "b = (cell_Box){ .s = cell_string_from_str(cell_str_from_parts(\"two\", 3)) };", "cell_drop_Box(&b);");
+    // Plan D Task 5's second half: a field moved out after the revival keeps
+    // the partial path. `s` is Box's only owning field, so nothing of `b` is
+    // released; the moved string is released through `moved`.
+    const g = try fnDef(e.text, "g");
+    try expectOccurrences(g, "cell_drop_Box(&b);", 0);
+    try expectOccurrences(g, "cell_string_free(&moved);", 1);
+    try expectOccurrences(g, "cell_string_free(&b.s);", 0);
     try expectCompiles(e.text);
 }
