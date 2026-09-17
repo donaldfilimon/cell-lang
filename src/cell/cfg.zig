@@ -378,6 +378,7 @@ const Builder = struct {
             .list_lit => |elems| for (elems) |*el| try self.lowerExprValue(el),
             .result_ctor => |rc| try self.lowerExprValue(rc.operand),
             .option_ctor => |oc| if (oc.operand) |o| try self.lowerExprValue(o),
+            .string_view => |operand| try self.lowerExprValue(operand),
             .int_const,
             .float_const,
             .bool_const,

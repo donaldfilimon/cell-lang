@@ -904,33 +904,19 @@ const Emitter = struct {
                 return Value.void_value;
             },
             .ref => |slot| {
-                // A KNOWN TYPE LIE, DELIBERATELY LEFT IN PLACE, and the reason
-                // an owned String cannot round-trip through a binding.
+                // THE SLOT'S REAL TYPE, and that is a correction. This used
+                // to load `llType(e.ty)`, which for a `String` is the 16-byte
+                // borrowed view whatever the slot holds, so an owning
+                // `%cell_string` binding was read 16 bytes wide: `return s`
+                // lost `cap`, and `peek(shared s)` worked only because the
+                // view is a layout prefix of the owning value. A read now
+                // yields exactly what the slot holds, and a position that
+                // wants a view gets a `string_view` node from hir.lower.
                 //
-                // `llType(.string)` is the BORROWED view `%cell_str`, whatever
-                // the slot holds, so reading an owning `%cell_string` binding
-                // yields a value this backend then calls 16 bytes wide. The
-                // slot's real type is in `slot_ty`. Before the placement guard
-                // that was silent wrong code: `let owned s: String = make()
-                // return s` emitted `load %cell_str, ptr %slot0` off a
-                // `%cell_string` alloca and stored 16 bytes into a 24-byte
-                // sret buffer, never copying `cap`. It is now REFUSED, which
-                // is the right verdict reached through a misleading message:
-                // the diagnostic says "borrowed view to owning value" while
-                // the source was already owning.
-                //
-                // Loading `slot_ty` here instead is NOT the fix on its own. It
-                // would flip `inspect(shared s)` for an owned `s`, which works
-                // today only because `%cell_str` is a layout prefix of
-                // `%cell_string`; making that correct needs a
-                // `cell_string_as_str` equivalent, and that is `static inline`
-                // in `runtime/cell_rt.h` too. Lift it in both backends at
-                // once, with `mlirmit.zig`'s identical note, or the two split
-                // on a verdict.
-                const t = self.llType(e.ty) orelse {
-                    try self.unsupported(e.span, "type of a binding");
-                    return Value.void_value;
-                };
+                // An empty slot type means the binding was already refused
+                // in `emitFn`, and a second diagnostic here would bury it.
+                const t = self.slotType(slot);
+                if (t.len == 0) return Value.void_value;
                 // A borrowed aggregate's slot holds the lender's ADDRESS, so
                 // reading it as a VALUE is two loads: the slot yields the
                 // address, the address yields the object.
@@ -970,23 +956,12 @@ const Emitter = struct {
             .field => |f| {
                 const base = try self.emitExpr(f.base);
                 if (base.isVoid()) return base;
-                // THE SAME TYPE LIE as `.ref` above, one level in, and here it
-                // produced IR clang rejects outright rather than merely wrong
-                // IR. `f.sel.ty` carries no ownership, so an `owned name:
-                // String` field reads as `%cell_str` while the `extractvalue`
-                // that produced it genuinely yields the struct's declared
-                // `%cell_string`. Measured on `pub fn f() -> String { let
-                // owned b = mk() return b.name }` before the guard:
-                //
-                //   error: '%3' defined with type '%cell_string' but expected
-                //   '%cell_str'
-                //
-                // so this shape was accepted by the emitter and could not be
-                // compiled. It is refused now. The real fix is to read the
-                // declared field's ownership, the way `emitStructLit` and
-                // `placeDestType` already do, and it belongs with the `.ref`
-                // lift above rather than on its own.
-                const t = self.llType(f.sel.ty) orelse {
+                // The field's DECLARED ownership decides its width, the way
+                // `emitStructLit` and `placeDestType` already read it. `sel.ty`
+                // alone called an `owned name: String` field `%cell_str` while
+                // the `extractvalue` below yields the struct's `%cell_string`,
+                // which clang rejected outright.
+                const t = self.llTypeOwned(f.sel.ty, f.sel.ownership) orelse {
                     try self.unsupported(e.span, "field type");
                     return Value.void_value;
                 };
@@ -1030,7 +1005,28 @@ const Emitter = struct {
             .match_expr => |me| return self.emitMatch(e, me.scrutinee, me.arms),
             .result_ctor => |rc| return self.emitResultCtor(e, rc.is_ok, rc.operand),
             .option_ctor => |oc| return self.emitOptionCtor(e, oc.is_some, oc.operand),
+            .string_view => |operand| return self.emitStringView(e, operand),
         }
+    }
+
+    /// A borrowed view of an owning String place: fields 0 and 1 of the
+    /// `%cell_string`, rebuilt as a `%cell_str`. This is `cell_string_as_str`,
+    /// which is `static inline` and has no symbol, so it is spelled here. The
+    /// view owns nothing; hir.lower inserts one only over a place, so the
+    /// buffer it points at outlives it.
+    fn emitStringView(self: *Emitter, e: *const hir.Expr, operand: *const hir.Expr) EmitError!Value {
+        const v = try self.emitExpr(operand);
+        if (v.isVoid()) return v;
+        if (!try self.fits(e.span, v.ty, "%cell_string", "a borrowed view of an owned String")) return Value.void_value;
+        const ptr = try self.nextTemp();
+        try self.out.print("  {s} = extractvalue %cell_string {s}, 0\n", .{ ptr, v.text });
+        const len = try self.nextTemp();
+        try self.out.print("  {s} = extractvalue %cell_string {s}, 1\n", .{ len, v.text });
+        const a = try self.nextTemp();
+        try self.out.print("  {s} = insertvalue %cell_str undef, ptr {s}, 0\n", .{ a, ptr });
+        const b = try self.nextTemp();
+        try self.out.print("  {s} = insertvalue %cell_str {s}, i64 {s}, 1\n", .{ b, a, len });
+        return .{ .text = b, .ty = "%cell_str" };
     }
 
     fn emitBinary(
@@ -1595,7 +1591,11 @@ const Emitter = struct {
     /// null guard, and only then memcmp. Calling memcmp on a null pointer or
     /// with a mismatched length would be undefined behaviour, so the guards
     /// are not decoration.
-    fn emitStringEq(self: *Emitter, scrutinee: Value, literal: []const u8) EmitError!Value {
+    fn emitStringEq(self: *Emitter, span: hir.Span, scrutinee: Value, literal: []const u8) EmitError!Value {
+        // The comparison reads a `%cell_str`. An owning value reaches here
+        // only when hir.lower could not view it (a temporary), and reading it
+        // as a view is the prefix trick this backend no longer relies on.
+        if (!try self.fits(span, scrutinee.ty, "%cell_str", "a string pattern's scrutinee")) return Value.void_value;
         const len = try self.nextTemp();
         try self.out.print("  {s} = extractvalue %cell_str {s}, 1\n", .{ len, scrutinee.text });
         const len_eq = try self.nextTemp();
@@ -1693,7 +1693,7 @@ const Emitter = struct {
                 // computed first and the arm chain branches on the result.
                 var cmp: []const u8 = undefined;
                 if (arm.pattern.kind == .string) {
-                    const eq = try self.emitStringEq(scrutinee, arm.pattern.kind.string);
+                    const eq = try self.emitStringEq(scrutinee_e.span, scrutinee, arm.pattern.kind.string);
                     if (eq.isVoid()) return Value.void_value;
                     cmp = eq.text;
                 } else if (arm.pattern.kind == .option_ctor) {
@@ -3156,4 +3156,87 @@ test "the guard does not refuse the ABI's own re-spellings, or a matching String
             return error.LegitimateProgramRefused;
         }
     }
+}
+
+test "an owned String is read as the owning value it is, and viewed where a view is wanted" {
+    // THE TYPE LIE, REMOVED. `.ref` used to load `llType(.string)`, the
+    // 16-byte view, off a 24-byte `%cell_string` slot, and `peek(shared s)`
+    // worked only because the view is a layout prefix of the owning value.
+    // The read now loads the slot's real type, and the view is a separate
+    // `string_view` node that hir.lower inserts where a view is wanted.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn peek(shared v: String) -> Int;
+        \\pub fn f() -> Int {
+        \\  let owned s: String = make()
+        \\  return peek(shared s)
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "load %cell_string, ptr %slot0");
+    try expectContains(e.text, "extractvalue %cell_string %");
+    try expectContains(e.text, "insertvalue %cell_str undef, ptr %");
+    // The lie's own text, pinned absent.
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "load %cell_str, ptr %slot0") == null);
+}
+
+test "the keyword and sigil spellings of a shared borrow of an owned String emit identical IR" {
+    const spellings = [_][]const u8{ "shared s", "&s" };
+    var texts: [2]?Emitted = .{ null, null };
+    defer for (&texts) |*t| if (t.*) |*x| x.deinit();
+    for (spellings, 0..) |sp, i| {
+        const src = try std.fmt.allocPrint(std.testing.allocator,
+            \\pub fn make() -> String;
+            \\pub fn peek(shared v: String) -> Int;
+            \\pub fn f() -> Int {{
+            \\  let owned s: String = make()
+            \\  return peek({s})
+            \\}}
+        , .{sp});
+        defer std.testing.allocator.free(src);
+        texts[i] = try emitSource(src);
+        try std.testing.expect(!texts[i].?.bag.hasErrors());
+    }
+    try std.testing.expectEqualStrings(texts[0].?.text, texts[1].?.text);
+}
+
+test "a string pattern on an owned TEMPORARY is refused, never viewed" {
+    // A view of a temporary would be a second owner of a buffer nobody holds,
+    // so hir.lower inserts none and the comparison's own guard refuses.
+    var e = try emitSource(
+        \\pub fn make() -> String;
+        \\pub fn f() -> Int { return match make() { "a" => 1, _ => 0, } }
+    );
+    defer e.deinit();
+    try expectDiagnosticContains(&e.bag, "%cell_string where %cell_str is expected, in a string pattern's scrutinee");
+}
+
+test "owned String places, fields and exclusive borrows are viewed and matched correctly" {
+    // 1 (the owned match) + 10 (the exclusive match) + 2 + 2 (both borrow
+    // spellings of `s`) + 5 (a field) + 3 (an owned String returned out of
+    // a field and bound) = 23. A lost view or a mis-sized read changes it.
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn str_from_int(copy v: Int) -> String;
+        \\pub fn str_len(shared s: String) -> Int;
+        \\pub struct Tag { owned name: String }
+        \\pub fn classify(exclusive s: String) -> Int { return match s { "42" => 10, _ => 0, } }
+        \\pub fn name_of(owned t: Tag) -> String { return t.name }
+        \\pub fn main() {
+        \\  var owned s: String = str_from_int(42)
+        \\  let owned t: Tag = Tag { name: str_from_int(12345) }
+        \\  let copy a = match s { "42" => 1, _ => 100, }
+        \\  let owned n: String = name_of(Tag { name: str_from_int(678) })
+        \\  print_int(a + classify(exclusive s) + str_len(shared s) + str_len(&s) + str_len(shared t.name) + str_len(shared n))
+        \\}
+    );
+    defer e.deinit();
+    if (e.bag.hasErrors()) {
+        for (e.bag.list.items) |d| std.debug.print("  {s}\n", .{d.message});
+        return error.Refused;
+    }
+    const out = try runEmitted(e.text);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("23\n", out);
 }

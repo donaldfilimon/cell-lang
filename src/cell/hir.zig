@@ -306,6 +306,13 @@ pub const Expr = struct {
         result_ctor: struct { is_ok: bool, operand: *Expr },
         /// `Some(x)` or `None` building the scalar optional named by `ty`.
         option_ctor: struct { is_some: bool, operand: ?*Expr },
+        /// A borrowed view of an owning `String` PLACE: the pointer and length
+        /// of a `cell_string_t`, as `cell_string_as_str` builds them. Inserted
+        /// only by `Lowerer.convertTo`, only over a place (a binding, a field
+        /// of one, or a borrow sigil wrapping either), never over a temporary,
+        /// because a view of a temporary would outlive the only owner of its
+        /// buffer. Typed `String`, `own = .shared`.
+        string_view: *Expr,
     };
 };
 
@@ -387,6 +394,9 @@ const Lowerer = struct {
     /// The declared return type of the function being lowered: the expected
     /// type of a `return Ok(..)`/`return Err(..)`, which has no type of its own.
     ret_ty: Ty = types.t_unit,
+    /// The declared return ownership, the other half of a `return`'s
+    /// destination for `convertTo`.
+    ret_own: Ownership = .owned,
 
     const ScopeEntry = struct { name: []const u8, slot: u32, depth: u32 };
     const Sig = struct {
@@ -471,6 +481,7 @@ const Lowerer = struct {
         const ret = if (f.return_type) |*rt| self.resolve(rt) else types.t_unit;
         const ret_ownership = returnOwnership(f.return_type);
         self.ret_ty = ret;
+        self.ret_own = ret_ownership;
 
         var body: ?[]Stmt = null;
         if (f.body) |stmts| {
@@ -524,6 +535,21 @@ const Lowerer = struct {
                 const declared: ?Ty = if (l.ty) |*t| self.resolve(t) else null;
                 var value: ?Expr = null;
                 if (l.value) |v| value = try self.lowerExprIn(&v, declared);
+                // An ANNOTATED `let` converts to its declared destination. An
+                // unannotated one takes its type from the value, so C keeps
+                // `let owned s = "ab"` a view and this does not copy it
+                // either; but its OWNERSHIP still names the slot, and C views
+                // an owned place bound `let shared v = s`
+                // (`cell_string_as_str`), so the view direction applies.
+                // An `exclusive` binding holds an address, so it wants the
+                // place itself and never a converted value.
+                if (value) |v| if (l.ownership != .exclusive) {
+                    if (declared) |d| {
+                        value = try self.convertTo(v, d, l.ownership);
+                    } else if (stringRep(l.ownership) == .view) {
+                        value = try self.convertTo(v, v.ty, l.ownership);
+                    }
+                };
                 const ty = declared orelse if (value) |v| v.ty else types.t_unknown;
 
                 const slot: u32 = @intCast(self.bindings.items.len);
@@ -540,8 +566,18 @@ const Lowerer = struct {
                 return .{ .span = stmt.span, .kind = .{ .let = .{ .slot = slot, .value = value } } };
             },
             .assign => |a| {
-                const value = try self.lowerExpr(&a.value);
+                var value = try self.lowerExpr(&a.value);
                 const place = try self.lowerPlace(&a.target);
+                // The destination is the target binding, or the last field
+                // selected. An `exclusive` target is a write THROUGH the
+                // borrow into the owning pointee, so it converts like `owned`.
+                const own: Ownership = if (place.path.len != 0)
+                    place.path[place.path.len - 1].ownership
+                else if (place.slot < self.bindings.items.len)
+                    self.bindings.items[place.slot].ownership
+                else
+                    .owned;
+                value = try self.convertTo(value, place.ty, own);
                 return .{ .span = stmt.span, .kind = .{ .assign = .{ .place = place, .value = value } } };
             },
             .expr => |e| return .{ .span = stmt.span, .kind = .{ .expr = try self.lowerExpr(&e) } },
@@ -561,7 +597,8 @@ const Lowerer = struct {
                     // one form that needs the declared return type is
                     // `Ok`/`Err`, which has no type of its own.
                     const expected: ?Ty = if (e.kind == .wrap) self.ret_ty else null;
-                    return .{ .span = stmt.span, .kind = .{ .ret = try self.lowerExprIn(&e, expected) } };
+                    const value = try self.lowerExprIn(&e, expected);
+                    return .{ .span = stmt.span, .kind = .{ .ret = try self.convertTo(value, self.ret_ty, self.ret_own) } };
                 }
                 return .{ .span = stmt.span, .kind = .{ .ret = null } };
             },
@@ -758,6 +795,12 @@ const Lowerer = struct {
                         for (sl.fields) |init_field| {
                             if (std.mem.eql(u8, init_field.name, df.name)) {
                                 fields[i] = try self.lowerExpr(&init_field.value);
+                                // A field is a destination with a declared
+                                // ownership. An `exclusive` field is left
+                                // alone, as at a `let`.
+                                if (df.ownership != .exclusive) {
+                                    fields[i] = try self.convertTo(fields[i], df.ty, df.ownership);
+                                }
                                 found = true;
                                 break;
                             }
@@ -828,7 +871,15 @@ const Lowerer = struct {
             },
 
             .match_expr => |me| {
-                const scrutinee = try self.box(try self.lowerExpr(me.scrutinee));
+                var scrutinee_value = try self.lowerExpr(me.scrutinee);
+                // A string pattern compares against a borrowed view, so the
+                // scrutinee is converted to one; other patterns take it as is.
+                for (me.arms) |arm| {
+                    if (arm.pattern.kind != .string) continue;
+                    scrutinee_value = try self.convertTo(scrutinee_value, scrutinee_value.ty, .shared);
+                    break;
+                }
+                const scrutinee = try self.box(scrutinee_value);
                 var arms = try self.arena.alloc(Arm, me.arms.len);
                 var result_ty: Ty = types.t_unit;
                 var result_own: ?Ownership = null;
@@ -929,6 +980,12 @@ const Lowerer = struct {
                 break :blk null;
             };
             lowered_args[i] = try self.lowerExprIn(&a, param_ty);
+            // An `exclusive` parameter takes the argument's ADDRESS, and a
+            // converted temporary has none, so it is left for the emitters to
+            // refuse, as C leaves it for `cc` (codegen's `want.pointer`).
+            if (param_ty) |pt| if (param_mode != .exclusive) {
+                lowered_args[i] = try self.convertTo(lowered_args[i], pt, param_mode);
+            };
             modes[i] = .{ .param = param_mode, .written = written };
         }
 
@@ -951,6 +1008,97 @@ const Lowerer = struct {
                 .modes = modes,
                 .ret_ownership = ret_ownership,
             } },
+        };
+    }
+
+    /// THE CONVERSION FUNNEL, the IR twin of `codegen.emitConversion`.
+    ///
+    /// Every position that lowers a value into a destination with a declared
+    /// type and ownership asks this one function: an annotated `let`, an
+    /// assignment, a call argument, a struct-literal field, a `return`, and
+    /// a string-pattern `match` scrutinee. The question is asked of the pair
+    /// (what `e` carries in `e.own`, what the slot wants), never of the
+    /// position, so a position nobody listed inherits the answer by calling
+    /// here rather than by being enumerated.
+    ///
+    /// An owning String PLACE where a view is wanted is wrapped in a
+    /// `string_view`. An owning TEMPORARY is left alone: a view of it would
+    /// outlive the value's only owner, so the emitters refuse it, which is
+    /// what C does.
+    ///
+    /// A `block`, `if` or `match` is not a value of its own: the conversion
+    /// is pushed into its tail, branches or arms, and the node is stamped with
+    /// the wanted ownership, so the value slot a backend allocates for it has
+    /// the destination's representation.
+    ///
+    /// Anything whose representation this cannot name (an `arc` on either
+    /// side, a non-String) is returned untouched. The emitters' `fits` guard
+    /// stays as the backstop for whatever reaches them unconverted.
+    fn convertTo(self: *Lowerer, e: Expr, want_ty: Ty, want_own: Ownership) LowerError!Expr {
+        if (e.ty.tag() != .string or want_ty.tag() != .string) return e;
+        switch (e.kind) {
+            .block => |b| {
+                const tail = b.tail orelse return e;
+                tail.* = try self.convertTo(tail.*, want_ty, want_own);
+                var out = e;
+                out.own = want_own;
+                return out;
+            },
+            .if_expr => |ie| {
+                const else_body = ie.else_body orelse return e;
+                ie.then_body.* = try self.convertTo(ie.then_body.*, want_ty, want_own);
+                else_body.* = try self.convertTo(else_body.*, want_ty, want_own);
+                var out = e;
+                out.own = want_own;
+                return out;
+            },
+            .match_expr => |me| {
+                for (me.arms) |arm| {
+                    arm.body.* = try self.convertTo(arm.body.*, want_ty, want_own);
+                }
+                var out = e;
+                out.own = want_own;
+                return out;
+            },
+            else => {},
+        }
+        const have = stringRep(e.own) orelse return e;
+        const want = stringRep(want_own) orelse return e;
+        if (have == want) return e;
+        if (have == .owning) {
+            if (!isPlace(&e)) return e;
+            return .{
+                .ty = e.ty,
+                .span = e.span,
+                .kind = .{ .string_view = try self.box(e) },
+                .own = .shared,
+            };
+        }
+        return e;
+    }
+
+    const StringRep = enum { view, owning };
+
+    /// A String's representation for an ownership, mirroring
+    /// `abi.stringStruct`: `shared` is the view, and `owned`, `copy` and
+    /// `exclusive` (the pointee) the owning value. Null for `arc`, which no
+    /// IR backend lowers. A value with no recorded fact is a view.
+    fn stringRep(own: ?Ownership) ?StringRep {
+        return switch (own orelse .shared) {
+            .shared => .view,
+            .owned, .copy, .exclusive => .owning,
+            .arc => null,
+        };
+    }
+
+    /// Whether `e` names storage that outlives the expression: a binding, a
+    /// field of a place, or a borrow sigil over either.
+    fn isPlace(e: *const Expr) bool {
+        return switch (e.kind) {
+            .ref => true,
+            .field => |f| isPlace(f.base),
+            .unary => |u| (u.op == .ref_shared or u.op == .ref_exclusive) and isPlace(u.operand),
+            else => false,
         };
     }
 
@@ -1455,18 +1603,20 @@ test "Expr.own records the ownership a value carries" {
     try std.testing.expect(!l.diagnostics.hasErrors());
     const body = l.module.findFn("f").?.body.?;
     try std.testing.expectEqual(@as(?Ownership, .owned), body[0].kind.let.value.?.own);
-    const a = body[2].kind.let.value.?.kind.call.args[0];
+    // Each owned argument below reaches a `shared` parameter, so the funnel
+    // wraps it in a view; the fact under test is on the wrapped operand.
+    const a = body[2].kind.let.value.?.kind.call.args[0].kind.string_view.*;
     try std.testing.expectEqual(@as(?Ownership, .owned), a.own);
     // The sigil spelling carries the operand's fact, so it cannot diverge
     // from the keyword spelling above.
-    const b = body[3].kind.let.value.?.kind.call.args[0];
+    const b = body[3].kind.let.value.?.kind.call.args[0].kind.string_view.*;
     try std.testing.expectEqual(.unary, std.meta.activeTag(b.kind));
     try std.testing.expectEqual(@as(?Ownership, .owned), b.own);
-    const c = body[4].kind.let.value.?.kind.call.args[0];
+    const c = body[4].kind.let.value.?.kind.call.args[0].kind.string_view.*;
     try std.testing.expectEqual(.field, std.meta.activeTag(c.kind));
     try std.testing.expectEqual(Ownership.owned, c.kind.field.sel.ownership);
     try std.testing.expectEqual(@as(?Ownership, .owned), c.own);
-    try std.testing.expectEqual(@as(?Ownership, .exclusive), body[5].kind.let.value.?.kind.call.args[0].own);
+    try std.testing.expectEqual(@as(?Ownership, .exclusive), body[5].kind.let.value.?.kind.call.args[0].kind.string_view.own);
     try std.testing.expectEqual(@as(?Ownership, .shared), body[6].kind.let.value.?.kind.call.args[0].own);
     try std.testing.expectEqual(@as(?Ownership, .shared), body[7].kind.let.value.?.kind.call.args[0].own);
     // A copy field read is copy, and a scalar call result is owned.
@@ -1491,6 +1641,59 @@ test "a block, if or match with no destination takes its first arm's ownership" 
     try std.testing.expectEqual(@as(?Ownership, .shared), body[1].kind.expr.own);
     try std.testing.expectEqual(@as(?Ownership, .owned), body[2].kind.expr.own);
     try std.testing.expectEqual(@as(?Ownership, .owned), body[3].kind.expr.own);
+}
+
+test "string_view is inserted for an owned place and never for an owned temporary" {
+    var l = try lowerSource(
+        \\pub struct Tag { owned name: String }
+        \\pub fn make() -> String;
+        \\pub fn peek(shared v: String) -> Int;
+        \\pub fn f(exclusive e: String) -> Int {
+        \\    let owned s: String = make()
+        \\    let owned t: Tag = Tag { name: make() }
+        \\    let copy a = peek(shared s)
+        \\    let copy b = peek(&s)
+        \\    let copy c = peek(shared t.name)
+        \\    let copy d = peek(shared e)
+        \\    let copy g = peek(shared make())
+        \\    let copy h = peek(shared "x")
+        \\    let shared v: String = s
+        \\    let shared w = s
+        \\    let copy k = match s { x => 1, }
+        \\    return match s { "a" => 1, _ => 0, }
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const body = l.module.findFn("f").?.body.?;
+    const arg = struct {
+        fn of(s: Stmt) Expr {
+            return s.kind.let.value.?.kind.call.args[0];
+        }
+    }.of;
+    // Owned places, whatever their spelling, become a view.
+    for ([_]usize{ 2, 3, 4, 5 }) |i| {
+        const v = arg(body[i]);
+        if (v.kind != .string_view) {
+            std.debug.print("statement {d}: {s}, not a string_view\n", .{ i, @tagName(v.kind) });
+            return error.MissingView;
+        }
+        try std.testing.expectEqual(@as(?Ownership, .shared), v.own);
+    }
+    try std.testing.expectEqual(.ref, std.meta.activeTag(arg(body[2]).kind.string_view.kind));
+    try std.testing.expectEqual(.unary, std.meta.activeTag(arg(body[3]).kind.string_view.kind));
+    try std.testing.expectEqual(.field, std.meta.activeTag(arg(body[4]).kind.string_view.kind));
+    // A temporary has no place to view, so it is left for the emitters to
+    // refuse, and a view stays a view.
+    try std.testing.expectEqual(.call, std.meta.activeTag(arg(body[6]).kind));
+    try std.testing.expectEqual(.string_const, std.meta.activeTag(arg(body[7]).kind));
+    // A `let shared` is a view slot whether or not it is annotated, and C
+    // views the place in both spellings.
+    try std.testing.expectEqual(.string_view, std.meta.activeTag(body[8].kind.let.value.?.kind));
+    try std.testing.expectEqual(.string_view, std.meta.activeTag(body[9].kind.let.value.?.kind));
+    // Only a match with a string pattern wants a view of its scrutinee.
+    try std.testing.expectEqual(.ref, std.meta.activeTag(body[10].kind.let.value.?.kind.match_expr.scrutinee.kind));
+    try std.testing.expectEqual(.string_view, std.meta.activeTag(body[11].kind.ret.?.kind.match_expr.scrutinee.kind));
 }
 
 test "UInt8 and Byte stay distinct destination widths" {

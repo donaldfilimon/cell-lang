@@ -509,6 +509,7 @@ const Walker = struct {
             .list_lit => |elems| for (elems) |*el| try self.walkExpr(el),
             .result_ctor => |rc| try self.walkExpr(rc.operand),
             .option_ctor => |oc| if (oc.operand) |o| try self.walkExpr(o),
+            .string_view => |operand| try self.walkExpr(operand),
             .ref => |slot| try self.addOp(self.cur.?, .{ .use = slot }),
             .int_const,
             .float_const,
