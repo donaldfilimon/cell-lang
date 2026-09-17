@@ -1006,6 +1006,14 @@ pub const Checker = struct {
         try self.checkExpr(@constCast(&w.cond));
         const moved_after_cond = self.moved_paths.items.len;
 
+        // The state the loop leaves through a failing condition: the entry
+        // state (a body that runs zero times revives nothing) plus the
+        // condition's own moves. A later failing evaluation starts from a
+        // back edge, whose outer dead entries are all in `entry_dead` or
+        // refused as R2.a below, so this covers it too.
+        var cond_dead = try self.dead.clone(self.allocator);
+        defer cond_dead.deinit(self.allocator);
+
         // The frame is pushed after the condition: a jump in a condition's
         // value block is counted by typecheck against the enclosing loop.
         try self.loop_frames.append(self.allocator, .{
@@ -1073,6 +1081,18 @@ pub const Checker = struct {
                 "'{s}' is declared outside this loop; assign to it before the end of the body to revive it",
                 .{d.display},
             ));
+        }
+
+        // The code after the loop is reached from the body end (the walk's
+        // `dead`), from every `break`, and from a failing condition. Union
+        // the other two in. This comes after `after_held` was computed and
+        // after the R2.a report above, so both still read the body-end state:
+        // `afterLoopHolds` must not see these entries, and R2.a must not
+        // report a `break` move the next iteration never reaches.
+        try self.unionDead(frame.break_dead.items);
+        for (cond_dead.items) |d| {
+            if (d.binding >= first_loop_id) continue;
+            if (!containsDead(self.dead.items, d)) try self.dead.append(self.allocator, d);
         }
 
         // After the poison: only the outer bindings this walk proved still
@@ -1168,6 +1188,22 @@ pub const Checker = struct {
         }
     }
 
+    /// A `break` leaves the loop in the state it was taken in, which the
+    /// body end never sees when a revival follows it. Every outer dead
+    /// entry is kept, including one already dead on entry: the `break` path
+    /// also skips a later revival of that one.
+    fn saveBreakState(self: *Checker) Error!void {
+        const n = self.loop_frames.items.len;
+        // Typecheck refuses a jump outside a loop.
+        if (n == 0) return;
+        const frame = &self.loop_frames.items[n - 1];
+        for (self.dead.items) |d| {
+            if (d.binding >= frame.first_loop_id) continue;
+            if (containsDead(frame.break_dead.items, d)) continue;
+            try frame.break_dead.append(self.allocator, d);
+        }
+    }
+
     fn checkStmt(self: *Checker, stmt: *const ast.Stmt) Error!void {
         try self.checkStmtKind(stmt);
         // After the returned expression is checked, so a place it moves out
@@ -1186,7 +1222,10 @@ pub const Checker = struct {
             // A `break` or `continue` moves nothing and borrows nothing. It
             // does change which paths reach the end of the body, which R2.a
             // below deliberately ignores; see the note there.
-            .break_stmt => try self.recordExit(.jump, @intFromPtr(stmt)),
+            .break_stmt => {
+                try self.saveBreakState();
+                try self.recordExit(.jump, @intFromPtr(stmt));
+            },
             .continue_stmt => {
                 try self.checkContinue(stmt.span);
                 try self.recordExit(.jump, @intFromPtr(stmt));
@@ -7999,6 +8038,140 @@ test "R2.a: reviving a place moved before the loop does not hide a body move" {
     ,
         \\t.cell:10:14: error: 'b' is moved inside a loop, so the next iteration would use it after the move
         \\t.cell:8:5: note: 'b' is declared outside this loop; assign to it before the end of the body to revive it
+        \\
+    );
+}
+
+// ── a `break` or a condition move leaves the place dead after the loop ──────
+
+test "R2: a use after a loop that may have broken while moved is refused" {
+    try expectDiagnostics(jump_prelude ++
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\    take(v)
+        \\}
+    ,
+        \\t.cell:14:10: error: use of 'v' after it was moved
+        \\t.cell:8:14: note: 'v' was moved here by the call to 'take'
+        \\
+    );
+}
+
+test "R2: a revival after the loop clears the break state" {
+    try expectAccepted(jump_prelude ++
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\    v = "c"
+        \\    take(v)
+        \\}
+    );
+}
+
+test "R2: a use after a loop whose condition moves the place is refused" {
+    try expectDiagnostics(jump_prelude ++
+        \\pub fn f() {
+        \\    var owned v: String = "a"
+        \\    while consume(v) {
+        \\        v = "b"
+        \\    }
+        \\    take(v)
+        \\}
+    ,
+        \\t.cell:8:10: error: use of 'v' after it was moved
+        \\t.cell:5:19: note: 'v' was moved here by the call to 'consume'
+        \\
+    );
+}
+
+test "R2.a: a condition move the body revives is accepted" {
+    try expectAccepted(jump_prelude ++
+        \\pub fn f() {
+        \\    var owned v: String = "a"
+        \\    while consume(v) {
+        \\        v = "b"
+        \\    }
+        \\}
+    );
+}
+
+test "R2.a: a condition move the body does not revive is refused" {
+    // The second evaluation of the condition reads the moved `v`.
+    try expectDiagnostics(jump_prelude ++
+        \\pub fn f() {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while consume(v) {
+        \\        i = i + 1
+        \\        if i > 1 {
+        \\            break
+        \\        }
+        \\    }
+        \\}
+    ,
+        \\t.cell:6:19: error: 'v' is moved inside a loop, so the next iteration would use it after the move
+        \\t.cell:6:5: note: 'v' is declared outside this loop; assign to it before the end of the body to revive it
+        \\
+    );
+}
+
+test "R2.a: an inner break while moved reaches the outer body end" {
+    try expectDiagnostics(jump_prelude ++
+        \\pub fn f() {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 2 {
+        \\        i = i + 1
+        \\        var j = 0
+        \\        while j < 2 {
+        \\            j = j + 1
+        \\            take(v)
+        \\            if j < 5 {
+        \\                break
+        \\            }
+        \\            v = "b"
+        \\        }
+        \\    }
+        \\}
+    ,
+        \\t.cell:11:18: error: 'v' is moved inside a loop, so the next iteration would use it after the move
+        \\t.cell:6:5: note: 'v' is declared outside this loop; assign to it before the end of the body to revive it
+        \\
+    );
+}
+
+test "R2: a use after a loop that may run zero times sees the move before it" {
+    try expectDiagnostics(jump_prelude ++
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    take(v)
+        \\    var i = 0
+        \\    while i < n {
+        \\        i = i + 1
+        \\        v = "b"
+        \\    }
+        \\    take(v)
+        \\}
+    ,
+        \\t.cell:11:10: error: use of 'v' after it was moved
+        \\t.cell:5:10: note: 'v' was moved here by the call to 'take'
         \\
     );
 }
