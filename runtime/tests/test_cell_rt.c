@@ -623,6 +623,8 @@ _Static_assert(sizeof(cell_res_i64_string_t) == 32 && offsetof(cell_res_i64_stri
     "cell_res_i64_string_t layout");
 _Static_assert(sizeof(cell_res_string_string_t) == 32, "cell_res_string_string_t layout");
 _Static_assert(sizeof(cell_res_unit_string_t) == 32, "cell_res_unit_string_t layout");
+_Static_assert(sizeof(cell_opt_string_t) == 32 && offsetof(cell_opt_string_t, value) == 8,
+    "cell_opt_string_t layout");
 
 static void test_result(void) {
     /* Per-instantiation Results (CELL_RT_ABI_VERSION 2). Every payload is
@@ -679,6 +681,12 @@ static void test_result(void) {
     CHECK(bo.ok && bo.as.ok.len == 3 && !be.ok && be.as.err.len == 2);
     cell_string_free(&bo.as.ok);
     cell_string_free(&be.as.err);
+
+    /* An owning String? (sub-project 4). */
+    cell_opt_string_t os = cell_opt_string_some(cell_string_from_cstr("opt"));
+    cell_opt_string_t on = cell_opt_string_none();
+    CHECK(os.has_value && os.value.len == 3 && !on.has_value);
+    cell_string_free(&os.value);
 
     /* The deprecated legacy names still compile for one runtime version. */
     cell_result_t legacy = cell_err(4);

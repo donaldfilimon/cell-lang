@@ -281,6 +281,9 @@ CELL_DEFINE_OPTIONAL(cell_opt_f64, double)
 CELL_DEFINE_OPTIONAL(cell_opt_bool, bool)
 CELL_DEFINE_OPTIONAL(cell_opt_byte, uint8_t)
 CELL_DEFINE_OPTIONAL(cell_opt_str, cell_str_t)
+/* An owning String? (2026-09-17): what codegen emits for `String?`. The
+ * view optional above stays for hosts that want one. */
+CELL_DEFINE_OPTIONAL(cell_opt_string, cell_string_t)
 CELL_DEFINE_OPTIONAL(cell_opt_ptr, void *)
 
 /* ------------------------------------------------------------------------ */
