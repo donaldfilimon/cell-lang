@@ -548,6 +548,11 @@ pub const Checker = struct {
     /// `after_loop_skip` releases. Empty unless `checkWhile` proved the
     /// skip-revival shape; a missing entry keeps the leak.
     skip_breaks: std.ArrayListUnmanaged(SkipBreak) = .empty,
+    /// Every `Ok(x)` whose operand place was MOVED into the Result (an owning
+    /// payload whose type resolved, 2026-09-17). Codegen passes that operand's
+    /// header straight in; any other owning operand it copies, because this
+    /// checker only read it.
+    wrap_moves: std.ArrayListUnmanaged(usize) = .empty,
     /// Per-field sibling of `exit_liveness`. One entry per (exit, visible
     /// binding, path in `moved_paths`): whether that field still held a
     /// value on the path being walked. Filled from `dead` at `recordExit`
@@ -627,6 +632,7 @@ pub const Checker = struct {
         self.assign_liveness.deinit(self.allocator);
         self.exit_liveness.deinit(self.allocator);
         self.skip_breaks.deinit(self.allocator);
+        self.wrap_moves.deinit(self.allocator);
         self.exit_field_liveness.deinit(self.allocator);
         self.loop_moved.deinit(self.allocator);
         self.names.deinit(self.allocator);
@@ -821,6 +827,11 @@ pub const Checker = struct {
     /// found it holding a value that no loop could have moved. False for an
     /// exit the checker did not record, so a drop point it did not vouch for
     /// keeps the leak. See `exit_liveness`.
+    /// True when `Ok(x)` at this expression moved its operand place.
+    pub fn wrapMoved(self: *const Checker, wrap_key: usize) bool {
+        return std.mem.indexOfScalar(usize, self.wrap_moves.items, wrap_key) != null;
+    }
+
     /// The `while` whose `after_loop_skip` releases this `break` must jump
     /// past, or null for an ordinary `break`.
     pub fn skipBreakLoop(self: *const Checker, break_key: usize) ?usize {
@@ -2507,7 +2518,7 @@ pub const Checker = struct {
             .if_expr => try self.checkIf(e),
             .match_expr => |*m| try self.checkMatch(m),
             .annotated => |a| try self.checkExpr(a.value),
-            .wrap => |w| if (w.operand) |o| try self.checkExpr(o),
+            .wrap => |w| try self.checkWrap(e, w),
         }
     }
 
@@ -2623,6 +2634,15 @@ pub const Checker = struct {
         // it costs a documented over-refusal of that program and closes the
         // class outright.
         const arm_origin: ArmOrigin = if (scrutinee_place == null) .temp else .alias;
+        // The scrutinee place's TYPE, carried to a binding-pattern arm
+        // binding for the resource-shape questions only (`Binding.ty`), so
+        // `match n { y => Ok(y) }` over a scalar still reads (2026-09-17).
+        const scrutinee_ty: ?ast.TypeExpr = blk: {
+            const p = scrutinee_place orelse break :blk null;
+            const sb = self.bindingById(p.binding) orelse break :blk null;
+            const pt = self.placeTypeOf(sb, p.path) orelse break :blk null;
+            break :blk pt.ty;
+        };
 
         var entry = try self.dead.clone(self.allocator);
         defer entry.deinit(self.allocator);
@@ -2643,6 +2663,7 @@ pub const Checker = struct {
                     .ownership = .owned,
                     .mutable = false,
                     .struct_name = scrutinee_struct,
+                    .ty = scrutinee_ty,
                     .decl_span = arm.pattern.span,
                     .arm_origin = arm_origin,
                     .arm_scrutinee = if (scrutinee_place) |p| p.display else null,
@@ -2650,20 +2671,51 @@ pub const Checker = struct {
                 });
             }
             if (arm.pattern.kind == .wrap_pattern) {
-                if (arm.pattern.kind.wrap_pattern.binding) |name| {
-                    // The payload is a scalar copied out of the scrutinee
-                    // (spec B.2), so it aliases nothing and owns nothing.
+                const wp = arm.pattern.kind.wrap_pattern;
+                if (wp.binding) |name| {
+                    // `Ok(owned x)` / `Ok(shared x)` (2026-09-17): an owning
+                    // payload. `owned` MOVES the scrutinee on this arm only,
+                    // so the per-arm merge leaves it maybe-dead after the
+                    // match and live on the other arms; `shared` borrows it
+                    // for the arm. Typecheck refuses a mode anywhere it
+                    // means nothing, so a mode here names a String payload.
+                    // Without a mode the payload is a scalar copied out of
+                    // the scrutinee (spec B.2): it aliases and owns nothing.
+                    const mode: ?Ownership = if (wp.ctor == .ok) wp.mode else null;
+                    const owning = mode != null and (mode.? == .owned or mode.? == .shared);
                     _ = try self.declare(.{
                         .id = 0,
                         .name = name,
-                        .ownership = .copy,
+                        .ownership = if (owning) mode.? else .copy,
                         .mutable = false,
                         .struct_name = null,
+                        .ty = if (owning) ast.TypeExpr{ .name = "String" } else null,
                         .decl_span = arm.pattern.span,
                         .arm_origin = .temp,
                         .arm_scrutinee = null,
                         .arm_scrutinee_binding = null,
                     });
+                    if (owning and mode.? == .owned) {
+                        var body: *const ast.Expr = arm.body;
+                        while (body.kind == .annotated) body = body.kind.annotated.value;
+                        if (body.kind == .ident and std.mem.eql(u8, body.kind.ident, name)) {
+                            try self.diagnostics.err(
+                                self.allocator,
+                                arm.body.span,
+                                try self.msg("yielding the 'Ok(owned {s})' binding directly from its arm is not implemented", .{name}),
+                            );
+                            try self.diagnostics.note(
+                                self.allocator,
+                                arm.body.span,
+                                "the arm's release of the binding and the destination's ownership of the value are not yet reconciled; consume it inside the arm instead",
+                            );
+                        }
+                        if (scrutinee_place) |sp| {
+                            try self.movePlace(sp, try self.msg("'{s}' was moved here by 'Ok(owned {s})'", .{ sp.display, name }));
+                        }
+                    } else if (owning) {
+                        if (scrutinee_place) |sp| try self.createLoan(sp, .shared, true, name);
+                    }
                 }
             }
             try self.checkExpr(arm.body);
@@ -2691,6 +2743,78 @@ pub const Checker = struct {
                 try self.dead.append(self.allocator, d);
             }
         }
+    }
+
+    /// `Some(x)`, `Ok(x)`, `Err(x)`. Only `Ok` can carry an owning payload
+    /// (an owned `String`, 2026-09-17), and this checker has no types, so it
+    /// asks the operand: a place whose type resolves to resources is MOVED
+    /// and recorded in `wrap_moves`; a place resolving to none, or not
+    /// resolving at all, is read, and codegen copies an owning one it was not
+    /// told was moved. An alias or an undecidable value shape that may own a
+    /// resource is refused, as at every other consumption site.
+    fn checkWrap(self: *Checker, e: *const ast.Expr, w: @FieldType(ast.Expr.Kind, "wrap")) Error!void {
+        const o = w.operand orelse return;
+        if (w.ctor != .ok) return self.checkExpr(o);
+        switch (try self.ownedMoveSource(o)) {
+            .place => |pl| {
+                const b = self.bindingById(pl.binding) orelse return self.checkExpr(o);
+                if (try self.placeResourceShape(b, pl.path)) |shape| {
+                    if (shape == .resources) {
+                        try self.movePlace(pl, try self.msg("'{s}' was moved here by 'Ok'", .{pl.display}));
+                        try self.wrap_moves.append(self.allocator, @intFromPtr(e));
+                        return;
+                    }
+                }
+                try self.checkExpr(o);
+            },
+            .aliases_place => |site| {
+                if (try self.valueMayOwn(o)) {
+                    try self.refuseScrutineeAlias(site, "wrap", "in", "'Ok' payload", null);
+                    return;
+                }
+                try self.checkExpr(o);
+            },
+            .unknown => |site| {
+                if (try self.valueMayOwn(o)) {
+                    try self.refuseUnknownMove(site, "wrap", "in", "'Ok' payload", null);
+                    return;
+                }
+                try self.checkExpr(o);
+            },
+            .no_owned_place => try self.checkExpr(o),
+        }
+    }
+
+    /// Whether a value may hand over an owned resource: false only when every
+    /// place it can yield resolves to no resources, or it is a fresh value.
+    /// Unresolved answers true, because this gates a refusal of an
+    /// UNDECIDABLE shape, where reading would risk a double free.
+    fn valueMayOwn(self: *Checker, e: *const ast.Expr) Error!bool {
+        if (try self.placeOf(e)) |pl| {
+            const b = self.bindingById(pl.binding) orelse return true;
+            const shape = (try self.placeResourceShape(b, pl.path)) orelse return true;
+            return shape != .no_resources;
+        }
+        return switch (e.kind) {
+            .int, .float, .string, .bool, .binary, .struct_lit, .list_lit, .call, .index, .wrap => false,
+            .unary => false,
+            .annotated => |a| try self.valueMayOwn(a.value),
+            .if_expr => |i| (try self.valueMayOwn(i.then_body)) or
+                (if (i.else_body) |eb| try self.valueMayOwn(eb) else false),
+            .match_expr => |m| blk: {
+                for (m.arms) |arm| {
+                    if (try self.valueMayOwn(arm.body)) break :blk true;
+                }
+                break :blk false;
+            },
+            .block => |stmts| blk: {
+                if (stmts.len == 0) break :blk false;
+                const last = &stmts[stmts.len - 1];
+                if (last.kind != .expr) break :blk false;
+                break :blk try self.valueMayOwn(&last.kind.expr);
+            },
+            .ident, .field => true,
+        };
     }
 
     // ── calls: R1, R2, R3, R4, R5, R15 ──────────────────────────────────
@@ -9130,6 +9254,144 @@ test "a branch that only sometimes returns still reaches the code after the if" 
         \\}
         \\
     , "use of 's' after it was moved");
+}
+
+const owning_ok_prelude =
+    \\pub fn take(owned s: String) { }
+    \\pub fn keep(owned r: Result<String, Int32>) { }
+    \\pub fn view(shared s: String) -> Int { return 0 }
+    \\pub fn read() -> Result<String, Int32>;
+    \\
+;
+
+test "Ok moves an owning String operand" {
+    // Owning String in Ok (2026-09-17).
+    try expectRejectedWith(owning_ok_prelude ++
+        \\pub fn f(owned s: String) -> Result<String, Int32> {
+        \\    let r: Result<String, Int32> = Ok(s)
+        \\    take(s)
+        \\    return r
+        \\}
+        \\
+    , "use of 's' after it was moved");
+    // A scalar operand is still only read.
+    try expectAccepted(
+        \\pub fn f(copy n: Int) -> Int {
+        \\    let r: Result<Int, Int32> = Ok(n)
+        \\    return n
+        \\}
+        \\
+    );
+}
+
+test "Ok(owned ..) consumes the Result on its own arm only" {
+    try expectRejectedWith(owning_ok_prelude ++
+        \\pub fn f(owned r: Result<String, Int32>) {
+        \\    match r {
+        \\        Ok(owned x) => take(x),
+        \\        Err(_) => {},
+        \\    }
+        \\    keep(r)
+        \\}
+        \\
+    , "use of 'r' after it was moved");
+    try expectAccepted(owning_ok_prelude ++
+        \\pub fn f(owned r: Result<String, Int32>) {
+        \\    match r {
+        \\        Ok(owned x) => take(x),
+        \\        Err(_) => keep(r),
+        \\    }
+        \\}
+        \\
+    );
+    try expectRejectedWith(owning_ok_prelude ++
+        \\pub fn f(owned r: Result<String, Int32>, copy n: Int) {
+        \\    var i = 0
+        \\    while i < n {
+        \\        i = i + 1
+        \\        match r {
+        \\            Ok(owned x) => take(x),
+        \\            Err(_) => {},
+        \\        }
+        \\    }
+        \\}
+        \\
+    , "is moved inside a loop");
+}
+
+test "Ok(shared ..) borrows the Result for its arm" {
+    try expectRejectedWith(owning_ok_prelude ++
+        \\pub fn f(owned r: Result<String, Int32>) -> Int {
+        \\    return match r {
+        \\        Ok(shared x) => {
+        \\            keep(r)
+        \\            view(x)
+        \\        },
+        \\        Err(_) => 0,
+        \\    }
+        \\}
+        \\
+    , "cannot move 'r' while it is borrowed");
+    try expectAccepted(owning_ok_prelude ++
+        \\pub fn f(owned r: Result<String, Int32>) -> Int {
+        \\    let n = match r {
+        \\        Ok(shared x) => view(x),
+        \\        Err(_) => 0,
+        \\    }
+        \\    keep(r)
+        \\    return n
+        \\}
+        \\
+    );
+}
+
+test "Ok of a match alias is refused like any consumption of an alias" {
+    try expectRejectedWith(owning_ok_prelude ++
+        \\pub fn f(owned s: String) -> Result<String, Int32> {
+        \\    return match s { y => Ok(y) }
+        \\}
+        \\
+    , "the scrutinee still owns the value");
+}
+
+test "Ok of a scalar match alias is still only a read" {
+    try expectAccepted(
+        \\pub fn f(owned n: Int) -> Result<Int, Int32> {
+        \\    return match n { y => Ok(y) }
+        \\}
+        \\
+    );
+}
+
+test "yielding an Ok(owned ..) binding straight out of its arm is refused" {
+    try expectRejectedWith(owning_ok_prelude ++
+        \\pub fn f(owned r: Result<String, Int32>) -> Int {
+        \\    let owned s: String = match r {
+        \\        Ok(owned x) => x,
+        \\        Err(_) => "e",
+        \\    }
+        \\    take(s)
+        \\    return 0
+        \\}
+        \\
+    , "yielding the 'Ok(owned x)' binding directly from its arm is not implemented");
+}
+
+test "Ok(owned ..) leaves the Result live on the other arm and dead after the match" {
+    var h: LiveHarness = try .init(owning_ok_prelude ++
+        \\pub fn f(owned res: Result<String, Int32>) {
+        \\    match res {
+        \\        Ok(owned x) => take(x),
+        \\        Err(_) => {},
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    // `h.binding` finds the FIRST binding of a name, and the prelude's
+    // `keep` has an `r`, hence `res`.
+    const r = h.binding("res");
+    try std.testing.expect(h.checker.wasMoved(r));
+    try std.testing.expect(!h.checker.liveAtExit(.block_end, h.fnBodyKey("f"), r));
 }
 
 test "a moved-then-break branch is accepted inside the loop and refused after it" {
