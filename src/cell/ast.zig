@@ -118,8 +118,10 @@ pub const Pattern = struct {
         string: []const u8,
         bool: bool,
         /// `Some(x)`, `Some(_)`, `None`, `Ok(x)`, `Err(x)`. `binding` is
-        /// null for `_` and for `None`.
-        wrap_pattern: struct { ctor: Ctor, binding: ?[]const u8 },
+        /// null for `_` and for `None`. `mode` is the ownership keyword
+        /// written before the binding (`Ok(owned s)`, `Ok(shared s)`), null
+        /// when none was written; typecheck decides which are meaningful.
+        wrap_pattern: struct { ctor: Ctor, binding: ?[]const u8, mode: ?Ownership = null },
     };
 };
 

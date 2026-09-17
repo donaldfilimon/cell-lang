@@ -588,11 +588,12 @@ pub const Parser = struct {
         }
         if (self.matchCtor()) |ctor| {
             try self.expect(.l_paren);
+            const mode = self.parseOwnership();
             if (!self.match(.ident)) return self.fail("expected a binding or '_' inside the pattern");
             const name = self.prev().lexeme;
             const binding: ?[]const u8 = if (std.mem.eql(u8, name, "_")) null else name;
             try self.expect(.r_paren);
-            return self.patternNode(.{ .wrap_pattern = .{ .ctor = ctor, .binding = binding } }, start);
+            return self.patternNode(.{ .wrap_pattern = .{ .ctor = ctor, .binding = binding, .mode = mode } }, start);
         }
         if (self.match(.ident)) {
             const name = self.prev().lexeme;
@@ -1204,6 +1205,36 @@ test "Some/None/Ok/Err parse as wrap patterns with a binding or a wildcard" {
     const p2 = m.arms[2].pattern.kind.wrap_pattern;
     try std.testing.expectEqual(ast.Ctor.none, p2.ctor);
     try std.testing.expect(p2.binding == null);
+}
+
+test "wrap patterns carry an optional ownership mode" {
+    // Owning String in Ok (2026-09-17): the mode parses on every
+    // constructor; typecheck refuses the combinations that mean nothing.
+    var tp = try parseForTest(
+        \\pub fn f(copy o: Int) -> Int {
+        \\  return match o {
+        \\    Ok(owned s) => 1,
+        \\    Ok(shared t) => 2,
+        \\    Err(e) => 3,
+        \\    Some(copy x) => 4,
+        \\    Ok(_) => 5,
+        \\    Some(owned _) => 6,
+        \\  }
+        \\}
+    );
+    defer tp.deinit();
+    const m = onlyStmt(tp.module).kind.return_stmt.?.kind.match_expr;
+    const p0 = m.arms[0].pattern.kind.wrap_pattern;
+    try std.testing.expectEqual(@as(?ast.Ownership, .owned), p0.mode);
+    try std.testing.expectEqualStrings("s", p0.binding.?);
+    try std.testing.expectEqual(@as(?ast.Ownership, .shared), m.arms[1].pattern.kind.wrap_pattern.mode);
+    try std.testing.expectEqual(@as(?ast.Ownership, null), m.arms[2].pattern.kind.wrap_pattern.mode);
+    try std.testing.expectEqual(@as(?ast.Ownership, .copy), m.arms[3].pattern.kind.wrap_pattern.mode);
+    const p4 = m.arms[4].pattern.kind.wrap_pattern;
+    try std.testing.expect(p4.binding == null and p4.mode == null);
+    const p5 = m.arms[5].pattern.kind.wrap_pattern;
+    try std.testing.expect(p5.binding == null);
+    try std.testing.expectEqual(@as(?ast.Ownership, .owned), p5.mode);
 }
 
 test "malformed wrap forms are parse errors" {
