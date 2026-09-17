@@ -212,7 +212,9 @@ pub fn optionalBase(elem: hir.Ty) ?[]const u8 {
         .float => "cell_opt_f64",
         .boolean => "cell_opt_bool",
         .byte => "cell_opt_byte",
-        .string => "cell_opt_str",
+        // The owning optional (cell_rt.h, Result sub-project 4). The view
+        // optional `cell_opt_str` stays in the header for hosts only.
+        .string => "cell_opt_string",
         else => null,
     };
 }

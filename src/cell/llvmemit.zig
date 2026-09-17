@@ -188,7 +188,7 @@ const Emitter = struct {
             \\%cell_opt_f64 = type { i8, double }
             \\%cell_opt_bool = type { i8, i8 }
             \\%cell_opt_byte = type { i8, i8 }
-            \\%cell_opt_str = type { i8, %cell_str }
+            \\%cell_opt_string = type { i8, %cell_string }
             \\
             \\
         );
@@ -3410,4 +3410,20 @@ test "String-valued matches and ifs compute the right lengths" {
     const out = try runEmitted(e.text);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("15\n", out);
+}
+
+test "a declared String? is the owning 32-byte optional C declares" {
+    // C declares `cell_opt_string_t cell_find(void)` (codegen, sub-project 4
+    // of the Result specs). The IR used to spell it `%cell_opt_str`, a
+    // 24-byte view, so the callee wrote 32 bytes into a 24-byte sret buffer.
+    var e = try emitSource(
+        \\fn find() -> String?
+        \\fn take(v: String?) -> Int
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "%cell_opt_string = type { i8, %cell_string }");
+    try expectContains(e.text, "declare void @cell_find(ptr sret(%cell_opt_string))");
+    try expectContains(e.text, "declare i64 @cell_take(ptr)");
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "%cell_opt_str ") == null);
 }

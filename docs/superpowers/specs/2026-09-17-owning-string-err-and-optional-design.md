@@ -6,8 +6,10 @@ first). Sub-project 3 is implemented (plan
 sub-project 2's `abi.layoutOf(Result<String, E>)`, which still answered the
 legacy 24 bytes. Sub-project 4 is implemented in the C backend (plan
 `docs/superpowers/plans/2026-09-17-owning-string-optional.md`); its IR
-spelling of `String?` (still the 24-byte view there, while C and abi say 32)
-is reconciled after the IR String branch merges. Review answers: `String?` is owning; `Result<String, String>` is in
+spelling of `String?` was reconciled after the IR String branch merged
+(`4aca38b`): LLVM and MLIR now spell a declared `String?` as the owning
+32-byte optional, and `examples/signatures/owning_string_optional.cell`
+pins it in gate stage 10. Review answers: `String?` is owning; `Result<String, String>` is in
 sub-project 3; both sub-projects proceed.
 Parents:
 - `2026-09-17-per-instantiation-results-design.md` (sub-project 1, landed).

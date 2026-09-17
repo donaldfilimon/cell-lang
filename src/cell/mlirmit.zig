@@ -1926,7 +1926,12 @@ const Emitter = struct {
             // and parameters go through mlirTypeOwned.
             .string => "!llvm.struct<(ptr, i64)>",
             .optional => |inner| blk: {
-                const it = self.mlirType(inner.*) orelse break :blk null;
+                // `String?` carries the OWNING String, as cell_opt_string_t
+                // does; the bare `.string` answer above is the borrowed view.
+                const it = if (inner.tag() == .string)
+                    "!llvm.struct<(ptr, i64, i64)>"
+                else
+                    self.mlirType(inner.*) orelse break :blk null;
                 break :blk std.fmt.allocPrint(self.arena, "!llvm.struct<(i8, {s})>", .{it}) catch null;
             },
             // One type-erased header for every element type, per cell_rt.h
@@ -3193,4 +3198,17 @@ test "String-valued matches and ifs get llvm.alloca slots and compute the right 
     const out = try runThroughMlir(gpa, e.text);
     defer gpa.free(out);
     try std.testing.expectEqualStrings("15\n", out);
+}
+
+test "a declared String? is the owning 32-byte optional C declares" {
+    // Twin of the llvmemit test: the sret pointee is the owning String
+    // struct inside the optional, not the 16-byte view.
+    var e = try emitSource(
+        \\fn find() -> String?
+        \\fn take(v: String?) -> Int
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "func.func private @cell_find(!llvm.ptr {llvm.sret = !llvm.struct<(i8, !llvm.struct<(ptr, i64, i64)>)>})");
+    try expectContains(e.text, "func.func private @cell_take(!llvm.ptr) -> i64");
 }

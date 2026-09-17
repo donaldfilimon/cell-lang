@@ -89,3 +89,12 @@ These are the same as sub-projects 2 and 3, plus the following names:
 - **Constructors:** IR construction stays refused (`optionPayloadCarried`).
 - **Tests:** pin the new spelling with a test.
 - **Gate:** it must stay clean.
+- **Done 2026-09-17.** Measured first: a declared `fn find() -> String?`
+  emitted `declare void @cell_find(ptr sret(%cell_opt_str))` (24 bytes)
+  while C declared `cell_opt_string_t cell_find(void)` (32 bytes), a real
+  overrun that no stage saw because no corpus file declared a `String?`.
+  Tests in llvmemit and mlirmit ("a declared String? is the owning 32-byte
+  optional C declares") failed first; the fixture
+  `examples/signatures/owning_string_optional.cell` makes stage 10 compare
+  it, and a gate run on the old spelling plus that fixture is the
+  falsification.

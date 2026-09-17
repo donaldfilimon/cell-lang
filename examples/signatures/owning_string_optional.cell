@@ -1,0 +1,12 @@
+// `String?` crossing the C boundary. C declares it as the owning
+// `cell_opt_string_t`, 32 bytes, returned through sret and passed by
+// pointer. LLVM and MLIR spelled it as the 24-byte view optional until
+// 2026-09-17, so a callee wrote 32 bytes into a 24-byte buffer. No
+// program in the corpus declared one, so nothing compared them.
+//
+// This file has no `main` on purpose: it is a signature fixture, not a
+// program. IR construction and matching of `String?` stay refused
+// (abi.optionPayloadCarried); only the declared layout is compared here.
+pub fn find() -> String?
+pub fn take(v: String?) -> Int
+pub fn give(shared v: String?) -> Int
