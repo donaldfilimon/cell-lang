@@ -831,12 +831,12 @@ const Lowerer = struct {
                     return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
                 }
                 const r = want.result;
-                if (abi.resultPayload(r.ok.*) == null) {
-                    try self.cannotLower(e.span, "a Result whose Ok payload is not a scalar integer, float or Bool");
+                if (r.ok.tag() != .unit and abi.resultMember(r.ok.*) == null) {
+                    try self.cannotLower(e.span, "a Result whose Ok payload is not a scalar primitive");
                     return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
                 }
-                if (!abi.resultErrorCarried(r.err.*)) {
-                    try self.cannotLower(e.span, "a Result whose Err payload is not Int32 or a payload-free enum");
+                if (abi.resultShape(r) == null) {
+                    try self.cannotLower(e.span, "a Result whose Err payload is not a scalar primitive or a payload-free enum");
                     return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "wrap" });
                 }
                 const operand_ast = w.operand orelse {
@@ -974,8 +974,12 @@ const Lowerer = struct {
                     return .{ .kind = .wildcard, .span = p.span };
                 }
                 const r = scrutinee_ty.result;
-                if (abi.resultPayload(r.ok.*) == null or !abi.resultErrorCarried(r.err.*)) {
-                    try self.cannotLower(p.span, "a Result pattern whose payload is not a scalar Ok and an Int32 or enum Err");
+                if (abi.resultShape(r) == null) {
+                    try self.cannotLower(p.span, "a Result pattern whose payloads are not scalar primitives or a payload-free enum");
+                    return .{ .kind = .wildcard, .span = p.span };
+                }
+                if (wp.binding != null and wp.ctor == .ok and r.ok.tag() == .unit) {
+                    try self.cannotLower(p.span, "binding the payload of a unit Ok");
                     return .{ .kind = .wildcard, .span = p.span };
                 }
                 var binding: ?u32 = null;
@@ -1372,7 +1376,9 @@ test "Some/None lower to option_ctor, and a Some pattern binds the payload" {
 test "Result and optional forms the IR backends do not carry are refused" {
     const cases = [_]struct { src: []const u8, needle: []const u8 }{
         .{ .src = "pub fn f() { let copy r: Result<String, Int32> = Ok(\"x\") }", .needle = "Ok payload is not a scalar" },
-        .{ .src = "pub fn f() { let copy r: Result<Int, Int> = Err(1) }", .needle = "Err payload is not Int32" },
+        // `Result<Int, Int>` is carried since 2026-09-17 (per-pair structs);
+        // an owning Err is not (sub-project 3).
+        .{ .src = "pub fn f() { let copy r: Result<Int, String> = Err(\"x\") }", .needle = "Err payload is not a scalar primitive or a payload-free enum" },
         .{ .src = "pub fn f() { let copy o: String? = Some(\"x\") }", .needle = "optional whose payload is not a scalar" },
         .{ .src = "pub fn f() { let copy o = Some(1) }", .needle = "Some/None need a declared optional destination" },
     };
