@@ -74,13 +74,14 @@ pub fn layoutOf(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) ?Layout {
         // depend on the element, and at 24 bytes it takes the same indirect
         // path cell_string_t already uses.
         .list => .{ .size = 24, .alignment = 8 },
-        // A Result is `cell_result_t`, `{ bool ok; int32_t error_code;
-        // cell_value_t value; }`, whatever T and E are: the payload rides in a
-        // 16-byte union whose widest member is cell_str_t. Measured with
-        // clang on AArch64/Darwin: size 24, align 8, fields at 0, 4, 8. So,
-        // like a list, it takes the indirect path. Which T and E a backend
-        // can actually read and write is decided by resultPayload below.
-        .result => .{ .size = 24, .alignment = 8 },
+        // A scalar Result is its per-pair struct (cell_rt.h ABI 2): the tag
+        // byte, padding to the union's alignment, the union. Any other pair
+        // is still the deprecated 24-byte `cell_result_t` pass-through the C
+        // backend keeps for it; the IR backends refuse those.
+        .result => |r| if (resultShape(r)) |s|
+            .{ .size = s.size, .alignment = s.alignment }
+        else
+            .{ .size = 24, .alignment = 8 },
         .func, .unknown => null,
     };
 }
@@ -114,6 +115,88 @@ pub fn resultPayload(ty: hir.Ty) ?ResultPayload {
         .boolean => .{ .natural = "i1", .store = "i8", .widen = .bool_byte },
         else => null,
     };
+}
+
+/// One side of a per-instantiation Result (`cell_res_<ok>_<err>_t` in
+/// cell_rt.h). The table is the single source both IR backends read; the C
+/// backend keeps its own name table (it does not import this module) and a
+/// parity test in codegen.zig pins the two together.
+pub const ResultMember = struct {
+    slug: []const u8,
+    c: []const u8,
+    natural: []const u8,
+    mem: []const u8,
+    size: u32,
+    alignment: u32,
+};
+
+fn member(slug: []const u8, c: []const u8, natural: []const u8, mem: []const u8, size: u32) ResultMember {
+    return .{ .slug = slug, .c = c, .natural = natural, .mem = mem, .size = size, .alignment = size };
+}
+
+pub fn resultMember(ty: hir.Ty) ?ResultMember {
+    return switch (ty) {
+        .int => member("i64", "int64_t", "i64", "i64", 8),
+        .int8 => member("i8", "int8_t", "i8", "i8", 1),
+        .int16 => member("i16", "int16_t", "i16", "i16", 2),
+        .int32 => member("i32", "int32_t", "i32", "i32", 4),
+        .uint => member("u64", "uint64_t", "i64", "i64", 8),
+        .uint8 => member("u8", "uint8_t", "i8", "i8", 1),
+        .uint16 => member("u16", "uint16_t", "i16", "i16", 2),
+        .uint32 => member("u32", "uint32_t", "i32", "i32", 4),
+        .float => member("f64", "double", "double", "double", 8),
+        .float32 => member("f32", "float", "float", "float", 4),
+        .boolean => member("bool", "bool", "i1", "i8", 1),
+        .byte => member("byte", "uint8_t", "i8", "i8", 1),
+        // A payload-free enum is an int32_t at the C boundary (SPEC 10.3).
+        .enum_type => member("i32", "int32_t", "i32", "i32", 4),
+        else => null,
+    };
+}
+
+pub const ResultShape = struct {
+    ok: ?ResultMember,
+    err: ResultMember,
+    union_member: ResultMember,
+    size: u32,
+    alignment: u32,
+};
+
+/// Null for a pair the per-instantiation runtime does not define: an
+/// owning or aggregate side, or a unit E.
+pub fn resultShape(r: types.ResultType) ?ResultShape {
+    const ok: ?ResultMember = if (r.ok.tag() == .unit) null else (resultMember(r.ok.*) orelse return null);
+    const err = resultMember(r.err.*) orelse return null;
+    // clang spells a union as its FIRST member of the largest alignment,
+    // declaration order `T ok; E err;` (measured, see the spec's table).
+    var chosen = err;
+    if (ok) |o| {
+        if (o.alignment >= err.alignment) chosen = o;
+    }
+    // Every scalar here has size == alignment, so the chosen member is also
+    // the largest. Refuse rather than mis-spell a pair where that fails.
+    if (ok) |o| {
+        if (o.size > chosen.size) return null;
+    }
+    if (err.size > chosen.size) return null;
+    const a = @max(chosen.alignment, 1);
+    const u = chosen.size;
+    return .{
+        .ok = ok,
+        .err = err,
+        .union_member = chosen,
+        .size = alignUp(alignUp(1, a) + u, a),
+        .alignment = a,
+    };
+}
+
+pub fn resultLlvmType(arena: std.mem.Allocator, s: ResultShape) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{{ i8, {{ {s} }} }}", .{s.union_member.mem});
+}
+
+pub fn resultMlirType(arena: std.mem.Allocator, s: ResultShape) ![]const u8 {
+    const m = if (std.mem.eql(u8, s.union_member.mem, "double")) "f64" else if (std.mem.eql(u8, s.union_member.mem, "float")) "f32" else s.union_member.mem;
+    return std.fmt.allocPrint(arena, "!llvm.struct<(i8, !llvm.struct<({s})>)>", .{m});
 }
 
 /// Whether an optional over `ty` is one the IR backends build and match: a
@@ -547,24 +630,73 @@ test "an out-of-scope type has no layout yet" {
     try std.testing.expect(layoutOf(&m, types.t_string, .arc) == null);
 }
 
-test "a Result is cell_result_t: 24 bytes, align 8, passed and returned indirectly" {
-    // Measured with clang -S -emit-llvm on AArch64/Darwin:
-    // %struct.cell_result = type { i8, i32, %union.cell_value }, sizeof 24,
-    // offsets 0/4/8, and `cell_result_t f(cell_result_t)` compiles to
-    // `void @f(ptr sret(%struct.cell_result), ptr)`.
+fn resultOf(ok: *const hir.Ty, err: *const hir.Ty) hir.Ty {
+    return .{ .result = .{ .ok = ok, .err = err } };
+}
+
+test "a scalar Result lays out as clang lays out its per-pair struct" {
+    // Measured by tools/measure-result-layouts.sh (clang, AArch64/Darwin,
+    // 2026-09-17). Union spelled as its first member of the largest
+    // alignment, Ok before Err.
     const m = emptyModule();
-    const t_int = types.t_int;
-    const t_i32 = types.t_int32;
-    const r: hir.Ty = .{ .result = .{ .ok = &t_int, .err = &t_i32 } };
-    const l = layoutOf(&m, r, .copy).?;
-    try std.testing.expectEqual(@as(u32, 24), l.size);
-    try std.testing.expectEqual(@as(u32, 8), l.alignment);
+    const Row = struct { ok: hir.Ty, err: hir.Ty, size: u32, alignment: u32, member: []const u8, param: Class };
+    const rows = [_]Row{
+        .{ .ok = types.t_int, .err = types.t_int32, .size = 16, .alignment = 8, .member = "i64", .param = .{ .coerce_int = 2 } },
+        .{ .ok = types.t_bool, .err = types.t_int32, .size = 8, .alignment = 4, .member = "i32", .param = .{ .coerce_int = 1 } },
+        .{ .ok = types.t_float, .err = types.t_int, .size = 16, .alignment = 8, .member = "double", .param = .{ .coerce_int = 2 } },
+        .{ .ok = types.t_int8, .err = types.t_float, .size = 16, .alignment = 8, .member = "double", .param = .{ .coerce_int = 2 } },
+        .{ .ok = types.t_int32, .err = types.t_int32, .size = 8, .alignment = 4, .member = "i32", .param = .{ .coerce_int = 1 } },
+        .{ .ok = types.t_unit, .err = types.t_int32, .size = 8, .alignment = 4, .member = "i32", .param = .{ .coerce_int = 1 } },
+        .{ .ok = types.t_float, .err = types.t_float, .size = 16, .alignment = 8, .member = "double", .param = .{ .coerce_int = 2 } },
+        .{ .ok = types.t_int8, .err = types.t_int8, .size = 2, .alignment = 1, .member = "i8", .param = .{ .coerce_int = 1 } },
+    };
+    for (rows) |row| {
+        const r = resultOf(&row.ok, &row.err);
+        const l = layoutOf(&m, r, .copy).?;
+        try std.testing.expectEqual(row.size, l.size);
+        try std.testing.expectEqual(row.alignment, l.alignment);
+        const s = resultShape(r.result).?;
+        try std.testing.expectEqualStrings(row.member, s.union_member.mem);
+        try std.testing.expect(std.meta.eql(row.param, classifyParam(&m, r, .copy)));
+    }
+}
+
+test "the Result member table covers every scalar and the payload-free enum" {
+    try std.testing.expectEqualStrings("i1", resultMember(types.t_bool).?.natural);
+    try std.testing.expectEqualStrings("i8", resultMember(types.t_bool).?.mem);
+    try std.testing.expectEqualStrings("byte", resultMember(types.t_byte).?.slug);
+    try std.testing.expectEqualStrings("u8", resultMember(types.t_uint8).?.slug);
+    try std.testing.expectEqualStrings("f32", resultMember(types.t_float32).?.slug);
+    const e: hir.Ty = .{ .enum_type = "E" };
+    try std.testing.expectEqualStrings("i32", resultMember(e).?.slug);
+    try std.testing.expect(resultMember(types.t_string) == null);
+    const t_s = types.t_string;
+    const t_i = types.t_int;
+    try std.testing.expect(resultShape(.{ .ok = &t_s, .err = &t_i }) == null);
+    try std.testing.expect(resultShape(.{ .ok = &t_i, .err = &types.t_unit }) == null);
+}
+
+test "a Result's IR spelling is the tag byte and its union member" {
+    const t_b = types.t_bool;
+    const t_i = types.t_int;
+    const s = resultShape(.{ .ok = &t_b, .err = &t_i }).?;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectEqualStrings("{ i8, { i64 } }", try resultLlvmType(a, s));
+    try std.testing.expectEqualStrings("!llvm.struct<(i8, !llvm.struct<(i64)>)>", try resultMlirType(a, s));
+    const t_f = types.t_float;
+    const sf = resultShape(.{ .ok = &t_f, .err = &t_i }).?;
+    try std.testing.expectEqualStrings("!llvm.struct<(i8, !llvm.struct<(f64)>)>", try resultMlirType(a, sf));
+}
+
+test "an out-of-scope Result keeps the legacy 24-byte indirect layout" {
+    const m = emptyModule();
+    const t_i = types.t_int;
+    const t_s = types.t_string;
+    const r = resultOf(&t_i, &t_s);
+    try std.testing.expectEqual(@as(u32, 24), layoutOf(&m, r, .copy).?.size);
     try std.testing.expect(classifyParam(&m, r, .copy) == .indirect);
-    try std.testing.expect(classifyReturn(&m, r) == .indirect);
-    try std.testing.expectEqualStrings("i64", resultPayload(types.t_int32).?.store);
-    try std.testing.expect(resultPayload(types.t_string) == null);
-    try std.testing.expect(resultErrorCarried(types.t_int32));
-    try std.testing.expect(!resultErrorCarried(types.t_int));
 }
 
 test "a small integer-class return is an exact-width integer, as clang returns it" {
