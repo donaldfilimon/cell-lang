@@ -2357,6 +2357,17 @@ ways, and each is a real, documented gap rather than an oversight:
   measured 500 on both witnesses before and 0 after, pinned in the gate;
   a probe with returns before the move, between move and revival, and
   after the revival (1080 calls) measured 0 and ran ASan-clean.
+  **FIXED 2026-09-17: the after-loop release freed a value read after the
+  loop.** It held back only when the enclosing block end recorded the
+  binding live, and a loop-moved binding's block end is always recorded
+  dead, so a READ after the loop (`print(shared s)`, `return k +
+  view_len(shared s)`) saw a zeroed header: a silent wrong answer, with
+  AddressSanitizer and the malloc counter both quiet. Codegen now skips the
+  after-loop release for a binding mentioned in anything that can run
+  later (the rest of every enclosing block, and every enclosing loop body),
+  so that value LEAKS instead until drops are precise.
+  `examples/loop_revive_read.cell` prints 19 on all three backends; the
+  pre-fix compiler prints 13.
   **CLOSED 2026-09-17: a skip-revival `break` whose place is never used
   after the loop.** borrowck records `ExitKind.after_loop_skip` when an
   outer binding of the current block is moved only as a whole, not by the

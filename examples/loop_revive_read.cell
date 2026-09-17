@@ -1,0 +1,40 @@
+// A value moved and revived inside a loop, then READ after the loop, must
+// still be intact when it is read.
+//
+// WHY THIS FILE EXISTS. The C backend's after-loop release (the R16
+// after_loop closure) held back only when the enclosing block end recorded
+// the value live, and a loop-moved binding's block end is always recorded
+// dead, so C freed the revived value right after the loop and the next
+// statement read a zeroed header. A wrong answer with AddressSanitizer and
+// the malloc counter both silent. Found 2026-09-17 while grounding IR
+// String step (c). The release is now skipped when the value is mentioned
+// after the loop; it leaks instead, until drops are precise.
+//
+// WHAT IT PRINTS. `digits(v)` is v + 1 bytes long. `sink` returns the
+// length it is handed. In `once(n)` the loop sinks the values of length
+// n + 1, 1 and 2, leaving the last revival (length 3) to be read after the
+// loop: n + 1 + 1 + 2 + 3 = n + 7. `once(0) + once(5)` is 7 + 12 = 19, and
+// an early release reads 0 for the final 3, so a wrong answer is 13.
+//
+// EXPECT-OUTPUT: 19
+
+pub fn print_int(copy value: Int);
+pub fn digits(copy v: Int) -> String;
+pub fn sink(owned s: String) -> Int;
+pub fn view_len(shared s: String) -> Int;
+
+pub fn once(copy n: Int) -> Int {
+    var owned s = digits(n)
+    var j = 0
+    var k = 0
+    while j < 3 {
+        k = k + sink(owned s)
+        s = digits(j)
+        j = j + 1
+    }
+    return k + view_len(shared s)
+}
+
+pub fn main() {
+    print_int(once(0) + once(5))
+}

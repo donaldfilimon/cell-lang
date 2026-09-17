@@ -396,6 +396,12 @@ pub const Generator = struct {
     /// local declared since the LOOP's mark, not since the innermost
     /// block's: `emitLoopExitDrops` reads the top of this stack.
     loop_marks: std.ArrayList(usize) = .empty,
+    /// The statements that run after the one being emitted, innermost
+    /// block first, and the bodies of the enclosing loops (which run again).
+    /// `usedLater` reads both so an after-loop release never frees a value
+    /// a later statement still reads.
+    later_rests: std.ArrayList([]const ast.Stmt) = .empty,
+    loop_bodies: std.ArrayList([]const ast.Stmt) = .empty,
     /// Temporary owning scrutinees of the `match`es being emitted, innermost
     /// last (2026-09-17). An early exit releases the untaken ones it leaves:
     /// a `return` all of them, a `break`/`continue` those created inside the
@@ -820,6 +826,8 @@ pub const Generator = struct {
 
     fn emitStmt(self: *Generator, stmt: *const ast.Stmt, rest: []const ast.Stmt, indent: usize) EmitError!void {
         const out = self.writer;
+        try self.later_rests.append(self.arena, rest);
+        defer _ = self.later_rests.pop();
         switch (stmt.kind) {
             .while_stmt => |w| {
                 const loop_key = @intFromPtr(stmt);
@@ -835,7 +843,9 @@ pub const Generator = struct {
                 try self.emitCond(&w.cond, indent);
                 try out.writeAll(") {\n");
                 try self.loop_marks.append(self.arena, self.locals.items.len);
+                try self.loop_bodies.append(self.arena, w.body);
                 try self.emitStmts(w.body, indent + 4);
+                _ = self.loop_bodies.pop();
                 _ = self.loop_marks.pop();
                 try self.writeIndent(indent);
                 try out.writeAll("}\n");
@@ -1528,6 +1538,20 @@ pub const Generator = struct {
         return top.id;
     }
 
+    /// Whether `name` is mentioned by anything that can run after the
+    /// current statement: the rest of every enclosing block, and every
+    /// enclosing loop body. Over-approximate on purpose (a shadowing `let`
+    /// also counts): a false yes only leaks.
+    fn usedLater(self: *const Generator, name: []const u8) bool {
+        for (self.later_rests.items) |r| {
+            if (stmtsUse(r, name)) return true;
+        }
+        for (self.loop_bodies.items) |b| {
+            if (stmtsUse(b, name)) return true;
+        }
+        return false;
+    }
+
     fn emitAfterLoopDrops(self: *Generator, key: usize, indent: usize) EmitError!void {
         const checker = self.checker orelse return;
         const here: Exit = .{ .kind = .after_loop, .key = key };
@@ -1540,6 +1564,9 @@ pub const Generator = struct {
             if (!local.droppable) continue;
             if (local.ownership != .owned and local.ownership != .arc) continue;
             if (!try self.needsDrop(local.ty)) continue;
+            // A later statement still reads or moves it (2026-09-17): the
+            // block end is poisoned for loop-moved bindings, so this leaks.
+            if (self.usedLater(local.name)) continue;
             if (local.ty.shape == .record) {
                 if (!checker.wasWhollyMoved(local.id)) continue;
                 if (!checker.recordLiveAtExit(here.kind, here.key, local.id) and
@@ -5829,6 +5856,63 @@ test "a value moved on one branch is still released on the other, after the fix"
     defer e.deinit();
     const f = try fnDef(e.text, "f");
     try expectOccurrences(f, "cell_string_free(&s);", 1);
+}
+
+test "a value revived in a loop and read after it is not released at the loop exit" {
+    // Found 2026-09-17 while grounding IR String step (c). The after-loop
+    // release held back only when the enclosing block end recorded the
+    // value live, and `loop_moved` forces that record false, so a READ
+    // after the loop was never considered: C emitted
+    // `cell_string_free(&s); cell_print(cell_string_as_str(&s));` and
+    // printed an empty line where LLVM and MLIR printed "again". Silent:
+    // the free zeroes the header, so ASan and the malloc counter saw nothing.
+    // Now a binding mentioned after the loop (in the rest of any enclosing
+    // block, or anywhere in an enclosing loop body) is not released there;
+    // it leaks instead, the safe direction, until the drop is precise.
+    var e = try emitSource(
+        \\pub fn print(shared msg: String);
+        \\pub fn take(owned s: String);
+        \\pub fn str_len(shared s: String) -> Int;
+        \\pub fn f() {
+        \\  var owned s: String = "first"
+        \\  var j = 0
+        \\  while j < 2 {
+        \\    take(owned s)
+        \\    s = "again"
+        \\    j = j + 1
+        \\  }
+        \\  print(shared s)
+        \\}
+        \\pub fn g(copy flag: Bool) -> Int {
+        \\  var owned t: String = "x"
+        \\  if flag {
+        \\    var j = 0
+        \\    while j < 2 {
+        \\      take(owned t)
+        \\      t = "y"
+        \\      j = j + 1
+        \\    }
+        \\  }
+        \\  return str_len(shared t)
+        \\}
+        \\pub fn h() {
+        \\  var owned u: String = "p"
+        \\  var j = 0
+        \\  while j < 2 {
+        \\    take(owned u)
+        \\    u = "q"
+        \\    j = j + 1
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectAbsent(f, "cell_string_free(&s);\n  cell_print");
+    const g = try fnDef(e.text, "g");
+    try expectAbsent(g, "cell_string_free(&t);");
+    // Not read after the loop: the after-loop release is still right.
+    const h = try fnDef(e.text, "h");
+    try expectOccurrences(h, "cell_string_free(&u);", 1);
 }
 
 test "a value moved by being returned is not dropped" {
