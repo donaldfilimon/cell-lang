@@ -308,6 +308,8 @@ pub const CType = struct {
     pub const string: CType = .{ .text = "cell_string_t", .shape = .string };
     pub const slice: CType = .{ .text = "cell_slice_t", .shape = .slice };
     pub const arc: CType = .{ .text = "cell_arc_t", .shape = .arc };
+    /// The deprecated ABI-1 spelling, used only for a Result pair cell_rt.h
+    /// has no instance for (see lowerType).
     pub const result: CType = .{ .text = "cell_result_t", .shape = .result };
 };
 
@@ -2126,11 +2128,16 @@ pub const Generator = struct {
                 try self.writeDecl(ty, name);
                 switch (wp.ctor) {
                     .some, .none => try self.writer.print(" = {s}.value;\n", .{temp}),
-                    .ok => {
-                        const rf = resultField(ty);
-                        try self.writer.print(" = {s}{s}.value.{s};\n", .{ rf.cast, temp, rf.field });
+                    .ok, .err => {
+                        const field = if (wp.ctor == .ok) "ok" else "err";
+                        if (!std.mem.startsWith(u8, scrut_ty.text, "cell_res_")) {
+                            try self.writer.writeAll(" = cell_res_unsupported_payload;\n");
+                        } else if (ty.shape == .enumeration) {
+                            try self.writer.print(" = ({s}){s}.as.{s};\n", .{ ty.text, temp, field });
+                        } else {
+                            try self.writer.print(" = {s}.as.{s};\n", .{ temp, field });
+                        }
                     },
-                    .err => try self.writer.print(" = ({s}){s}.error_code;\n", .{ ty.text, temp }),
                 }
                 // A scalar copy: never droppable, `copy` like borrowck says.
                 try self.pushLocal(name, ty, .copy, false);
@@ -2569,21 +2576,21 @@ pub const Generator = struct {
                     try out.writeAll(")");
                 }
             },
-            .ok => {
-                const operand = w.operand.?;
-                const payload: CType = if (want) |d| (if (d.shape == .result and d.payload != null) d.payload.?.* else try self.inferExpr(operand)) else try self.inferExpr(operand);
-                const rf = resultField(payload);
-                try out.print("{s}(", .{rf.ctor});
-                if (rf.cast.len != 0) {
-                    // Widen Byte to u64 and Float32 to double explicitly.
-                    try out.writeAll(if (std.mem.eql(u8, payload.text, "uint8_t")) "(uint64_t)" else if (std.mem.eql(u8, payload.text, "float")) "(double)" else "");
+            .ok, .err => {
+                const is_ok = w.ctor == .ok;
+                const dest: ?CType = if (want) |d| (if (d.shape == .result) d else null) else null;
+                const base = if (dest) |d| resultBase(d) else null;
+                if (base == null) {
+                    // No declared per-pair destination: cc must refuse it
+                    // rather than guess a layout.
+                    try out.writeAll(if (is_ok) "cell_res_unknown_ok(" else "cell_res_unknown_err(");
+                    try self.emitExpr(w.operand.?, indent);
+                    try out.writeAll(")");
+                    return;
                 }
-                try self.emitExpr(operand, indent);
-                try out.writeAll(")");
-            },
-            .err => {
-                try out.writeAll("cell_err((int32_t)");
-                try self.emitExpr(w.operand.?, indent);
+                const member = if (is_ok) dest.?.payload.?.* else dest.?.err_payload.?.*;
+                try out.print("{s}_{s}(", .{ base.?, if (is_ok) "ok" else "err" });
+                try self.emitArgLike(w.operand.?, member, indent);
                 try out.writeAll(")");
             },
         }
@@ -3374,7 +3381,14 @@ pub const Generator = struct {
                 ok.* = try self.lowerType(r.ok, .copy);
                 const err = try self.arena.create(CType);
                 err.* = try self.lowerType(r.err, .copy);
-                break :blk .{ .text = CType.result.text, .shape = .result, .payload = ok, .err_payload = err };
+                const text = if (try self.resultSlug(r.ok, true)) |os|
+                    if (try self.resultSlug(r.err, false)) |es|
+                        try std.fmt.allocPrint(self.arena, "cell_res_{s}_{s}_t", .{ os, es })
+                    else
+                        CType.result.text
+                else
+                    CType.result.text;
+                break :blk .{ .text = text, .shape = .result, .payload = ok, .err_payload = err };
             },
             .ref => |r| try self.lowerType(r.inner, r.ownership),
         };
@@ -3444,6 +3458,22 @@ pub const Generator = struct {
             };
         }
         return CType.unknown;
+    }
+
+    /// A Result side's slug: a scalar name, a payload-free enum (`i32`), or
+    /// unit on the Ok side. Null for anything cell_rt.h does not define.
+    fn resultSlug(self: *Generator, ty: *const ast.TypeExpr, is_ok: bool) Alloc!?[]const u8 {
+        switch (ty.*) {
+            .unit => return if (is_ok) "unit" else null,
+            .name => |n| {
+                if (scalarSlug(n)) |s| return s;
+                const base = try self.namedType(n);
+                if (base.shape == .enumeration) return "i32";
+                return null;
+            },
+            .ref => |r| return try self.resultSlug(r.inner, is_ok),
+            else => return null,
+        }
     }
 
     /// Which `CELL_DEFINE_OPTIONAL` instance covers `T?`. cell_rt.h predefines
@@ -3887,24 +3917,6 @@ fn optBaseForPayload(t: CType) ?[]const u8 {
     return null;
 }
 
-/// Which `cell_value_t` field an ok payload of this C type rides in, and
-/// the runtime constructor that writes it.
-fn resultField(t: CType) struct { field: []const u8, ctor: []const u8, cast: []const u8 } {
-    if (std.mem.eql(u8, t.text, "int64_t")) return .{ .field = "i64", .ctor = "cell_ok_i64", .cast = "" };
-    if (std.mem.eql(u8, t.text, "int8_t")) return .{ .field = "i64", .ctor = "cell_ok_i64", .cast = "(int8_t)" };
-    if (std.mem.eql(u8, t.text, "int16_t")) return .{ .field = "i64", .ctor = "cell_ok_i64", .cast = "(int16_t)" };
-    if (std.mem.eql(u8, t.text, "int32_t")) return .{ .field = "i64", .ctor = "cell_ok_i32", .cast = "(int32_t)" };
-    if (std.mem.eql(u8, t.text, "uint64_t")) return .{ .field = "u64", .ctor = "cell_ok_u64", .cast = "" };
-    if (std.mem.eql(u8, t.text, "uint8_t")) return .{ .field = "u64", .ctor = "cell_ok_u64", .cast = "(uint8_t)" };
-    if (std.mem.eql(u8, t.text, "uint16_t")) return .{ .field = "u64", .ctor = "cell_ok_u64", .cast = "(uint16_t)" };
-    if (std.mem.eql(u8, t.text, "uint32_t")) return .{ .field = "u64", .ctor = "cell_ok_u64", .cast = "(uint32_t)" };
-    if (std.mem.eql(u8, t.text, "double")) return .{ .field = "f64", .ctor = "cell_ok_f64", .cast = "" };
-    if (std.mem.eql(u8, t.text, "float")) return .{ .field = "f64", .ctor = "cell_ok_f64", .cast = "(float)" };
-    if (std.mem.eql(u8, t.text, "bool")) return .{ .field = "b", .ctor = "cell_ok_bool", .cast = "" };
-    // Unknown payloads are refused by the checker; keep the C loud.
-    return .{ .field = "i64", .ctor = "cell_ok_i64", .cast = "" };
-}
-
 fn unwrapAnnotated(e: *const ast.Expr) *const ast.Expr {
     var current = e;
     while (true) {
@@ -4022,6 +4034,31 @@ fn endsInReturn(body: []const ast.Stmt) bool {
         .return_stmt => true,
         else => false,
     };
+}
+
+/// The per-instantiation Result slug for a Cell scalar type name (cell_rt.h
+/// ABI 2). Mirrors abi.resultMember; the parity test pins the two.
+fn scalarSlug(n: []const u8) ?[]const u8 {
+    if (eq(n, "Int") or eq(n, "Int64")) return "i64";
+    if (eq(n, "Int8")) return "i8";
+    if (eq(n, "Int16")) return "i16";
+    if (eq(n, "Int32")) return "i32";
+    if (eq(n, "UInt") or eq(n, "UInt64")) return "u64";
+    if (eq(n, "UInt8")) return "u8";
+    if (eq(n, "UInt16")) return "u16";
+    if (eq(n, "UInt32")) return "u32";
+    if (eq(n, "Float") or eq(n, "Float64")) return "f64";
+    if (eq(n, "Float32")) return "f32";
+    if (eq(n, "Bool")) return "bool";
+    if (eq(n, "Byte")) return "byte";
+    return null;
+}
+
+/// `cell_res_i64_i32` for `cell_res_i64_i32_t`; null for the legacy
+/// pass-through spelling, which has no per-pair constructors.
+fn resultBase(t: CType) ?[]const u8 {
+    if (!std.mem.startsWith(u8, t.text, "cell_res_")) return null;
+    return t.text[0 .. t.text.len - 2];
 }
 
 /// The bounds-checked runtime reader for a list built with `elem`.
@@ -4963,6 +5000,8 @@ test "TYPE-06: a Result type lowers to cell_result_t and is passed through, neve
         \\}
     );
     defer e.deinit();
+    // `Result<Int, String>` has no per-pair instance (an owning Err), so it
+    // keeps the deprecated ABI-1 pass-through spelling (sub-project 3).
     try expectContains(e.text, "cell_result_t cell_read(void);");
     try expectContains(try fnDef(e.text, "relay"), "return cell_read();");
     try expectContains(try fnDef(e.text, "keep"), "return r;");
@@ -8853,9 +8892,9 @@ test "Some/None/Ok/Err lower onto the runtime constructors" {
     try expectContains(f, "cell_opt_i64_t a = cell_opt_i64_some(1);");
     try expectContains(f, "cell_opt_i64_t b = cell_opt_i64_none();");
     try expectContains(f, "cell_opt_i32_t c = cell_opt_i32_some(2);");
-    try expectContains(f, "cell_result_t d = cell_ok_i64(3);");
-    try expectContains(f, "cell_result_t g = cell_err((int32_t)cell_E_B);");
-    try expectContains(f, "cell_result_t h = cell_ok_u64((uint64_t)4);");
+    try expectContains(f, "cell_res_i64_i32_t d = cell_res_i64_i32_ok(3);");
+    try expectContains(f, "cell_res_i64_i32_t g = cell_res_i64_i32_err(cell_E_B);");
+    try expectContains(f, "cell_res_byte_i32_t h = cell_res_byte_i32_ok(4);");
     try expectContains(f, "cell_opt_i64_t i = cell_opt_i64_some(5);");
     try expectCompiles(e.text);
 }
@@ -8875,9 +8914,52 @@ test "wrap patterns test the tag and bind the payload" {
     try expectContains(f, "int64_t x = _cell_t1.value;");
     try expectContains(f, "} else if (!_cell_t1.has_value) {");
     try expectContains(f, "if (_cell_t3.ok) {");
-    try expectContains(f, "uint8_t v = (uint8_t)_cell_t3.value.u64;");
-    try expectContains(f, "cell_E code = (cell_E)_cell_t3.error_code;");
+    try expectContains(f, "uint8_t v = _cell_t3.as.ok;");
+    try expectContains(f, "cell_E code = (cell_E)_cell_t3.as.err;");
     try expectCompiles(e.text);
+}
+
+test "a Result keeps its error at full width and its payload in its own type" {
+    var e = try emitSource(
+        \\pub fn big(copy n: Int) -> Result<Bool, Int> {
+        \\  if n > 0 {
+        \\    return Ok(true)
+        \\  }
+        \\  return Err(5000000000)
+        \\}
+        \\pub fn half(copy x: Float32) -> Result<Float32, UInt16> {
+        \\  return Ok(x)
+        \\}
+        \\pub fn get(copy r: Result<Bool, Int>) -> Int {
+        \\  return match r { Ok(v) => 1, Err(e) => e }
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "cell_res_bool_i64_t cell_big(int64_t n);");
+    try expectContains(try fnDef(e.text, "big"), "return cell_res_bool_i64_err(5000000000);");
+    try expectContains(try fnDef(e.text, "half"), "return cell_res_f32_u16_ok(x);");
+    try expectContains(try fnDef(e.text, "get"), "int64_t e = _cell_t");
+    try expectAbsent(e.text, "cell_result_t");
+    try expectAbsent(e.text, "(int32_t)");
+    try expectCompiles(e.text);
+}
+
+test "the C Result slugs match abi.resultMember for every scalar name" {
+    const abi = @import("abi.zig");
+    const types = @import("types.zig");
+    const Pair = struct { name: []const u8, ty: types.Type };
+    const pairs = [_]Pair{
+        .{ .name = "Int", .ty = types.t_int },       .{ .name = "Int8", .ty = types.t_int8 },
+        .{ .name = "Int16", .ty = types.t_int16 },   .{ .name = "Int32", .ty = types.t_int32 },
+        .{ .name = "UInt", .ty = types.t_uint },     .{ .name = "UInt8", .ty = types.t_uint8 },
+        .{ .name = "UInt16", .ty = types.t_uint16 }, .{ .name = "UInt32", .ty = types.t_uint32 },
+        .{ .name = "Float", .ty = types.t_float },   .{ .name = "Float32", .ty = types.t_float32 },
+        .{ .name = "Bool", .ty = types.t_bool },     .{ .name = "Byte", .ty = types.t_byte },
+    };
+    for (pairs) |p| {
+        try std.testing.expectEqualStrings(abi.resultMember(p.ty).?.slug, scalarSlug(p.name).?);
+    }
+    try std.testing.expect(scalarSlug("String") == null);
 }
 
 test "a var moved on one branch is released at the end of the other" {

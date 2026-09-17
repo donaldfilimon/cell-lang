@@ -576,8 +576,12 @@ pub const Checker = struct {
                         return try self.resultOf(payload, types.t_unknown);
                     },
                     .err => {
-                        // `Err("x")` is left typed as written so the declared
-                        // slot reports the mismatch with both types named.
+                        // E is carried at its own width (cell_rt.h ABI 2), so
+                        // it must be a scalar or a payload-free enum.
+                        if (!isScalarPayload(payload) and payload.tag() != .enum_type) {
+                            try self.errf(expr.span, "optional/Result payloads other than scalar primitives are not implemented", .{});
+                            return try self.resultOf(types.t_unknown, types.t_unknown);
+                        }
                         return try self.resultOf(types.t_unknown, payload);
                     },
                 }
@@ -1152,7 +1156,7 @@ test "Ok and Err are checked against the declared Result" {
         \\}
     );
     try t.expectCount(2);
-    try t.expectDiag(0, .err, 5, 35, "cannot initialize a binding of type Result<Int, Int32> with a value of type Result<<unknown>, String>");
+    try t.expectDiag(0, .err, 5, 35, "optional/Result payloads other than scalar primitives are not implemented");
     try t.expectDiag(1, .err, 6, 19, "'Ok' needs a declared Result type here");
 }
 
