@@ -376,6 +376,12 @@ LEAK_REASSIGNED_VAR=0
 # gets no pre-drop (each guard measured as an ASan failure when removed), so
 # R16's revival leak is unchanged and not measured here. Stays pinned at 0.
 LEAK_REASSIGNED_OWNED_VAR=0
+# Owned scalar Result<T, E> and T? values hold no heap memory (T is scalar and
+# E is an int32_t code), so building, passing `owned`, returning, reassigning
+# and dropping 1000 of each allocates nothing that could leak. Pinned at 0 so
+# a future resource-bearing payload, which would need real drop glue, fails
+# here instead of leaking silently.
+LEAK_OWNED_SCALAR_WRAPPERS=0
 # The revival leak (OWNERSHIP.md R16): a var moved and then revived by a
 # fresh assignment (R3a) was never released at scope end, because the drop
 # admission read borrowck's permanent `wasMoved`. Measured 5000 on both
@@ -943,6 +949,7 @@ else
     run_c_leaks block_scoped_local "" "$LEAK_BLOCK_SCOPED_LOCAL" "R11 row 4, CLOSED 2026-09-15"
     run_c_leaks reassigned_var "" "$LEAK_REASSIGNED_VAR" "R11 row 5, CLOSED 2026-09-15"
     run_c_leaks reassigned_owned_var "" "$LEAK_REASSIGNED_OWNED_VAR" "owned twin of row 5, CLOSED 2026-09-16"
+    run_c_leaks owned_scalar_wrappers "" "$LEAK_OWNED_SCALAR_WRAPPERS" "scalar Result/optional own nothing, 2026-09-17"
     run_c_leaks revived_var "" "$LEAK_REVIVED_VAR" "R16 revival leak, CLOSED 2026-09-16"
     run_c_leaks value_block_local "" "$LEAK_VALUE_BLOCK_LOCAL" "R11 value-position block residual, CLOSED 2026-09-15"
     run_c_leaks partial_move_field "" "$LEAK_PARTIAL_MOVE_FIELD" "partial-move residual, CLOSED 2026-09-16"

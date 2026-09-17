@@ -1,0 +1,54 @@
+// Owned scalar `Result<T, E>` and `T?` values hold no heap memory, so the
+// "no drop" row in docs/FEATURES.md (TYPE-06) cannot leak today: `T` is a
+// scalar primitive and `E` is narrowed to an int32_t code, so cell_result_t
+// and cell_opt_*_t are plain values with nothing to release. This fixture
+// pins that at 0 on both witnesses, so a future resource-bearing payload
+// (which would need real drop glue) shows up here as a nonzero count rather
+// than as a silent leak.
+//
+// Each iteration builds owned Results and optionals, passes them `owned`,
+// returns them, reassigns `var`s holding them, and lets them fall out of
+// scope, 1000 times.
+//
+// Status: parses, passes `cell check`. Lives under examples/leaks/ so it is
+// outside the top-level corpus, agreement and mlir-lowering loops (see
+// examples/leaks/README.md).
+
+pub enum ParseError { Empty, TooLong }
+
+pub fn print_int(copy value: Int);
+
+pub fn parse(copy n: Int) -> Result<Int, ParseError> {
+    if n == 0 {
+        return Err(ParseError.Empty)
+    }
+    return Ok(n)
+}
+
+pub fn pick(copy n: Int) -> Int? {
+    if n > 1 {
+        return Some(n)
+    }
+    return None
+}
+
+pub fn consume(owned r: Result<Int, ParseError>, owned o: Int?) -> Int {
+    let copy a = match r { Ok(v) => v, Err(_) => 0 }
+    let copy b = match o { Some(v) => v, None => 0 }
+    return a + b
+}
+
+pub fn main() {
+    var i = 0
+    var total = 0
+    while i < 1000 {
+        var owned r: Result<Int, ParseError> = parse(i)
+        r = parse(i + 1)
+        var owned o: Int? = pick(i)
+        o = pick(i + 2)
+        total = total + consume(parse(i), pick(i))
+        let owned kept: Result<Int, ParseError> = parse(0)
+        i = i + 1
+    }
+    print_int(total)
+}

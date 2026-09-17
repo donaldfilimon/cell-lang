@@ -816,9 +816,12 @@ backends lower the type to `cell_result_t`; LLVM and MLIR build it the way
 `cell_ok_*` does (zeroed, `ok` byte, payload widened into the union's 64-bit
 slot, a C `bool` as one byte) and pass and return it indirectly, as clang does
 for a 24-byte struct. They refuse, together and with `cannot lower`, a `Byte`
-or non-scalar `T` and a constructor with no declared Result destination. A `Result` has no drop spelling, so an `owned` one is never
-released: the leak direction, and the stated boundary for a resource-bearing
-`T` or `E`, whose payload layout in `cell_value_t` is not designed.
+or non-scalar `T` and a constructor with no declared Result destination. A `Result` has no drop spelling, and none is needed while its payloads
+are what they are: a scalar `T` and an `int32_t` code own no memory, so an
+`owned` Result releases nothing and leaks nothing
+(`examples/leaks/owned_scalar_wrappers.cell` pins that at 0, together with
+scalar optionals). A resource-bearing `T` or `E` is the stated boundary: its
+payload layout in `cell_value_t` and its drop glue are not designed.
 `let arc r: Result<Int, Int> = read()` is a loud C type error (a
 `cell_result_t` does not initialize a `cell_arc_t`), the same refusal as other
 unboxable `arc` shapes.
