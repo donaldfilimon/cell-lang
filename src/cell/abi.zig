@@ -80,6 +80,8 @@ pub fn layoutOf(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) ?Layout {
         // backend keeps for it; the IR backends refuse those.
         .result => |r| if (resultShape(r)) |s|
             .{ .size = s.size, .alignment = s.alignment }
+        else if (resultCLayout(r)) |l|
+            l
         else
             .{ .size = 24, .alignment = 8 },
         .func, .unknown => null,
@@ -157,6 +159,24 @@ pub fn resultShape(r: types.ResultType) ?ResultShape {
         .size = alignUp(alignUp(1, a) + u, a),
         .alignment = a,
     };
+}
+
+/// The C layout of a per-pair Result the IR backends do not carry: one with
+/// an owning String side (sub-projects 2 and 3, 2026-09-17; the C backend
+/// only). `resultShape` stays null for these, so hir keeps refusing them.
+fn resultCLayout(r: types.ResultType) ?Layout {
+    const ok = resultSideLayout(r.ok.*, true) orelse return null;
+    const err = resultSideLayout(r.err.*, false) orelse return null;
+    const a = @max(@max(ok.alignment, err.alignment), 1);
+    const u = @max(ok.size, err.size);
+    return .{ .size = alignUp(alignUp(1, a) + u, a), .alignment = a };
+}
+
+fn resultSideLayout(ty: hir.Ty, is_ok: bool) ?Layout {
+    if (ty.tag() == .string) return .{ .size = 24, .alignment = 8 };
+    if (ty.tag() == .unit) return if (is_ok) Layout{ .size = 0, .alignment = 1 } else null;
+    const m = resultMember(ty) orelse return null;
+    return .{ .size = m.size, .alignment = m.alignment };
 }
 
 pub fn resultLlvmType(arena: std.mem.Allocator, s: ResultShape) ![]const u8 {
@@ -653,10 +673,29 @@ test "a Result's IR spelling is the tag byte and its union member" {
 test "an out-of-scope Result keeps the legacy 24-byte indirect layout" {
     const m = emptyModule();
     const t_i = types.t_int;
-    const t_s = types.t_string;
-    const r = resultOf(&t_i, &t_s);
+    const elem = types.t_int;
+    const t_l: hir.Ty = .{ .list = &elem };
+    const r = resultOf(&t_i, &t_l);
     try std.testing.expectEqual(@as(u32, 24), layoutOf(&m, r, .copy).?.size);
     try std.testing.expect(classifyParam(&m, r, .copy) == .indirect);
+}
+
+test "an owning String side is sized as the per-pair struct, and the IR still has no shape" {
+    // Sub-projects 2 and 3 (2026-09-17), measured by
+    // tools/measure-result-layouts.sh: cell_res_string_i32_t and
+    // cell_res_i64_string_t are 32 bytes, align 8, passed by pointer.
+    const m = emptyModule();
+    const t_i = types.t_int;
+    const t_i32 = types.t_int32;
+    const t_s = types.t_string;
+    const t_u = types.t_unit;
+    for ([_]hir.Ty{ resultOf(&t_s, &t_i32), resultOf(&t_i, &t_s), resultOf(&t_s, &t_s), resultOf(&t_u, &t_s) }) |r| {
+        const l = layoutOf(&m, r, .copy).?;
+        try std.testing.expectEqual(@as(u32, 32), l.size);
+        try std.testing.expectEqual(@as(u32, 8), l.alignment);
+        try std.testing.expect(classifyParam(&m, r, .copy) == .indirect);
+        try std.testing.expect(resultShape(r.result) == null);
+    }
 }
 
 test "a small integer-class return is an exact-width integer, as clang returns it" {

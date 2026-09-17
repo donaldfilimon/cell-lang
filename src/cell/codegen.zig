@@ -1159,9 +1159,17 @@ pub const Generator = struct {
         }
         try out.writeAll("\n");
         for (seen.items) |base| {
-            try out.print("// Owning String Ok (2026-09-17): release the payload only when present.\n", .{});
+            const ok_owns = std.mem.startsWith(u8, base, "cell_res_string_");
+            const err_owns = std.mem.endsWith(u8, base, "_string");
+            try out.print("// Owning String Result (2026-09-17): release the side that is present.\n", .{});
             try out.print("static inline __attribute__((unused)) void cell_drop_{s}({s}_t *r) {{\n", .{ base["cell_".len..], base });
-            try out.writeAll("  if (r->ok) cell_string_free(&r->as.ok);\n}\n\n");
+            if (ok_owns and err_owns) {
+                try out.writeAll("  if (r->ok) cell_string_free(&r->as.ok); else cell_string_free(&r->as.err);\n}\n\n");
+            } else if (ok_owns) {
+                try out.writeAll("  if (r->ok) cell_string_free(&r->as.ok);\n}\n\n");
+            } else {
+                try out.writeAll("  if (!r->ok) cell_string_free(&r->as.err);\n}\n\n");
+            }
         }
     }
 
@@ -2205,7 +2213,10 @@ pub const Generator = struct {
         if (arm.pattern.kind == .wrap_pattern) {
             const wp = arm.pattern.kind.wrap_pattern;
             if (wp.binding) |name| {
-                const owning_mode: ?ast.Ownership = if (wp.ctor == .ok and isOwningResult(scrut_ty)) wp.mode else null;
+                const owning_side = (wp.ctor == .ok and resultOkOwning(scrut_ty)) or
+                    (wp.ctor == .err and resultErrOwning(scrut_ty));
+                const owning_mode: ?ast.Ownership = if (owning_side) wp.mode else null;
+                const side = if (wp.ctor == .ok) "ok" else "err";
                 const payload_ty: CType = switch (wp.ctor) {
                     .some, .none => if (scrut_ty.payload) |p| p.* else CType.unknown,
                     .ok => if (scrut_ty.payload) |p| p.* else CType.unknown,
@@ -2217,9 +2228,9 @@ pub const Generator = struct {
                 try self.writeDecl(ty, name);
                 if (owning_mode) |mode| {
                     if (mode == .shared) {
-                        try self.writer.print(" = cell_string_as_str(&{s}.as.ok);\n", .{temp});
+                        try self.writer.print(" = cell_string_as_str(&{s}.as.{s});\n", .{ temp, side });
                     } else {
-                        try self.writer.print(" = {s}.as.ok;\n", .{temp});
+                        try self.writer.print(" = {s}.as.{s};\n", .{ temp, side });
                     }
                     // `owned` takes the payload's buffer and is released like
                     // any owned local; `shared` never is.
@@ -2269,8 +2280,9 @@ pub const Generator = struct {
         // A temporary owning scrutinee no arm binding took.
         if (scrut_is_temp and isOwningResult(scrut_ty)) {
             const took = arm.pattern.kind == .wrap_pattern and
-                arm.pattern.kind.wrap_pattern.ctor == .ok and
-                arm.pattern.kind.wrap_pattern.mode == .owned;
+                arm.pattern.kind.wrap_pattern.mode == .owned and
+                ((arm.pattern.kind.wrap_pattern.ctor == .ok and resultOkOwning(scrut_ty)) or
+                    (arm.pattern.kind.wrap_pattern.ctor == .err and resultErrOwning(scrut_ty)));
             if (!took) {
                 try self.writeIndent(indent);
                 try self.writer.print("cell_drop_{s}(&{s});\n", .{ resultBase(scrut_ty).?["cell_".len..], temp });
@@ -2722,7 +2734,7 @@ pub const Generator = struct {
                 const moved = if (self.checker) |c| c.wrapMoved(@intFromPtr(w.operand.?)) else false;
                 const is_place = operand.kind == .ident or operand.kind == .field;
                 const op_ty = if (is_place) try self.inferExpr(operand) else CType.unknown;
-                if (is_ok and member.shape == .string and is_place and !moved and op_ty.shape == .string) {
+                if (member.shape == .string and is_place and !moved and op_ty.shape == .string) {
                     try out.writeAll(if (op_ty.pointer) "cell_string_clone(" else "cell_string_clone(&");
                     try self.emitExpr(operand, indent);
                     try out.writeAll(")");
@@ -3605,8 +3617,9 @@ pub const Generator = struct {
             .unit => return if (is_ok) "unit" else null,
             .name => |n| {
                 if (scalarSlug(n)) |s| return s;
-                // An owning String payload, Ok side only (2026-09-17).
-                if (is_ok and eq(n, "String")) return "string";
+                // An owning String payload, on either side (sub-projects 2
+                // and 3, 2026-09-17).
+                if (eq(n, "String")) return "string";
                 const base = try self.namedType(n);
                 if (base.shape == .enumeration) return "i32";
                 return null;
@@ -4201,10 +4214,19 @@ fn resultBase(t: CType) ?[]const u8 {
     return t.text[0 .. t.text.len - 2];
 }
 
-/// A Result whose Ok side is an owning String (2026-09-17): it owns heap
-/// memory and has per-module release glue.
+/// A Result with an owning String side (sub-projects 2 and 3, 2026-09-17):
+/// it owns heap memory and has per-module release glue.
 fn isOwningResult(t: CType) bool {
+    return resultOkOwning(t) or resultErrOwning(t);
+}
+
+fn resultOkOwning(t: CType) bool {
     return t.shape == .result and std.mem.startsWith(u8, t.text, "cell_res_string_");
+}
+
+fn resultErrOwning(t: CType) bool {
+    return t.shape == .result and std.mem.startsWith(u8, t.text, "cell_res_") and
+        std.mem.endsWith(u8, t.text, "_string_t");
 }
 
 /// The bounds-checked runtime reader for a list built with `elem`.
@@ -5137,12 +5159,10 @@ test "a match whose reached arms never read the scrutinee voids its temporary" {
     try expectCompiles(e.text);
 }
 
-test "TYPE-06: a Result type lowers to cell_result_t and is passed through, never dropped" {
-    // Parsing arrived 2026-09-16 with no construction syntax, so a Result
-    // value only enters a body from a declared callee or a parameter. It has
-    // no drop spelling (`hasDropCall(.result)` is false), so an owned one is
-    // leaked rather than released, the safe side, even though R11 row 1 now
-    // admits the parameter to the drop pass.
+test "TYPE-06: a Result with an owning String error is its own instance and is released" {
+    // Until sub-project 3 (2026-09-17) this pair was the ABI-1 `cell_result_t`
+    // pass-through and was never dropped (a leak). It now has an instance and
+    // release glue: a returned value moves, an ignored owned one is released.
     var e = try emitSource(
         \\pub fn read() -> Result<Int, String>;
         \\pub fn relay() -> Result<Int, String> {
@@ -5156,12 +5176,12 @@ test "TYPE-06: a Result type lowers to cell_result_t and is passed through, neve
         \\}
     );
     defer e.deinit();
-    // `Result<Int, String>` has no per-pair instance (an owning Err), so it
-    // keeps the deprecated ABI-1 pass-through spelling (sub-project 3).
-    try expectContains(e.text, "cell_result_t cell_read(void);");
+    try expectContains(e.text, "cell_res_i64_string_t cell_read(void);");
+    try expectContains(e.text, "if (!r->ok) cell_string_free(&r->as.err);");
     try expectContains(try fnDef(e.text, "relay"), "return cell_read();");
     try expectContains(try fnDef(e.text, "keep"), "return r;");
-    try expectAbsent(e.text, "_free(&r)");
+    try expectAbsent(try fnDef(e.text, "keep"), "cell_drop_res_i64_string(&r);");
+    try expectOccurrences(try fnDef(e.text, "ignore"), "cell_drop_res_i64_string(&r);", 1);
     try expectAbsent(e.text, "cell_arc_drop");
     try expectCompiles(e.text);
 }
@@ -7626,6 +7646,62 @@ test "reassigning an owning Result var releases the old value first" {
     defer e.deinit();
     const f = try fnDef(e.text, "f");
     try expectOccurrences(f, "cell_drop_res_string_i32(&r);", 2);
+    try expectCompiles(e.text);
+}
+
+test "an owning String error is bound, released per side, and copied when unresolved" {
+    // Sub-project 3 (2026-09-17).
+    var e = try emitSource(
+        \\pub fn take(owned s: String);
+        \\pub fn view(shared s: String) -> Int;
+        \\pub fn make() -> String;
+        \\pub fn read() -> Result<Int, String>;
+        \\pub fn both() -> Result<String, String>;
+        \\pub fn owned_arm(owned r: Result<Int, String>) -> Int {
+        \\  return match r {
+        \\    Ok(v) => v,
+        \\    Err(owned e) => view(e),
+        \\  }
+        \\}
+        \\pub fn shared_arm(owned r: Result<Int, String>) -> Int {
+        \\  return match r {
+        \\    Ok(v) => v,
+        \\    Err(shared e) => view(e),
+        \\  }
+        \\}
+        \\pub fn temp() -> Int {
+        \\  return match read() {
+        \\    Ok(v) => v,
+        \\    Err(owned e) => view(e),
+        \\  }
+        \\}
+        \\pub fn two() -> Int {
+        \\  return match both() {
+        \\    Ok(owned a) => view(a),
+        \\    Err(shared b) => view(b),
+        \\  }
+        \\}
+        \\pub fn unresolved(copy c: Int) -> Result<Int, String> {
+        \\  let owned s = if c > 0 { make() } else { make() }
+        \\  return Err(s)
+        \\}
+    );
+    defer e.deinit();
+    try expectContains(e.text, "if (r->ok) cell_string_free(&r->as.ok); else cell_string_free(&r->as.err);");
+    const oa = try fnDef(e.text, "owned_arm");
+    try expectContains(oa, "cell_string_t e = _cell_t");
+    try expectContains(oa, ".as.err;");
+    try expectOccurrences(oa, "cell_string_free(&e);", 1);
+    try expectOccurrences(oa, "cell_drop_res_i64_string(&r);", 1);
+    const sa = try fnDef(e.text, "shared_arm");
+    try expectContains(sa, "cell_str_t e = cell_string_as_str(&_cell_t");
+    try expectOccurrences(sa, "cell_drop_res_i64_string(&r);", 1);
+    const tp = try fnDef(e.text, "temp");
+    try expectOccurrences(tp, "cell_drop_res_i64_string(&_cell_t", 1);
+    const tw = try fnDef(e.text, "two");
+    try expectOccurrences(tw, "cell_drop_res_string_string(&_cell_t", 1);
+    const ur = try fnDef(e.text, "unresolved");
+    try expectContains(ur, "cell_res_i64_string_err(cell_string_clone(&s))");
     try expectCompiles(e.text);
 }
 
