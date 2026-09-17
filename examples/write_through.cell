@@ -27,11 +27,10 @@
 // is invisible by value: reading a copy answers the same as reading the
 // original, and only the address distinguishes them.
 //
-// WHY THE MUTATOR HAS NO BODY HERE. Writing `b.len = b.len + 1` in Cell would
-// pin only the C and LLVM backends: the MLIR backend refuses assignment
-// through a field path today ("cannot lower to MLIR"), and this file would
-// then disagree with itself across backends and fail the gate's agreement
-// stage for a reason that has nothing to do with what it is testing. Declaring
+// WHY THE MUTATOR HAS NO BODY HERE. When this file was written, writing
+// `b.len = b.len + 1` in Cell would have pinned only the C and LLVM backends:
+// the MLIR backend refused assignment through a field path until 2026-09-17,
+// and write_through_field.cell now carries that Cell-bodied shape. Declaring
 // `grow` and `look` without bodies moves the mutation to `write_through_host.c`
 // and leaves this file testing exactly one thing: which address the CALL SITE
 // hands over. All three backends emit that call, so all three are measured.

@@ -8,8 +8,8 @@
 //
 //     b.len = b.len + 1        the FIELD form, which write_through.cell's C
 //                              host performs, and which the MLIR backend
-//                              refuses in a Cell body to this day
-//                              ("assignment through a field path")
+//                              refused in a Cell body until 2026-09-17
+//                              (write_through_field.cell carries it now)
 //     b = Buffer { ... }       the WHOLE-VALUE form, which no example used at
 //                              all, and which the MLIR backend silently
 //                              MISCOMPILED

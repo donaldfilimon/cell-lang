@@ -1,0 +1,51 @@
+// A FIELD write, `b.len = ...`, in a Cell body, through an `exclusive`
+// borrow and on an owned local, including a nested field path.
+//
+// WHY THIS FILE EXISTS. write_through.cell keeps its mutator bodyless and
+// write_through_whole.cell writes the whole value, both because the MLIR
+// backend refused assignment through a field path ("cannot lower to MLIR")
+// while C and LLVM lowered it. That refusal was lifted on 2026-09-17: the
+// MLIR backend now walks the path with `llvm.getelementptr`, loading a
+// borrow's slot first, as llvmemit.placeAddress does. So the field form
+// finally has a printing program on all three backends.
+//
+// WHAT IT PRINTS, and how to read a wrong answer. One integer,
+// `buf.len * 10 + o.inner.step`:
+//
+//   `buf.len` starts at 37; each of the two borrow spellings adds
+//   `buf.step` (1) through the CALLEE's field write, and the local write
+//   adds 100, so 139. A lost callee write shows as 138 or 137. `o.inner.step`
+//   is set through a two-level path to 7; a write that lands on the wrong
+//   field or level leaves it 0. So 1397 is the only correct answer.
+//
+// `step` is a second field, read at an offset past the first, for the
+// reason write_through_whole.cell gives: at offset 0 a wrong base and a
+// right base can coincide.
+//
+// EXPECT-OUTPUT: 1397
+
+pub struct Buffer {
+    copy len: Int,
+    copy step: Int,
+}
+
+pub struct Outer {
+    copy tag: Int,
+    copy inner: Buffer,
+}
+
+pub fn print_int(copy value: Int);
+
+pub fn bump(exclusive b: Buffer) {
+    b.len = b.len + b.step
+}
+
+pub fn main() {
+    var owned buf = Buffer { len: 37, step: 1 }
+    bump(exclusive buf)
+    bump(&mut buf)
+    buf.len = buf.len + 100
+    var owned o = Outer { tag: 1, inner: Buffer { len: 0, step: 0 } }
+    o.inner.step = 7
+    print_int(buf.len * 10 + o.inner.step)
+}

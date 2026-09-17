@@ -682,15 +682,40 @@ const Emitter = struct {
         /// Write through the ADDRESS the slot holds, to the lender's object.
         /// Carries the pointee type; the value must match it exactly.
         through_slot: []const u8,
+        /// Write one FIELD of the aggregate the slot holds (or, for a
+        /// borrow, points at), walked with `llvm.getelementptr` the way
+        /// `llvmemit.placeAddress` walks it. Carries the root struct type
+        /// and the selected field's ownership-aware type.
+        into_field: struct { root: []const u8, field: []const u8 },
         /// This backend cannot say where the write would land. Refuse at the
         /// span. Carries the text for the diagnostic.
         refuse: []const u8,
     };
 
     fn assignDest(self: *Emitter, place: hir.Place) AssignDest {
-        if (place.path.len != 0) return .{ .refuse = "assignment through a field path" };
         if (place.slot >= self.slots.items.len) {
             return .{ .refuse = "assignment to a binding with no slot" };
+        }
+        if (place.path.len != 0) {
+            // The root must have an ADDRESS: a borrow's slot holds one, and an
+            // aggregate local lives in an llvm.alloca. A memref slot holds a
+            // scalar, which has no fields, so anything else fails closed.
+            const root = if (place.slot < self.slot_ptr_to.items.len and self.slot_ptr_to.items[place.slot] != null)
+                self.slot_ptr_to.items[place.slot].?
+            else if (place.slot < self.slot_is_llvm.items.len and self.slot_is_llvm.items[place.slot])
+                self.slot_ty.items[place.slot]
+            else
+                return .{ .refuse = "assignment through a field path of a slot with no address" };
+            if (root.len == 0) return .{ .refuse = "assignment through a field path of a refused binding" };
+            for (place.path) |sel| {
+                if (self.structType(sel.struct_name) == null) {
+                    return .{ .refuse = "assignment through a field path of an unlowered struct" };
+                }
+            }
+            const last = place.path[place.path.len - 1];
+            const field = self.mlirTypeOwned(last.ty, last.ownership) orelse
+                return .{ .refuse = "assignment to a field of an unlowered type" };
+            return .{ .into_field = .{ .root = root, .field = field } };
         }
         if (self.slot_ptr_to.items[place.slot]) |pointee| return .{ .through_slot = pointee };
         // THE `exclusive String`/`[T]`/`T?` REFUSAL THAT SAT HERE IS GONE, and
@@ -734,6 +759,23 @@ const Emitter = struct {
                 // len: 42 } }` did: the C backend printed 42 and this one
                 // printed 37, with no diagnostic from either.
                 const addr = try self.loadSlot(place.slot, "!llvm.ptr");
+                try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ val.text, addr, val.ty });
+            },
+            .into_field => |f| {
+                if (!try self.fits(value.span, val.ty, f.field, "a field write")) return;
+                var addr = if (self.slot_ptr_to.items[place.slot] != null)
+                    try self.loadSlot(place.slot, "!llvm.ptr")
+                else
+                    self.slots.items[place.slot];
+                for (place.path) |sel| {
+                    const st = self.structType(sel.struct_name).?; // checked in assignDest
+                    const next = try self.nextSsa();
+                    try self.line(
+                        "{s} = llvm.getelementptr inbounds {s}[0, {d}] : (!llvm.ptr) -> !llvm.ptr, {s}",
+                        .{ next, addr, sel.index, st },
+                    );
+                    addr = next;
+                }
                 try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ val.text, addr, val.ty });
             },
             .refuse => unreachable, // handled above
@@ -2813,21 +2855,67 @@ test "a borrowed PRIMITIVE parameter still writes its own slot, matching C" {
     try expectContains(e.text, "memref.store");
 }
 
-test "assignment through a field path is still refused, and refused FIRST" {
-    // Unchanged behaviour, pinned because emitAssign now classifies before it
-    // emits the right-hand side. The refusal must still fire, and it must no
-    // longer leave the value's ops behind in a module nobody will lower.
+test "assignment through a field path writes the field, through a borrow too" {
+    // Was refused ("assignment through a field path") while llvmemit.zig
+    // lowered it with getelementptr, a split between the two IR backends
+    // that no gate stage read (examples/leaks/field_revival.cell carried it).
+    // Each of the five borrow spellings adds 1 through the callee's field
+    // write, the owned local's field write adds 100, and the nested write
+    // sets the inner field: 37 + 5 + 100 = 142, then 7.
+    const gpa = std.testing.allocator;
     var e = try emitSource(
-        \\pub struct Buffer { copy len: Int }
-        \\pub fn bump(exclusive b: Buffer) { b.len = b.len + 5 }
+        \\pub struct Buffer { copy len: Int, copy step: Int }
+        \\pub struct Outer { copy tag: Int, copy inner: Buffer }
+        \\pub fn print_int(copy value: Int);
+        \\pub fn bump(exclusive b: Buffer) { b.len = b.len + b.step }
+        \\pub fn main() {
+        \\  var owned buf = Buffer { len: 37, step: 1 }
+        \\  bump(exclusive buf)
+        \\  bump(&mut buf)
+        \\  bump(&var buf)
+        \\  bump(&exclusive buf)
+        \\  bump(exclusive &buf)
+        \\  buf.len = buf.len + 100
+        \\  print_int(buf.len)
+        \\  var owned o = Outer { tag: 1, inner: Buffer { len: 0, step: 0 } }
+        \\  o.inner.step = 7
+        \\  print_int(o.inner.step + o.tag - 1)
+        \\}
     );
     defer e.deinit();
-    try std.testing.expect(e.bag.hasErrors());
-    var found = false;
-    for (e.bag.list.items) |d| {
-        if (std.mem.indexOf(u8, d.message, "field path") != null) found = true;
-    }
-    try std.testing.expect(found);
+    for (e.bag.list.items) |d| std.debug.print("diag: {s}\n", .{d.message});
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "llvm.getelementptr");
+
+    const out = try runThroughMlir(gpa, e.text);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("142\n7\n", out);
+}
+
+test "an owned String field write converts and runs, the field_revival shape" {
+    // examples/leaks/field_revival.cell: LLVM accepted it, this backend
+    // refused it. The literal is converted through cell_string_from_str at
+    // the field's declared ownership (hir.lower, FieldSel.ownership), and the
+    // stored value is the 24-byte owning String.
+    const gpa = std.testing.allocator;
+    var e = try emitSource(
+        \\pub struct Pair { owned a: String, owned b: String }
+        \\pub fn print_int(copy value: Int);
+        \\pub fn take(owned s: String) { }
+        \\pub fn size(shared s: String) -> Int;
+        \\pub fn main() {
+        \\  var owned p: Pair = Pair { a: "aaaaaaaa", b: "bb" }
+        \\  take(p.a)
+        \\  p.a = "ccc"
+        \\  print_int(3)
+        \\}
+    );
+    defer e.deinit();
+    for (e.bag.list.items) |d| std.debug.print("diag: {s}\n", .{d.message});
+    try std.testing.expect(!e.bag.hasErrors());
+    try expectContains(e.text, "cell_string_from_str");
+    try expectNoViewStoredIntoOwningSlot(e.text);
+    _ = gpa;
 }
 
 test "a let-bound borrow of a temporary is refused rather than bound to a copy" {
