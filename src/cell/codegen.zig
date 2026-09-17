@@ -1422,7 +1422,8 @@ pub const Generator = struct {
             if (!try self.needsDrop(local.ty)) continue;
             if (local.ty.shape == .record) {
                 if (!checker.wasWhollyMoved(local.id)) continue;
-                if (!checker.recordLiveAtExit(here.kind, here.key, local.id)) continue;
+                if (!checker.recordLiveAtExit(here.kind, here.key, local.id) and
+                    !checker.recordLiveAtExit(.after_loop_skip, here.key, local.id)) continue;
                 if (after) |a| {
                     if (checker.recordLiveAtExit(a.kind, a.key, local.id)) continue;
                 }
@@ -7077,8 +7078,9 @@ test "a skip-revival break is lowered as a jump only where every release agrees"
     // that is not its own `break`), two vars are dead at different breaks
     // (`mixed`), or the loop also has a var released on every path
     // (`with_plain`); in the last two no single label serves every break.
-    // `live_and_dead` is the positive: a `break` that still holds the
-    // value stays a `break` and runs the release.
+    // `live_and_dead` and `record` are positives: a `break` that still
+    // holds the value stays a `break` and runs the release, and a record
+    // moved whole is released through its drop glue.
     var e = try emitSource(
         \\pub fn take(owned s: String);
         \\pub fn nested(copy n: Int) {
@@ -7131,6 +7133,20 @@ test "a skip-revival break is lowered as a jump only where every release agrees"
         \\    w = "b"
         \\  }
         \\}
+        \\pub struct P { a: String, b: String }
+        \\pub fn take_p(owned p: P);
+        \\pub fn record(copy n: Int, owned p0: P) {
+        \\  var owned q: P = p0
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    i = i + 1
+        \\    take_p(q)
+        \\    if i > n {
+        \\      break
+        \\    }
+        \\    q = P { a: "x", b: "y" }
+        \\  }
+        \\}
         \\pub fn with_plain(copy n: Int) {
         \\  var owned v: String = "a"
         \\  var owned w: String = "a"
@@ -7161,6 +7177,11 @@ test "a skip-revival break is lowered as a jump only where every release agrees"
     try expectAbsent(mixed, "goto");
     try expectAbsent(mixed, "cell_string_free(&v);");
     try expectAbsent(mixed, "cell_string_free(&w);");
+    // A whole-moved record takes the same route through its drop glue.
+    const rec = try fnDef(e.text, "record");
+    try expectOccurrences(rec, "cell_drop_P(&q);", 1);
+    try expectOccurrences(rec, "goto cell_skip_", 1);
+    try expectAbsent(rec, "break;");
     const plain = try fnDef(e.text, "with_plain");
     try expectAbsent(plain, "goto");
     try expectAbsent(plain, "cell_string_free(&v);");
