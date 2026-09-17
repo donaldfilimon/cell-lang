@@ -215,6 +215,7 @@ are not.
 | `early_return.cell` | an `if` branch or `match` arm that always leaves keeps its moves out of the code after it; prints 1124 through all three backends |
 | `results_wide.cell` | 16-byte per-pair Results with a 64-bit error; prints -8999999983 through all three backends |
 | `results_small.cell` | 8-byte and 2-byte per-pair Results crossing calls in one word; prints 7533 through all three backends |
+| `results_err_string.cell` | an owning `String` in `Err` and in both sides of `Result<String, String>`: `Err(x)` moves, `Err(owned e)`, `Err(shared e)`; prints 678034242 through C; LLVM and MLIR refuse together |
 | `results_string.cell` | an owning `String` in `Ok`: `Ok(x)` moves, `Ok(owned s)`, `Ok(shared s)`, `Ok(_)`, released on every path that still holds it; prints 1105240143 through C; LLVM and MLIR refuse together |
 
 ## Running `arc.cell`, the one example with a C host
@@ -302,6 +303,8 @@ fail for opposite reasons, so keep both:
 `owned_payload_bare_binding.cell` (2026-09-17) pins the pattern-mode rule for
 an owning payload: `Ok(s)` on a `Result<String, E>` must say `owned` or
 `shared`, because a bare binding would not say whether the arm takes the buffer.
+`owned_err_bare_binding.cell` pins the same rule for an owning `Err`
+(sub-project 3).
 - `owned_field_alias.cell`: a resource-bearing owned struct field formerly
   shallow-copied an existing place. Moving the field out and dropping the
   original produced an AddressSanitizer double free. It is refused until

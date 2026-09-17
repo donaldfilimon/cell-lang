@@ -1,7 +1,10 @@
 # Owning `String` in `Err` and in `String?` (Result sub-projects 3 and 4)
 
 Status: approved by Donald 2026-09-17 for plan and build (sub-project 3
-first). Review answers: `String?` is owning; `Result<String, String>` is in
+first). Sub-project 3 is implemented (plan
+`docs/superpowers/plans/2026-09-17-owning-string-err.md`); it also corrected
+sub-project 2's `abi.layoutOf(Result<String, E>)`, which still answered the
+legacy 24 bytes. Review answers: `String?` is owning; `Result<String, String>` is in
 sub-project 3; both sub-projects proceed.
 Parents:
 - `2026-09-17-per-instantiation-results-design.md` (sub-project 1, landed).

@@ -1,0 +1,72 @@
+// An owning String in Err (sub-project 3, 2026-09-17), and in both sides of
+// `Result<String, String>`. `Err(x)` moves `x`; `Err(owned e)` takes the
+// error and consumes the Result on that arm only; `Err(shared e)` borrows
+// it; the release glue frees whichever side is present.
+//
+// Status: parses, passes `cell check`, and the emitted C compiles, links and
+// runs, printing 678034242 (see EXPECT-OUTPUT). C backend only: LLVM and
+// MLIR refuse a Result with a String side together.
+// EXPECT-OUTPUT: 678034242
+
+pub fn print_int(copy value: Int);
+pub fn str_from_int(copy v: Int) -> String;
+pub fn str_len(shared s: String) -> Int;
+
+pub fn check(copy n: Int) -> Result<Int, String> {
+    if n < 0 {
+        return Err(str_from_int(n))
+    }
+    return Ok(n * 2)
+}
+
+pub fn describe(copy n: Int) -> Result<String, String> {
+    if n < 0 {
+        return Err(str_from_int(n))
+    }
+    return Ok(str_from_int(n))
+}
+
+pub fn take_len(owned s: String) -> Int {
+    return str_len(s)
+}
+
+pub fn score(owned r: Result<Int, String>) -> Int {
+    return match r {
+        Ok(v) => v,
+        Err(owned e) => take_len(e) * 1000,
+    }
+}
+
+pub fn peek(owned r: Result<Int, String>) -> Int {
+    return match r {
+        Ok(v) => v,
+        Err(shared e) => str_len(e) * 100,
+    }
+}
+
+pub fn both(owned r: Result<String, String>) -> Int {
+    return match r {
+        Ok(owned s) => take_len(s),
+        Err(shared e) => str_len(e) * 10,
+    }
+}
+
+pub fn main() {
+    let copy a = score(check(21))
+    let copy b = score(check(-123))
+    let copy c = peek(check(-5))
+    let copy d = both(describe(777))
+    let copy e = both(describe(-88))
+    let copy f = match check(-1234) {
+        Ok(v) => v,
+        Err(owned x) => take_len(x),
+    }
+    let copy g = match check(-9) {
+        Ok(v) => v,
+        Err(_) => 7,
+    }
+    var owned r: Result<Int, String> = check(-11)
+    r = check(3)
+    let copy h = score(r)
+    print_int(a + b + c + d * 10000 + e * 100000 + f * 1000000 + g * 10000000 + h * 100000000)
+}

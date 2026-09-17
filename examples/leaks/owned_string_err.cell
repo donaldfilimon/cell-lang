@@ -1,0 +1,85 @@
+// Owning String in Err (sub-project 3, 2026-09-17), and both sides owning.
+// Every shape results_err_string.cell pins, looped 1000 times, plus
+// temporaries whose error no arm takes (`Err(_)`, `Err(shared ..)`) and a
+// `Result<String, String>` released on each side.
+//
+// Pinned at 0 on both witnesses, and also run by hand under
+// AddressSanitizer (stage 9 does not see examples/leaks/).
+//
+// Status: parses, passes `cell check`; C only; lives under examples/leaks/.
+
+pub fn print_int(copy value: Int);
+pub fn str_from_int(copy v: Int) -> String;
+pub fn str_len(shared s: String) -> Int;
+
+pub fn check(copy n: Int) -> Result<Int, String> {
+    if n < 0 {
+        return Err(str_from_int(n))
+    }
+    return Ok(n * 2)
+}
+
+pub fn describe(copy n: Int) -> Result<String, String> {
+    if n < 0 {
+        return Err(str_from_int(n))
+    }
+    return Ok(str_from_int(n))
+}
+
+pub fn take_len(owned s: String) -> Int {
+    return str_len(s)
+}
+
+pub fn score(owned r: Result<Int, String>) -> Int {
+    return match r {
+        Ok(v) => v,
+        Err(owned e) => take_len(e),
+    }
+}
+
+pub fn peek(owned r: Result<Int, String>) -> Int {
+    return match r {
+        Ok(v) => v,
+        Err(shared e) => str_len(e),
+    }
+}
+
+pub fn both(owned r: Result<String, String>) -> Int {
+    return match r {
+        Ok(owned s) => take_len(s),
+        Err(shared e) => str_len(e),
+    }
+}
+
+pub fn once(copy i: Int) -> Int {
+    let copy a = score(check(-i - 1))
+    let copy b = peek(check(-i - 2))
+    let copy c = both(describe(i))
+    let copy d = both(describe(-i - 3))
+    let copy e = match check(-i - 4) {
+        Ok(v) => v,
+        Err(_) => 1,
+    }
+    let copy f = match check(-i - 5) {
+        Ok(v) => v,
+        Err(shared x) => str_len(x),
+    }
+    let copy g = match describe(-i - 6) {
+        Ok(owned s) => take_len(s),
+        Err(_) => 2,
+    }
+    var owned r: Result<Int, String> = check(-i - 7)
+    r = check(i)
+    let copy h = score(r)
+    return a + b + c + d + e + f + g + h
+}
+
+pub fn main() {
+    var i = 0
+    var n = 0
+    while i < 1000 {
+        n = n + once(i)
+        i = i + 1
+    }
+    print_int(n)
+}
