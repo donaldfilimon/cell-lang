@@ -704,9 +704,10 @@ Section 10.3 is the ABI table. A literal bound as `arc` is now boxed
 sentence used to name is CLOSED as of 2026-09-08: the C backend coerces a
 literal's borrowed view into an owning `String` through `cell_string_from_str`
 at eight positions, funnelled through one predicate. The LLVM and MLIR
-backends REFUSE those same programs, because neither can call a `static
-inline` runtime helper, so the three backends disagree here by design rather
-than by accident.
+backends refused those programs until 2026-09-17 (the stated reason, that
+the helper is `static inline`, was wrong: it is a real symbol). Since IR
+String step (a) they convert at the same positions, through
+`hir.lower`'s funnel, and free nothing, having no drop pass yet.
 
 **Any other type name is refused at typecheck** with `unknown type 'Strng'`.
 A name is a type iff it is one of the sixteen primitives, a declared struct,
@@ -2310,6 +2311,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Mangling on call sites | implemented |
 | Primitive parameter mapping | implemented |
 | `String` as a length-prefixed slice | implemented |
+| Borrowed view to owned `String` (`cell_string_from_str`) | implemented at eight declared-destination positions in C (2026-09-08) and in LLVM and MLIR (2026-09-17, IR String step (a): `hir.lower` inserts the call and declares the helper once); LLVM and MLIR still refuse an unannotated `let owned s = "ab"` (C keeps it a view) and a binding pattern over a view, and free no owned String they build |
 | Ownership lowering at the boundary | implemented for all five modes in the C backend (see 10.4) |
 | `const` for `shared` aggregates | implemented |
 | `arc` as `cell_arc_t` | implemented in the C backend, in every position including an un-annotated `let` |

@@ -18,13 +18,14 @@
 // into it. Both are here, last, because the reusable lesson of this defect is
 // that the enumeration is never the fix.
 //
-// C ONLY, DELIBERATELY. The LLVM and MLIR backends refuse every line below
-// with `cannot lower`. The conversion is a call to `cell_string_from_str`,
-// which IS a real symbol (corrected 2026-09-17: this header used to say it was
-// `static inline`); the IR backends refuse because they have no drop pass, so
-// the owned result would never be freed (see
-// examples/leaks/ir_owned_string.cell). They refuse TOGETHER, so the gate's agreement stage stays green; the three backends
-// disagreeing here is the intended end state, not a defect.
+// ALL THREE BACKENDS, since IR String step (a) (2026-09-17). This file was C
+// only: the LLVM and MLIR backends refused every line below. The conversion
+// is a call to `cell_string_from_str`, a real runtime symbol, and hir.lower
+// now inserts it at each of the eight positions, so both IR backends make the
+// same copy C does and print the same 44. They have no drop pass, so they
+// free none of the eight: gate stage 7 pins that (C 0, LLVM and MLIR 8, the
+// host's `take` freeing the ninth allocation), and
+// examples/leaks/ir_string_conversion.cell loops the same positions.
 //
 // It prints 44, which is 2+3+4+5+6+7+8+9: the byte length of each of the
 // eight conversions, so a conversion that silently produced an empty or a

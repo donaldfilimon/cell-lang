@@ -1261,6 +1261,17 @@ build the IR String work (conversions, indexing, list literals) with these
 leaks pinned, then port the C backend's drop decisions onto HIR so both IR
 backends share them.
 
+**IR String step (a), the conversions, landed 2026-09-17 on those terms.**
+Both IR backends now call `cell_string_from_str` wherever C converts a
+borrowed view into an owned `String`, and free none of the results. Measured
+and pinned in stage 7: `examples/leaks/ir_string_conversion.cell` (the eight
+positions, 1000 calls) is C 0 on both witnesses and LLVM and MLIR 9000;
+`examples/owned_string.cell` with its host is C 0 and LLVM and MLIR 8.
+`ir_owned_string` stays at 3000. Two leaks C also has are inherited rather
+than new: a write through an `exclusive String` borrow overwrites the old
+buffer without freeing it (the IR converts `s = "cd"` there, as C does), and
+nothing is freed on any IR path until the drop pass is ported.
+
 The checker decides where these go; codegen emits them. The runtime functions
 exist and work: `cell_arc_new`, `cell_arc_clone` (increment), and
 `cell_arc_drop` (decrement, and call the drop function at zero), all in
