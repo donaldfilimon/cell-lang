@@ -95,9 +95,6 @@ pub const lowering_passes = [_][]const u8{
     "--reconcile-unrealized-casts",
 };
 
-/// The MLIR spelling of `%cell_result` in llvmemit.zig.
-const result_type = "!llvm.struct<(i8, i32, !llvm.struct<(!llvm.struct<(ptr, i64)>)>)>";
-
 /// abi.ResultPayload speaks LLVM IR; MLIR's builtin floats are f32/f64.
 fn mlirScalar(llvm_ty: []const u8) []const u8 {
     if (std.mem.eql(u8, llvm_ty, "double")) return "f64";
@@ -1493,85 +1490,63 @@ const Emitter = struct {
         return .{ .text = out, .ty = opt_ty };
     }
 
-    /// `Ok(x)`/`Err(e)`, built the way llvmemit.zig builds it and cell_rt.h's
-    /// constructors do: a zeroed cell_result_t, the `ok` byte, then the
-    /// widened payload at field 2 or the int32 code at field 1.
+    /// `Ok(x)`/`Err(e)`, built the way llvmemit.zig builds it: a zeroed
+    /// per-pair struct, the `ok` byte, then the payload at field 1 in its own
+    /// member type.
     fn emitResultCtor(self: *Emitter, e: *const hir.Expr, is_ok: bool, operand_e: *const hir.Expr) EmitError!Value {
-        const r = e.ty.result;
+        const s = abi.resultShape(e.ty.result).?;
+        const ty = try abi.resultMlirType(self.arena, s);
         const v = try self.emitExpr(operand_e);
         if (v.isNone()) return Value.none;
+        const m = if (is_ok) s.ok.? else s.err;
+        const natural = mlirScalar(m.natural);
+        const mem = mlirScalar(m.mem);
+        if (!try self.fits(operand_e.span, v.ty, natural, if (is_ok) "an Ok payload" else "an Err payload")) return Value.none;
         const one = try self.nextSsa();
         try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
         const buf = try self.nextSsa();
-        try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ buf, one, result_type });
+        try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ buf, one, ty });
         const zero = try self.nextSsa();
-        try self.line("{s} = llvm.mlir.zero : {s}", .{ zero, result_type });
-        try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ zero, buf, result_type });
+        try self.line("{s} = llvm.mlir.zero : {s}", .{ zero, ty });
+        try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ zero, buf, ty });
         if (is_ok) {
-            const p = abi.resultPayload(r.ok.*).?;
-            const natural = mlirScalar(p.natural);
-            const store = mlirScalar(p.store);
-            if (!try self.fits(operand_e.span, v.ty, natural, "an Ok payload")) return Value.none;
             const tag = try self.nextSsa();
             try self.line("{s} = llvm.mlir.constant(1 : i8) : i8", .{tag});
             try self.line("llvm.store {s}, {s} : i8, !llvm.ptr", .{ tag, buf });
-            const stored = switch (p.widen) {
-                .none => v.text,
-                .sext, .zext, .fpext, .bool_byte => blk: {
-                    const w = try self.nextSsa();
-                    const op: []const u8 = switch (p.widen) {
-                        .sext => "arith.extsi",
-                        .zext, .bool_byte => "arith.extui",
-                        .fpext => "arith.extf",
-                        .none => unreachable,
-                    };
-                    try self.line("{s} = {s} {s} : {s} to {s}", .{ w, op, v.text, natural, store });
-                    break :blk w;
-                },
-            };
-            const at = try self.nextSsa();
-            try self.line("{s} = llvm.getelementptr inbounds {s}[0, 2] : (!llvm.ptr) -> !llvm.ptr, {s}", .{ at, buf, result_type });
-            try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ stored, at, store });
-        } else {
-            if (!try self.fits(operand_e.span, v.ty, "i32", "an Err code")) return Value.none;
-            const at = try self.nextSsa();
-            try self.line("{s} = llvm.getelementptr inbounds {s}[0, 1] : (!llvm.ptr) -> !llvm.ptr, {s}", .{ at, buf, result_type });
-            try self.line("llvm.store {s}, {s} : i32, !llvm.ptr", .{ v.text, at });
         }
+        var stored = v.text;
+        if (!std.mem.eql(u8, natural, mem)) {
+            const w = try self.nextSsa();
+            try self.line("{s} = arith.extui {s} : {s} to {s}", .{ w, v.text, natural, mem });
+            stored = w;
+        }
+        const at = try self.nextSsa();
+        try self.line("{s} = llvm.getelementptr inbounds {s}[0, 1] : (!llvm.ptr) -> !llvm.ptr, {s}", .{ at, buf, ty });
+        try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ stored, at, mem });
         const out = try self.nextSsa();
-        try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ out, buf, result_type });
-        return .{ .text = out, .ty = result_type };
+        try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ out, buf, ty });
+        return .{ .text = out, .ty = ty };
     }
 
-    /// The payload a matched `Ok(v)`/`Err(e)` binds, read back and narrowed.
+    /// The payload a matched `Ok(v)`/`Err(e)` binds, read from field 1.
     fn readResultPayload(self: *Emitter, scrutinee: Value, ty: hir.Ty, is_ok: bool) EmitError!Value {
-        const r = ty.result;
-        if (!is_ok) {
-            const code = try self.nextSsa();
-            try self.line("{s} = llvm.extractvalue {s}[1] : {s}", .{ code, scrutinee.text, result_type });
-            return .{ .text = code, .ty = "i32" };
-        }
-        const p = abi.resultPayload(r.ok.*).?;
-        const natural = mlirScalar(p.natural);
-        const store = mlirScalar(p.store);
-        // Through memory: the payload is a union member, not a struct field.
+        const s = abi.resultShape(ty.result).?;
+        const st = try abi.resultMlirType(self.arena, s);
+        const m = if (is_ok) s.ok.? else s.err;
+        const natural = mlirScalar(m.natural);
+        const mem = mlirScalar(m.mem);
         const one = try self.nextSsa();
         try self.line("{s} = llvm.mlir.constant(1 : i64) : i64", .{one});
         const buf = try self.nextSsa();
-        try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ buf, one, result_type });
-        try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ scrutinee.text, buf, result_type });
+        try self.line("{s} = llvm.alloca {s} x {s} : (i64) -> !llvm.ptr", .{ buf, one, st });
+        try self.line("llvm.store {s}, {s} : {s}, !llvm.ptr", .{ scrutinee.text, buf, st });
         const at = try self.nextSsa();
-        try self.line("{s} = llvm.getelementptr inbounds {s}[0, 2] : (!llvm.ptr) -> !llvm.ptr, {s}", .{ at, buf, result_type });
+        try self.line("{s} = llvm.getelementptr inbounds {s}[0, 1] : (!llvm.ptr) -> !llvm.ptr, {s}", .{ at, buf, st });
         const raw = try self.nextSsa();
-        try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ raw, at, store });
-        if (p.widen == .none) return .{ .text = raw, .ty = natural };
+        try self.line("{s} = llvm.load {s} : !llvm.ptr -> {s}", .{ raw, at, mem });
+        if (std.mem.eql(u8, natural, mem)) return .{ .text = raw, .ty = natural };
         const n = try self.nextSsa();
-        const op: []const u8 = switch (p.widen) {
-            .sext, .zext, .bool_byte => "arith.trunci",
-            .fpext => "arith.truncf",
-            .none => unreachable,
-        };
-        try self.line("{s} = {s} {s} : {s} to {s}", .{ n, op, raw, store, natural });
+        try self.line("{s} = arith.trunci {s} : {s} to {s}", .{ n, raw, mem, natural });
         return .{ .text = n, .ty = natural };
     }
 
@@ -1637,9 +1612,9 @@ const Emitter = struct {
                     });
                     cmp = c;
                 } else if (arm.pattern.kind == .result_ctor) {
-                    // `ok` is cell_result_t's first field, a C bool byte.
+                    // `ok` is the per-pair struct's first field, a C bool byte.
                     const tag = try self.nextSsa();
-                    try self.line("{s} = llvm.extractvalue {s}[0] : {s}", .{ tag, scrutinee.text, result_type });
+                    try self.line("{s} = llvm.extractvalue {s}[0] : {s}", .{ tag, scrutinee.text, scrutinee.ty });
                     const zero = try self.nextSsa();
                     try self.line("{s} = arith.constant 0 : i8", .{zero});
                     const c = try self.nextSsa();
@@ -1898,13 +1873,12 @@ const Emitter = struct {
             // One type-erased header for every element type, per cell_rt.h
             // section 3: elem_size travels at the call site, not in the type.
             .list => "!llvm.struct<(ptr, i64, i64)>",
-            // cell_result_t, `{ bool ok; int32_t error_code; cell_value_t
-            // value; }`, with the union spelled as clang spells it: its widest
-            // member, cell_str_t. Only for the payloads both IR backends read.
-            .result => |r| if (abi.resultPayload(r.ok.*) != null and abi.resultErrorCarried(r.err.*))
-                result_type
-            else
-                null,
+            // The per-pair struct (abi.resultShape), structural like
+            // llvmemit.zig's. Any other pair is refused.
+            .result => |r| blk: {
+                const s = abi.resultShape(r) orelse break :blk null;
+                break :blk abi.resultMlirType(self.arena, s) catch null;
+            },
             .func, .unknown => null,
         };
     }
@@ -2669,7 +2643,7 @@ test "Some/None lower to a zeroed tagged struct in the llvm dialect" {
     try expectContains(e.text, "arith.cmpi ne,");
 }
 
-test "a scalar Result lowers to the cell_result_t struct in the llvm dialect" {
+test "a scalar Result lowers to its per-pair struct in the llvm dialect" {
     var e = try emitSource(
         \\pub enum ParseError { Empty, TooLong }
         \\pub fn parse_len(copy n: Int) -> Result<Int, ParseError> {
@@ -2679,20 +2653,21 @@ test "a scalar Result lowers to the cell_result_t struct in the llvm dialect" {
         \\pub fn score(copy r: Result<Int8, ParseError>, copy d: Int8) -> Int8 {
         \\    return match r { Ok(v) => v, Err(_) => d }
         \\}
+        \\pub fn wide() -> Result<Float, Int> { return Err(5000000000) }
     );
     defer e.deinit();
     try std.testing.expect(!e.bag.hasErrors());
-    try expectContains(e.text, "llvm.sret = !llvm.struct<(i8, i32, !llvm.struct<(!llvm.struct<(ptr, i64)>)>)>");
-    try expectContains(e.text, "llvm.mlir.zero : !llvm.struct<(i8, i32, !llvm.struct<(!llvm.struct<(ptr, i64)>)>)>");
-    try expectContains(e.text, "llvm.getelementptr inbounds");
-    try expectContains(e.text, "[0, 2] : (!llvm.ptr) -> !llvm.ptr");
-    try expectContains(e.text, "[0, 1] : (!llvm.ptr) -> !llvm.ptr");
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "!llvm.struct<(i8, i32, ") == null);
+    try expectContains(e.text, "llvm.mlir.zero : !llvm.struct<(i8, !llvm.struct<(i64)>)>");
+    try expectContains(e.text, "llvm.alloca");
+    try expectContains(e.text, "[0, 1] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i8, !llvm.struct<(i64)>)>");
     try expectContains(e.text, "arith.cmpi ne,");
-    try expectContains(e.text, "arith.trunci");
-    // A Result parameter is a pointer to the caller's copy, as in C.
-    try expectContains(e.text, "@cell_score(%arg0: !llvm.ptr, %arg1: i8)");
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "arith.trunci") == null);
+    // Result<Int8, ParseError> is 8 bytes: one word, as in C.
+    try expectContains(e.text, "@cell_score(%arg0: !llvm.array<1 x i64>, %arg1: i8)");
+    try expectContains(e.text, "!llvm.struct<(i8, !llvm.struct<(f64)>)>");
     // A Result slot is an llvm.alloca: memref cannot hold an !llvm.struct.
-    try std.testing.expect(std.mem.indexOf(u8, e.text, "memref<!llvm.struct<(i8, i32") == null);
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "memref<!llvm.struct<(i8, ") == null);
 }
 
 test "an exclusive String, list and optional are POINTERS, and writes through them LAND" {

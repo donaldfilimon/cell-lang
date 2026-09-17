@@ -230,8 +230,8 @@ pub const Pattern = struct {
         bool: bool,
         /// `Ok(x)` or `Err(e)` on a scalar Result scrutinee. `binding` is the
         /// payload's slot, typed as the Result's `ok` or `err` type, or null
-        /// for `Ok(_)`/`Err(_)`. Only the payloads `abi.resultPayload` and
-        /// `abi.resultErrorCarried` accept are lowered to this form.
+        /// for `Ok(_)`/`Err(_)`. Only the pairs `abi.resultShape` lays out
+        /// are lowered to this form.
         result_ctor: struct { is_ok: bool, binding: ?u32 },
         /// `Some(x)` or `None` on a scalar optional scrutinee. `binding` is the
         /// payload slot for `Some(x)`, null for `Some(_)` and `None`.

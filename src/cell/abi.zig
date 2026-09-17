@@ -86,37 +86,6 @@ pub fn layoutOf(m: *const hir.Module, ty: hir.Ty, own: hir.Ownership) ?Layout {
     };
 }
 
-/// How a scalar Result payload is stored in `cell_value_t`, matching the C
-/// backend's `resultField` table and cell_rt.h's `cell_ok_*` constructors.
-/// `store` is the LLVM type written at offset 8; `widen` is how the payload
-/// reaches it. Null for a payload the IR backends refuse.
-pub const ResultPayload = struct {
-    /// The payload's own LLVM type.
-    natural: []const u8,
-    /// What occupies the union slot: i64, double, or i8 for a C `bool`.
-    store: []const u8,
-    widen: Widen,
-
-    pub const Widen = enum { none, sext, zext, fpext, bool_byte };
-};
-
-pub fn resultPayload(ty: hir.Ty) ?ResultPayload {
-    return switch (ty) {
-        .int => .{ .natural = "i64", .store = "i64", .widen = .none },
-        .int8 => .{ .natural = "i8", .store = "i64", .widen = .sext },
-        .int16 => .{ .natural = "i16", .store = "i64", .widen = .sext },
-        .int32 => .{ .natural = "i32", .store = "i64", .widen = .sext },
-        .uint => .{ .natural = "i64", .store = "i64", .widen = .none },
-        .uint8 => .{ .natural = "i8", .store = "i64", .widen = .zext },
-        .uint16 => .{ .natural = "i16", .store = "i64", .widen = .zext },
-        .uint32 => .{ .natural = "i32", .store = "i64", .widen = .zext },
-        .float => .{ .natural = "double", .store = "double", .widen = .none },
-        .float32 => .{ .natural = "float", .store = "double", .widen = .fpext },
-        .boolean => .{ .natural = "i1", .store = "i8", .widen = .bool_byte },
-        else => null,
-    };
-}
-
 /// One side of a per-instantiation Result (`cell_res_<ok>_<err>_t` in
 /// cell_rt.h). The table is the single source both IR backends read; the C
 /// backend keeps its own name table (it does not import this module) and a
@@ -205,15 +174,6 @@ pub fn resultMlirType(arena: std.mem.Allocator, s: ResultShape) ![]const u8 {
 pub fn optionPayloadCarried(ty: hir.Ty) bool {
     if (ty.tag() == .string) return false;
     return optionalBase(ty) != null;
-}
-
-/// Whether `ty` is an error type the IR backends carry: the C backend narrows
-/// E to an `int32_t` code, and only Int32 and payload-free enums reach it.
-pub fn resultErrorCarried(ty: hir.Ty) bool {
-    return switch (ty) {
-        .int32, .enum_type => true,
-        else => false,
-    };
 }
 
 /// The runtime's optional-instance base for an element type, matching what
