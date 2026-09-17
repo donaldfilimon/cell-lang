@@ -476,6 +476,9 @@ LEAK_OWNED_STRING_RESULT=0
 # times. Measured 0 (ALLOC=8000 FREE=8000); with the Err release emptied it
 # measured 4000.
 LEAK_OWNED_STRING_ERR=0
+# Owning String? (sub-project 4, 2026-09-17), 1000 times. Measured 0
+# (ALLOC=8000 FREE=8000); with the release glue emptied it measured 5000.
+LEAK_OWNED_STRING_OPTIONAL=0
 # Early exits (2026-09-17): shapes refused before the divergence rule, so a
 # regression pin rather than a closed gap. Measured 0 on first run.
 LEAK_EARLY_RETURN=0
@@ -988,6 +991,7 @@ else
     run_c_leaks return_in_loop "" "$LEAK_RETURN_IN_LOOP" "R16 residual return inside a loop, CLOSED 2026-09-17 by live return records in accepted loops; 500 -> 0"
     run_c_leaks owned_string_result "" "$LEAK_OWNED_STRING_RESULT" "owning String Ok, 2026-09-17"
     run_c_leaks owned_string_err "" "$LEAK_OWNED_STRING_ERR" "owning String Err and both sides, 2026-09-17"
+    run_c_leaks owned_string_optional "" "$LEAK_OWNED_STRING_OPTIONAL" "owning String?, 2026-09-17"
     run_c_leaks early_return "" "$LEAK_EARLY_RETURN" "early exits keep moves out of the merge, 2026-09-17; regression pin"
     run_c_leaks partial_nested_field "" "$LEAK_PARTIAL_NESTED_FIELD" "R16 residual nested partial field, CLOSED 2026-09-16 by recursive emitPartialRecordDrop; 1000 -> 0"
     run_c_leaks branch_field "" "$LEAK_BRANCH_FIELD" "R16 residual 1 at field granularity, CLOSED 2026-09-16 by branch-end field releases; 1000 -> 0"

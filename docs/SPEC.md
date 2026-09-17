@@ -738,7 +738,13 @@ on a type name.
 Constructors are `Some(e)` and `None`. Patterns are `Some(x)`, `Some(_)`, and
 `None`. Payloads this slice admits are the scalar primitives (`Int`, `Int8`,
 `Int16`, `Int32`, `UInt`, `UInt8`, `UInt16`, `UInt32`, `Float`, `Float32`,
-`Bool`, `Byte`); anything else is refused.
+`Bool`, `Byte`), and since 2026-09-17 an owning `String` in the C backend
+(sub-project 4): `String?` lowers to `cell_opt_string_t`, `Some(x)` moves `x`
+when its type resolves (and copies it otherwise), `Some(owned s)` /
+`Some(shared s)` bind the payload (a bare `Some(s)` on it is refused), and the
+optional is released on every path that still holds it through generated
+`cell_drop_opt_string`. `examples/optional_string.cell` and
+`examples/leaks/owned_string_optional.cell` pin it. Anything else is refused.
 `None` needs a declared optional slot (`let a: Int? = None`); `Some(e)` is
 complete from its operand in C. LLVM and MLIR build the runtime's tagged
 instance (zeroed, `has_value`, payload; a C `bool` payload as one byte) and
@@ -1800,8 +1806,8 @@ struct-literal restriction on (section 6.7), so `match c { ... }` works.
 Wrap patterns `Some(x)`, `Some(_)`, `None`, `Ok(x)`, `Err(x)` inspect an
 optional or Result scrutinee. The inner pattern is a binding or `_`, optionally
 preceded by an ownership keyword (`Ok(owned s)`, `Ok(shared s)`; 2026-09-17),
-which only an owning `Ok` or `Err` payload accepts (section 3.4); nested
-patterns are a parse error.
+which only an owning `Ok`, `Err` or `Some` payload accepts (sections 3.2 and
+3.4); nested patterns are a parse error.
 
 ### 9.0 Match guards
 

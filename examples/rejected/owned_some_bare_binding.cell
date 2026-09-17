@@ -1,0 +1,16 @@
+// EXPECT: currently-rejected
+// Violates: an owning payload binding must say its mode (SPEC 3.2,
+// sub-project 4, 2026-09-17).
+//
+// `String?` owns its String, so `Some(s)` would not say whether the arm takes
+// the buffer or borrows it. `cell check` reports
+// `'Some(s)' on an owning payload must say 'owned' or 'shared'`.
+
+pub fn str_len(shared s: String) -> Int;
+
+pub fn length(owned o: String?) -> Int {
+    return match o {
+        Some(s) => str_len(s),
+        None => 0,
+    }
+}

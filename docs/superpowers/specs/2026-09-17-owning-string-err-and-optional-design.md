@@ -4,7 +4,10 @@ Status: approved by Donald 2026-09-17 for plan and build (sub-project 3
 first). Sub-project 3 is implemented (plan
 `docs/superpowers/plans/2026-09-17-owning-string-err.md`); it also corrected
 sub-project 2's `abi.layoutOf(Result<String, E>)`, which still answered the
-legacy 24 bytes. Review answers: `String?` is owning; `Result<String, String>` is in
+legacy 24 bytes. Sub-project 4 is implemented in the C backend (plan
+`docs/superpowers/plans/2026-09-17-owning-string-optional.md`); its IR
+spelling of `String?` (still the 24-byte view there, while C and abi say 32)
+is reconciled after the IR String branch merges. Review answers: `String?` is owning; `Result<String, String>` is in
 sub-project 3; both sub-projects proceed.
 Parents:
 - `2026-09-17-per-instantiation-results-design.md` (sub-project 1, landed).

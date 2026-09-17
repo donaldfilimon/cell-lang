@@ -685,8 +685,8 @@ compared by prefix. Nothing in the tree is missing.
 Matching on an `owned` place moves it into the arm's bindings. Matching on a
 `shared` borrow binds `shared`. Matching on `exclusive` binds `exclusive`.
 
-**Owning `Ok` and `Err` payloads (implemented 2026-09-17, C backend; the
-error side is sub-project 3).** For a Result with an owning String side the
+**Owning `Ok`, `Err` and `Some` payloads (implemented 2026-09-17, C backend;
+the error side is sub-project 3, `String?` sub-project 4).** For a Result with an owning String side the
 binding on that side says its mode (`Err(owned e)`/`Err(shared e)` mirror
 the `Ok` forms below; falsified the same way, an ASan double free at exit 134
 without the arm's move). `Ok(owned s)` MOVES
@@ -1236,7 +1236,9 @@ ARC retain/release support to either IR backend.
 **Owning Result release (2026-09-17).** A Result with an owning String side
 is released through per-module glue (`cell_drop_res_string_<err>` frees the
 `Ok` payload when present, `cell_drop_res_<ok>_string` the `Err` payload, and
-`cell_drop_res_string_string` whichever side is present;
+`cell_drop_res_string_string` whichever side is present, and
+`cell_drop_opt_string` a present `String?` payload, pinned at 0 by
+`examples/leaks/owned_string_optional.cell` and 5000 with it emptied;
 `examples/leaks/owned_string_err.cell` pinned at 0, 4000 with the error
 release emptied), wherever an owned local of that type is still live: scope end, a
 branch end (every match arm now ends with those releases), an owned

@@ -1,0 +1,73 @@
+// Owning String? (sub-project 4, 2026-09-17). Every shape
+// optional_string.cell pins, looped 1000 times, plus temporaries no arm
+// takes (`Some(_)`, `Some(shared ..)`) and a reassigned `var`.
+//
+// Pinned at 0 on both witnesses, and also run by hand under
+// AddressSanitizer (stage 9 does not see examples/leaks/).
+//
+// Status: parses, passes `cell check`; C only; lives under examples/leaks/.
+
+pub fn print_int(copy value: Int);
+pub fn str_from_int(copy v: Int) -> String;
+pub fn str_len(shared s: String) -> Int;
+
+pub fn lookup(copy n: Int) -> String? {
+    if n < 0 {
+        return None
+    }
+    return Some(str_from_int(n))
+}
+
+pub fn take_len(owned s: String) -> Int {
+    return str_len(s)
+}
+
+pub fn owned_len(owned o: String?) -> Int {
+    return match o {
+        Some(owned s) => take_len(s),
+        None => 0,
+    }
+}
+
+pub fn shared_len(owned o: String?) -> Int {
+    return match o {
+        Some(shared s) => str_len(s),
+        None => 1,
+    }
+}
+
+pub fn wrap(owned s: String) -> String? {
+    return Some(s)
+}
+
+pub fn once(copy i: Int) -> Int {
+    var owned o: String? = lookup(i + 1)
+    o = lookup(i + 2)
+    let copy a = owned_len(lookup(i))
+    let copy b = shared_len(lookup(i + 3))
+    let copy c = owned_len(wrap(str_from_int(i)))
+    let copy d = match lookup(i + 4) {
+        Some(_) => 1,
+        None => 0,
+    }
+    let copy e = match lookup(i + 5) {
+        Some(shared s) => str_len(s),
+        None => 0,
+    }
+    let copy f = match lookup(i + 6) {
+        Some(owned s) => take_len(s),
+        None => 0,
+    }
+    let copy g = shared_len(o)
+    return a + b + c + d + e + f + g
+}
+
+pub fn main() {
+    var i = 0
+    var n = 0
+    while i < 1000 {
+        n = n + once(i)
+        i = i + 1
+    }
+    print_int(n)
+}
