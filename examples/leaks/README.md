@@ -1,12 +1,17 @@
 # `examples/leaks/`
 
-Eighteen fixtures: R11's measurable gaps and their CLOSED pins (seven,
-including the value-block residual and the `owned` twin of row 5); R16's
-revival leak (`revived_var.cell`, closed 2026-09-16) and eight closed
+Twenty-seven fixtures, twenty-five measured on the C backend and two IR
+backend pins (below). The C ones are: R11's measurable gaps and their CLOSED
+pins (seven, including the value-block residual and the `owned` twin of row
+5); R16's revival leak (`revived_var.cell`, closed 2026-09-16) and ten closed
 residuals (`branch_move`, `loop_jump_revival`, `value_block_revival`,
-`revived_record`, `loop_cross`, `partial_nested_field`, `branch_field`, `field_revival`); the partial-move pin; and one regression pin for an
-implemented feature (`arc_box_move.cell`, below). Each isolates exactly one
-disclosed retain/release shape and loops it 1000 times so a leak is a
+`revived_record`, `loop_cross`, `partial_nested_field`, `branch_field`,
+`field_revival`, `return_in_loop`, `skip_revival_break`); the partial-move
+pin; the owned scalar wrappers and the three owning-payload pins
+(`owned_string_result`, `owned_string_err`, `owned_string_optional`); and two
+regression pins for implemented features (`arc_box_move.cell` and
+`early_return.cell`, below). Each isolates exactly one
+disclosed retain/release shape and loops it many times so a leak is a
 stable count, not noise.
 
 **These programs assert leaks that currently exist.** That is deliberate:
@@ -50,6 +55,9 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `loop_cross.cell` | R16 residual: a var moved inside a `while` it was declared outside of; **CLOSED 2026-09-16** by after_loop releases, 1000 -> 0 |
 | `branch_field.cell` | R16 residual 1 at field granularity: a field moved on only one branch of an `if` leaked on the other; **CLOSED 2026-09-16** by branch-end field releases (live here, dead after the merge), 1000 -> 0 |
 | `field_revival.cell` | R16 residual: a field revived after it was moved leaked the new value; **CLOSED 2026-09-16** by retracting the revived path from `fieldWasMoved`, 1000 -> 0 |
+| `return_in_loop.cell` | R16 residual: a `return` taken inside a loop after the loop revived a moved var released nothing; **CLOSED 2026-09-17** by keeping an accepted loop's `return` records live, 500 -> 0 |
+| `skip_revival_break.cell` | R16 residual: a `break` that can be taken while the var is dead made the post-loop release unsafe, so the condition-false path leaked its revived value; **CLOSED 2026-09-17** by `after_loop_skip` releases, 500 -> 0 |
+| `early_return.cell` | not a gap: a branch that always leaves keeps its moves out of the code after the `if` (2026-09-17); these shapes were refused before, so this is a regression pin at 0 |
 
 ## IR backend pins
 
