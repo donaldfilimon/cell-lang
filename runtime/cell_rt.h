@@ -96,7 +96,7 @@
  * ---------------------------------------------------------------------------
  * 5. Result<T, E>
  * ---------------------------------------------------------------------------
- *   Result<T, E> -> cell_result_t { bool ok; int32_t error_code; cell_value_t value; }
+ *   Result<T, E> -> cell_res_<ok>_<err>_t { bool ok; union { T ok; E err; } as; } (ABI 2)
  *
  * `value` is a union of the scalar shapes, so Result<Int, E> carries its
  * payload inline with no heap allocation. The previous `void *value` layout
@@ -287,7 +287,96 @@ CELL_DEFINE_OPTIONAL(cell_opt_ptr, void *)
 /* Result<T, E>                                                              */
 /* ------------------------------------------------------------------------ */
 
-/** Inline scalar payload. Aggregates travel through `ptr`. */
+
+/**
+ * ABI version of the runtime's type spellings. 2 = per-instantiation
+ * Results (2026-09-17). Bumped whenever an emitted type's layout changes.
+ */
+#define CELL_RT_ABI_VERSION 2
+
+/*
+ * One exact struct per Result<T, E> pair. `ok` is the tag; the payload lives
+ * in `as`, in its own C type. Constructors zero the whole struct first, so
+ * padding is deterministic (the IR backends build from zeroinitializer).
+ * Instances are named cell_res_<ok>_<err>; see the slug table below.
+ */
+#define CELL_DEFINE_RESULT(base, T, E)                                         \
+    typedef struct base##_s {                                                  \
+        bool ok;                                                               \
+        union { T ok; E err; } as;                                             \
+    } base##_t;                                                                \
+    static inline base##_t base##_ok(T v) {                                    \
+        base##_t r;                                                            \
+        memset(&r, 0, sizeof(r));                                              \
+        r.ok = true;                                                           \
+        r.as.ok = v;                                                           \
+        return r;                                                              \
+    }                                                                          \
+    static inline base##_t base##_err(E e) {                                   \
+        base##_t r;                                                            \
+        memset(&r, 0, sizeof(r));                                              \
+        r.ok = false;                                                          \
+        r.as.err = e;                                                          \
+        return r;                                                              \
+    }
+
+/** A unit T: only the error has storage. */
+#define CELL_DEFINE_RESULT_UNIT(base, E)                                       \
+    typedef struct base##_s {                                                  \
+        bool ok;                                                               \
+        union { E err; } as;                                                   \
+    } base##_t;                                                                \
+    static inline base##_t base##_ok(void) {                                   \
+        base##_t r;                                                            \
+        memset(&r, 0, sizeof(r));                                              \
+        r.ok = true;                                                           \
+        return r;                                                              \
+    }                                                                          \
+    static inline base##_t base##_err(E e) {                                   \
+        base##_t r;                                                            \
+        memset(&r, 0, sizeof(r));                                              \
+        r.ok = false;                                                          \
+        r.as.err = e;                                                          \
+        return r;                                                              \
+    }
+
+/*
+ * Every in-scope pair, predefined like the scalar optionals. Slugs: i64 i32
+ * i16 i8 u64 u32 u16 u8 f64 f32 bool byte, plus unit for T. A payload-free
+ * enum is int32_t and uses i32. Byte stays distinct from UInt8.
+ */
+#define CELL_RES_ERRS(X, pfx, OT)                                              \
+    X(pfx, OT, i64, int64_t) X(pfx, OT, i32, int32_t)                          \
+    X(pfx, OT, i16, int16_t) X(pfx, OT, i8, int8_t)                            \
+    X(pfx, OT, u64, uint64_t) X(pfx, OT, u32, uint32_t)                        \
+    X(pfx, OT, u16, uint16_t) X(pfx, OT, u8, uint8_t)                          \
+    X(pfx, OT, f64, double) X(pfx, OT, f32, float)                             \
+    X(pfx, OT, bool, bool) X(pfx, OT, byte, uint8_t)
+/* The Ok side travels as its already-pasted prefix: <stdbool.h> makes
+ * `bool` a macro, and a bare `bool` slug passed through two macro levels
+ * would expand to `_Bool` before it is pasted. The Err slug is only ever an
+ * operand of ##, which is never macro-expanded. */
+#define CELL_RES_OKS(Y)                                                        \
+    Y(cell_res_i64, int64_t) Y(cell_res_i32, int32_t)                          \
+    Y(cell_res_i16, int16_t) Y(cell_res_i8, int8_t)                            \
+    Y(cell_res_u64, uint64_t) Y(cell_res_u32, uint32_t)                        \
+    Y(cell_res_u16, uint16_t) Y(cell_res_u8, uint8_t)                          \
+    Y(cell_res_f64, double) Y(cell_res_f32, float)                             \
+    Y(cell_res_bool, bool) Y(cell_res_byte, uint8_t)
+#define CELL_RES_DEFINE_ONE(pfx, OT, err, ET) CELL_DEFINE_RESULT(pfx##_##err, OT, ET)
+#define CELL_RES_DEFINE_UNIT(pfx, OT, err, ET) CELL_DEFINE_RESULT_UNIT(pfx##_##err, ET)
+#define CELL_RES_FOR_OK(pfx, OT) CELL_RES_ERRS(CELL_RES_DEFINE_ONE, pfx, OT)
+CELL_RES_OKS(CELL_RES_FOR_OK)
+CELL_RES_ERRS(CELL_RES_DEFINE_UNIT, cell_res_unit, void)
+#undef CELL_RES_FOR_OK
+#undef CELL_RES_DEFINE_UNIT
+#undef CELL_RES_DEFINE_ONE
+#undef CELL_RES_OKS
+#undef CELL_RES_ERRS
+
+/** DEPRECATED (ABI 1). Kept for one runtime version; codegen emits cell_res_*
+ * for scalar pairs and this only as an opaque pass-through for a pair it
+ * cannot lay out. */
 typedef union cell_value {
     int64_t i64;
     uint64_t u64;
@@ -297,7 +386,7 @@ typedef union cell_value {
     cell_str_t str;
 } cell_value_t;
 
-/** Result type used by the Cell ABI. Carries a scalar payload without boxing. */
+/** DEPRECATED (ABI 1) Result spelling; see cell_value_t above. */
 typedef struct cell_result {
     bool ok;
     int32_t error_code;

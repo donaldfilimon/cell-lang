@@ -8,6 +8,7 @@
  * fallback for cell_cxx_probe and cell_swift_probe is exercised for real.
  */
 
+#include <stddef.h>
 #include "cell_rt.h"
 
 #include <math.h>
@@ -603,52 +604,61 @@ static void test_optionals(void) {
 /* Result                                                                    */
 /* ------------------------------------------------------------------------ */
 
+_Static_assert(sizeof(cell_res_i64_i32_t) == 16 && _Alignof(cell_res_i64_i32_t) == 8
+    && offsetof(cell_res_i64_i32_t, as) == 8, "cell_res_i64_i32_t layout");
+_Static_assert(sizeof(cell_res_bool_i32_t) == 8 && _Alignof(cell_res_bool_i32_t) == 4
+    && offsetof(cell_res_bool_i32_t, as) == 4, "cell_res_bool_i32_t layout");
+_Static_assert(sizeof(cell_res_f64_i64_t) == 16 && offsetof(cell_res_f64_i64_t, as) == 8,
+    "cell_res_f64_i64_t layout");
+_Static_assert(sizeof(cell_res_i8_f64_t) == 16 && offsetof(cell_res_i8_f64_t, as) == 8,
+    "cell_res_i8_f64_t layout");
+_Static_assert(sizeof(cell_res_i32_i32_t) == 8, "cell_res_i32_i32_t layout");
+_Static_assert(sizeof(cell_res_unit_i32_t) == 8 && offsetof(cell_res_unit_i32_t, as) == 4,
+    "cell_res_unit_i32_t layout");
+_Static_assert(sizeof(cell_res_f64_f64_t) == 16, "cell_res_f64_f64_t layout");
+_Static_assert(sizeof(cell_res_i8_i8_t) == 2, "cell_res_i8_i8_t layout");
+
 static void test_result(void) {
-    /* Result<Int, E> carries its payload inline, with no boxing. */
-    cell_result_t ok = cell_ok_i64(INT64_MIN);
+    /* Per-instantiation Results (CELL_RT_ABI_VERSION 2). Every payload is
+     * stored in its own C type: no widening, no narrowing of E. */
+    CHECK(CELL_RT_ABI_VERSION == 2);
+
+    cell_res_i64_i32_t ok = cell_res_i64_i32_ok(INT64_MIN);
     CHECK(ok.ok);
-    CHECK(ok.error_code == 0);
-    CHECK(ok.value.i64 == INT64_MIN);
-
-    cell_result_t okmax = cell_ok_i64(INT64_MAX);
-    CHECK(okmax.value.i64 == INT64_MAX);
-
-    cell_result_t err = cell_err(-3);
+    CHECK(ok.as.ok == INT64_MIN);
+    cell_res_i64_i32_t err = cell_res_i64_i32_err(-3);
     CHECK(!err.ok);
-    CHECK(err.error_code == -3);
+    CHECK(err.as.err == -3);
 
-    cell_result_t unit = cell_ok_unit();
+    /* A 64-bit error round-trips; cell_err narrowed it to int32_t. */
+    cell_res_bool_i64_t big = cell_res_bool_i64_err(INT64_C(5000000000));
+    CHECK(!big.ok);
+    CHECK(big.as.err == INT64_C(5000000000));
+    cell_res_bool_i64_t yes = cell_res_bool_i64_ok(true);
+    CHECK(yes.ok && yes.as.ok);
+
+    cell_res_f64_i64_t f = cell_res_f64_i64_ok(1.25);
+    CHECK(f.ok && f.as.ok == 1.25);
+    cell_res_u64_byte_t u = cell_res_u64_byte_ok(UINT64_MAX);
+    CHECK(u.as.ok == UINT64_MAX);
+    cell_res_byte_u8_t b = cell_res_byte_u8_err(200);
+    CHECK(!b.ok && b.as.err == 200);
+    cell_res_f32_f32_t g = cell_res_f32_f32_err(0.5f);
+    CHECK(!g.ok && g.as.err == 0.5f);
+
+    cell_res_unit_i32_t unit = cell_res_unit_i32_ok();
     CHECK(unit.ok);
-    CHECK(unit.error_code == 0);
+    cell_res_unit_i32_t unit_err = cell_res_unit_i32_err(9);
+    CHECK(!unit_err.ok && unit_err.as.err == 9);
 
-    cell_result_t f = cell_ok_f64(1.25);
-    CHECK(f.ok);
-    CHECK(f.value.f64 == 1.25);
+    /* Constructors zero the struct first, so padding compares equal. */
+    cell_res_i8_f64_t z1 = cell_res_i8_f64_ok(7);
+    cell_res_i8_f64_t z2 = cell_res_i8_f64_ok(7);
+    CHECK(memcmp(&z1, &z2, sizeof(z1)) == 0);
 
-    cell_result_t u = cell_ok_u64(UINT64_MAX);
-    CHECK(u.value.u64 == UINT64_MAX);
-
-    cell_result_t b = cell_ok_bool(false);
-    CHECK(b.ok);
-    CHECK(b.value.b == false);
-
-    int marker = 0;
-    cell_result_t p = cell_ok_ptr(&marker);
-    CHECK(p.ok);
-    CHECK(p.value.ptr == &marker);
-
-    cell_result_t s = cell_ok_str(cell_str_from_cstr("payload"));
-    CHECK(s.ok);
-    CHECK(cell_str_eq(s.value.str, cell_str_from_cstr("payload")));
-
-    cell_result_t e = cell_err(7);
-    CHECK(!e.ok);
-    CHECK(e.error_code == 7);
-    CHECK(e.value.i64 == 0);
-    cell_result_t i32 = cell_ok_i32(-5);
-    CHECK(i32.ok);
-    CHECK(i32.error_code == 0);
-    CHECK((int32_t)i32.value.i64 == -5);
+    /* The deprecated legacy names still compile for one runtime version. */
+    cell_result_t legacy = cell_err(4);
+    CHECK(!legacy.ok && legacy.error_code == 4);
 }
 
 /* ------------------------------------------------------------------------ */

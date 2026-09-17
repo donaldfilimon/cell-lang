@@ -20,7 +20,7 @@
  */
 
 cell_string_t cell_rt_version(void) {
-    return cell_string_from_cstr("cell-rt 0.2.0 (c11, atomic arc)");
+    return cell_string_from_cstr("cell-rt 0.3.0 (c11, atomic arc)");
 }
 
 /* ------------------------------------------------------------------------ */
