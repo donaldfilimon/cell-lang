@@ -2275,7 +2275,18 @@ ways, and each is a real, documented gap rather than an oversight:
   `.jump` still holding a value. Codegen releases that binding after the
   closing `}`, moved-only. `examples/leaks/loop_cross.cell` measured 1000
   on both witnesses before and 0 after, pinned in the gate; ASan clean.
-  What still leaks, by design: a `return` inside the loop.
+  **CLOSED 2026-09-17: a `return` inside the loop.** The loop's poison
+  now skips `return` records: a `return` leaves the function, and in an
+  accepted loop R2.a makes every iteration start with each carried outer
+  binding holding a value, so the single walk's state at the `return` is
+  the state on every iteration. A loop that reported any error keeps its
+  `return` records poisoned, because codegen emits C for rejected modules
+  (falsified: dropping that re-poison fails the `back_edge` codegen pin).
+  A binding dead on loop entry and revived inside still leaks at a
+  `return` before its revival (the walk sees it dead). `examples/leaks/return_in_loop.cell`
+  measured 500 on both witnesses before and 0 after, pinned in the gate;
+  a probe with returns before the move, between move and revival, and
+  after the revival (1080 calls) measured 0 and ran ASan-clean.
   **CLOSED 2026-09-17: a skip-revival `break` whose place is never used
   after the loop.** borrowck records `ExitKind.after_loop_skip` when an
   outer binding of the current block is moved only as a whole, not by the
@@ -2314,9 +2325,9 @@ ways, and each is a real, documented gap rather than an oversight:
   matching field paths from `moved_paths` drop queries; `fieldWasMoved`
   is false for the revived field so the new value is released at scope
   end. `examples/leaks/field_revival.cell` measured 1000 before and 0
-  after, pinned in the gate. A `return` inside a loop still leaks (a
-  skip-revival `break` with no later use is released since 2026-09-17,
-  see the after-loop entry above); a skip-revival `continue` of a place
+  after, pinned in the gate. A skip-revival `break` with no later use and
+  a `return` inside an accepted loop are released since 2026-09-17 (see
+  the after-loop entry above); a skip-revival `continue` of a place
   declared outside the loop is refused by R2.a since 2026-09-16.
 
 Formerly out of scope and closed 2026-09-15: a `struct` with owning fields is now destroyed through generated per-struct drop glue (R11 row 2, above), so the paragraph that stood here is history. The partial-move case that stood here is closed as well (2026-09-16): a struct with one field moved out now has its remaining owning fields released, and a nested field whose sibling was moved is released by recursing that same partial drop. A field moved on only one branch is closed the same day (`branch_field.cell`): it is released on the keeping path from per-field exit liveness, not by drop flags. A field revived after it was moved is closed the same day (`field_revival.cell`): R3a retracts that path from `fieldWasMoved`.

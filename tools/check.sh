@@ -458,6 +458,10 @@ LEAK_LOOP_CROSS=0
 # revived after it). Measured 500 before (2026-09-17, ALLOC=2000
 # FREE=1500 LIVE=500); CLOSED the same day by after_loop_skip releases.
 LEAK_SKIP_REVIVAL_BREAK=0
+# R16 residual: a `return` inside a loop after the outer var's revival.
+# Measured 500 before (2026-09-17, ALLOC=2500 FREE=2000 LIVE=500); CLOSED
+# the same day by sparing an accepted loop's `return` records.
+LEAK_RETURN_IN_LOOP=0
 # R16 residual: a nested field whose sibling was moved. `p.inner.a` is
 # moved, and `fieldWasMoved` used to skip the whole `inner` field, so
 # `p.inner.b` leaked. Measured 1000 before (2026-09-16, ALLOC=3000
@@ -964,6 +968,7 @@ else
     run_c_leaks revived_record "" "$LEAK_REVIVED_RECORD" "R16 residual 4, CLOSED 2026-09-16 by record-revival admission; 1000 -> 0"
     run_c_leaks loop_cross "" "$LEAK_LOOP_CROSS" "R16 residual outer-while-var, CLOSED 2026-09-16 by after_loop releases; 1000 -> 0"
     run_c_leaks skip_revival_break "" "$LEAK_SKIP_REVIVAL_BREAK" "R16 residual skip-revival break, CLOSED 2026-09-17 by after_loop_skip releases; 500 -> 0"
+    run_c_leaks return_in_loop "" "$LEAK_RETURN_IN_LOOP" "R16 residual return inside a loop, CLOSED 2026-09-17 by live return records in accepted loops; 500 -> 0"
     run_c_leaks partial_nested_field "" "$LEAK_PARTIAL_NESTED_FIELD" "R16 residual nested partial field, CLOSED 2026-09-16 by recursive emitPartialRecordDrop; 1000 -> 0"
     run_c_leaks branch_field "" "$LEAK_BRANCH_FIELD" "R16 residual 1 at field granularity, CLOSED 2026-09-16 by branch-end field releases; 1000 -> 0"
     run_c_leaks field_revival "" "$LEAK_FIELD_REVIVAL" "R16 residual field revival, CLOSED 2026-09-16 by retracting the revived path from fieldWasMoved; 1000 -> 0"

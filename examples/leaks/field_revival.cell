@@ -6,9 +6,9 @@
 // field is 1000, not one.
 //
 // BEFORE: 1000. AFTER: 0. CLOSED 2026-09-16 by retracting the revived
-// field path from `fieldWasMoved`. A `return` inside a loop still leaks
-// (a skip-revival `break` is released since 2026-09-17, and a skip-revival
-// `continue` of an outer place is refused by R2.a).
+// field path from `fieldWasMoved`. A skip-revival `break` and a `return`
+// inside an accepted loop are released since 2026-09-17; a skip-revival
+// `continue` of an outer place is refused by R2.a.
 //
 // Status: parses, passes `cell check`; C only; lives under examples/leaks/.
 

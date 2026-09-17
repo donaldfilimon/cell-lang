@@ -1,0 +1,40 @@
+// R16 residual: a `return` inside a loop. The loop moves an outer var and
+// revives it; a `return` taken after the revival holds the revived value,
+// but the loop's end poisoned every in-loop exit record for that var, so
+// the `return` released nothing.
+//
+// `once(0)` returns at the first iteration after `take` and the revival:
+// one revived value leaked per call before the fix. `once(5)` leaves by the
+// condition, which `after_loop` already releases. 500 calls of each => 500.
+// Measured before the fix: leaks 500, counter LIVE=500. AFTER: 0.
+// CLOSED 2026-09-17 by keeping an accepted loop's `return` records live.
+//
+// Status: parses, passes `cell check`; C only; lives under examples/leaks/.
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn once(copy n: Int) {
+    var owned s: String = "aaaaaaaa"
+    var i = 0
+    while i < 2 {
+        i = i + 1
+        take(s)
+        s = "bbbbbbbb"
+        if i > n {
+            return
+        }
+    }
+}
+
+pub fn main() {
+    var i = 0
+    while i < 500 {
+        once(0)
+        once(5)
+        i = i + 1
+    }
+    print_int(i)
+}

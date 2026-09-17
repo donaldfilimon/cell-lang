@@ -83,7 +83,9 @@
 //! use is released after the loop (`after_loop_skip`, 2026-09-17), the
 //! dead `break` lowered as a `goto` past that release, because a C
 //! `break` there runs it on a moved buffer (ASan exit 134, measured);
-//! a `return` inside a loop still leaks (a skip-revival `continue`
+//! a `return` inside an accepted loop releases what the walk saw live
+//! there (2026-09-17; borrowck spares `return` records from the loop
+//! poison unless the loop reported an error) (a skip-revival `continue`
 //! of an outer place, and a skip-revival `break` followed by a use, are
 //! refused by borrowck's R2.a since 2026-09-16; before that they were
 //! accepted and ran as double frees, which no drop decision here caused);
@@ -7185,6 +7187,60 @@ test "a skip-revival break is lowered as a jump only where every release agrees"
     const plain = try fnDef(e.text, "with_plain");
     try expectAbsent(plain, "goto");
     try expectAbsent(plain, "cell_string_free(&v);");
+    try expectCompiles(e.text);
+}
+
+test "a return inside a loop releases an outer var only where it holds a value" {
+    // 2026-09-17: an accepted loop's `return` records stay live. `before`
+    // (live on every iteration: R2.a) and `after` (revived) release `v`
+    // at the return; `between` (moved, not yet revived) must not. The
+    // rejected-loop guard is pinned by `back_edge` above.
+    var e = try emitSource(
+        \\pub fn take(owned s: String);
+        \\pub fn before(copy n: Int) {
+        \\  var owned v: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    i = i + 1
+        \\    if i > n {
+        \\      return
+        \\    }
+        \\    take(v)
+        \\    v = "b"
+        \\  }
+        \\}
+        \\pub fn after(copy n: Int) {
+        \\  var owned v: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    i = i + 1
+        \\    take(v)
+        \\    v = "b"
+        \\    if i > n {
+        \\      return
+        \\    }
+        \\  }
+        \\}
+        \\pub fn between(copy n: Int) {
+        \\  var owned v: String = "a"
+        \\  var i = 0
+        \\  while i < 3 {
+        \\    i = i + 1
+        \\    take(v)
+        \\    if i > n {
+        \\      return
+        \\    }
+        \\    v = "b"
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    for ([_][]const u8{ "before", "after" }) |name| {
+        const body = try fnDef(e.text, name);
+        try expectLineBefore(body, "return;", "cell_string_free(&v);");
+    }
+    const between = try fnDef(e.text, "between");
+    try expectLineBefore(between, "return;", "if (i > n) {");
     try expectCompiles(e.text);
 }
 

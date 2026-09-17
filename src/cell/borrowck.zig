@@ -540,7 +540,8 @@ pub const Checker = struct {
     /// stay. So a binding declared outside a loop
     /// and moved anywhere in it (the condition included) is never live at an
     /// exit recorded inside that loop (cleared by `checkWhile` once the body
-    /// is walked) or at any exit after it (`loop_moved`). Bindings declared inside the loop body are
+    /// is walked; a `return` in a loop that reported no error is spared,
+    /// 2026-09-17) or at any exit after it (`loop_moved`). Bindings declared inside the loop body are
     /// fresh on every iteration, so the back edge carries none of their moves.
     exit_liveness: std.ArrayListUnmanaged(ExitLiveness) = .empty,
     /// Every `break` codegen must lower as a jump past its loop's
@@ -1066,6 +1067,9 @@ pub const Checker = struct {
         // value block that are as fresh per iteration as the body's own.
         const first_loop_id = self.next_binding_id;
         defer self.invalidateLoopStores(liveness_before, moved_before);
+        // Errors this loop reports (R2.a, anything in the body). A rejected
+        // loop keeps every in-loop exit poisoned, `return`s included.
+        const errors_before = self.diagnostics.count(.err);
 
         // A COPY, not an index: `revive` removes entries with `swapRemove`,
         // so an index into `dead` taken here can end up past a move the body
@@ -1137,11 +1141,18 @@ pub const Checker = struct {
         }
 
         // See `exit_liveness`: the back edge and every `break` can carry a
-        // move of an outer binding past the revival the walk saw.
+        // move of an outer binding past the revival the walk saw. A `return`
+        // is spared here (2026-09-17): it leaves the function, and in an
+        // ACCEPTED loop R2.a makes every iteration start with each carried
+        // outer binding holding a value, so the walk's state at the
+        // `return` is the state on every iteration. Re-poisoned below if
+        // this loop reported an error, because codegen emits C for rejected
+        // modules too.
         for (self.moved_paths.items[moved_before..]) |m| {
             if (m.binding >= first_loop_id) continue;
             try self.loop_moved.put(self.allocator, m.binding, {});
             for (self.exit_liveness.items[exits_before..]) |*entry| {
+                if (entry.kind == .return_stmt) continue;
                 if (entry.binding == m.binding) entry.live = false;
             }
         }
@@ -1163,6 +1174,15 @@ pub const Checker = struct {
                 "'{s}' is declared outside this loop; assign to it before the end of the body to revive it",
                 .{d.display},
             ));
+        }
+
+        if (self.diagnostics.count(.err) != errors_before) {
+            for (self.moved_paths.items[moved_before..]) |m| {
+                if (m.binding >= first_loop_id) continue;
+                for (self.exit_liveness.items[exits_before..]) |*entry| {
+                    if (entry.kind == .return_stmt and entry.binding == m.binding) entry.live = false;
+                }
+            }
         }
 
         // The code after the loop is reached from the body end (the walk's
@@ -5736,6 +5756,26 @@ fn firstJumpIn(stmts: []const ast.Stmt) ?usize {
     return null;
 }
 
+fn firstReturnIn(stmts: []const ast.Stmt) ?usize {
+    for (stmts) |*s| {
+        switch (s.kind) {
+            .return_stmt => return @intFromPtr(s),
+            .while_stmt => |w| if (firstReturnIn(w.body)) |k| return k,
+            .expr => |e| if (firstReturnInExpr(&e)) |k| return k,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn firstReturnInExpr(e: *const ast.Expr) ?usize {
+    return switch (e.kind) {
+        .block => |stmts| firstReturnIn(stmts),
+        .if_expr => |i| firstReturnInExpr(i.then_body) orelse if (i.else_body) |eb| firstReturnInExpr(eb) else null,
+        else => null,
+    };
+}
+
 fn firstJumpInExpr(e: *const ast.Expr) ?usize {
     return switch (e.kind) {
         .block => |stmts| firstJumpIn(stmts),
@@ -8860,6 +8900,48 @@ test "after_loop_skip is absent for a field move" {
     const key = h.firstWhile("field");
     try std.testing.expect(!h.checker.liveAtExit(.after_loop_skip, key, h.binding("q")));
     try std.testing.expect(!h.checker.loopHasSkipBreaks(key));
+}
+
+test "a return inside an accepted loop keeps the walk's liveness" {
+    // 2026-09-17. An accepted loop no longer poisons its `return` records:
+    // after the revival the value is live at the `return`.
+    var h: LiveHarness = try .init(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        v = "b"
+        \\        if i > n {
+        \\            return
+        \\        }
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    try std.testing.expect(h.checker.liveAtExit(.return_stmt, firstReturnIn(h.fnBody("f")).?, h.binding("v")));
+}
+
+test "a return between the move and the revival stays dead" {
+    var h: LiveHarness = try .init(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        if i > n {
+        \\            return
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    try std.testing.expect(!h.checker.liveAtExit(.return_stmt, firstReturnIn(h.fnBody("f")).?, h.binding("v")));
 }
 
 test "after_loop is absent when the condition moves the outer var" {
