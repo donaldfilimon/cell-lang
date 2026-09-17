@@ -511,12 +511,12 @@ pub const Checker = struct {
                             // mode where the payload is a scalar copy, is
                             // refused.
                             const known = payload != null and !payload.?.isUnknown();
-                            const owning = wp.ctor == .ok and known and payload.?.tag() == .string;
+                            const owning = (wp.ctor == .ok or wp.ctor == .err) and known and payload.?.tag() == .string;
                             var ownership: ast.Ownership = .copy;
                             var mode_ok = true;
                             if (wp.mode) |mode| {
-                                if (wp.ctor != .ok) {
-                                    try self.errf(arm.pattern.span, "a mode on 'Some'/'Err' payloads is not implemented", .{});
+                                if (wp.ctor != .ok and wp.ctor != .err) {
+                                    try self.errf(arm.pattern.span, "a mode on 'Some' payloads is not implemented", .{});
                                     mode_ok = false;
                                 } else if (wp.binding == null) {
                                     try self.errf(arm.pattern.span, "a wildcard binds nothing; remove '{s}'", .{@tagName(mode)});
@@ -532,7 +532,7 @@ pub const Checker = struct {
                                 }
                             } else if (owning) {
                                 if (wp.binding) |name| {
-                                    try self.errf(arm.pattern.span, "'Ok({s})' on an owning payload must say 'owned' or 'shared'", .{name});
+                                    try self.errf(arm.pattern.span, "'{s}({s})' on an owning payload must say 'owned' or 'shared'", .{ if (wp.ctor == .ok) "Ok" else "Err", name });
                                     mode_ok = false;
                                 }
                             }
@@ -610,8 +610,9 @@ pub const Checker = struct {
                     },
                     .err => {
                         // E is carried at its own width (cell_rt.h ABI 2), so
-                        // it must be a scalar or a payload-free enum.
-                        if (!isScalarPayload(payload) and payload.tag() != .enum_type) {
+                        // it must be a scalar, a payload-free enum, or an
+                        // owning String (sub-project 3, 2026-09-17).
+                        if (!isScalarPayload(payload) and payload.tag() != .enum_type and payload.tag() != .string) {
                             try self.errf(expr.span, "optional/Result payloads other than scalar primitives are not implemented", .{});
                             return try self.resultOf(types.t_unknown, types.t_unknown);
                         }
@@ -1213,6 +1214,37 @@ test "an owning payload binding must say owned or shared" {
     }
 }
 
+test "an owning String error is built by Err and bound with owned or shared" {
+    // Owning String in Err (sub-project 3, 2026-09-17).
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn mk(owned s: String) -> Result<Int, String> {
+        \\    return Err(s)
+        \\}
+        \\pub fn a(owned r: Result<Int, String>) -> Int {
+        \\    return match r { Ok(v) => v, Err(owned e) => 1 }
+        \\}
+        \\pub fn b(owned r: Result<Int, String>) -> Int {
+        \\    return match r { Ok(_) => 0, Err(shared e) => 2 }
+        \\}
+        \\pub fn c(owned r: Result<String, String>) -> Int {
+        \\    return match r { Ok(owned x) => 1, Err(shared e) => 2 }
+        \\}
+    );
+    try t.expectClean();
+    try expectOnlyMessage(
+        \\pub fn f(owned r: Result<Int, String>) -> Int {
+        \\    return match r { Ok(v) => v, Err(e) => 2 }
+        \\}
+    , "'Err(e)' on an owning payload must say 'owned' or 'shared'");
+    try expectOnlyMessage(
+        \\pub fn f(owned r: Result<String, String>) -> Int {
+        \\    return match r { Ok(x) => 1, Err(owned e) => 2 }
+        \\}
+    , "'Ok(x)' on an owning payload must say 'owned' or 'shared'");
+}
+
 test "a mode is refused where it means nothing" {
     try expectOnlyMessage(
         \\pub fn f(copy r: Result<Int, Int32>) -> Int {
@@ -1223,12 +1255,12 @@ test "a mode is refused where it means nothing" {
         \\pub fn f(copy o: Int?) -> Int {
         \\    return match o { Some(owned v) => v, None => 2 }
         \\}
-    , "a mode on 'Some'/'Err' payloads is not implemented");
+    , "a mode on 'Some' payloads is not implemented");
     try expectOnlyMessage(
         \\pub fn f(copy r: Result<Int, Int32>) -> Int {
         \\    return match r { Ok(v) => v, Err(shared e) => 2 }
         \\}
-    , "a mode on 'Some'/'Err' payloads is not implemented");
+    , "a scalar payload is copied; remove 'shared'");
     try expectOnlyMessage(owning_prelude ++
         \\pub fn f(owned r: Result<String, Int32>) -> Int {
         \\    return match r { Ok(owned _) => 1, Err(_) => 2 }
@@ -1265,7 +1297,7 @@ test "Ok and Err are checked against the declared Result" {
         \\}
     );
     try t.expectCount(2);
-    try t.expectDiag(0, .err, 5, 35, "optional/Result payloads other than scalar primitives are not implemented");
+    try t.expectDiag(0, .err, 5, 35, "cannot initialize a binding of type Result<Int, Int32> with a value of type Result<<unknown>, String>");
     try t.expectDiag(1, .err, 6, 19, "'Ok' needs a declared Result type here");
 }
 
