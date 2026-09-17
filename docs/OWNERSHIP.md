@@ -1250,6 +1250,23 @@ leaves (2026-09-17): a `return` all of them, a `break`/`continue` those
 created inside the loop it leaves; `examples/leaks/owned_string_optional.cell`
 covers both (0, and 3000 with those releases disabled).
 
+**CLOSED 2026-09-17: a `match` over an owned String temporary.** A plain
+owned `String` scrutinee (`match str_from_int(i) { "1" => 1, _ => 2 }`) was
+never released in C, because the temporary-scrutinee release above covered
+only owning Results and `String?`. A call's owned String scrutinee now joins
+the same stack and is released with `cell_string_free` at every arm end and
+on every early exit from an arm. `examples/leaks/match_string_temp.cell`
+(arm ends, a `return` and a loop `break` inside an arm) is pinned at 0 on
+both witnesses, 4997 with the release emptied, and ASan clean by hand. Only a
+CALL scrutinee is released: a `str` literal owns nothing, and a block or `if`
+of type String may name an existing owner, so those keep the leak. A binding
+arm (`x => ..`) over any tracked temporary is an alias borrowck lets the body
+move while codegen binds an undropped bitwise copy, so an arm whose body
+names the binding counts as having taken the temporary and releases nothing.
+That closed a measured double free (`match lookup(i) { x => eat(x) }` over a
+`String?` temporary, ASan exit 134 before) and leaves a disclosed leak when
+the body only reads the binding.
+
 **The IR backends insert no releases at all (measured 2026-09-17).** Both
 accept an owned `String` from a call (`let owned s = str_from_int(i)`, and an
 owned `var` reassigned from a call) and never free it, while the C backend

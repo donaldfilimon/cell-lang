@@ -1,9 +1,17 @@
-// A `match` over an owned String TEMPORARY leaks the temporary in C
-// (2026-09-17, found while grounding IR String step (c), its defect 4).
-// The temporary-scrutinee release (`owning_temps`, fdf36ed) covers owning
+// A `match` over an owned String TEMPORARY leaked the temporary in C
+// (2026-09-17, found while grounding IR String step (c), its defect 4):
+// the temporary-scrutinee release (`owning_temps`, fdf36ed) covered owning
 // Results and `String?` only, not a plain owned String matched against
 // string patterns. 1000 calls => 1000. The IR backends refuse a string
 // pattern on a temporary (it has no place to view), so this is C only.
+//
+// CLOSED 2026-09-17: a call's owned String scrutinee is released at every
+// arm end and on every early exit from an arm. Three shapes, 1000 times
+// each: arm ends (`once`), a `return` inside an arm (`early`), and a
+// `break` out of a loop from inside an arm (`loop_break`). Pinned at 0 on
+// both witnesses, and run by hand under AddressSanitizer (stage 9 does not
+// see examples/leaks/). A binding arm (`x => ..`) that names the value is
+// treated as having taken it and still leaks by design; it is not measured.
 //
 // Status: parses, passes `cell check`; lives under examples/leaks/.
 
@@ -17,11 +25,35 @@ pub fn once(copy i: Int) -> Int {
     }
 }
 
+pub fn early(copy i: Int) -> Int {
+    match str_from_int(i) {
+        "7" => {
+            return 7
+        },
+        _ => {},
+    }
+    return 0
+}
+
+pub fn loop_break(copy i: Int) -> Int {
+    var k = 0
+    while k < 3 {
+        k = k + 1
+        match str_from_int(i + k) {
+            "2" => {
+                break
+            },
+            _ => {},
+        }
+    }
+    return k
+}
+
 pub fn main() {
     var i = 0
     var n = 0
     while i < 1000 {
-        n = n + once(i)
+        n = n + once(i) + early(i) + loop_break(i)
         i = i + 1
     }
     print_int(n)

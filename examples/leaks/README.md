@@ -10,9 +10,9 @@ residuals (`branch_move`, `loop_jump_revival`, `value_block_revival`,
 pin; the owned scalar wrappers and the three owning-payload pins
 (`owned_string_result`, `owned_string_err`, `owned_string_optional`); and two
 regression pins for implemented features (`arc_box_move.cell` and
-`early_return.cell`, below); and four disclosed gaps found on 2026-09-17
+`early_return.cell`, below); and four gaps disclosed on 2026-09-17
 (`discarded_result`, `field_store_old`, `match_string_temp`,
-`unbound_list_temp`). Each isolates exactly one
+`unbound_list_temp`), of which `match_string_temp` closed the same day. Each isolates exactly one
 disclosed retain/release shape and loops it many times so a leak is a
 stable count, not noise.
 
@@ -62,7 +62,7 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `early_return.cell` | not a gap: a branch that always leaves keeps its moves out of the code after the `if` (2026-09-17); these shapes were refused before, so this is a regression pin at 0 |
 | `discarded_result.cell` | not a numbered row: an owned String call result discarded in statement position is freed by no backend; 2000 (1000 calls, two results), disclosed 2026-09-17 |
 | `field_store_old.cell` | not a numbered row: a store to an owned String field kept the old value unreleased in C; 1000, disclosed 2026-09-17. **CLOSED 2026-09-21:** 0 (`ALLOC=2000 FREE=2000`), ASan clean. A field store now pre-drops the old owned `String`/list value when borrowck vouches for the store (`field_assign_liveness`); an `exclusive` root, a record/optional/Result field and any store behind a loop move of the root keep the leak |
-| `match_string_temp.cell` | not a numbered row: a `match` with string patterns over an owned String temporary never releases it in C; 1000, disclosed 2026-09-17 |
+| `match_string_temp.cell` | not a numbered row: a `match` with string patterns over an owned String temporary never released it in C (1000, disclosed 2026-09-17); **CLOSED 2026-09-17** by releasing a call's owned String scrutinee at every arm end and on a `return`, `break` or `continue` from inside an arm. With an early `return` and a loop `break` added, 0 on both witnesses (4997 allocations), 4997 with the release emptied, ASan clean by hand. A binding arm that names the value keeps its leak by design |
 | `unbound_list_temp.cell` | not a numbered row: owned list temporaries passed to `shared` positions are never released in C; 2000 (1000 calls, two lists), disclosed 2026-09-17 |
 
 ## IR backend pins

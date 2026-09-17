@@ -408,6 +408,8 @@ or an existing refusal.
    - `owning_temps` tracks only `hasOwningGlue` shapes.
    - Both IR backends refuse this program, so there is no backend
      disagreement.
+   - CLOSED in C 2026-09-17: a call's owned String scrutinee joins
+     `owning_temps` (`examples/leaks/match_string_temp.cell` pinned at 0).
 
 5. **An MLIR `exclusive` argument that is a field place is passed as a
    spilled copy, so a write through it is lost. This is a silent wrong

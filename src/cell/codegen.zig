@@ -1715,8 +1715,19 @@ pub const Generator = struct {
             i -= 1;
             const t = self.owning_temps.items[i];
             if (t.loop_depth < min_depth or t.taken) continue;
-            try self.writeIndent(indent);
-            try self.writer.print("cell_drop_{s}(&{s});\n", .{ t.stem, t.name });
+            try self.emitTempRelease(indent, t.ty, t.name);
+        }
+    }
+
+    /// The one spelling of a temporary scrutinee's release, shared by the
+    /// arm end and the early exits: an owned String through the runtime, an
+    /// owning Result or `String?` through its per-module glue.
+    fn emitTempRelease(self: *Generator, indent: usize, ty: CType, name: []const u8) EmitError!void {
+        try self.writeIndent(indent);
+        if (ty.shape == .string) {
+            try self.writer.print("cell_string_free(&{s});\n", .{name});
+        } else {
+            try self.writer.print("cell_drop_{s}(&{s});\n", .{ glueStem(ty), name });
         }
     }
 
@@ -2265,11 +2276,11 @@ pub const Generator = struct {
         const outer_mark = self.locals.items.len;
         const scrut_inner = unwrapAnnotated(m.scrutinee);
         const scrut_is_temp = scrut_inner.kind != .ident and scrut_inner.kind != .field;
-        const tracks_temp = scrut_is_temp and hasOwningGlue(scrut_ty);
+        const tracks_temp = scrut_is_temp and ownsTempScrutinee(scrut_inner, scrut_ty);
         if (tracks_temp) {
             try self.owning_temps.append(self.arena, .{
                 .name = temp,
-                .stem = glueStem(scrut_ty),
+                .ty = scrut_ty,
                 .loop_depth = self.loop_marks.items.len,
             });
         }
@@ -2322,20 +2333,20 @@ pub const Generator = struct {
                 }
             }
             try out.writeAll(") {\n");
-            try self.emitArmBody(arm, temp, scrut_ty, dest, indent + 2, outer_mark, scrut_is_temp);
+            try self.emitArmBody(arm, temp, scrut_ty, dest, indent + 2, outer_mark, tracks_temp);
             tested += 1;
         }
 
         if (tested == 0) {
             // The first arm matches everything, so no test is emitted at all.
             if (default_arm) |arm| {
-                try self.emitArmBody(arm, temp, scrut_ty, dest, indent + 1, outer_mark, scrut_is_temp);
+                try self.emitArmBody(arm, temp, scrut_ty, dest, indent + 1, outer_mark, tracks_temp);
             }
         } else {
             try self.writeIndent(indent + 1);
             try out.writeAll("} else {\n");
             if (default_arm) |arm| {
-                try self.emitArmBody(arm, temp, scrut_ty, dest, indent + 2, outer_mark, scrut_is_temp);
+                try self.emitArmBody(arm, temp, scrut_ty, dest, indent + 2, outer_mark, tracks_temp);
             } else {
                 // Cell has no exhaustiveness checking, so an unmatched value
                 // aborts rather than falling through with a made-up result.
@@ -2358,17 +2369,26 @@ pub const Generator = struct {
         dest: ?Dest,
         indent: usize,
         arm_outer_mark: usize,
-        scrut_is_temp: bool,
+        tracks_temp: bool,
     ) EmitError!void {
         const mark = self.locals.items.len;
         defer self.locals.shrinkRetainingCapacity(mark);
         const outer_after = self.current_after;
-        const took = arm.pattern.kind == .wrap_pattern and
+        const took_payload = arm.pattern.kind == .wrap_pattern and
             arm.pattern.kind.wrap_pattern.mode == .owned and
             ((arm.pattern.kind.wrap_pattern.ctor == .ok and resultOkOwning(scrut_ty)) or
                 (arm.pattern.kind.wrap_pattern.ctor == .err and resultErrOwning(scrut_ty)) or
                 (arm.pattern.kind.wrap_pattern.ctor == .some and isOwningOptional(scrut_ty)));
-        if (scrut_is_temp and hasOwningGlue(scrut_ty)) {
+        // A binding arm (`x => ..`) over a temporary is an alias of it that
+        // borrowck lets the body MOVE (`ArmOrigin.temp`), while this backend
+        // binds a bitwise copy that is never dropped. Whether the body moved
+        // it is not asked here, so a binding arm that names the value counts
+        // as having taken it: a body that only reads `x` leaks the temporary,
+        // one that moves it is never double freed (2026-09-17).
+        const took_binding = arm.pattern.kind == .binding and
+            exprUses(arm.body, arm.pattern.kind.binding);
+        const took = took_payload or took_binding;
+        if (tracks_temp) {
             self.owning_temps.items[self.owning_temps.items.len - 1].taken = took;
         }
 
@@ -2463,12 +2483,7 @@ pub const Generator = struct {
         // An outer owner this arm kept while another arm moved it.
         try self.emitBranchEndDrops(key, arm_outer_mark, outer_after, indent);
         // A temporary owning scrutinee no arm binding took.
-        if (scrut_is_temp and hasOwningGlue(scrut_ty)) {
-            if (!took) {
-                try self.writeIndent(indent);
-                try self.writer.print("cell_drop_{s}(&{s});\n", .{ glueStem(scrut_ty), temp });
-            }
-        }
+        if (tracks_temp and !took) try self.emitTempRelease(indent, scrut_ty, temp);
     }
 
     /// Emit an expression for its effect, in statement position.
@@ -4427,6 +4442,17 @@ fn hasOwningGlue(t: CType) bool {
     return isOwningResult(t) or isOwningOptional(t);
 }
 
+/// Whether a `match` releases its temporary scrutinee `inner` of type `ty`.
+/// An owning Result or `String?` (fdf36ed), or an owned String a CALL
+/// returned (2026-09-17): a call's declared return type lowers `owned`, so
+/// the value has no other owner. A `str` view (a literal) owns nothing, and
+/// other String-typed expressions (a block, an `if`) may name an existing
+/// owner, so they keep the leak.
+fn ownsTempScrutinee(inner: *const ast.Expr, ty: CType) bool {
+    if (hasOwningGlue(ty)) return true;
+    return inner.kind == .call and ty.shape == .string and !ty.pointer;
+}
+
 /// `res_i64_string` for `cell_res_i64_string_t`, `opt_string` for
 /// `cell_opt_string_t`: the part after `cell_drop_`.
 fn glueStem(t: CType) []const u8 {
@@ -4499,7 +4525,7 @@ const Exit = struct {
 
 const OwningTemp = struct {
     name: []const u8,
-    stem: []const u8,
+    ty: CType,
     loop_depth: usize,
     taken: bool = false,
 };
@@ -8238,6 +8264,98 @@ test "a temporary owning scrutinee is released when its arm leaves early" {
     try expectOccurrences(tk, "cell_drop_opt_string(&_cell_t", 1);
     const lx = try fnDef(e.text, "loop_exit");
     try expectOccurrences(lx, "cell_drop_opt_string(&_cell_t", 2);
+    try expectCompiles(e.text);
+}
+
+test "a temporary owned String scrutinee is released once on every path out" {
+    // 2026-09-17: `match str_from_int(i) { "1" => 1, _ => 2 }` never freed
+    // the temporary (examples/leaks/match_string_temp.cell, 1000). String
+    // patterns bind nothing, so every arm end and every early exit releases
+    // it. A binding arm (`x => ...`) is an alias borrowck lets the body move,
+    // so it is treated as taken and keeps the leak rather than risk a double
+    // free. A `str` scrutinee (a literal) owns nothing and is never freed.
+    var e = try emitSource(
+        \\pub fn str_from_int(copy v: Int) -> String;
+        \\pub fn take(owned s: String);
+        \\pub fn once(copy i: Int) -> Int {
+        \\  return match str_from_int(i) {
+        \\    "1" => 1,
+        \\    _ => 2,
+        \\  }
+        \\}
+        \\pub fn early(copy i: Int) -> Int {
+        \\  match str_from_int(i) {
+        \\    "1" => {
+        \\      return 1
+        \\    },
+        \\    _ => {},
+        \\  }
+        \\  return 0
+        \\}
+        \\pub fn loop_exit(copy n: Int) -> Int {
+        \\  var i = 0
+        \\  while i < n {
+        \\    i = i + 1
+        \\    match str_from_int(i) {
+        \\      "3" => {
+        \\        break
+        \\      },
+        \\      _ => {
+        \\        continue
+        \\      },
+        \\    }
+        \\  }
+        \\  return i
+        \\}
+        \\pub fn bound(copy i: Int) {
+        \\  match str_from_int(i) {
+        \\    x => take(x),
+        \\  }
+        \\}
+        \\pub fn literal() -> Int {
+        \\  return match "a" {
+        \\    "a" => 1,
+        \\    _ => 2,
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    // One per arm end.
+    try expectOccurrences(try fnDef(e.text, "once"), "cell_string_free(&_cell_t", 2);
+    // Before the early return, and at the end of the `_` arm.
+    try expectOccurrences(try fnDef(e.text, "early"), "cell_string_free(&_cell_t", 2);
+    // Before the `break` and before the `continue`.
+    try expectOccurrences(try fnDef(e.text, "loop_exit"), "cell_string_free(&_cell_t", 2);
+    try expectAbsent(try fnDef(e.text, "bound"), "cell_string_free(");
+    try expectAbsent(try fnDef(e.text, "literal"), "cell_string_free(");
+    try expectCompiles(e.text);
+}
+
+test "a binding arm that moves a temporary owning scrutinee does not release it" {
+    // 2026-09-17, measured: before the binding rule, `match lookup(i) { x =>
+    // eat(x) }` released the `String?` temporary at the arm end after `eat`
+    // had freed it, a double free AddressSanitizer reported (exit 134).
+    // borrowck accepts the move (the scrutinee has no place), and this
+    // backend binds `x` as an undropped bitwise copy, so a binding arm that
+    // names the value counts as having taken it. One that never names it
+    // still releases the temporary.
+    var e = try emitSource(
+        \\pub fn lookup(copy n: Int) -> String?;
+        \\pub fn eat(owned o: String?) -> Int;
+        \\pub fn moved(copy i: Int) -> Int {
+        \\  return match lookup(i) {
+        \\    x => eat(x),
+        \\  }
+        \\}
+        \\pub fn unnamed(copy i: Int) -> Int {
+        \\  return match lookup(i) {
+        \\    x => 0,
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    try expectAbsent(try fnDef(e.text, "moved"), "cell_drop_opt_string(&_cell_t");
+    try expectOccurrences(try fnDef(e.text, "unnamed"), "cell_drop_opt_string(&_cell_t", 1);
     try expectCompiles(e.text);
 }
 
