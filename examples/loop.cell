@@ -1,0 +1,34 @@
+// `loop { }` is `while true { }` and nothing else (SPEC 7.6, D-F1 ruled
+// 2026-09-21). It is a statement, it carries no value, and `break` inside it
+// takes no value. The parser builds the same `while_stmt` a `while true`
+// would, so every checker and backend sees one construct, not two; the
+// `loop and while true` test in src/root.zig pins that the emitted C, LLVM IR
+// and MLIR are byte-identical.
+//
+// All three backends print 21:
+//   cell emit               examples/loop.cell   -> C
+//   cell emit --target=llvm examples/loop.cell   -> LLVM IR
+//   cell emit --target=mlir examples/loop.cell   -> MLIR
+//
+// 21 is 1+2+3+4+5+6, the sum `sum_until` reaches before its `break`.
+
+pub fn print_int(copy value: Int);
+
+/// A `loop` leaves only through `break` (or `return`).
+pub fn sum_until(copy limit: Int) -> Int {
+    var total = 0
+    var i = 0
+    loop {
+        i = i + 1
+        if i > limit {
+            break
+        }
+        total = total + i
+    }
+    return total
+}
+
+// EXPECT-OUTPUT: 21
+pub fn main() {
+    print_int(sum_until(copy 6))
+}

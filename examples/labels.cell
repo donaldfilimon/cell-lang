@@ -1,0 +1,92 @@
+// Labelled loops (SPEC 7.7, D-F2 ruled 2026-09-21): `name: while c { }` or
+// `name: loop { }`, and `break :name` / `continue :name` from anywhere inside
+// it, including from inside a nested loop. The spelling is Zig's.
+//
+// All three backends print 227:
+//   cell emit               examples/labels.cell   -> C
+//   cell emit --target=llvm examples/labels.cell   -> LLVM IR
+//   cell emit --target=mlir examples/labels.cell   -> MLIR
+//
+// 227 = 206 (find_pair) + 12 (count_rows) + 9 (moved_then_continue).
+
+pub fn print_int(copy value: Int);
+pub fn str_from_int(copy v: Int) -> String;
+pub fn str_len(shared s: String) -> Int;
+
+pub fn take(owned s: String) -> Int {
+    return str_len(s)
+}
+
+/// `break :outer` leaves both loops at once. The first pair whose product is
+/// `target` is 2 * 6, so this returns 206.
+pub fn find_pair(copy target: Int) -> Int {
+    var found = 0
+    var i = 0
+    outer: while i < 10 {
+        i = i + 1
+        var j = 0
+        while j < 10 {
+            j = j + 1
+            if i * j == target {
+                found = i * 100 + j
+                break :outer
+            }
+        }
+    }
+    return found
+}
+
+/// `continue :outer` skips the rest of the outer body, so `rows + 1000`
+/// never runs. Each of the `n` outer iterations adds 1 + 2, so this
+/// returns 12 for n = 4.
+pub fn count_rows(copy n: Int) -> Int {
+    var rows = 0
+    var i = 0
+    outer: while i < n {
+        i = i + 1
+        var j = 0
+        while j < n {
+            j = j + 1
+            rows = rows + j
+            if j == 2 {
+                continue :outer
+            }
+        }
+        rows = rows + 1000
+    }
+    return rows
+}
+
+/// `loop` with a label, a labelled `break` that names the innermost loop
+/// (a plain `break` in every backend), and the case docs/OWNERSHIP.md R2.a
+/// accepts: `v` is declared inside the outer body, so `continue :outer`
+/// after moving it is fine, because the next outer iteration declares a
+/// fresh `v`. R2.a asks only the loop a jump targets. Each of the three
+/// outer iterations adds 1 and then `take`s a two-digit string, so this
+/// returns 9.
+pub fn moved_then_continue() -> Int {
+    var total = 0
+    var i = 0
+    outer: loop {
+        i = i + 1
+        if i > 3 {
+            break :outer
+        }
+        let owned v = str_from_int(i * 10)
+        var j = 0
+        while j < 5 {
+            j = j + 1
+            if j == 2 {
+                total = total + take(v)
+                continue :outer
+            }
+            total = total + j
+        }
+    }
+    return total
+}
+
+// EXPECT-OUTPUT: 227
+pub fn main() {
+    print_int(find_pair(copy 12) + count_rows(copy 4) + moved_then_continue())
+}

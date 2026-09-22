@@ -526,8 +526,9 @@ never collide with a user enum's variants (section 9).
 ### 2.5 Reserved for future use
 
 **Status: implemented.** These lex as keywords as of the union stage recorded
-in 0.8. None of them has a parser rule yet, which is the point: using one as a
-name is now a parse error rather than a silent misreading.
+in 0.8. `while`, `break`, `continue` (section 7.6, 7.7) and, since 2026-09-22,
+`loop` have parser rules; the rest have none, which is the point: using one as
+a name is a parse error rather than a silent misreading.
 
 The following are reserved by this specification so that programs do not come
 to depend on using them as names:
@@ -1615,12 +1616,24 @@ unused-result diagnostic, which is half of the `while` trap in section 2.5.
 
 ### 7.6 Loops
 
-**Status: implemented (`while`). `for` and `loop` are designed, not
-implemented.**
+**Status: implemented (`while`, and `loop` since 2026-09-22). `for` is
+designed, not implemented, and deferred by ruling (D-F4).**
 
 ```
+loop_stmt  = [ label ":" ] ( while_stmt | loop )
 while_stmt = "while" expr_no_struct_lit block
+loop       = "loop" block
 ```
+
+`loop { B }` means exactly `while true { B }` (ruled 2026-09-21, D-F1). It is
+a statement, like `while`, and there is no `break` with a value. The parser
+builds the same node for both, with a `true` condition spanning the `loop`
+keyword, so no checker or backend can treat them differently: the C, LLVM IR
+and MLIR they emit are byte-identical (pinned in `src/root.zig`).
+`examples/loop.cell` prints 21 through all three backends. Like `while true`,
+a `loop` whose body always `return`s still needs a `return` after it in a
+function declared to return a value: the missing-return check does not reason
+about loops.
 
 ```cell
 var i = 0
@@ -1640,7 +1653,7 @@ a value from its branches; a loop produces nothing, and modelling it as an
 expression would force a unit value. `()` is a return type only (section 3.5);
 unit values are not first-class.
 
-`for`, `loop`, and iteration over a collection remain designed. There is no
+`for` and iteration over a collection remain designed. There is no
 iteration protocol and no range value, so `for` needs both before it needs
 syntax. (Postfix indexing `a[i]` exists since 2026-09-21, section 6.11, C
 backend only; this sentence used to say there was no indexing operator.)
@@ -1653,34 +1666,64 @@ covers every path, not only the end of the body: a `continue`, a `break`,
 and the condition (see 7.7), with
 `examples/rejected/skip_revival_jump.cell` as the worked case.
 
-### 7.7 `break` and `continue`
+### 7.7 `break`, `continue` and labels
 
-**Status: implemented.**
+**Status: implemented; labels since 2026-09-22 (D-F2), on all three
+backends.**
 
 ```
-break_stmt    = "break"
-continue_stmt = "continue"
+break_stmt    = "break" [ ":" label ]
+continue_stmt = "continue" [ ":" label ]
+label         = ident
 ```
 
-Both apply to the innermost enclosing `while`. Using either outside a loop is
-an error reported by the typechecker, so the diagnostic points at Cell source
-rather than at emitted C:
+A plain `break` or `continue` applies to the innermost enclosing loop. A loop
+may carry a label, written Zig's way before `while` or `loop`
+(`outer: while c { }`, `outer: loop { }`), and `break :outer` /
+`continue :outer` then apply to the innermost enclosing loop with that label,
+from any depth inside it. `examples/labels.cell` prints 227 through all three
+backends. Using either jump outside a loop, naming a label no enclosing loop
+carries, or repeating a label an enclosing loop already has, is an error
+reported by the typechecker, so the diagnostic points at Cell source rather
+than at emitted code:
 
 > `err: 'break' is only valid inside a loop`
+> `err: no enclosing loop is labelled 'outr'`
+> `err: label 'outer' is already used by an enclosing loop`
+> `note: the enclosing loop labelled 'outer' is here`
 
-Neither carries a value and neither takes a label. Labelled loops are not
-designed.
+Sibling loops may reuse a label, because neither encloses the other, and a
+label nothing jumps to is allowed. A loop's condition is checked before its
+body is entered, so a jump inside the condition belongs to the loop around
+it, not to the loop the condition controls. Neither jump carries a value, and
+labelled blocks (`blk: { .. break :blk v }`) are not part of the language.
+
+**How a labelled jump is lowered.** `hir.lower` resolves the label once, to
+the number of loops the jump leaves beyond the innermost (0 is a plain jump),
+and every IR consumer indexes its loop stack with it: the CFG adds its edge to
+the target loop's exit or condition, and LLVM and MLIR branch to the target's
+end or condition block. The C backend releases every owning local declared
+since the TARGET loop's body opened, and every untaken owning temporary made
+inside it, then jumps: `goto cell_brk_<n>` lands right after that loop, before
+anything that runs after it, and `goto cell_cont_<n>` lands at the end of the
+loop's own block, outside the block that holds its body, so the jump crosses
+no declaration. A labelled jump that names the innermost loop is a plain
+`break` or `continue`. The leak fixtures `examples/leaks/labelled_break.cell`
+and `labelled_continue.cell` pin C at 0 on both witnesses; LLVM and MLIR free
+nothing yet (no IR drop pass), and their pins join the default-target flip
+criterion.
 
 **Both carry an ownership rule** (`docs/OWNERSHIP.md` R2.a, jump clause,
-2026-09-16). A `continue` reached while a place declared outside the loop is
-moved and not yet revived is refused, because the next iteration would use
-it after the move:
+2026-09-16), asked of the loop the jump TARGETS and of no loop in between
+(2026-09-22). A `continue` reached while a place declared outside its target
+loop is moved and not yet revived is refused, because the next iteration of
+that loop would use it after the move:
 
 > `err: 'v' is moved inside a loop, so the next iteration would use it after the move`
 > `note: this 'continue' is reached before 'v' is assigned again`
 
-A `break` taken in that state is accepted, but the place is dead after the
-loop, so a later use is an ordinary use-after-move (R2). A move in the
+A `break` taken in that state is accepted, but the place is dead after its
+target loop, so a later use is an ordinary use-after-move (R2). A move in the
 `while` condition counts as a move inside the loop, and a place is dead after
 the loop when it is dead on any path out, including a body that runs zero
 times. Before 2026-09-16 all of these were accepted and ran as double frees.
@@ -2172,7 +2215,8 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | `_` reserved as a wildcard outside patterns | designed, not implemented |
 | Unicode identifiers | designed, not implemented |
 | Keywords (43 in the lexer's table) | implemented |
-| Reserved words that are lexed and NOT implemented (`for`, `loop`, `async`, `await`, `defer`, `impl`, `trait`, ...) | designed, not implemented |
+| Reserved words that are lexed and NOT implemented (`for`, `async`, `await`, `defer`, `impl`, `trait`, ...) | designed, not implemented |
+| `loop` | implemented 2026-09-22: parses as `while true` (7.6) |
 | `while` | implemented: it was in this row as a reserved word long after loops landed |
 | Decimal integer literal | implemented |
 | Hex / binary / octal literal | implemented |
@@ -2289,6 +2333,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Expression statement | implemented |
 | Unused-result diagnostic | designed, not implemented |
 | Loops and `break` / `continue` | implemented: `while`, `break` and `continue` on all three backends (FEATURES.md FLOW-02); `for`, `loop` and labels are FLOW-03, still reserved |
+| `loop`, loop labels, `break :label` / `continue :label` | implemented 2026-09-22 on all three backends (7.6, 7.7) |
 
 ### Items
 

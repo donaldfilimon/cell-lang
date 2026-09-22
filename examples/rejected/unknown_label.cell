@@ -1,0 +1,22 @@
+// EXPECT: currently-rejected
+// Violates: SPEC 7.7 (a labelled `break` or `continue` must name an enclosing
+// loop).
+//
+// `outr` is a typo for `outer`. The typechecker refuses it at the jump,
+// rather than letting any stage guess that the innermost loop was meant:
+//
+//   error: no enclosing loop is labelled 'outr'
+//
+// A label on a sibling loop that has already ended does not count either;
+// only loops that ENCLOSE the jump do. The text is pinned by the typecheck
+// test "a jump naming no enclosing loop is reported at the jump".
+
+pub fn main() {
+    var i = 0
+    outer: while i < 3 {
+        i = i + 1
+        loop {
+            break :outr
+        }
+    }
+}

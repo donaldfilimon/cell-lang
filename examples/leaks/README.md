@@ -1,7 +1,8 @@
 # `examples/leaks/`
 
-Thirty-one fixtures, twenty-nine measured on the C backend and two IR
-backend pins (below). The C ones are: R11's measurable gaps and their CLOSED
+Thirty-three fixtures: twenty-nine measured on the C backend only, two IR
+backend pins, and two FLOW-03 labelled-jump fixtures measured on all three
+backends (both below). The C ones are: R11's measurable gaps and their CLOSED
 pins (seven, including the value-block residual and the `owned` twin of row
 5); R16's revival leak (`revived_var.cell`, closed 2026-09-16) and ten closed
 residuals (`branch_move`, `loop_jump_revival`, `value_block_revival`,
@@ -80,6 +81,12 @@ landed.
 |---|---|
 | `ir_owned_string.cell` | owned Strings the IR backends accepted before any conversion existed: C 0, LLVM and MLIR 3000 (2026-09-17) |
 | `ir_string_conversion.cell` | the eight borrowed-view to owned-`String` positions of `examples/owned_string.cell`, which the IR backends convert through `cell_string_from_str` since IR String step (a): nine allocations per call, C 0, LLVM and MLIR 9000 (2026-09-17) |
+| `labelled_break.cell` | FLOW-03: `break :outer` from a nested loop crossing an owning local in each body; C releases both on the jump, 0 on both witnesses (a requirement, spec invariant 13); LLVM and MLIR 3000 (2026-09-22) |
+| `labelled_continue.cell` | FLOW-03: `continue :outer` from a nested loop, the same shape; C 0 on both witnesses; LLVM and MLIR 6000 (2026-09-22) |
+
+Every LLVM/MLIR pin here is part of the default-target flip criterion
+(`docs/superpowers/specs/2026-09-21-mod02-flow03-ir-first-design.md`,
+Rulings): `--target` flips from C to LLVM only when all of them read 0.
 
 `tools/check.sh` also measures `examples/owned_string.cell` itself with its
 host in this stage: C 0, LLVM and MLIR 8 (nine allocations, one freed by the

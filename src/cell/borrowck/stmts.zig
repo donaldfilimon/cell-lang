@@ -119,6 +119,7 @@ pub fn checkWhile(self: *Checker, stmt: *const ast.Stmt) Error!void {
     // The frame is pushed after the condition: a jump in a condition's
     // value block is counted by typecheck against the enclosing loop.
     try self.loop_frames.append(self.allocator, .{
+        .label = w.label,
         .first_loop_id = first_loop_id,
         .entry = entry_dead.items,
     });
@@ -374,15 +375,34 @@ pub fn invalidateLoopStores(self: *Checker, liveness_before: usize, moved_before
     }
 }
 
-/// R2.a at a `continue`: the jump reaches the next iteration, so every
-/// move the frame carries is a use-after-move there, exactly as it would
-/// be at the end of the body. The body end never sees this path when a
-/// revival follows the `continue`.
-pub fn checkContinue(self: *Checker, span: Span) Error!void {
-    const n = self.loop_frames.items.len;
-    // Typecheck refuses a jump outside a loop.
-    if (n == 0) return;
-    const frame = &self.loop_frames.items[n - 1];
+/// The frame a jump targets: the innermost for a plain jump, the innermost
+/// frame carrying `label` otherwise. Null outside a loop and for a label no
+/// enclosing loop carries: typecheck refuses both, and this checker runs
+/// independently of it, so neither may crash here. The pointer is into
+/// `loop_frames` and stays valid until the next push, which no caller makes
+/// while holding it.
+pub fn jumpTarget(self: *Checker, label: ?[]const u8) ?*LoopFrame {
+    const frames = self.loop_frames.items;
+    if (frames.len == 0) return null;
+    const name = label orelse return &frames[frames.len - 1];
+    var i = frames.len;
+    while (i > 0) {
+        i -= 1;
+        const l = frames[i].label orelse continue;
+        if (std.mem.eql(u8, l, name)) return &frames[i];
+    }
+    return null;
+}
+
+/// R2.a at a `continue`: the jump reaches the next iteration of its TARGET
+/// loop, so every move that frame carries is a use-after-move there,
+/// exactly as it would be at the end of that loop's body. The body end
+/// never sees this path when a revival follows the `continue`. A
+/// `continue :outer` asks the outer frame only: a place declared inside
+/// the outer body is not carried by it (the next outer iteration declares
+/// it afresh), and the inner loops it leaves never reach their back edge.
+pub fn checkContinue(self: *Checker, span: Span, label: ?[]const u8) Error!void {
+    const frame = self.jumpTarget(label) orelse return;
     for (self.dead.items) |d| {
         if (!frame.carries(d)) continue;
         if (containsDead(frame.reported.items, d)) continue;
@@ -400,15 +420,14 @@ pub fn checkContinue(self: *Checker, span: Span) Error!void {
     }
 }
 
-/// A `break` leaves the loop in the state it was taken in, which the
-/// body end never sees when a revival follows it. Every outer dead
+/// A `break` leaves its TARGET loop in the state it was taken in, which
+/// the body end never sees when a revival follows it. Every outer dead
 /// entry is kept, including one already dead on entry: the `break` path
-/// also skips a later revival of that one.
-pub fn saveBreakState(self: *Checker) Error!void {
-    const n = self.loop_frames.items.len;
-    // Typecheck refuses a jump outside a loop.
-    if (n == 0) return;
-    const frame = &self.loop_frames.items[n - 1];
+/// also skips a later revival of that one. A `break :outer` saves into the
+/// outer frame only; the loops in between never reach their after-loop
+/// point on this path.
+pub fn saveBreakState(self: *Checker, label: ?[]const u8) Error!void {
+    const frame = self.jumpTarget(label) orelse return;
     for (self.dead.items) |d| {
         if (d.binding >= frame.first_loop_id) continue;
         if (containsDead(frame.break_dead.items, d)) continue;
@@ -435,16 +454,15 @@ pub fn checkStmtKind(self: *Checker, stmt: *const ast.Stmt) Error!void {
         // each is a path the body end never sees. R2.a is asked at a
         // `continue` (the next iteration), and a `break`'s state is
         // unioned into `dead` after the loop. See `checkWhile`.
-        .break_stmt => {
-            try self.saveBreakState();
-            if (self.loop_frames.items.len > 0) {
-                const frame = &self.loop_frames.items[self.loop_frames.items.len - 1];
+        .break_stmt => |j| {
+            try self.saveBreakState(j.label);
+            if (self.jumpTarget(j.label)) |frame| {
                 try frame.breaks.append(self.allocator, @intFromPtr(stmt));
             }
             try self.recordExit(.jump, @intFromPtr(stmt));
         },
-        .continue_stmt => {
-            try self.checkContinue(stmt.span);
+        .continue_stmt => |j| {
+            try self.checkContinue(stmt.span, j.label);
             try self.recordExit(.jump, @intFromPtr(stmt));
         },
         .let => |*l| try self.checkLet(l, stmt.span),

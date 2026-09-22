@@ -287,19 +287,24 @@ const Builder = struct {
                 }
             },
             .while_loop => |w| try self.lowerWhile(w),
-            .brk => try self.lowerJump(.brk),
-            .cont => try self.lowerJump(.cont),
+            .brk => |depth| try self.lowerJump(.brk, depth),
+            .cont => |depth| try self.lowerJump(.cont, depth),
         }
     }
 
-    fn lowerJump(self: *Builder, kind: enum { brk, cont }) CfgError!void {
+    /// `depth` is the HIR payload: loops left beyond the innermost, so the
+    /// target is `loops[len - 1 - depth]`. A labelled `break` gets an edge to
+    /// the OUTER loop's exit and a labelled `continue` one to its condition;
+    /// the loops in between get no edge from this path at all.
+    fn lowerJump(self: *Builder, kind: enum { brk, cont }, depth: u32) CfgError!void {
         const c = self.cur orelse return;
-        // `break`/`continue` outside a loop are already rejected by
-        // `typecheck.zig`, so a loop context is always open here; a fixture
-        // that violates this is a bug in the fixture, and the assert says so
-        // plainly instead of building a silently wrong graph.
-        std.debug.assert(self.loops.items.len > 0);
-        const target = self.loops.items[self.loops.items.len - 1];
+        // `break`/`continue` outside a loop, and a label no enclosing loop
+        // carries, are already rejected by `typecheck.zig`, so the target
+        // loop context is always open here; a fixture that violates this is
+        // a bug in the fixture, and the assert says so plainly instead of
+        // building a silently wrong graph.
+        std.debug.assert(self.loops.items.len > depth);
+        const target = self.loops.items[self.loops.items.len - 1 - depth];
         const to = switch (kind) {
             .brk => target.exit,
             .cont => target.cond,
@@ -776,8 +781,8 @@ test "break targets the loop exit, continue targets the condition" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .brk };
-    var cont_stmt = hir.Stmt{ .span = test_span, .kind = .cont };
+    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
+    var cont_stmt = hir.Stmt{ .span = test_span, .kind = .{ .cont = 0 } };
     var then_body = oneStmtBlock(&brk_stmt);
     var else_body = oneStmtBlock(&cont_stmt);
     var if_cond = boolExpr(true);
@@ -824,8 +829,8 @@ test "a fully-diverging if/else inside a loop leaves the condition block's preds
     defer arena.deinit();
     const a = arena.allocator();
 
-    var brk1 = hir.Stmt{ .span = test_span, .kind = .brk };
-    var brk2 = hir.Stmt{ .span = test_span, .kind = .brk };
+    var brk1 = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
+    var brk2 = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
     var then_body = oneStmtBlock(&brk1);
     var else_body = oneStmtBlock(&brk2);
     var if_cond = boolExpr(true);
@@ -1047,7 +1052,7 @@ test "nested control flow: an if inside a while inside a match arm" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .brk };
+    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
     var if_then = oneStmtBlock(&brk_stmt);
     var if_cond = boolExpr(true);
     const if_e = unitExpr(.{ .if_expr = .{
@@ -1089,4 +1094,67 @@ test "nested control flow: an if inside a while inside a match arm" {
     for (g.blocks) |b| {
         try std.testing.expect(b.term != .unreachable_);
     }
+}
+
+test "a labelled break targets the outer loop's exit, a labelled continue its condition" {
+    // `outer: while { while { if c { break :outer } else { continue :outer } } }`,
+    // as HIR hands it over: depth 1 on both jumps. The inner loop gets no
+    // edge from either path; only its own condition reaches its exit.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .{ .brk = 1 } };
+    var cont_stmt = hir.Stmt{ .span = test_span, .kind = .{ .cont = 1 } };
+    var then_body = oneStmtBlock(&brk_stmt);
+    var else_body = oneStmtBlock(&cont_stmt);
+    var if_cond = boolExpr(true);
+    const if_e = unitExpr(.{ .if_expr = .{
+        .cond = &if_cond,
+        .then_body = &then_body,
+        .else_body = &else_body,
+    } });
+    var inner_body = [_]hir.Stmt{exprStmt(if_e)};
+    const inner_cond = boolExpr(true);
+    var outer_body = [_]hir.Stmt{
+        .{ .span = test_span, .kind = .{ .while_loop = .{ .cond = inner_cond, .body = &inner_body } } },
+    };
+    const outer_cond = boolExpr(true);
+    var stmts = [_]hir.Stmt{
+        .{ .span = test_span, .kind = .{ .while_loop = .{ .cond = outer_cond, .body = &outer_body } } },
+    };
+    const f = testFn(&stmts);
+
+    const g = (try build(a, &f)).?;
+    try assertPredsSuccsAgree(g);
+
+    const entry = findBlock(g, g.entry);
+    const outer_cond_b = findBlock(g, entry.succs[0]);
+    const outer_body_b = findBlock(g, outer_cond_b.succs[0]);
+    const outer_exit_b = findBlock(g, outer_cond_b.succs[1]);
+    const inner_cond_b = findBlock(g, outer_body_b.succs[0]);
+    const inner_body_b = findBlock(g, inner_cond_b.succs[0]);
+    const inner_exit_b = findBlock(g, inner_cond_b.succs[1]);
+    try std.testing.expectEqual(BlockKind.while_cond, inner_cond_b.kind);
+
+    try std.testing.expectEqual(Terminator.branch, inner_body_b.term);
+    const then_b = findBlock(g, inner_body_b.succs[0]);
+    const else_b = findBlock(g, inner_body_b.succs[1]);
+    try std.testing.expectEqual(Terminator.goto, then_b.term);
+    try std.testing.expectEqual(outer_exit_b.id, then_b.succs[0]);
+    try std.testing.expectEqual(Terminator.goto, else_b.term);
+    try std.testing.expectEqual(outer_cond_b.id, else_b.succs[0]);
+
+    // The inner exit is reached only by the inner condition failing, and
+    // falls through to the outer back edge.
+    try std.testing.expectEqual(@as(usize, 1), inner_exit_b.preds.len);
+    try std.testing.expectEqual(inner_cond_b.id, inner_exit_b.preds[0]);
+    try std.testing.expectEqual(outer_cond_b.id, inner_exit_b.succs[0]);
+    // Every path through the inner body jumps, so its condition is entered
+    // once from the outer body and never from a back edge.
+    try std.testing.expectEqual(@as(usize, 1), inner_cond_b.preds.len);
+    // The outer condition: entry, the labelled continue, the inner exit.
+    try std.testing.expectEqual(@as(usize, 3), outer_cond_b.preds.len);
+    // The outer exit: its own condition failing, and the labelled break.
+    try std.testing.expectEqual(@as(usize, 2), outer_exit_b.preds.len);
 }

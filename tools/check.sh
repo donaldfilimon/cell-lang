@@ -532,6 +532,18 @@ LEAK_BRANCH_FIELD=0
 # LIVE=1000); CLOSED the same day by R3a retracting the revived field
 # path from `fieldWasMoved`, 1000 -> 0.
 LEAK_FIELD_REVIVAL=0
+# FLOW-03 labelled jumps (2026-09-22): `break :outer` and `continue :outer`
+# from inside a nested loop, each crossing an owning local in the outer body
+# and one in the inner. C must release both on the jump: 0 is a requirement
+# (spec invariant 13). The IR rows are the backends' measured counts, one
+# witness, and join the default-target flip criterion (every LLVM/MLIR pin
+# at 0), because the IR has no drop pass yet.
+LEAK_LABELLED_BREAK_C=0
+LEAK_LABELLED_BREAK_LLVM=3000
+LEAK_LABELLED_BREAK_MLIR=3000
+LEAK_LABELLED_CONTINUE_C=0
+LEAK_LABELLED_CONTINUE_LLVM=6000
+LEAK_LABELLED_CONTINUE_MLIR=6000
 
 # ---- stage 10 disclosed signature disagreements, pinned by defect ---------
 # Each line is `<example key>:<function>:<leg>` naming a place where the C
@@ -913,7 +925,7 @@ run_mlir() {
 
 # hello uses a struct; backends is scalar-only and is the cross-backend
 # agreement case; loops covers while/break/continue.
-for pair in "hello 42" "backends 24" "loops 55"; do
+for pair in "hello 42" "backends 24" "loops 55" "loop 21" "labels 227"; do
     set -- $pair
     run_c "$1" "$2"
     run_llvm "$1" "$2"
@@ -1133,6 +1145,12 @@ else
     run_c_leaks owned_string examples/owned_string_host.c "$LEAK_OWNED_STRING_C" "C frees what the IR backends leak, 2026-09-17" examples/owned_string.cell
     run_ir_leaks owned_string llvm "$LEAK_OWNED_STRING_LLVM" "the host frees take's argument; no IR drop pass, 2026-09-17" examples/owned_string.cell examples/owned_string_host.c
     run_ir_leaks owned_string mlir "$LEAK_OWNED_STRING_MLIR" "the host frees take's argument; no IR drop pass, 2026-09-17" examples/owned_string.cell examples/owned_string_host.c
+    run_c_leaks labelled_break "" "$LEAK_LABELLED_BREAK_C" "FLOW-03 break :outer releases the outer and inner bodies' locals, 2026-09-22"
+    run_ir_leaks labelled_break llvm "$LEAK_LABELLED_BREAK_LLVM" "FLOW-03 break :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
+    run_ir_leaks labelled_break mlir "$LEAK_LABELLED_BREAK_MLIR" "FLOW-03 break :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
+    run_c_leaks labelled_continue "" "$LEAK_LABELLED_CONTINUE_C" "FLOW-03 continue :outer releases the outer and inner bodies' locals, 2026-09-22"
+    run_ir_leaks labelled_continue llvm "$LEAK_LABELLED_CONTINUE_LLVM" "FLOW-03 continue :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
+    run_ir_leaks labelled_continue mlir "$LEAK_LABELLED_CONTINUE_MLIR" "FLOW-03 continue :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
 fi
 
 # ------------------------------------------- 8. cross-backend answer agreement --

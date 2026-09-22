@@ -31,7 +31,10 @@
 //! includes the entry state). Before that, five accepted shapes ran as
 //! AddressSanitizer double frees; `checkWhile` and `docs/OWNERSHIP.md` R2.a
 //! list them. It is the file's recurring defect again: one back-edge source
-//! was enumerated and a property of all of them asserted.
+//! was enumerated and a property of all of them asserted. A labelled jump
+//! (`break :outer`, `continue :outer`, 2026-09-22) is asked of the loop it
+//! TARGETS and of no loop in between (`jumpTarget`): control on that path
+//! reaches neither the back edge nor the after-loop point of an inner loop.
 //!
 //! **R2.b** is the general rule that one clause of R10 was a special case of:
 //! an `owned` consumption position is asked of the EXPRESSION, not of a place.
@@ -465,6 +468,7 @@ pub const Checker = struct {
     pub const invalidateLoopStores = bk_stmts.invalidateLoopStores;
     pub const checkContinue = bk_stmts.checkContinue;
     pub const saveBreakState = bk_stmts.saveBreakState;
+    pub const jumpTarget = bk_stmts.jumpTarget;
     pub const checkStmt = bk_stmts.checkStmt;
     pub const checkStmtKind = bk_stmts.checkStmtKind;
     pub const ScopeMark = bk_scope.ScopeMark;

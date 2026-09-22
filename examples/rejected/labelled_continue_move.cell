@@ -1,0 +1,37 @@
+// EXPECT: currently-rejected
+// Violates: docs/OWNERSHIP.md R2.a, asked of the loop a labelled jump
+// TARGETS (spec invariant 14).
+//
+// `v` is declared before `outer`, moved inside the inner loop, and then
+// `continue :outer` starts the next OUTER iteration, which would use `v`
+// after the move. R2.a asks the outer frame, and the outer frame carries `v`:
+//
+//   error: 'v' is moved inside a loop, so the next iteration would use it
+//          after the move
+//   note: this 'continue' is reached before 'v' is assigned again
+//
+// Its accepted twin is `moved_then_continue` in examples/labels.cell: there
+// `v` is declared INSIDE the outer body, the next outer iteration declares a
+// fresh one, and the same jump is fine. Asking every frame the jump passes
+// would refuse that twin too, because the inner frame carries `v`. The text
+// is pinned by the borrowck test "R2.a: continue :outer after moving a place
+// declared before the outer loop is refused".
+
+pub fn take(owned s: String) { }
+
+pub fn main() {
+    var owned v: String = "a"
+    var i = 0
+    outer: while i < 3 {
+        i = i + 1
+        var j = 0
+        while j < 3 {
+            j = j + 1
+            if j == 2 {
+                take(v)
+                continue :outer
+            }
+        }
+        v = "b"
+    }
+}

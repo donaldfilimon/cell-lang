@@ -67,8 +67,10 @@ pub const TokenKind = enum {
     // function named `while` followed by a discarded block, and a program
     // written believing Cell has loops compiled and did nothing.
     //
-    // Of these only while/break/continue are scheduled to gain rules. The rest
-    // are reserved so that programs do not come to depend on them as names.
+    // while/break/continue have rules, and so does `loop` since 2026-09-22
+    // (SPEC 7.6: it parses as `while true`). `for` and `defer` are designed
+    // and deferred by ruling (D-F3, D-F4). The rest are reserved so that
+    // programs do not come to depend on them as names.
     kw_while,
     kw_for,
     kw_loop,

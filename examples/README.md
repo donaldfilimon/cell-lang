@@ -213,6 +213,8 @@ are not.
 | `backends.cell` | the cross-backend agreement case: scalar-only, carried by C, LLVM and MLIR alike, and all three print `24` |
 | `borrows.cell` | every borrow spelling (`shared`/`&`, `exclusive`/`&mut`/`&var`/`&exclusive`) and the keyword-wins rule for mixing |
 | `loops.cell` | `while`, both spellings, plus `break` and `continue`; prints 55 through all three backends |
+| `loop.cell` | `loop { }`, which is exactly `while true { }` (SPEC 7.6); prints 21 through all three backends |
+| `labels.cell` | labelled loops, `break :outer` and `continue :outer` from a nested loop, and the R2.a case a labelled `continue` accepts (SPEC 7.7); prints 227 through all three backends |
 | `comparisons.cell` | `==` and `!=` as the whole condition of `if`, `else if` and `while`; prints 621 through all three backends, and is the corpus's only guard against the doubled `if ((a == 2))` that clang rejects under `-Werror` |
 | `while_is_now_a_loop.cell` | the same program that once passed and silently did nothing, now looping correctly; its header records all four meanings it has had |
 | `unit_type.cell` | explicit `()` in type position: `-> ()` is the same unit as an omitted `->`; a `let` of `()` is refused |
@@ -321,6 +323,12 @@ an owning payload: `Ok(s)` on a `Result<String, E>` must say `owned` or
   original produced an AddressSanitizer double free. It is refused until
   aggregate transfer and partial-move drop state exist. Copy String/list fields
   are rejected structurally at declaration time for the same two-owner hazard.
+
+`unknown_label.cell` and `duplicate_label.cell` pin SPEC 7.7's two label
+refusals (a label no enclosing loop carries, and a label repeating an
+enclosing loop's), and `labelled_continue_move.cell` pins R2.a asked of the
+loop a `continue :outer` targets (2026-09-22); its accepted twin is
+`moved_then_continue` in `examples/labels.cell`.
 
 `skip_revival_jump.cell` carries R2.a's jump clause (2026-09-16): five loop
 shapes that the body-end check never saw (a `continue` or `break` between a

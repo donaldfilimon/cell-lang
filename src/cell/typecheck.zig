@@ -50,10 +50,17 @@ pub const Checker = struct {
 
     /// Declared return type of the function whose body is being checked.
     fn_return: Type = types.t_unit,
-    /// How many `while` bodies enclose the statement being checked. `break`
-    /// and `continue` outside a loop have nothing to jump to and would emit C
-    /// that does not compile, so they are rejected here rather than there.
-    loop_depth: u32 = 0,
+    /// The `while` bodies enclosing the statement being checked, innermost
+    /// last, each with its label (null when none was written) and the span of
+    /// its statement. `break` and `continue` outside a loop have nothing to
+    /// jump to and would emit C that does not compile, and a label no
+    /// enclosing loop carries names nothing, so both are rejected here rather
+    /// than downstream. A loop's condition is checked before its entry is
+    /// pushed, so a jump in the condition belongs to the enclosing loop, the
+    /// same rule `hir.lower`, borrowck and codegen follow.
+    loop_labels: std.ArrayList(LoopLabel) = .empty,
+
+    const LoopLabel = struct { name: ?[]const u8, span: ast.Span };
 
     pub const Symbol = struct {
         ownership: ast.Ownership,
@@ -78,6 +85,7 @@ pub const Checker = struct {
 
     pub fn deinit(self: *Checker) void {
         self.scopes.deinit(self.allocator);
+        self.loop_labels.deinit(self.allocator);
         self.structs.deinit();
         self.enums.deinit();
         self.diagnostics.deinit(self.allocator);
@@ -215,21 +223,35 @@ pub const Checker = struct {
                         .{try self.typeName(cond)},
                     );
                 }
+                // A label may not repeat one already enclosing it: `break
+                // :outer` would then name two loops. Sibling loops may reuse
+                // a name, because neither encloses the other.
+                if (w.label) |name| {
+                    if (self.loopLabelIndex(name)) |i| {
+                        try self.errf(stmt.span, "label '{s}' is already used by an enclosing loop", .{name});
+                        try self.diagnostics.note(
+                            self.allocator,
+                            self.loop_labels.items[i].span,
+                            try std.fmt.allocPrint(self.arena(), "the enclosing loop labelled '{s}' is here", .{name}),
+                        );
+                    }
+                }
                 // The body is a scope of its own, so a binding declared in it
                 // does not leak past the loop.
                 self.pushScope();
                 defer self.popScope();
-                self.loop_depth += 1;
-                defer self.loop_depth -= 1;
+                try self.loop_labels.append(self.allocator, .{ .name = w.label, .span = stmt.span });
+                defer _ = self.loop_labels.pop();
                 for (w.body) |*s2| try self.checkStmt(@constCast(s2));
             },
-            .break_stmt, .continue_stmt => {
-                if (self.loop_depth == 0) {
-                    try self.errf(
-                        stmt.span,
-                        "'{s}' is only valid inside a loop",
-                        .{if (stmt.kind == .break_stmt) "break" else "continue"},
-                    );
+            .break_stmt, .continue_stmt => |j| {
+                const word = if (stmt.kind == .break_stmt) "break" else "continue";
+                if (self.loop_labels.items.len == 0) {
+                    try self.errf(stmt.span, "'{s}' is only valid inside a loop", .{word});
+                } else if (j.label) |name| {
+                    if (self.loopLabelIndex(name) == null) {
+                        try self.errf(stmt.span, "no enclosing loop is labelled '{s}'", .{name});
+                    }
                 }
             },
             .let => |*l| {
@@ -996,6 +1018,18 @@ pub const Checker = struct {
 
     fn typeName(self: *Checker, ty: Type) CheckError![]const u8 {
         return try types.name(self.arena(), ty);
+    }
+
+    /// The innermost enclosing loop labelled `name`, as an index into
+    /// `loop_labels`, or null when no enclosing loop carries it.
+    fn loopLabelIndex(self: *const Checker, name: []const u8) ?usize {
+        var i = self.loop_labels.items.len;
+        while (i > 0) {
+            i -= 1;
+            const l = self.loop_labels.items[i].name orelse continue;
+            if (std.mem.eql(u8, l, name)) return i;
+        }
+        return null;
     }
 
     fn errf(
@@ -2133,4 +2167,101 @@ test "a struct field may name a struct declared later in the file" {
         \\}
     );
     try t.expectClean();
+}
+
+test "loop is a loop: break and continue inside it are accepted" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f() {
+        \\    loop {
+        \\        continue
+        \\        break
+        \\    }
+        \\}
+    );
+    try t.expectClean();
+}
+
+test "a labelled jump names an enclosing loop, from any depth" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f(copy n: Int) {
+        \\    outer: while n > 0 {
+        \\        inner: loop {
+        \\            if n > 1 {
+        \\                break :outer
+        \\            }
+        \\            continue :inner
+        \\        }
+        \\    }
+        \\    again: loop {
+        \\        break :again
+        \\    }
+        \\}
+    );
+    try t.expectClean();
+}
+
+test "a jump naming no enclosing loop is reported at the jump" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f() {
+        \\    outer: loop {
+        \\        break :outr
+        \\    }
+        \\    inner: loop {
+        \\        break
+        \\    }
+        \\    loop {
+        \\        continue :inner
+        \\    }
+        \\}
+    );
+    try t.expectCount(2);
+    try t.expectDiag(0, .err, 3, 9, "no enclosing loop is labelled 'outr'");
+    // `inner` labels a SIBLING loop that has already ended, not an enclosing one.
+    try t.expectDiag(1, .err, 9, 9, "no enclosing loop is labelled 'inner'");
+}
+
+test "a label repeating an enclosing loop's is reported, and siblings may share one" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f() {
+        \\    outer: loop {
+        \\        outer: loop {
+        \\            break
+        \\        }
+        \\        break
+        \\    }
+        \\    outer: loop {
+        \\        break :outer
+        \\    }
+        \\}
+    );
+    try t.expectCount(2);
+    try t.expectDiag(0, .err, 3, 9, "label 'outer' is already used by an enclosing loop");
+    try t.expectDiag(1, .note, 2, 5, "the enclosing loop labelled 'outer' is here");
+}
+
+test "a jump in a loop's condition belongs to the enclosing loop" {
+    var t: TestModule = .init();
+    defer t.deinit();
+    try t.check(
+        \\pub fn f() {
+        \\    loop {
+        \\        outer: while { break :outer
+        \\            true } {
+        \\            break
+        \\        }
+        \\    }
+        \\}
+    );
+    // The `break :outer` runs before `outer`'s body is entered, so `outer`
+    // does not enclose it yet; the unlabelled `loop` around it does.
+    try t.expectCount(1);
+    try t.expectDiag(0, .err, 3, 24, "no enclosing loop is labelled 'outer'");
 }

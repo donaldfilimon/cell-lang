@@ -455,14 +455,19 @@ const Walker = struct {
                 self.cur = null;
             },
             .while_loop => |w| try self.walkWhile(w),
-            .brk => self.jump(),
-            .cont => self.jump(),
+            .brk => |depth| self.jump(depth),
+            .cont => |depth| self.jump(depth),
         }
     }
 
-    fn jump(self: *Walker) void {
+    /// Mirrors `cfg.Builder.lowerJump`, which asserts the same bound. A jump
+    /// allocates no block and records no op whatever loop it targets, so a
+    /// labelled jump changes nothing here but the assertion: the lockstep
+    /// with `cfg.Builder` (and the `GraphMismatch` check guarding it) holds
+    /// unchanged.
+    fn jump(self: *Walker, depth: u32) void {
         if (self.cur == null) return;
-        std.debug.assert(self.loop_depth > 0);
+        std.debug.assert(self.loop_depth > depth);
         self.cur = null;
     }
 
@@ -873,8 +878,8 @@ test "break and continue: liveness reaches the loop exit through both" {
 
     var bindings = [_]hir.Binding{dummyBinding(0)};
 
-    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .brk };
-    var cont_stmt = hir.Stmt{ .span = test_span, .kind = .cont };
+    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
+    var cont_stmt = hir.Stmt{ .span = test_span, .kind = .{ .cont = 0 } };
     var then_body = oneStmtBlock(&brk_stmt);
     var else_body = oneStmtBlock(&cont_stmt);
     var if_cond = boolExpr(true);
@@ -967,8 +972,8 @@ test "the zero-predecessor join shape does not destabilize the fixpoint" {
 
     var bindings = [_]hir.Binding{dummyBinding(0)};
 
-    var brk1 = hir.Stmt{ .span = test_span, .kind = .brk };
-    var brk2 = hir.Stmt{ .span = test_span, .kind = .brk };
+    var brk1 = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
+    var brk2 = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
     var then_body = oneStmtBlock(&brk1);
     var else_body = oneStmtBlock(&brk2);
     var if_cond = boolExpr(true);
@@ -1147,4 +1152,46 @@ test "analyze returns error.GraphMismatch rather than silently misaligning op li
 
     // f_big walked against g_small: 4 real blocks vs. a 1-block graph.
     try std.testing.expectError(error.GraphMismatch, analyze(a, &f_big, &g_small));
+}
+
+test "a labelled break keeps the walker in lockstep and carries liveness to the outer exit" {
+    // `let s = 1; outer: while { while { break :outer } }; return s`. The
+    // jump allocates no block in either traversal, so `analyze` must not
+    // return GraphMismatch, and `s` must be live through the inner loop,
+    // because the labelled break reaches the read after the outer loop.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = [_]hir.Binding{dummyBinding(0)};
+
+    var inner_body = [_]hir.Stmt{.{ .span = test_span, .kind = .{ .brk = 1 } }};
+    const inner_cond = boolExpr(true);
+    var outer_body = [_]hir.Stmt{
+        .{ .span = test_span, .kind = .{ .while_loop = .{ .cond = inner_cond, .body = &inner_body } } },
+    };
+    const outer_cond = boolExpr(true);
+    var stmts = [_]hir.Stmt{
+        letStmt(0, intExpr(1)),
+        .{ .span = test_span, .kind = .{ .while_loop = .{ .cond = outer_cond, .body = &outer_body } } },
+        retStmt(refExpr(0)),
+    };
+    const f = testFn(&stmts, &bindings);
+
+    const g = (try cfg.build(a, &f)).?;
+    const r = try analyze(a, &f, &g);
+
+    const entry = findBlock(g, g.entry);
+    const outer_cond_b = findBlock(g, entry.succs[0]);
+    const outer_body_b = findBlock(g, outer_cond_b.succs[0]);
+    const outer_exit_b = findBlock(g, outer_cond_b.succs[1]);
+    const inner_cond_b = findBlock(g, outer_body_b.succs[0]);
+    const inner_body_b = findBlock(g, inner_cond_b.succs[0]);
+
+    // The labelled break is the inner body's only statement: its block's
+    // one successor is the OUTER exit.
+    try std.testing.expectEqual(outer_exit_b.id, inner_body_b.succs[0]);
+    try std.testing.expect(r.live_out[inner_body_b.id][0]);
+    try std.testing.expect(r.live_in[inner_cond_b.id][0]);
+    try std.testing.expect(hasLastUse(r.last_uses, outer_exit_b.id, 0));
 }

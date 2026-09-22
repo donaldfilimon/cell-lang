@@ -441,10 +441,18 @@ every point that reaches a next iteration or the code after the loop:
   moved before the loop and still moved at a `continue` restarts the body in
   the state the walk checked, so it is not reported.
 
-Only the innermost loop is consulted, since a jump targets the innermost
-`while` (SPEC 7.7). An inner loop's `break` state reaches the outer body
-through the inner loop's own union, so a skip-revival `break` in an inner loop
-is refused at the outer body end. Corpus:
+Only the loop a jump TARGETS is consulted: the innermost `while` for a plain
+jump, the loop it names for `break :outer` or `continue :outer` (SPEC 7.7,
+2026-09-22). No loop in between is asked, because control on that path never
+reaches its back edge or its after-loop point. So `continue :outer` after
+moving a place declared inside the outer body is accepted (the next outer
+iteration declares it afresh; `examples/labels.cell`, `moved_then_continue`),
+and the same jump after moving a place declared before the outer loop is
+refused (`examples/rejected/labelled_continue_move.cell`). A `break :outer`
+taken while a place is moved leaves it dead after the OUTER loop, and not
+after the inner one. An inner loop's plain `break` state reaches the outer
+body through the inner loop's own union, so a skip-revival `break` in an inner
+loop is refused at the outer body end. Corpus:
 `examples/rejected/skip_revival_jump.cell`, which carries the measurements.
 
 **This rejects some safe programs, by decision.** Take a place that is

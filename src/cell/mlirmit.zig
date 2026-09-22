@@ -137,6 +137,9 @@ pub fn emitModule(
     try e.run();
 }
 
+/// A loop's two jump targets: `brk` is its end block, `cont` its condition.
+const LoopTarget = struct { brk: []const u8, cont: []const u8 };
+
 const Emitter = struct {
     arena: std.mem.Allocator,
     out: *Io.Writer,
@@ -151,10 +154,11 @@ const Emitter = struct {
     /// exactly one per block.
     returned: bool = false,
     block: u32 = 0,
-    /// Where a `break` and a `continue` jump, for the innermost enclosing
-    /// loop. Null outside a loop, which the typechecker already rejects.
-    break_block: ?[]const u8 = null,
-    continue_block: ?[]const u8 = null,
+    /// Where a `break` and a `continue` jump, for every loop enclosing the
+    /// statement being emitted, innermost last. A jump with HIR depth `n`
+    /// takes entry `len - 1 - n`. Empty outside a loop, which the
+    /// typechecker already rejects.
+    loop_targets: std.ArrayList(LoopTarget) = .empty,
     /// Slot -> true when the slot is an `llvm.alloca` rather than a
     /// `memref.alloca`. A memref cannot hold an `!llvm.struct`: mlir-opt
     /// rejects it outright with "invalid memref element type", so aggregates
@@ -603,25 +607,21 @@ const Emitter = struct {
                 try self.line("cf.cond_br {s}, {s}, {s}", .{ cond.text, body_b, end_b });
 
                 try self.block_label(body_b);
-                const saved_break = self.break_block;
-                const saved_continue = self.continue_block;
-                self.break_block = end_b;
-                self.continue_block = cond_b;
+                try self.loop_targets.append(self.arena, .{ .brk = end_b, .cont = cond_b });
                 for (w.body) |s2| try self.emitStmt(&s2);
-                self.break_block = saved_break;
-                self.continue_block = saved_continue;
+                _ = self.loop_targets.pop();
                 if (!self.returned) try self.line("cf.br {s}", .{cond_b});
 
                 try self.block_label(end_b);
             },
-            .brk => {
-                const target = self.break_block orelse return;
-                try self.line("cf.br {s}", .{target});
+            .brk => |depth| {
+                const target = self.loopTarget(depth) orelse return;
+                try self.line("cf.br {s}", .{target.brk});
                 self.returned = true;
             },
-            .cont => {
-                const target = self.continue_block orelse return;
-                try self.line("cf.br {s}", .{target});
+            .cont => |depth| {
+                const target = self.loopTarget(depth) orelse return;
+                try self.line("cf.br {s}", .{target.cont});
                 self.returned = true;
             },
             .ret => |maybe| {
@@ -2078,6 +2078,14 @@ const Emitter = struct {
         return name;
     }
 
+    /// The loop a jump of HIR depth `depth` targets, or null when fewer
+    /// loops enclose it (unreachable after typecheck).
+    fn loopTarget(self: *const Emitter, depth: u32) ?LoopTarget {
+        const n = self.loop_targets.items.len;
+        if (depth >= n) return null;
+        return self.loop_targets.items[n - 1 - depth];
+    }
+
     fn nextBlock(self: *Emitter) []const u8 {
         const b = std.fmt.allocPrint(self.arena, "^bb{d}", .{self.block}) catch "^bb0";
         self.block += 1;
@@ -3416,4 +3424,56 @@ test "an arc aggregate parameter is refused, never passed as the raw value" {
             return error.TestUnexpectedResult;
         }
     }
+}
+
+test "labelled jumps lower through MLIR to the same answer the C backend prints" {
+    // Same program as llvmemit's labelled-jump test: find(12) is 206 and
+    // rows(4) is 12. A labelled jump that branched to the INNER loop's
+    // blocks would print something else (find would keep scanning; rows
+    // would add the 1000s).
+    const gpa = std.testing.allocator;
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn find(copy target: Int) -> Int {
+        \\  var found = 0
+        \\  var i = 0
+        \\  outer: while i < 10 {
+        \\    i = i + 1
+        \\    var j = 0
+        \\    while j < 10 {
+        \\      j = j + 1
+        \\      if i * j == target {
+        \\        found = i * 100 + j
+        \\        break :outer
+        \\      }
+        \\    }
+        \\  }
+        \\  return found
+        \\}
+        \\pub fn rows(copy n: Int) -> Int {
+        \\  var r = 0
+        \\  var i = 0
+        \\  outer: while i < n {
+        \\    i = i + 1
+        \\    var j = 0
+        \\    while j < n {
+        \\      j = j + 1
+        \\      r = r + j
+        \\      if j == 2 {
+        \\        continue :outer
+        \\      }
+        \\    }
+        \\    r = r + 1000
+        \\  }
+        \\  return r
+        \\}
+        \\pub fn main() {
+        \\  print_int(find(copy 12) + rows(copy 4))
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    const out = try runThroughMlir(gpa, e.text);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("218\n", out);
 }

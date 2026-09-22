@@ -158,10 +158,13 @@ const Emitter = struct {
     uses_panic: bool = false,
     /// Set when a string pattern needed memcmp, so its declaration is emitted.
     uses_memcmp: bool = false,
-    /// Where a `break` and a `continue` jump, for the innermost enclosing
-    /// loop. Null outside a loop, which the typechecker already rejects.
-    break_label: ?[]const u8 = null,
-    continue_label: ?[]const u8 = null,
+    /// Where a `break` and a `continue` jump, for every loop enclosing the
+    /// statement being emitted, innermost last. A jump with HIR depth `n`
+    /// takes entry `len - 1 - n`. Empty outside a loop, which the
+    /// typechecker already rejects.
+    loop_targets: std.ArrayList(LoopTarget) = .empty,
+
+    const LoopTarget = struct { brk: []const u8, cont: []const u8 };
 
     const StringGlobal = struct { name: []const u8, bytes: []const u8 };
 
@@ -680,26 +683,22 @@ const Emitter = struct {
 
                 try self.out.print("{s}:\n", .{body_b});
                 self.terminated = false;
-                const saved_break = self.break_label;
-                const saved_continue = self.continue_label;
-                self.break_label = end_b;
-                self.continue_label = cond_b;
+                try self.loop_targets.append(self.arena, .{ .brk = end_b, .cont = cond_b });
                 for (w.body) |s2| try self.emitStmt(&s2);
-                self.break_label = saved_break;
-                self.continue_label = saved_continue;
+                _ = self.loop_targets.pop();
                 if (!self.terminated) try self.out.print("  br label %{s}\n", .{cond_b});
 
                 try self.out.print("{s}:\n", .{end_b});
                 self.terminated = false;
             },
-            .brk => {
-                const target = self.break_label orelse return;
-                try self.out.print("  br label %{s}\n", .{target});
+            .brk => |depth| {
+                const target = self.loopTarget(depth) orelse return;
+                try self.out.print("  br label %{s}\n", .{target.brk});
                 self.terminated = true;
             },
-            .cont => {
-                const target = self.continue_label orelse return;
-                try self.out.print("  br label %{s}\n", .{target});
+            .cont => |depth| {
+                const target = self.loopTarget(depth) orelse return;
+                try self.out.print("  br label %{s}\n", .{target.cont});
                 self.terminated = true;
             },
             .ret => |maybe| {
@@ -1928,6 +1927,14 @@ const Emitter = struct {
         const t = try std.fmt.allocPrint(self.arena, "%{d}", .{self.temp});
         self.temp += 1;
         return t;
+    }
+
+    /// The loop a jump of HIR depth `depth` targets, or null when fewer
+    /// loops enclose it (unreachable after typecheck).
+    fn loopTarget(self: *const Emitter, depth: u32) ?LoopTarget {
+        const n = self.loop_targets.items.len;
+        if (depth >= n) return null;
+        return self.loop_targets.items[n - 1 - depth];
     }
 
     fn nextLabel(self: *Emitter, prefix: []const u8) EmitError![]const u8 {
@@ -3464,4 +3471,79 @@ test "an arc aggregate parameter is refused, never passed as the raw value" {
     var ok = try emitSource("pub fn h(arc v: Int) -> Int;");
     defer ok.deinit();
     try std.testing.expect(!ok.bag.hasErrors());
+}
+
+test "a labelled break branches to the outer loop's end block, a labelled continue to its condition" {
+    var e = try emitSource(
+        \\pub fn f(copy n: Int) -> Int {
+        \\  var i = 0
+        \\  outer: while i < n {
+        \\    i = i + 1
+        \\    loop {
+        \\      if i > 2 {
+        \\        break :outer
+        \\      }
+        \\      continue :outer
+        \\    }
+        \\  }
+        \\  return i
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    // The outer loop takes labels 0 to 2 (cond, body, end), the inner loop
+    // 3 to 5, so the two jumps name the OUTER blocks.
+    try expectContains(e.text, "loop.end.2:");
+    try expectContains(e.text, "  br label %loop.end.2\n");
+    try expectContains(e.text, "  br label %loop.cond.0\n");
+}
+
+test "labelled jumps compute the same answer the C backend does" {
+    // find(12) stops at 2 * 6 and returns 206; rows(4) adds 1 + 2 per outer
+    // iteration and skips the `+ 1000`, 12. The C backend prints 218 too
+    // (examples/labels.cell carries the same two functions).
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn find(copy target: Int) -> Int {
+        \\  var found = 0
+        \\  var i = 0
+        \\  outer: while i < 10 {
+        \\    i = i + 1
+        \\    var j = 0
+        \\    while j < 10 {
+        \\      j = j + 1
+        \\      if i * j == target {
+        \\        found = i * 100 + j
+        \\        break :outer
+        \\      }
+        \\    }
+        \\  }
+        \\  return found
+        \\}
+        \\pub fn rows(copy n: Int) -> Int {
+        \\  var r = 0
+        \\  var i = 0
+        \\  outer: while i < n {
+        \\    i = i + 1
+        \\    var j = 0
+        \\    while j < n {
+        \\      j = j + 1
+        \\      r = r + j
+        \\      if j == 2 {
+        \\        continue :outer
+        \\      }
+        \\    }
+        \\    r = r + 1000
+        \\  }
+        \\  return r
+        \\}
+        \\pub fn main() {
+        \\  print_int(find(copy 12) + rows(copy 4))
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    const out = try runEmitted(e.text);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("218\n", out);
 }

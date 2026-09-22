@@ -1342,3 +1342,173 @@ test "an arc binding is a cell_arc_t and a literal initializer is boxed" {
     );
     try expectAbsent(e.text, "cell_arc_clone");
 }
+
+test "break :outer releases every local since the outer body opened, once, then jumps past the loop" {
+    // Spec invariant 13: `a` (outer body) and `b` (inner body) are both
+    // released on the jump, exactly once, and the label sits after the outer
+    // loop, before anything that runs after it.
+    var e = try emitSource(
+        \\pub fn str_from_int(copy v: Int) -> String;
+        \\pub fn str_len(shared s: String) -> Int;
+        \\pub fn f(copy i: Int) -> Int {
+        \\  var n = 0
+        \\  outer: loop {
+        \\    let owned a = str_from_int(i)
+        \\    var j = 0
+        \\    while j < 3 {
+        \\      let owned b = str_from_int(j)
+        \\      n = n + str_len(a) + str_len(b)
+        \\      if j == 1 {
+        \\        break :outer
+        \\      }
+        \\      j = j + 1
+        \\    }
+        \\  }
+        \\  return n
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectOccurrences(f, "goto cell_brk_0;", 1);
+    try expectLineBefore(f, "goto cell_brk_0;", "cell_string_free(&a);");
+    // Each is released twice in the text: once on the jump and once at its
+    // own body's end (a different path). Innermost first on the jump.
+    try expectOccurrences(f, "cell_string_free(&b);", 2);
+    try expectOccurrences(f, "cell_string_free(&a);", 2);
+    try expectBefore(f, "cell_string_free(&b);", "cell_string_free(&a);");
+    try expectOccurrences(f, "cell_brk_0:;", 1);
+    try expectBefore(f, "cell_brk_0:;", "return n;");
+    try expectAbsent(f, "cell_cont_");
+    try expectCompiles(e.text);
+}
+
+test "continue :outer releases the same locals and lands outside the block holding the body" {
+    var e = try emitSource(
+        \\pub fn str_from_int(copy v: Int) -> String;
+        \\pub fn str_len(shared s: String) -> Int;
+        \\pub fn g(copy i: Int) -> Int {
+        \\  var n = 0
+        \\  var k = 0
+        \\  outer: while k < 2 {
+        \\    k = k + 1
+        \\    let owned a = str_from_int(i)
+        \\    var j = 0
+        \\    while j < 3 {
+        \\      let owned b = str_from_int(j)
+        \\      n = n + str_len(a) + str_len(b)
+        \\      j = j + 1
+        \\      if j == 2 {
+        \\        continue :outer
+        \\      }
+        \\    }
+        \\  }
+        \\  return n
+        \\}
+    );
+    defer e.deinit();
+    const g = try fnDef(e.text, "g");
+    try expectOccurrences(g, "goto cell_cont_0;", 1);
+    try expectLineBefore(g, "goto cell_cont_0;", "cell_string_free(&a);");
+    // The label follows the block that closes the body's scope, so the jump
+    // crosses no declaration; and the loop's own `}` follows the label.
+    try expectLineBefore(g, "cell_cont_0:;", "}");
+    try expectAbsent(g, "cell_brk_");
+    try expectCompiles(e.text);
+}
+
+test "a labelled jump releases an untaken owning temporary of the loop it leaves" {
+    // `emitTempReleases(target + 1)`: the match scrutinee is made in the
+    // outer body (loop depth 1), so `break :outer` (target 0) releases it,
+    // while a plain `break` of the inner loop would have released only
+    // temporaries of depth 2 and leaked it.
+    var e = try emitSource(
+        \\pub fn str_from_int(copy v: Int) -> String;
+        \\pub fn t(copy n: Int) -> Int {
+        \\  var i = 0
+        \\  outer: while i < n {
+        \\    i = i + 1
+        \\    match str_from_int(i) {
+        \\      "3" => {
+        \\        while true {
+        \\          break :outer
+        \\        }
+        \\      },
+        \\      _ => {},
+        \\    }
+        \\  }
+        \\  return i
+        \\}
+    );
+    defer e.deinit();
+    const t = try fnDef(e.text, "t");
+    try expectLineBefore(t, "goto cell_brk_0;", "cell_string_free(&_cell_t0);");
+    try expectCompiles(e.text);
+}
+
+test "a labelled jump that names the innermost loop is a plain break, and no C label is written" {
+    // -Wall makes an unused label an error, so a labelled loop nobody
+    // leaves from a nested loop must not get one.
+    var e = try emitSource(
+        \\pub fn u(copy n: Int) {
+        \\  var i = 0
+        \\  here: loop {
+        \\    i = i + 1
+        \\    if i > n {
+        \\      break :here
+        \\    }
+        \\    continue :here
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    const u = try fnDef(e.text, "u");
+    try expectOccurrences(u, "break;", 1);
+    try expectOccurrences(u, "continue;", 1);
+    try expectAbsent(u, "cell_brk_");
+    try expectAbsent(u, "cell_cont_");
+    try expectAbsent(u, "goto");
+    try expectCompiles(e.text);
+}
+
+test "a skip-revival break :outer jumps past the outer loop's release, and writes no unused label" {
+    // borrowck records the labelled break against the OUTER loop, whose skip
+    // label is not the top of `skip_labels` at the jump; `skipLabelFor`
+    // finds it by loop key. The `goto cell_brk_` the jump would otherwise
+    // take is never emitted, so `cell_brk_0:;` must not be either.
+    var e = try emitSource(
+        \\pub fn take(owned s: String) { }
+        \\pub fn s(copy n: Int) {
+        \\  var owned v: String = "a"
+        \\  var i = 0
+        \\  outer: while i < 3 {
+        \\    i = i + 1
+        \\    take(v)
+        \\    while i > n {
+        \\      break :outer
+        \\    }
+        \\    v = "b"
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    const s = try fnDef(e.text, "s");
+    try expectOccurrences(s, "goto cell_skip_0;", 1);
+    try expectLineBefore(s, "cell_skip_0:;", "cell_string_free(&v);");
+    try expectAbsent(s, "cell_brk_");
+    try expectCompiles(e.text);
+}
+
+test "an unknown label emits a goto cc refuses, never a guess at a loop" {
+    // Unchecked input (emitSource runs no typecheck). Spec invariant 16.
+    var e = try emitSource(
+        \\pub fn f() {
+        \\  loop {
+        \\    break :nowhere
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectContains(f, "goto cell_no_loop_labelled_nowhere;");
+    try expectAbsent(f, "break;");
+}

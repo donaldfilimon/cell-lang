@@ -322,6 +322,21 @@ pub fn endsInJump(body: []const ast.Stmt) bool {
 }
 
 /// A drop point, spelled the way borrowck keyed it in `exit_liveness`.
+/// One enclosing loop as `emitJump` sees it: its label (null when none was
+/// written), the number its C labels carry, and whether a jump from a
+/// nested loop has already been emitted as `goto cell_brk_<id>` or
+/// `goto cell_cont_<id>`. A C label is written only when its flag is set,
+/// because `-Wall` makes an unused label an error, and a labelled jump at
+/// the loop's own level (a plain `break`/`continue`) or a skip-revival
+/// `break` (`goto cell_skip_<n>`) uses neither.
+pub const LoopJump = struct {
+    label: ?[]const u8,
+    id: usize,
+    brk_used: bool = false,
+    cont_used: bool = false,
+};
+
+
 pub const Exit = struct {
     kind: borrowck.ExitKind,
     key: usize,

@@ -517,3 +517,78 @@ test "a bodyless two-argument assert takes the runtime's own symbol" {
     try std.testing.expectEqualStrings("cell_assert_msg", lowered.fns[0].symbol);
     try std.testing.expectEqualStrings("cell_assert1", lowered.fns[1].symbol);
 }
+
+/// Emit `source` for `target` into an arena-owned string.
+fn emitText(a: std.mem.Allocator, source: []const u8, target: Target) ![]const u8 {
+    var module = try compile(a, source, "t.cell");
+    var out: Io.Writer.Allocating = .init(a);
+    var err_buf: [4096]u8 = undefined;
+    var errw = Io.Writer.fixed(&err_buf);
+    try emitFor(a, &module, source, &out.writer, target, &errw);
+    return out.written();
+}
+
+test "loop and while true emit byte-identical C, LLVM IR and MLIR, over the same CFG" {
+    // Spec invariant 15: `loop` is parsed as `while true`, so no stage can
+    // tell the two apart. Byte-identical output on all three targets is the
+    // whole-pipeline form of that claim.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const with_loop =
+        \\pub fn f(copy n: Int) -> Int {
+        \\    var i = 0
+        \\    loop {
+        \\        i = i + 1
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\    }
+        \\    return i
+        \\}
+    ;
+    const with_while =
+        \\pub fn f(copy n: Int) -> Int {
+        \\    var i = 0
+        \\    while true {
+        \\        i = i + 1
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\    }
+        \\    return i
+        \\}
+    ;
+    for ([_]Target{ .c, .llvm, .mlir }) |target| {
+        try std.testing.expectEqualStrings(
+            try emitText(a, with_while, target),
+            try emitText(a, with_loop, target),
+        );
+    }
+
+    var bag: diag.Bag = .init("t.cell", null);
+    defer bag.deinit(a);
+    var m1 = try compile(a, with_loop, "t.cell");
+    var m2 = try compile(a, with_while, "t.cell");
+    const h1 = try hir.lower(a, &m1, &bag);
+    const h2 = try hir.lower(a, &m2, &bag);
+    try std.testing.expect(!bag.hasErrors());
+    const g1 = (try cfg.build(a, &h1.fns[0])).?;
+    const g2 = (try cfg.build(a, &h2.fns[0])).?;
+    try std.testing.expectEqual(g2.blocks.len, g1.blocks.len);
+    for (g1.blocks, g2.blocks) |b1, b2| {
+        try std.testing.expectEqual(b2.kind, b1.kind);
+        try std.testing.expectEqualSlices(u32, b2.succs, b1.succs);
+    }
+}
+
+test "shipped check refuses a jump to a label no enclosing loop carries" {
+    try expectCheckHas(
+        \\pub fn f() {
+        \\    outer: loop {
+        \\        break :outr
+        \\    }
+        \\}
+    , "error: no enclosing loop is labelled 'outr'");
+}

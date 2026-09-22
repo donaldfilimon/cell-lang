@@ -69,17 +69,49 @@ pub fn emitStmt(self: *Generator, stmt: *const ast.Stmt, rest: []const ast.Stmt,
                 self.next_skip_label += 1;
                 try self.skip_labels.append(self.arena, .{ .loop_key = loop_key, .id = skip_id });
             }
+            // A labelled loop's body goes inside one extra block, so a
+            // `continue :label` from a nested loop can land on
+            // `cell_cont_<n>:;` OUTSIDE the scope of every body local and
+            // cross no declaration. Unlabelled loops keep their C byte
+            // for byte.
+            var label_id: usize = 0;
+            if (w.label != null) {
+                label_id = self.next_loop_label;
+                self.next_loop_label += 1;
+            }
             try self.writeIndent(indent);
             try out.writeAll("while (");
             try self.emitCond(&w.cond, indent);
             try out.writeAll(") {\n");
+            const body_indent = if (w.label != null) indent + 8 else indent + 4;
+            if (w.label != null) {
+                try self.writeIndent(indent + 4);
+                try out.writeAll("{\n");
+            }
             try self.loop_marks.append(self.arena, self.locals.items.len);
+            try self.loop_jumps.append(self.arena, .{ .label = w.label, .id = label_id });
             try self.loop_bodies.append(self.arena, w.body);
-            try self.emitStmts(w.body, indent + 4);
+            try self.emitStmts(w.body, body_indent);
             _ = self.loop_bodies.pop();
+            const jumps = self.loop_jumps.pop().?;
             _ = self.loop_marks.pop();
+            if (w.label != null) {
+                try self.writeIndent(indent + 4);
+                try out.writeAll("}\n");
+            }
+            if (jumps.cont_used) {
+                try self.writeIndent(indent + 4);
+                try out.print("cell_cont_{d}:;\n", .{label_id});
+            }
             try self.writeIndent(indent);
             try out.writeAll("}\n");
+            // `break :label` from a nested loop lands here: after the
+            // loop and before its after-loop releases, exactly where a
+            // plain `break` of this loop lands.
+            if (jumps.brk_used) {
+                try self.writeIndent(indent);
+                try out.print("cell_brk_{d}:;\n", .{label_id});
+            }
             // R16 after_loop: an outer var this while moved and then
             // revived on every path out. Moved-only: emitDropsSince
             // would also free unmoved locals and double-free them at
@@ -93,20 +125,8 @@ pub fn emitStmt(self: *Generator, stmt: *const ast.Stmt, rest: []const ast.Stmt,
                 try out.print("cell_skip_{d}:;\n", .{skip_id});
             }
         },
-        .break_stmt => {
-            try self.emitLoopExitDrops(.{ .kind = .jump, .key = @intFromPtr(stmt) }, indent);
-            try self.writeIndent(indent);
-            if (self.skipLabelFor(@intFromPtr(stmt))) |id| {
-                try out.print("goto cell_skip_{d};\n", .{id});
-            } else {
-                try out.writeAll("break;\n");
-            }
-        },
-        .continue_stmt => {
-            try self.emitLoopExitDrops(.{ .kind = .jump, .key = @intFromPtr(stmt) }, indent);
-            try self.writeIndent(indent);
-            try out.writeAll("continue;\n");
-        },
+        .break_stmt => |j| try self.emitJump(stmt, j.label, .brk, indent),
+        .continue_stmt => |j| try self.emitJump(stmt, j.label, .cont, indent),
         .let => |l| {
             const ty = try self.letType(l.ty, l.value, l.ownership);
             try self.writeIndent(indent);

@@ -256,10 +256,14 @@ pub const OpenBlock = struct {
     index: usize,
 };
 
-/// One `while` whose body is being walked. A `break` or `continue` targets
-/// the innermost `while` (SPEC 7.7), so only the top frame is consulted.
-/// See `checkWhile`.
+/// One `while` whose body is being walked. A plain `break` or `continue`
+/// targets the innermost `while`; a labelled one targets the innermost frame
+/// carrying its label (SPEC 7.7). Either way ONLY the target frame is
+/// consulted: control on that path never reaches the back edge or the
+/// after-loop point of a loop in between. See `checkWhile` and `jumpTarget`.
 pub const LoopFrame = struct {
+    /// The loop's label, null when none was written.
+    label: ?[]const u8 = null,
     /// Every binding with a smaller id was declared before the loop, so
     /// the back edge and a `break` carry its moves.
     first_loop_id: u32,
@@ -272,7 +276,8 @@ pub const LoopFrame = struct {
     /// the loop.
     break_dead: std.ArrayListUnmanaged(Dead) = .empty,
     /// The address of every `break` that leaves THIS loop (not a nested
-    /// one), for the skip-revival rule in `checkWhile`.
+    /// one), including a `break :label` naming this loop from inside a
+    /// nested one, for the skip-revival rule in `checkWhile`.
     breaks: std.ArrayListUnmanaged(usize) = .empty,
     /// Moves R2.a already reported at a `continue`, so the body end does not
     /// report the same move twice.

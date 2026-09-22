@@ -1,0 +1,20 @@
+// EXPECT: currently-rejected
+// Violates: SPEC 7.7 (a label may not repeat one already enclosing it).
+//
+// Two enclosing loops both called `outer` would make `break :outer` name two
+// loops. Sibling loops may reuse a name, because neither encloses the other.
+//
+//   error: label 'outer' is already used by an enclosing loop
+//   note: the enclosing loop labelled 'outer' is here
+//
+// The text is pinned by the typecheck test "a label repeating an enclosing
+// loop's is reported, and siblings may share one".
+
+pub fn main() {
+    outer: loop {
+        outer: loop {
+            break :outer
+        }
+        break
+    }
+}

@@ -1,0 +1,47 @@
+// FLOW-03 (2026-09-22): `break :outer` taken from inside a nested loop must
+// release, exactly once, every owning local declared since the OUTER loop's
+// body opened: here `a` (outer body) and `b` (inner body), and nothing
+// declared outside the outer loop (spec invariant 13). Three owned Strings
+// per call (`a`, then `b` for j = 0 and j = 1), 1000 calls.
+//
+// Pinned: C 0 on both witnesses; this is a requirement, not a measurement,
+// and a nonzero C count means the labelled jump dropped too little. LLVM and
+// MLIR are pinned at their measured count on the malloc counter (the only
+// witness an IR build carries, see tools/check.sh): they have no drop pass.
+// Those two IR pins join the default-target flip criterion (spec
+// 2026-09-21-mod02-flow03-ir-first-design.md, Rulings): `--target` flips to
+// LLVM only when every LLVM/MLIR leak pin in gate stage 7 reads 0.
+//
+// Status: parses, passes `cell check`; C, LLVM and MLIR; lives under
+// examples/leaks/.
+
+pub fn print_int(copy value: Int);
+pub fn str_from_int(copy v: Int) -> String;
+pub fn str_len(shared s: String) -> Int;
+
+pub fn once(copy i: Int) -> Int {
+    var n = 0
+    outer: loop {
+        let owned a = str_from_int(i)
+        var j = 0
+        while j < 3 {
+            let owned b = str_from_int(j)
+            n = n + str_len(a) + str_len(b)
+            if j == 1 {
+                break :outer
+            }
+            j = j + 1
+        }
+    }
+    return n
+}
+
+pub fn main() {
+    var i = 0
+    var n = 0
+    while i < 1000 {
+        n = n + once(i)
+        i = i + 1
+    }
+    print_int(n)
+}

@@ -1013,3 +1013,152 @@ test "a branch that only sometimes returns still reaches the code after the if" 
         \\
     , "use of 's' after it was moved");
 }
+
+// ── labelled jumps target one frame (FLOW-03, 2026-09-22) ─────────────────
+//
+// A `break :outer` or `continue :outer` is asked of the OUTER frame only
+// (spec invariant 14). Control on that path never reaches the back edge or
+// the after-loop point of any loop in between, so those frames see neither.
+
+test "R2.a: loop is while true, so a move in it is refused the same way" {
+    try expectDiagnostics(jump_prelude ++
+        \\pub fn f() {
+        \\    var owned v: String = "a"
+        \\    loop {
+        \\        take(v)
+        \\    }
+        \\}
+    ,
+        \\t.cell:6:14: error: 'v' is moved inside a loop, so the next iteration would use it after the move
+        \\t.cell:5:5: note: 'v' is declared outside this loop; assign to it before the end of the body to revive it
+        \\
+    );
+}
+
+test "R2.a: continue :outer after moving a place declared in the outer body is accepted" {
+    // The next OUTER iteration declares a fresh `v`, so the move is not
+    // carried. Asking every frame the jump passes would wrongly refuse this:
+    // the inner frame carries `v` (declared before the inner loop).
+    try expectAccepted(jump_prelude ++
+        \\pub fn f(copy n: Int) {
+        \\    var i = 0
+        \\    outer: while i < 3 {
+        \\        i = i + 1
+        \\        var owned v: String = "a"
+        \\        var j = 0
+        \\        while j < n {
+        \\            j = j + 1
+        \\            if j == 2 {
+        \\                take(v)
+        \\                continue :outer
+        \\            }
+        \\        }
+        \\    }
+        \\}
+    );
+}
+
+test "R2.a: continue :outer after moving a place declared before the outer loop is refused" {
+    try expectDiagnostics(jump_prelude ++
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    outer: while i < 3 {
+        \\        i = i + 1
+        \\        var j = 0
+        \\        while j < n {
+        \\            j = j + 1
+        \\            if j == 2 {
+        \\                take(v)
+        \\                continue :outer
+        \\            }
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\}
+    ,
+        \\t.cell:12:22: error: 'v' is moved inside a loop, so the next iteration would use it after the move
+        \\t.cell:13:17: note: this 'continue' is reached before 'v' is assigned again
+        \\
+    );
+}
+
+test "R2: break :outer while moved reaches the code after the OUTER loop" {
+    try expectDiagnostics(jump_prelude ++
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    outer: while i < 3 {
+        \\        i = i + 1
+        \\        var j = 0
+        \\        while j < n {
+        \\            j = j + 1
+        \\            if j == 2 {
+        \\                take(v)
+        \\                break :outer
+        \\            }
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\    take(v)
+        \\}
+    ,
+        \\t.cell:18:10: error: use of 'v' after it was moved
+        \\t.cell:12:22: note: 'v' was moved here by the call to 'take'
+        \\
+    );
+}
+
+test "R2: break :outer's state skips the inner loop's after-loop point" {
+    // If the labelled break saved into the INNER frame, `v` would be dead
+    // after the inner loop and `take(v)` below it would be a use after
+    // move. The path that moved `v` leaves both loops, so it never gets there.
+    try expectAccepted(jump_prelude ++
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    outer: while i < 3 {
+        \\        i = i + 1
+        \\        var j = 0
+        \\        while j < n {
+        \\            j = j + 1
+        \\            if j == 2 {
+        \\                take(v)
+        \\                break :outer
+        \\            }
+        \\        }
+        \\        take(v)
+        \\        v = "b"
+        \\    }
+        \\}
+    );
+}
+
+test "a labelled skip-revival break is recorded against the loop it names" {
+    // The skip-revival shape of `after_loop_skip is live for a skip-revival
+    // break`, with the `break` moved into a nested loop and naming the
+    // outer one. borrowck appends it to the OUTER frame's `breaks`, so the
+    // outer loop gets the skip record and codegen's `skipLabelFor` finds it
+    // by loop key (it is not the innermost loop at the jump).
+    var h: LiveHarness = try .init(
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    outer: while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        while i > n {
+        \\            break :outer
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\}
+    );
+    defer h.deinit();
+    const v = h.binding("v");
+    const outer_key = @intFromPtr(&h.fnBody("f")[2]);
+    try std.testing.expect(!h.checker.liveAtExit(.after_loop, outer_key, v));
+    try std.testing.expect(h.checker.liveAtExit(.after_loop_skip, outer_key, v));
+    try std.testing.expectEqual(@as(?usize, outer_key), h.checker.skipBreakLoop(h.firstJump("f")));
+}

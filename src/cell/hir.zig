@@ -395,8 +395,13 @@ pub const Stmt = struct {
         /// `while cond { ... }`. A statement, not an expression: a loop
         /// produces no value.
         while_loop: struct { cond: Expr, body: []Stmt },
-        brk,
-        cont,
+        /// `break` and `continue`. The payload is how many loops the jump
+        /// leaves BEYOND the innermost enclosing one: 0 is a plain jump (or a
+        /// label naming the innermost loop), 1 targets the loop around it,
+        /// and so on. `lower` resolves the label once; every consumer indexes
+        /// its own loop stack at `len - 1 - n` and never sees a name.
+        brk: u32,
+        cont: u32,
     };
 };
 
@@ -443,6 +448,12 @@ const Lowerer = struct {
     scope: std.ArrayList(ScopeEntry) = .empty,
 
     depth: u32 = 0,
+
+    /// The labels of the loops enclosing the statement being lowered,
+    /// innermost last, null for an unlabelled loop. Pushed after a loop's
+    /// condition is lowered, so a jump in the condition belongs to the
+    /// enclosing loop, as typecheck decides it.
+    loop_labels: std.ArrayList(?[]const u8) = .empty,
 
     /// The declared return type of the function being lowered: the expected
     /// type of a `return Ok(..)`/`return Err(..)`, which has no type of its own.
@@ -519,6 +530,7 @@ const Lowerer = struct {
     fn lowerFn(self: *Lowerer, span: Span, f: ast.FnDef) LowerError!void {
         self.bindings.clearRetainingCapacity();
         self.scope.clearRetainingCapacity();
+        self.loop_labels.clearRetainingCapacity();
         self.depth = 1;
 
         for (f.params) |p| {
@@ -727,12 +739,14 @@ const Lowerer = struct {
             .while_stmt => |w| {
                 const cond = try self.lowerExpr(&w.cond);
                 self.pushScope();
+                try self.loop_labels.append(self.arena, w.label);
                 const body = try self.lowerStmts(w.body);
+                _ = self.loop_labels.pop();
                 self.popScope();
                 return .{ .span = stmt.span, .kind = .{ .while_loop = .{ .cond = cond, .body = body } } };
             },
-            .break_stmt => return .{ .span = stmt.span, .kind = .brk },
-            .continue_stmt => return .{ .span = stmt.span, .kind = .cont },
+            .break_stmt => |j| return .{ .span = stmt.span, .kind = .{ .brk = try self.jumpDepth(stmt.span, j.label) } },
+            .continue_stmt => |j| return .{ .span = stmt.span, .kind = .{ .cont = try self.jumpDepth(stmt.span, j.label) } },
             .return_stmt => |maybe| {
                 if (maybe) |e| {
                     // Destination typing stays let- and call-arg-only for
@@ -746,6 +760,22 @@ const Lowerer = struct {
                 return .{ .span = stmt.span, .kind = .{ .ret = null } };
             },
         }
+    }
+
+    /// How many loops a jump leaves beyond the innermost: 0 for a plain jump
+    /// and for a label naming the innermost loop. A label no enclosing loop
+    /// carries is reachable only in a module typecheck refused; it is `cannot
+    /// lower`, never a guess at the innermost loop (spec invariant 16).
+    fn jumpDepth(self: *Lowerer, span: Span, label: ?[]const u8) LowerError!u32 {
+        const name = label orelse return 0;
+        var i = self.loop_labels.items.len;
+        while (i > 0) {
+            i -= 1;
+            const l = self.loop_labels.items[i] orelse continue;
+            if (std.mem.eql(u8, l, name)) return @intCast(self.loop_labels.items.len - 1 - i);
+        }
+        try self.cannotLower(span, try std.fmt.allocPrint(self.arena, "no enclosing loop is labelled '{s}'", .{name}));
+        return 0;
     }
 
     /// Flatten an assignment target into a slot plus a field path.
@@ -2010,4 +2040,62 @@ test "a conflicting source declaration of the runtime symbol is refused" {
         }
         try std.testing.expectEqual(@as(usize, 1), countSymbol(l.module, "cell_string_from_str"));
     }
+}
+
+test "a labelled jump lowers to how many loops it leaves beyond the innermost" {
+    var l = try lowerSource(
+        \\pub fn f(copy n: Int) {
+        \\    outer: while n > 0 {
+        \\        mid: loop {
+        \\            loop {
+        \\                break :outer
+        \\                continue :mid
+        \\                break
+        \\                continue
+        \\            }
+        \\        }
+        \\    }
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const outer = l.module.findFn("f").?.body.?[0].kind.while_loop;
+    const mid = outer.body[0].kind.while_loop;
+    const inner = mid.body[0].kind.while_loop;
+    try std.testing.expectEqual(@as(u32, 2), inner.body[0].kind.brk);
+    try std.testing.expectEqual(@as(u32, 1), inner.body[1].kind.cont);
+    try std.testing.expectEqual(@as(u32, 0), inner.body[2].kind.brk);
+    try std.testing.expectEqual(@as(u32, 0), inner.body[3].kind.cont);
+}
+
+test "a label naming the innermost loop lowers exactly like a plain jump" {
+    var l = try lowerSource(
+        \\pub fn f() {
+        \\    here: loop {
+        \\        break :here
+        \\    }
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const w = l.module.findFn("f").?.body.?[0].kind.while_loop;
+    try std.testing.expectEqual(@as(u32, 0), w.body[0].kind.brk);
+}
+
+test "an unresolvable label is cannot lower, never a guess at the innermost loop" {
+    // Unchecked input: typecheck refuses this before any backend runs.
+    var l = try lowerSource(
+        \\pub fn f() {
+        \\    loop {
+        \\        break :nowhere
+        \\    }
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(l.diagnostics.hasErrors());
+    var found = false;
+    for (l.diagnostics.list.items) |d| {
+        if (std.mem.eql(u8, d.message, "cannot lower: no enclosing loop is labelled 'nowhere'")) found = true;
+    }
+    try std.testing.expect(found);
 }

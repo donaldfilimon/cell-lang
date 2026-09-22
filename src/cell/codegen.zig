@@ -237,6 +237,7 @@ const isOwningResult = cg_helpers.isOwningResult;
 const Exit = cg_helpers.Exit;
 const OwningTemp = cg_helpers.OwningTemp;
 const SkipLabel = cg_helpers.SkipLabel;
+const LoopJump = cg_helpers.LoopJump;
 const nameIn = cg_helpers.nameIn;
 const stmtsUse = cg_helpers.stmtsUse;
 
@@ -270,6 +271,14 @@ pub const Generator = struct {
     /// local declared since the LOOP's mark, not since the innermost
     /// block's: `emitLoopExitDrops` reads the top of this stack.
     loop_marks: std.ArrayList(usize) = .empty,
+    /// One entry per `loop_marks` entry, pushed and popped with it: the
+    /// loop's label (null when none was written) and the number its C labels
+    /// carry. A labelled jump resolves against this to an index `t`, then
+    /// drops since `loop_marks[t]`; see `emitJump`.
+    loop_jumps: std.ArrayList(LoopJump) = .empty,
+    /// The next labelled loop's number, unique within the translation unit,
+    /// so `cell_brk_<n>` and `cell_cont_<n>` never collide across functions.
+    next_loop_label: usize = 0,
     /// The statements that run after the one being emitted, innermost
     /// block first, and the bodies of the enclosing loops (which run again).
     /// `usedLater` reads both so an after-loop release never frees a value
@@ -839,19 +848,90 @@ pub const Generator = struct {
     }
 
     /// The `break`/`continue` drop point: everything declared since the
-    /// innermost enclosing `while` body opened, which includes the locals of
-    /// any block, `if` branch, or arm body the jump sits inside. Outside any
-    /// loop there is nothing to do; the parser does not produce a bare
-    /// `break`, so the empty case is defensive rather than reachable.
-    pub fn emitLoopExitDrops(self: *Generator, key: Exit, indent: usize) EmitError!void {
-        if (self.loop_marks.items.len == 0) return;
-        const mark = self.loop_marks.items[self.loop_marks.items.len - 1];
+    /// TARGET loop's body opened (`loop_marks[target]`), which includes the
+    /// locals of every nested loop, block, `if` branch and arm body the jump
+    /// sits inside, and nothing declared outside the target. Temporaries
+    /// are released from depth `target + 1`, because a temporary's
+    /// `loop_depth` is `loop_marks.len` when it was made: one created in the
+    /// target's body has depth `target + 1` or more. A plain jump passes the
+    /// innermost index, `len - 1`, which is exactly what this did before
+    /// labels. Out of range is defensive: typecheck refuses a jump outside a
+    /// loop.
+    pub fn emitLoopExitDrops(self: *Generator, key: Exit, target: usize, indent: usize) EmitError!void {
+        if (target >= self.loop_marks.items.len) return;
+        const mark = self.loop_marks.items[target];
         const saved = self.drop_exit;
         self.drop_exit = key;
         defer self.drop_exit = saved;
         try self.emitDropsSince(mark, indent, key);
         // Temporaries created inside the loop this jump leaves.
-        try self.emitTempReleases(self.loop_marks.items.len, indent);
+        try self.emitTempReleases(target + 1, indent);
+    }
+
+    /// The loop a jump targets, as an index into `loop_marks`/`loop_jumps`:
+    /// the innermost for a plain jump, the innermost loop carrying `label`
+    /// otherwise. Null outside a loop, or for a label no enclosing loop
+    /// carries; typecheck refuses both, so only an unchecked module gets here.
+    pub fn jumpTarget(self: *const Generator, label: ?[]const u8) ?usize {
+        const n = self.loop_jumps.items.len;
+        if (n == 0) return null;
+        const name = label orelse return n - 1;
+        var i = n;
+        while (i > 0) {
+            i -= 1;
+            const l = self.loop_jumps.items[i].label orelse continue;
+            if (eq(l, name)) return i;
+        }
+        return null;
+    }
+
+    /// `break`, `continue`, `break :label` and `continue :label`. The drops
+    /// are the target loop's (`emitLoopExitDrops`), then the jump itself:
+    /// a plain `break`/`continue` when the target is the innermost loop, so
+    /// every unlabelled program's C is unchanged; `goto cell_brk_<n>` or
+    /// `goto cell_cont_<n>` when it is an outer one, marking that loop's
+    /// `LoopJump` so the label gets written; `goto cell_skip_<n>` for a
+    /// skip-revival `break` of any loop (`skipLabelFor`).
+    pub fn emitJump(
+        self: *Generator,
+        stmt: *const ast.Stmt,
+        label: ?[]const u8,
+        kind: enum { brk, cont },
+        indent: usize,
+    ) EmitError!void {
+        const out = self.writer;
+        const word = if (kind == .brk) "break" else "continue";
+        const target = self.jumpTarget(label) orelse {
+            // Unchecked input only. A plain jump outside a loop keeps its old
+            // spelling, which `cc` refuses; an unknown label becomes a `goto`
+            // to a label that does not exist, which `cc` also refuses. Neither
+            // guesses a loop (spec invariant 16).
+            try self.writeIndent(indent);
+            if (label) |l| {
+                try out.print("goto cell_no_loop_labelled_{s};\n", .{l});
+            } else {
+                try out.print("{s};\n", .{word});
+            }
+            return;
+        };
+        try self.emitLoopExitDrops(.{ .kind = .jump, .key = @intFromPtr(stmt) }, target, indent);
+        try self.writeIndent(indent);
+        if (kind == .brk) {
+            if (self.skipLabelFor(@intFromPtr(stmt))) |id| {
+                try out.print("goto cell_skip_{d};\n", .{id});
+                return;
+            }
+        }
+        if (target + 1 == self.loop_jumps.items.len) {
+            try out.print("{s};\n", .{word});
+            return;
+        }
+        const loop = &self.loop_jumps.items[target];
+        switch (kind) {
+            .brk => loop.brk_used = true,
+            .cont => loop.cont_used = true,
+        }
+        try out.print("goto cell_{s}_{d};\n", .{ if (kind == .brk) "brk" else "cont", loop.id });
     }
 
     /// After a `while`: release an outer binding this loop moved and then
@@ -871,16 +951,19 @@ pub const Generator = struct {
     /// (`while consume(v) { v = make() }`) double-frees, because the last
     /// failing condition already took `v`.
     /// The label a skip-revival `break` jumps to, or null for a plain
-    /// `break`. Only the innermost loop can own it: borrowck records a
-    /// `break` only for the loop it leaves.
+    /// `break`. Searched by the loop borrowck recorded, not read off the
+    /// top: a `break :outer` from inside a nested loop is recorded against
+    /// the outer loop (`LoopFrame.breaks`), whose entry is not the top.
     pub fn skipLabelFor(self: *const Generator, break_key: usize) ?usize {
         const checker = self.checker orelse return null;
         const loop_key = checker.skipBreakLoop(break_key) orelse return null;
-        const n = self.skip_labels.items.len;
-        if (n == 0) return null;
-        const top = self.skip_labels.items[n - 1];
-        if (top.loop_key != loop_key) return null;
-        return top.id;
+        var i = self.skip_labels.items.len;
+        while (i > 0) {
+            i -= 1;
+            const sl = self.skip_labels.items[i];
+            if (sl.loop_key == loop_key) return sl.id;
+        }
+        return null;
     }
 
     /// Whether `name` is mentioned by anything that can run after the

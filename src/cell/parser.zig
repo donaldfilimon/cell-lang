@@ -195,14 +195,36 @@ pub const Parser = struct {
     /// the body. Both `while c { }` and `while (c) { }` fall out of this, the
     /// second because a parenthesized expression is already an expression, so
     /// the CELL v2.0 spelling costs nothing.
-    fn parseWhile(self: *Parser, start: Token) ParseError!ast.Stmt {
+    ///
+    /// `start` is the first token of the statement: the label when one was
+    /// written, so the statement's span (and every diagnostic about the loop)
+    /// covers `outer: while ...` from its first byte.
+    fn parseWhile(self: *Parser, start: Token, label: ?[]const u8) ParseError!ast.Stmt {
         const cond = try self.parseNoStructLitExpr();
         // parseBlockBody does not consume the opening brace; every caller
         // does it, and forgetting silently swallows the enclosing function's
         // closing brace instead of failing here.
         try self.expect(.l_brace);
         const body = try self.parseBlockBody();
-        return self.stmt(.{ .while_stmt = .{ .cond = cond, .body = body } }, start);
+        return self.stmt(.{ .while_stmt = .{ .cond = cond, .body = body, .label = label } }, start);
+    }
+
+    /// `loop { ... }` (SPEC 7.6, D-F1): exactly `while true { ... }`, and a
+    /// statement. The `loop` keyword has just been consumed. The condition is
+    /// a synthesized `true` literal spanning that keyword, so every later
+    /// stage sees an ordinary `while_stmt` and none of them has a case of its
+    /// own for `loop`. There is no `break` with a value.
+    fn parseLoop(self: *Parser, start: Token, label: ?[]const u8) ParseError!ast.Stmt {
+        const cond: ast.Expr = .{ .kind = .{ .bool = true }, .span = tokenSpan(self.prev()) };
+        try self.expect(.l_brace);
+        const body = try self.parseBlockBody();
+        return self.stmt(.{ .while_stmt = .{ .cond = cond, .body = body, .label = label } }, start);
+    }
+
+    /// The optional `:name` after `break` or `continue` (SPEC 7.7).
+    fn parseJumpLabel(self: *Parser) ParseError!?[]const u8 {
+        if (!self.match(.colon)) return null;
+        return try self.expectIdent();
     }
 
     fn parseStmt(self: *Parser) ParseError!ast.Stmt {
@@ -232,14 +254,29 @@ pub const Parser = struct {
             _ = self.match(.semicolon);
             return self.stmt(.{ .return_stmt = value }, start);
         }
-        if (self.match(.kw_while)) return self.parseWhile(start);
+        if (self.match(.kw_while)) return self.parseWhile(start, null);
+        if (self.match(.kw_loop)) return self.parseLoop(start, null);
+        // `name: while ...` and `name: loop ...` (SPEC 7.7). Two tokens decide
+        // it, an identifier and then `:`, and no other statement can begin
+        // that way: an expression never starts `ident :` (a struct literal's
+        // `name: value` sits inside its braces), so this takes nothing from
+        // the expression fallthrough below.
+        if (self.check(.ident) and self.peekIs(1, .colon)) {
+            const label = self.advance().lexeme;
+            _ = self.advance(); // the `:`
+            if (self.match(.kw_while)) return self.parseWhile(start, label);
+            if (self.match(.kw_loop)) return self.parseLoop(start, label);
+            return self.fail("a label must be followed by 'while' or 'loop'");
+        }
         if (self.match(.kw_break)) {
+            const label = try self.parseJumpLabel();
             _ = self.match(.semicolon);
-            return self.stmt(.break_stmt, start);
+            return self.stmt(.{ .break_stmt = .{ .label = label } }, start);
         }
         if (self.match(.kw_continue)) {
+            const label = try self.parseJumpLabel();
             _ = self.match(.semicolon);
-            return self.stmt(.continue_stmt, start);
+            return self.stmt(.{ .continue_stmt = .{ .label = label } }, start);
         }
 
         // Either an assignment or a bare expression statement. Parse the
@@ -801,6 +838,15 @@ pub const Parser = struct {
 
     fn check(self: *const Parser, kind: TokenKind) bool {
         return self.current().kind == kind;
+    }
+
+    /// Whether the token `offset` places past the current one is `kind`.
+    /// Bounded: a peek past the end is a mismatch, never an index out of
+    /// range (a hand-built token slice in a test need not end in `eof`).
+    fn peekIs(self: *const Parser, offset: usize, kind: TokenKind) bool {
+        const i = self.index + offset;
+        if (i >= self.tokens.len) return false;
+        return self.tokens[i].kind == kind;
     }
 
     fn match(self: *Parser, kind: TokenKind) bool {
@@ -1581,5 +1627,63 @@ test "adjacent and trailing underscores are refused as literals" {
     try std.testing.expectEqualStrings(
         "invalid integer literal",
         try parseErrorFor("pub fn main() { let copy a = 1__000 }"),
+    );
+}
+
+test "loop parses as a while whose condition is a synthesized true" {
+    var tp = try parseForTest(
+        \\pub fn f() {
+        \\  loop {
+        \\    break
+        \\  }
+        \\}
+    );
+    defer tp.deinit();
+    const w = onlyStmt(tp.module).kind.while_stmt;
+    try std.testing.expect(w.cond.kind.bool);
+    // The synthesized condition spans the `loop` keyword, so a diagnostic
+    // about it points at source the user wrote.
+    try std.testing.expectEqual(@as(u32, 2), w.cond.span.line);
+    try std.testing.expectEqual(@as(u32, 3), w.cond.span.column);
+    try std.testing.expectEqual(@as(u32, 4), w.cond.span.end - w.cond.span.start);
+    try std.testing.expect(w.label == null);
+    try std.testing.expectEqual(@as(usize, 1), w.body.len);
+    try std.testing.expect(w.body[0].kind.break_stmt.label == null);
+}
+
+test "a label before while or loop is carried, and jumps carry the label they name" {
+    var tp = try parseForTest(
+        \\pub fn f(copy n: Int) {
+        \\  outer: while n > 0 {
+        \\    inner: loop {
+        \\      break :outer
+        \\      continue :inner
+        \\      break
+        \\    }
+        \\  }
+        \\}
+    );
+    defer tp.deinit();
+    const outer_stmt = onlyStmt(tp.module);
+    const outer = outer_stmt.kind.while_stmt;
+    try std.testing.expectEqualStrings("outer", outer.label.?);
+    // The statement's span starts at the label, not at `while`.
+    try std.testing.expectEqual(@as(u32, 3), outer_stmt.span.column);
+    const inner = outer.body[0].kind.while_stmt;
+    try std.testing.expectEqualStrings("inner", inner.label.?);
+    try std.testing.expect(inner.cond.kind.bool);
+    try std.testing.expectEqualStrings("outer", inner.body[0].kind.break_stmt.label.?);
+    try std.testing.expectEqualStrings("inner", inner.body[1].kind.continue_stmt.label.?);
+    try std.testing.expect(inner.body[2].kind.break_stmt.label == null);
+}
+
+test "a label must be followed by while or loop, and a jump label must be a name" {
+    try std.testing.expectEqualStrings(
+        "a label must be followed by 'while' or 'loop'",
+        try parseErrorFor("pub fn f() {\n  outer: let x = 1\n}"),
+    );
+    try std.testing.expectEqualStrings(
+        "expected identifier",
+        try parseErrorFor("pub fn f() {\n  loop {\n    break :\n  }\n}"),
     );
 }

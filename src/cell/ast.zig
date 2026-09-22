@@ -162,10 +162,24 @@ pub const Stmt = struct {
         /// produces nothing, and modelling it as an expression would force a
         /// unit value. `()` is a return type only (SPEC 3.5); unit values are
         /// not first-class.
-        while_stmt: struct { cond: Expr, body: []Stmt },
-        break_stmt,
-        continue_stmt,
+        ///
+        /// `label` is the `name` of `name: while c { }` or `name: loop { }`
+        /// (SPEC 7.7), null when none was written. `loop { B }` is parsed as
+        /// `while true { B }`, so there is no separate loop node and no later
+        /// stage can treat the two differently.
+        while_stmt: struct { cond: Expr, body: []Stmt, label: ?[]const u8 = null },
+        break_stmt: Jump,
+        continue_stmt: Jump,
     };
+};
+
+/// The payload of `break` and `continue`: the loop label a `break :name` or
+/// `continue :name` names, or null for a plain jump, which targets the
+/// innermost enclosing loop. Resolved against the enclosing loops by
+/// typecheck (which refuses a name no enclosing loop carries) and again, to a
+/// depth, by `hir.lower`; nothing downstream of HIR sees a name.
+pub const Jump = struct {
+    label: ?[]const u8 = null,
 };
 
 pub const Item = struct {
