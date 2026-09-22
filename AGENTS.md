@@ -80,7 +80,7 @@ It does **not** print `All 0 tests passed`. `src/root.zig:145` is an anonymous `
 - **Confirm the NAMED test you asked for appears in the output.** The count is not evidence that your filter matched anything.
 - **The count is always one higher** than the number of named tests that matched, in `src/root.zig`.
 
-`zig test src/main.zig` does not work at all: it fails with `no module named 'cell'`, because the CLI's `@import("cell")` is supplied by `build.zig` (`--dep cell -Mcell=src/root.zig`) along with the runtime C sources the three `extern fn`s need. The CLI tests run only under `zig build test`.
+`zig test src/main.zig` does not work at all: it fails with `no module named 'cell'`, because the CLI's `@import("cell")` is supplied by `build.zig` (`--dep cell -Mcell=src/root.zig`) along with the runtime C sources the four `extern fn`s need. The CLI tests run only under `zig build test`.
 
 `src/root.zig` pulls in the whole library via `refAllDecls`, including codegen tests that shell out to `cc -c`.
 
@@ -178,7 +178,7 @@ llc -filetype=obj out.ll -o out.o && cc ...
 One unit: `load.zig` (classifies extension, pairs `.body`/`.bod` with same-dir `.cell`/`.cel` stem-mate, merges decls, enforces some pairing rules) → lexer/parser → `ast.Module` → `typecheck.Checker` + `borrowck.Checker` (independent) → (optional `hir.lower`) → emit.
 
 - `src/root.zig`: library surface (`compile`, `check`, `emit`, `emitFor`, `loadAndCheck`, tests).
-- `src/main.zig`: CLI dispatcher + the three `extern fn` declarations (`cell_rt_version`, `cell_cxx_probe`, `cell_swift_probe`) that pin runtime signatures. Changing the C side without updating these breaks the build in a way the C compiler cannot see.
+- `src/main.zig`: CLI dispatcher + the four `extern fn` declarations (`cell_rt_version`, `cell_string_free`, `cell_cxx_probe`, `cell_swift_probe`) that pin runtime signatures. Changing the C side without updating these breaks the build in a way the C compiler cannot see.
 - `runtime/cell_rt.h`: the ABI contract. Change it and the emitters together or emitted code stops linking.
 - `src/cell/`: stages live here (`load`, `lexer`, `parser`, `ast`, `typecheck`, `borrowck`, `hir`, `codegen` (AST→C), `llvmemit`, `mlirmit`, `diag`...).
 - `stdlib/prelude.cell`: bodyless declarations only (spec of intended surface; nothing is auto-imported; no module resolution exists yet).

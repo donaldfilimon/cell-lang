@@ -97,6 +97,12 @@ tools/sweep-backends.sh                 # differential HUNTING tool: generates
 tools/tests/test-gate-integrity.sh      # tests the gate itself against a fake
                                         # `cell` (sources check.sh with
                                         # CELL_GATE_LIBRARY_ONLY=1)
+sh tools/tests/test-grok-bots.sh        # tests check-grok-bots.sh: live tree
+                                        # passes, a copy missing a token fails
+python3 tools/tests/test_qualify.py     # tests qualify.py's report
+sh tools/measure-result-layouts.sh      # clang's layout for Result structs;
+                                        # run by hand after changing the layout
+                                        # rule in src/cell/abi.zig
 sh tools/check-rule-lists.sh            # stage 11 alone: needs no build, exits 1
                                         # on drift. Run it after editing THIS file,
                                         # which it reads
@@ -173,7 +179,7 @@ always one higher than the number of named tests that matched.
 `zig test` on the file directly. That works for `src/root.zig` and the
 `src/cell/*` modules, but **not** for `src/main.zig`, which fails outright with
 `no module named 'cell'`: the CLI's `@import("cell")` and the C sources behind
-its three `extern fn`s are supplied by `build.zig`, so its tests run only under
+its four `extern fn`s are supplied by `build.zig`, so its tests run only under
 `zig build test`.
 
 ## Architecture
@@ -244,10 +250,10 @@ function for function, so **the two walks must change together**; a drift
 misaligns every list against the wrong block.
 
 `runtime/cell_rt.h` is the ABI contract that keeps emitted code linking: change
-it and the emitters together. `src/main.zig` holds the three `extern fn`
-declarations (`cell_rt_version`, `cell_cxx_probe`, `cell_swift_probe`) that pin
-runtime signatures, so changing the C side without updating them breaks the
-build in a way the C compiler cannot see.
+it and the emitters together. `src/main.zig` holds the four `extern fn`
+declarations (`cell_rt_version`, `cell_string_free`, `cell_cxx_probe`,
+`cell_swift_probe`) that pin runtime signatures, so changing the C side
+without updating them breaks the build in a way the C compiler cannot see.
 
 `cell build` and `cell run` do not read the checkout's runtime. `src/main.zig`
 `@embedFile`s `cell_rt_h` and `cell_rt_c`, two anonymous imports `build.zig`
