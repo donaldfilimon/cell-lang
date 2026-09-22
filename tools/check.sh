@@ -499,7 +499,10 @@ LEAK_OWNED_STRING_OPTIONAL=0
 # Disclosed C leaks found 2026-09-17 while grounding IR String steps (b)
 # and (c). Measured before pinning; a drop means the gap closed.
 LEAK_DISCARDED_RESULT=2000
-LEAK_FIELD_STORE_OLD=1000
+# CLOSED 2026-09-21: a field store releases the old owned String/list
+# value first when borrowck vouches (`field_assign_liveness`). Measured
+# 0 leaks, ALLOC=2000 FREE=2000, ASan clean; 1000 before the fix.
+LEAK_FIELD_STORE_OLD=0
 LEAK_MATCH_STRING_TEMP=1000
 LEAK_UNBOUND_LIST_TEMP=2000
 # Early exits (2026-09-17): shapes refused before the divergence rule, so a
@@ -1046,7 +1049,7 @@ else
     run_c_leaks owned_string_err "" "$LEAK_OWNED_STRING_ERR" "owning String Err and both sides, 2026-09-17"
     run_c_leaks owned_string_optional "" "$LEAK_OWNED_STRING_OPTIONAL" "owning String?, 2026-09-17"
     run_c_leaks discarded_result "" "$LEAK_DISCARDED_RESULT" "discarded owned String results, disclosed 2026-09-17"
-    run_c_leaks field_store_old "" "$LEAK_FIELD_STORE_OLD" "field store keeps the old value, disclosed 2026-09-17"
+    run_c_leaks field_store_old "" "$LEAK_FIELD_STORE_OLD" "field store releases the old value, CLOSED 2026-09-21"
     run_c_leaks match_string_temp "" "$LEAK_MATCH_STRING_TEMP" "match on an owned String temporary, disclosed 2026-09-17"
     run_c_leaks unbound_list_temp "" "$LEAK_UNBOUND_LIST_TEMP" "unbound list temporaries, disclosed 2026-09-17"
     run_c_leaks early_return "" "$LEAK_EARLY_RETURN" "early exits keep moves out of the merge, 2026-09-17; regression pin"

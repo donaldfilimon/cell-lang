@@ -5,6 +5,10 @@
 // calls, one leaked old value each => 1000. The new value is released
 // with the record at scope end.
 //
+// CLOSED 2026-09-21: the store now releases the old value first when
+// borrowck vouches for it (`field_assign_liveness`), so this measures 0
+// (ALLOC=2000 FREE=2000) and is a regression pin.
+//
 // Status: parses, passes `cell check`; lives under examples/leaks/.
 
 pub fn print_int(copy value: Int);

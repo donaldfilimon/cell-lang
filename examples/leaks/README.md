@@ -61,7 +61,7 @@ same as `examples/arc.cell`, since none lowers a scalar-only program).
 | `skip_revival_break.cell` | R16 residual: a `break` that can be taken while the var is dead made the post-loop release unsafe, so the condition-false path leaked its revived value; **CLOSED 2026-09-17** by `after_loop_skip` releases, 500 -> 0 |
 | `early_return.cell` | not a gap: a branch that always leaves keeps its moves out of the code after the `if` (2026-09-17); these shapes were refused before, so this is a regression pin at 0 |
 | `discarded_result.cell` | not a numbered row: an owned String call result discarded in statement position is freed by no backend; 2000 (1000 calls, two results), disclosed 2026-09-17 |
-| `field_store_old.cell` | not a numbered row: a store to an owned String field keeps the old value unreleased in C; 1000, disclosed 2026-09-17 |
+| `field_store_old.cell` | not a numbered row: a store to an owned String field kept the old value unreleased in C; 1000, disclosed 2026-09-17. **CLOSED 2026-09-21:** 0 (`ALLOC=2000 FREE=2000`), ASan clean. A field store now pre-drops the old owned `String`/list value when borrowck vouches for the store (`field_assign_liveness`); an `exclusive` root, a record/optional/Result field and any store behind a loop move of the root keep the leak |
 | `match_string_temp.cell` | not a numbered row: a `match` with string patterns over an owned String temporary never releases it in C; 1000, disclosed 2026-09-17 |
 | `unbound_list_temp.cell` | not a numbered row: owned list temporaries passed to `shared` positions are never released in C; 2000 (1000 calls, two lists), disclosed 2026-09-17 |
 

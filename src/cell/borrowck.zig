@@ -527,6 +527,20 @@ pub const Checker = struct {
     /// anywhere in that body (`moved_paths` is append-only, so "anywhere in
     /// the body" is a range). `while` is the only back edge Cell has.
     assign_liveness: std.ArrayListUnmanaged(AssignLiveness) = .empty,
+    /// The FIELD-store twin of `assign_liveness` (2026-09-21): one entry per
+    /// accepted store `r.f = ...` (any depth of `.field`, no deref, index or
+    /// call in the chain) whose root binding is `owned` and whose target
+    /// field is `owned`, recording whether the target path still held its
+    /// whole value after the right side was checked. `findDead` is asked of
+    /// the FULL path in both directions, so a moved field (R3a revival), a
+    /// moved parent and a moved subfield all record `live = false`. Keyed by
+    /// the root identifier's name bytes, unique per statement. Codegen reads
+    /// it through `fieldAssignReleasesOldValue` and frees the old field value
+    /// before the store only on a `true`. Every other shape records nothing
+    /// and keeps the leak: an `exclusive` or `shared` root (the old value
+    /// belongs to the referent, not measured), an `arc` root or field (R9 and
+    /// R10 refuse those stores), a `copy` field.
+    field_assign_liveness: std.ArrayListUnmanaged(AssignLiveness) = .empty,
     /// One entry per (scope exit, visible binding): whether the binding still
     /// held a value at that exit on the path the checker was walking. Codegen
     /// reads it through `liveAtExit` to release a var that was moved and then
@@ -638,6 +652,7 @@ pub const Checker = struct {
         self.moved.deinit(self.allocator);
         self.moved_paths.deinit(self.allocator);
         self.assign_liveness.deinit(self.allocator);
+        self.field_assign_liveness.deinit(self.allocator);
         self.exit_liveness.deinit(self.allocator);
         self.skip_breaks.deinit(self.allocator);
         self.wrap_moves.deinit(self.allocator);
@@ -816,6 +831,21 @@ pub const Checker = struct {
         const key = @intFromPtr(name_ptr);
         var found = false;
         for (self.assign_liveness.items) |entry| {
+            if (entry.key != key) continue;
+            if (!entry.live) return false;
+            found = true;
+        }
+        return found;
+    }
+
+    /// The field-store twin of `assignReleasesOldValue`: true only when every
+    /// check of the field store whose ROOT identifier starts at `name_ptr`
+    /// found the whole target path live, with enclosing loops accounted for.
+    /// False for an unknown site. See `field_assign_liveness`.
+    pub fn fieldAssignReleasesOldValue(self: *const Checker, name_ptr: [*]const u8) bool {
+        const key = @intFromPtr(name_ptr);
+        var found = false;
+        for (self.field_assign_liveness.items) |entry| {
             if (entry.key != key) continue;
             if (!entry.live) return false;
             found = true;
@@ -1080,12 +1110,14 @@ pub const Checker = struct {
         const span = stmt.span;
         // Taken before the condition: it runs on every iteration too.
         const liveness_before = self.assign_liveness.items.len;
+        const field_liveness_before = self.field_assign_liveness.items.len;
         const exits_before = self.exit_liveness.items.len;
         const moved_before = self.moved_paths.items.len;
         // Taken before the condition, which can declare bindings inside a
         // value block that are as fresh per iteration as the body's own.
         const first_loop_id = self.next_binding_id;
         defer self.invalidateLoopStores(liveness_before, moved_before);
+        defer invalidateLoopStoresIn(self.field_assign_liveness.items[field_liveness_before..], self.moved_paths.items[moved_before..]);
         // Errors this loop reports (R2.a, anything in the body). A rejected
         // loop keeps every in-loop exit poisoned, `return`s included.
         const errors_before = self.diagnostics.count(.err);
@@ -1336,6 +1368,20 @@ pub const Checker = struct {
             if (!entry.live) return false;
         }
         return true;
+    }
+
+    /// The same invalidation for any liveness list: an entry whose binding is
+    /// moved anywhere in the loop body (ANY path of it, which is conservative
+    /// in the leak direction for a field store) can no longer vouch.
+    fn invalidateLoopStoresIn(entries: []AssignLiveness, moves: []const MovedPath) void {
+        for (entries) |*entry| {
+            for (moves) |m| {
+                if (m.binding == entry.binding) {
+                    entry.live = false;
+                    break;
+                }
+            }
+        }
     }
 
     /// A store recorded inside a loop body cannot vouch for its target if
@@ -2236,6 +2282,17 @@ pub const Checker = struct {
             if (assignTargetName(&a.target)) |name| {
                 try self.assign_liveness.append(self.allocator, .{
                     .key = @intFromPtr(name.ptr),
+                    .binding = place.binding,
+                    .live = self.findDead(place) == null,
+                });
+            }
+        } else if (b.ownership == .owned and self.placeOwnership(b, place.path) == .owned) {
+            // A field store (see `field_assign_liveness`). `ast.rootName`
+            // walks `.field` and `.annotated` only, so a deref, index or
+            // call anywhere in the chain records nothing.
+            if (ast.rootName(&a.target)) |root| {
+                try self.field_assign_liveness.append(self.allocator, .{
+                    .key = @intFromPtr(root.ptr),
                     .binding = place.binding,
                     .live = self.findDead(place) == null,
                 });

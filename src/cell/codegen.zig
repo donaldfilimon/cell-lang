@@ -999,6 +999,28 @@ pub const Generator = struct {
             try out.print("{s} = {s};\n", .{ local.name, temp });
             return;
         }
+        // The FIELD-store twin (2026-09-21, closing the disclosed
+        // `examples/leaks/field_store_old.cell` gap): `t.name = v` releases
+        // the old field value first, under the same "borrowck vouches for
+        // THIS store" rule. The right side goes into a temporary first,
+        // because `t.name = mk(t.name)` reads the old value (and borrowck
+        // then records the path dead, so that shape keeps the leak anyway).
+        if (self.fieldStoreReleasesOld(&a.target, want)) {
+            const temp = try self.nextTemp();
+            try self.writeIndent(indent);
+            try self.writeDecl(want, temp);
+            try out.writeAll(" = ");
+            try self.emitArgLike(&a.value, want, indent);
+            try out.writeAll(";\n");
+            try self.writeIndent(indent);
+            try out.writeAll(if (want.shape == .string) "cell_string_free(&" else "cell_slice_free(&");
+            try self.emitExpr(&a.target, indent);
+            try out.writeAll(");\n");
+            try self.writeIndent(indent);
+            try self.emitExpr(&a.target, indent);
+            try out.print(" = {s};\n", .{temp});
+            return;
+        }
         try self.writeIndent(indent);
         if (want.pointee) |pointee| {
             try out.writeAll("*");
@@ -1008,6 +1030,44 @@ pub const Generator = struct {
         try out.writeAll(" = ");
         try self.emitArgLike(&a.value, want, indent);
         try out.writeAll(";\n");
+    }
+
+    /// Whether a FIELD store may release the target's old value first. Every
+    /// axis defaults to "keep the leak" unless listed as covered:
+    ///
+    ///   * target shape: a `.field` chain (any depth, through annotations)
+    ///     rooted at an identifier. A deref, index or call in the chain
+    ///     answers false (`ast.rootName` stops there, and borrowck records
+    ///     nothing).
+    ///   * root: an `owned` `record` local visible here, droppable (a local
+    ///     or an `owned` parameter; a match-arm binding is not droppable).
+    ///     An `exclusive`/`shared` root, whose old field value belongs to
+    ///     the referent, is NOT covered: not measured.
+    ///   * field type: an owning `String` or list, by value. A record field
+    ///     with drop glue, an `arc` field (R9/R10 refuse the store), an
+    ///     optional or Result field are NOT covered: not measured.
+    ///   * liveness: `fieldAssignReleasesOldValue`, which is false when the
+    ///     target path, a parent or a subfield was moved (R3a revival), when
+    ///     the right side moved it, and when any move of the root's binding
+    ///     sits in an enclosing `while` body.
+    fn fieldStoreReleasesOld(self: *Generator, target: *const ast.Expr, want: CType) bool {
+        if (want.pointee != null) return false;
+        if (want.shape != .string and want.shape != .slice) return false;
+        var t = target;
+        while (t.kind == .annotated) t = t.kind.annotated.value;
+        if (t.kind != .field) return false;
+        const root = ast.rootName(t) orelse return false;
+        var i = self.locals.items.len;
+        while (i > 0) {
+            i -= 1;
+            const local = self.locals.items[i];
+            if (!eq(local.name, root)) continue;
+            if (!local.droppable or local.ownership != .owned) return false;
+            if (local.ty.shape != .record or local.ty.pointee != null) return false;
+            const checker = self.checker orelse return false;
+            return checker.fieldAssignReleasesOldValue(root.ptr);
+        }
+        return false;
     }
 
     /// The innermost visible local an assignment target names, when its old
@@ -7365,6 +7425,81 @@ test "reassigning a never-moved owned var releases the old value first" {
     try expectOccurrences(f, "cell_string_free(&s);", 2);
     const g = try fnDef(e.text, "g");
     try expectOccurrences(g, "cell_slice_free(&xs);", 2);
+    try expectCompiles(e.text);
+}
+
+test "a field store releases the old owned String or list field first" {
+    // examples/leaks/field_store_old.cell, pinned at 1000 until 2026-09-21:
+    // `t.name = v` never released the old value. Same shape as the
+    // whole-binding pre-drop: temporary, release, store.
+    var e = try emitSource(
+        \\pub fn make() -> String { return "abc" }
+        \\pub fn list() -> [Int] { return [1] }
+        \\pub struct Tag {
+        \\  owned name: String
+        \\  owned xs: [Int]
+        \\}
+        \\pub fn f() {
+        \\  var owned t = Tag { name: make(), xs: list() }
+        \\  t.name = make()
+        \\  t.xs = list()
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectOccurrences(f, "cell_string_free(&t.name);", 1);
+    try expectOccurrences(f, "cell_slice_free(&t.xs);", 1);
+    try expectLineBefore(f, "t.name = _cell_t", "cell_string_free(&t.name);");
+    try expectCompiles(e.text);
+}
+
+test "a field store keeps the leak when the field, or any path of its root in a loop, was moved" {
+    // Three guards, each the leak direction. `revive`: the old value went to
+    // `take` (R3a revival), so a pre-drop would double free it. `in_loop`: a
+    // move of ANY path of `t` inside the enclosing `while` body invalidates
+    // the store, conservatively (the back edge could carry it). `through`:
+    // an `exclusive` root; the old value belongs to the referent and the
+    // shape was not measured.
+    var e = try emitSource(
+        \\pub fn make() -> String { return "abc" }
+        \\pub fn take(owned s: String);
+        \\pub struct Tag {
+        \\  owned name: String
+        \\  owned other: String
+        \\}
+        \\pub fn revive() {
+        \\  var owned t = Tag { name: make(), other: make() }
+        \\  take(t.name)
+        \\  t.name = make()
+        \\}
+        \\pub fn in_loop(copy c: Int) {
+        \\  var owned t = Tag { name: make(), other: make() }
+        \\  var i = 0
+        \\  while i < c {
+        \\    t.name = make()
+        \\    take(t.other)
+        \\    t.other = make()
+        \\    i = i + 1
+        \\  }
+        \\}
+        \\pub fn through(exclusive t: Tag) {
+        \\  t.name = make()
+        \\}
+    );
+    defer e.deinit();
+    // The scope-end drop still releases the revived field once, after the
+    // store, so what must be absent is the PRE-drop shape: the value into a
+    // temporary, then a free before the store.
+    for ([_][]const u8{ "revive", "in_loop" }) |name| {
+        const body = try fnDef(e.text, name);
+        try expectAbsent(body, "_cell_t");
+        try expectOccurrences(body, "cell_string_free(&t.name);", 1);
+        // The one free is the scope-end release: it comes AFTER the store.
+        const store = std.mem.indexOf(u8, body, "t.name = cell_make();").?;
+        const free = std.mem.indexOf(u8, body, "cell_string_free(&t.name);").?;
+        try std.testing.expect(store < free);
+    }
+    try expectAbsent(try fnDef(e.text, "through"), "cell_string_free(");
     try expectCompiles(e.text);
 }
 
