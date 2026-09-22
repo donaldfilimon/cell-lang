@@ -6,6 +6,7 @@
 const std = @import("std");
 const ast = @import("../ast.zig");
 const Span = ast.Span;
+const bk_loans = @import("loans.zig");
 const bk_model = @import("model.zig");
 const bk_root = @import("../borrowck.zig");
 const Checker = bk_root.Checker;
@@ -17,7 +18,7 @@ const LoanStatus = bk_model.LoanStatus;
 const OracleVerdict = bk_model.OracleVerdict;
 const NameSet = bk_model.NameSet;
 const ArgContext = bk_model.ArgContext;
-const loanConflicts = Checker.loanConflicts;
+const loanConflicts = bk_loans.loanConflicts;
 
 pub fn noteLoanScope(self: *Checker, loan: Loan) Error!void {
     const text = if (loan.lexical)
