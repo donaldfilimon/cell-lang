@@ -4,7 +4,12 @@ This is the current-status entry point. SPEC.md defines intended semantics;
 OWNERSHIP.md defines ownership rules and retains historical defect evidence.
 Their dated snapshot tables are not current qualification results.
 
-Source inspected: compiler revision `59a42b7`, 2026-09-17. Rows OWN-04, OWN-05 and EXPR-01 re-inspected at `1291c94`,
+Source inspected: compiler revision `59a42b7`, 2026-09-17. Fixed since and not
+yet folded into a row (2026-09-22): `392a8e4` narrow integer parameters carry
+`zeroext`/`signext` on both IR backends (ABI-01); `04f645b` an unannotated
+string-literal list builds owning `cell_string_t` elements in C (TYPE-04);
+`8cfc486` a list literal push that fails panics instead of shortening the list
+(EXPR-01). Rows OWN-04, OWN-05 and EXPR-01 re-inspected at `1291c94`,
 2026-09-21. This matrix records
 static source and fixture evidence, not freshly qualified execution. No row is
 release-qualified on macOS, Linux or Windows. Gate reports qualify particular

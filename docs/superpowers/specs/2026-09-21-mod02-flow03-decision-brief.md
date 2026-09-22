@@ -1,6 +1,7 @@
 # Decision brief: MOD-02 (modules, visibility) and FLOW-03 (loop, labels, defer, for)
 
-Status: **decisions needed, nothing implemented.** Written 2026-09-21 after the
+Status: **ruled by Donald 2026-09-21 (every default accepted); design in
+`2026-09-21-mod02-flow03-ir-first-design.md`.** Originally: decisions needed, nothing implemented. Written 2026-09-21 after the
 field-store leak closed (see `examples/leaks/field_store_old.cell`). Both rows in
 `docs/FEATURES.md` need semantics before code, and this repository's history
 (AGENTS.md, "Instances of ONE reasoning failure") shows every brief that

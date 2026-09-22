@@ -338,7 +338,10 @@ C backend.
 
 ### 1.1 Encoding and file extensions
 
-**Status: designed, not implemented.**
+**Status: the four extensions are implemented** (`load.classify`, and stem
+pairing in section 1.2); UTF-8 identifiers are designed, not implemented.
+(Corrected 2026-09-22: this line said the whole section was designed, not
+implemented, long after `load.zig` classified all four.)
 
 A Cell source file is UTF-8 text. The lexer classifies only ASCII
 (`std.ascii.isAlphabetic`, `std.ascii.isDigit`), so a non-ASCII byte outside a
@@ -434,11 +437,14 @@ module. `examples/pairing/` is the worked pair.
 
 ### 1.3 Compilation unit
 
-**Status: implemented (single file only).**
+**Status: implemented (one module, optionally paired with its body file).**
 
-`cell <command> <file>` compiles exactly one file. There is no module
-resolution, no include path, no package manager, and no linking of a module to
-its body file. A `use` declaration (section 8.4) is recorded and emitted as a C
+`cell <command> <file>` compiles exactly one module: a `.body`/`.bod` file is
+paired with its `.cell`/`.cel` stem-mate by section 1.2 (a `.cell` entry is not
+yet paired with its `.body`; the approved MOD-02 design pairs every entry).
+There is no module resolution, no include path and no package manager.
+(Corrected 2026-09-22: this paragraph said there was no linking of a module to
+its body file, which section 1.2 contradicts.) A `use` declaration (section 8.4) is recorded and emitted as a C
 comment. Since 2026-09-16 `cell build` and `cell run` take that one file's C
 through `$CC` together with an embedded copy of the runtime; they add no second Cell
 unit and no target other than C, so the compilation unit is unchanged and a
@@ -1635,8 +1641,9 @@ expression would force a unit value. `()` is a return type only (section 3.5);
 unit values are not first-class.
 
 `for`, `loop`, and iteration over a collection remain designed. There is no
-iteration protocol, no range value, and no indexing operator (section 3.3), so
-`for` needs all three before it needs syntax.
+iteration protocol and no range value, so `for` needs both before it needs
+syntax. (Postfix indexing `a[i]` exists since 2026-09-21, section 6.11, C
+backend only; this sentence used to say there was no indexing operator.)
 
 **Loops interact with ownership, and that interaction is a rule, not a
 detail.** See `docs/OWNERSHIP.md` R2.a: a place declared outside a loop and

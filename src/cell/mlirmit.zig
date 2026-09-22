@@ -64,8 +64,10 @@
 //! hir.lower inserts), owned String places read as themselves, borrowed views
 //! of them, and String-valued `if`/`match` (on an `llvm.alloca` slot). No
 //! owned String this backend builds is freed: there is no IR drop pass.
-//! STILL REFUSED with `cannot lower to MLIR`: assignment through a field
-//! path, non-empty list literals, and `arc` locals.
+//! STILL REFUSED with `cannot lower to MLIR`: non-empty list literals,
+//! indexing, and `arc` over an aggregate. (Assignment through a field path
+//! lowers since the `into_field` destination; this line listed it until
+//! 2026-09-22.)
 //!
 //! So the boundary is a list of operations that shrinks, not a property of
 //! the types. Probe the emitter rather than trusting this paragraph, and

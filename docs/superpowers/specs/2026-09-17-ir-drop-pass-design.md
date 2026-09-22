@@ -520,7 +520,9 @@ wait for this pass. Q3: the IR drops a shadowed binding correctly, so the leak
 fixture pins a count per backend (C keeps its disclosed leak). Q4: record drops
 are inline per field, with no glue symbols. Q5: a narrow `DropFacts` interface
 that borrowck implements; `hir.zig` does not import `borrowck.zig`. Q6 and Q7
-stay open and are asked when slice 2 starts. Defects 2 to 5 are fixed or
+stay open and are asked when slice 2 starts. **Ruled 2026-09-22:** Q6 adopts
+the runtime-and-host-only ASan witness for the IR legs with slice 2; Q7 does
+revival and branch-end releases first, then value blocks and `return` in a loop. Defects 2 to 5 are fixed or
 pinned: `748df08` (C only), `673f996` (three shapes still disclosed),
 `23942c8`, `7e8491f` (this document's commit 5a). Slice 1 waits for the
 borrowck/codegen split, since `DropFacts` lives in borrowck. The default
