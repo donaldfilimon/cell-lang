@@ -5,6 +5,7 @@ const std = @import("std");
 const ast = @import("../ast.zig");
 const Span = ast.Span;
 const Ownership = ast.Ownership;
+const bk_bindings = @import("bindings.zig");
 const bk_model = @import("model.zig");
 const bk_root = @import("../borrowck.zig");
 const Checker = bk_root.Checker;
@@ -16,8 +17,8 @@ const refKind = bk_model.refKind;
 const findField = bk_model.findField;
 const ctorName = bk_model.ctorName;
 const containsDead = bk_model.containsDead;
-const branchDiverges = Checker.branchDiverges;
-const branchKeyOf = Checker.branchKeyOf;
+const branchDiverges = bk_bindings.branchDiverges;
+const branchKeyOf = bk_bindings.branchKeyOf;
 
 // ── expressions ─────────────────────────────────────────────────────
 
