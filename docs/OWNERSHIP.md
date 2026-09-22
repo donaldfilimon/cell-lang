@@ -89,7 +89,7 @@ case work without analysis:
 2. A borrow created inside an `if` condition or a `match` scrutinee ends when
    that expression finishes.
 3. **A NAMED loan ends as soon as its holder is provably never reached again.**
-   This is the non-lexical rule, and it is enforced: `src/cell/borrowck.zig`'s
+   This is the non-lexical rule, and it is enforced: `src/cell/borrowck/nll.zig`'s
    `loanStatusAt` decides it, and all four conflict sites (a new borrow, a
    read, a move, an assignment) skip a loan it calls dead.
 
@@ -133,7 +133,7 @@ always safe here. Only acceptance needs proof.**
 R8. A callee may not return a `shared` or `exclusive` borrow and may not store
 one in a struct field. Cell has no lifetime parameters, no references inside
 aggregates, and no closures, so a callee has nowhere to put what it is handed.
-`src/cell/borrowck.zig` carries a test named for this invariant; **if lifetime
+`src/cell/borrowck/tests_core.zig` carries a test named for this invariant; **if lifetime
 parameters ever land, that test fails and this rule must be revisited with
 it.**
 
@@ -731,8 +731,8 @@ is removed R7 inherits it.
 
 #### R7's consumption clause: an arm binding may not be consumed while the scrutinee still owns the value
 
-**Enforced.** `borrowck.zig`, `ArmOrigin` and `ownedMoveSource`'s
-`.aliases_place`.
+**Enforced.** `borrowck/`: `ArmOrigin` (`model.zig`) and `ownedMoveSource`'s
+`.aliases_place` (`arc.zig`).
 
 The scrutinee is READ, never moved, so an arm binding is an ALIAS of it and not
 a second owner. Every `owned` consumption site asked `placeOf`, got a perfectly
@@ -970,7 +970,7 @@ revision can relax the rule without invalidating existing programs.
 |---|---|---|
 | `arc` place to an `arc` parameter | yes | retains; both holders live afterward |
 | `arc` place to a `shared` parameter | yes | borrows the pointee for the call; no retain |
-| `arc` place to an `exclusive` parameter | no | R9. **IMPLEMENTED** in `borrowck.zig` as of the R9 work above, at `createLoan`, which covers every spelling of an exclusive borrow rather than this position alone |
+| `arc` place to an `exclusive` parameter | no | R9. **IMPLEMENTED** in `borrowck/loans.zig` as of the R9 work above, at `createLoan`, which covers every spelling of an exclusive borrow rather than this position alone |
 | `arc` place to an `owned` parameter | no | see below. **IMPLEMENTED** in `borrowck.zig`, the only clause of R10 that is, and enforced at four positions rather than just this one |
 | `owned` place to an `arc` parameter | **designed, not implemented** | R10 designs this as a move into a fresh `arc` box with the source dead by R2, and the checker does not do it: the source is NOT consumed. **Refused with an explicit diagnostic as of 2026-09-16** at five positions, rather than left to a `cc` type error. See below |
 | `shared` or `exclusive` borrow to an `arc` parameter | no | see below |
@@ -1364,7 +1364,7 @@ refuse `arc` outright and emit no drops at all):
 - Retain rule 1 boxes a literal, a call result, or a `shared` view with
   `cell_arc_from_string` / `cell_arc_from_slice`. It does **not** box an
   `owned` String or list PLACE, because those helpers move their argument
-  while `borrowck.zig`'s `checkLet` moves an initializer place only for
+  while `borrowck/bindings.zig`'s `checkLet` moves an initializer place only for
   `.owned` and an `.arc` call argument only reads it. R10's "moved into a
   fresh `arc` box; the source is dead by R2" is therefore unimplemented in the
   front end, and until it lands the backend leaves a C type error rather than
@@ -1444,9 +1444,9 @@ PLACE bound as `arc`** (the reverse of R10's refused direction), was never a
 leak once `c6ddda3` refused it at five positions, and it is now implemented at
 the one position where it was measured: `let arc a = s` with `s` a whole
 `owned` binding of `String` or list type MOVES `s` into the box.
-`borrowck.zig`'s `boxableOwnedBinding` records the move (a later use of `s` is
+`borrowck/arc.zig`'s `boxableOwnedBinding` records the move (a later use of `s` is
 a use after move, and a move inside a loop is refused by R2.a), and
-`codegen.zig`'s `isMovedOwnedBinding` lets `emitArcConversion` box that place
+`codegen/conversion.zig`'s `isMovedOwnedBinding` lets `emitArcConversion` box that place
 with `cell_arc_from_string`/`cell_arc_from_slice`, which take the header; the
 moved source has no drop of its own, so the box's release is the only one.
 Measured with both witnesses and under AddressSanitizer on a program that
@@ -1731,7 +1731,7 @@ declared inside a statement-position block, a `while` body, an `if` branch, or a
 function-scoped and the binding was popped before the drop pass ran; in a
 `while` body that was unbounded, measured at **3000 leaks / 80000 bytes** over
 1000 iterations once `leaks -atExit`'s under-count was corrected. `emitStmts`
-in `codegen.zig` is now a block-scope drop point, and `break`/`continue` drop
+in `codegen/stmts.zig` is now a block-scope drop point, and `break`/`continue` drop
 everything declared since the enclosing loop opened. Measured at **0** on both
 the `leaks` count and the malloc counter's LIVE, with the other four fixtures
 unchanged. Safe against a loop body that moves an OUTER place because R2.a
@@ -1780,7 +1780,7 @@ That program became expressible on 2026-09-15 itself: until then the
 typechecker typed every block as `()` (so the typed form was refused) and
 codegen's inference could not see the block's own `let`, so the untyped form
 emitted `int64_t r` and did not compile; both are fixed the same day and pinned
-by tests in `codegen.zig` and `typecheck.zig`. The `owned` form,
+by tests in `codegen/tests_ownership.zig` and `typecheck.zig`. The `owned` form,
 `let owned s = { let owned t = make() \n t }`, was refused until later on
 2026-09-15 ("cannot bind the unresolved name 't'"), because the
 ownership-source walks R10 and R2.b run over an initializer, `arcUniqueSource`

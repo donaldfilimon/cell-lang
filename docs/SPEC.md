@@ -669,7 +669,7 @@ printed by the CLI; see section 11.
 
 **Status: implemented.**
 
-`Generator.namedType` in `src/cell/codegen.zig` fixes these names. This
+`Generator.namedType` in `src/cell/codegen/lower.zig` fixes these names. This
 table is normative and exhaustive:
 
 | Cell | C emitted today | Notes |
@@ -1409,7 +1409,7 @@ A block's type is its last statement's expression type when that statement is
 an expression, else unit; the typechecker typed every block as unit until
 2026-09-15, which let `let arc r = { let arc a = "x" \n a }` through to C that
 did not compile. Codegen's inference sees a block's own `let`s since the same
-day (`pushScratchLocal` in `codegen.zig`).
+day (`pushScratchLocal` in `codegen/lower.zig`).
 
 A brace-delimited block is a primary expression, so `{ ... }` may appear
 wherever an expression may. `Expr.block` carries the statements. Codegen

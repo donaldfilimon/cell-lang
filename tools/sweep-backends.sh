@@ -24,7 +24,7 @@
 # added the same day): 88 programs probed and 5 reported, the same five as
 # below. Re-run the same evening after `let owned x = { let owned t = mk() t }`
 # stopped being a front-end refusal (borrowck's `checkOwnedLetFromBlock`, since
-# generalised to every owned consumption site as `openBlockTail`): the
+# generalised to every owned consumption site as `openBlockTail`, in src/cell/borrowck/bindings.zig): the
 # owned value-block rows now reach `cc`, and still 88 probed / 5 reported.
 # Re-run once more at b290c43 (value-position release, `emitValueBlockDrops`):
 # 88 probed / 5 reported, the same five, so the release changed no

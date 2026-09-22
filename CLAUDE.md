@@ -215,7 +215,7 @@ in explains most surprises:
   retaining when unsure, because retaining too much leaks and retaining too
   little dangles.
 
-  Retains reach two kinds of position by two deliberately different routes,
+  Retains reach two kinds of position by two deliberately different routes (both in `codegen/conversion.zig`),
   and the split is not accidental: `emitArcConversion` is **type-directed** and
   serves argument and value slots, while `returnedArcNeedsRetain` is a
   **position policy** for `return`: it retains every returned `arc` place,

@@ -82,7 +82,7 @@
 #                       is silent again. examples/write_through_named.cell is
 #                       that half for these three, and
 #                       examples/let_binding_modes.cell is that half for the
-#                       five in codegen.zig's `letType`.
+#                       five in codegen/conversion.zig's `letType`.
 #                       A SHAPE THIS STAGE STILL CANNOT CARRY, recorded so it
 #                       is a known hole rather than a silence. The `let`
 #                       family's fix covers OWNING types too: `let exclusive e
@@ -103,7 +103,7 @@
 #                       fixed would mean either a red gate or teaching this
 #                       stage to look away from a real defect, and stage 7's
 #                       header already says which of those is allowed. The
-#                       coverage lives meanwhile in codegen.zig's test "an
+#                       coverage lives meanwhile in codegen/tests_conversions.zig's test "an
 #                       exclusive String let is not a double free, run under
 #                       AddressSanitizer", which compiles and RUNS the shape.
 #   9. sanitizers       the same programs, rebuilt with -fsanitize=address and
@@ -349,7 +349,7 @@ LEAK_UNBOUND_SHARED_TEMP=0
 # same evening, through the same host and counter). It stays in the gate
 # BECAUSE it is closed: pinned at 0, any nonzero reading here re-opens row 4.
 # The codegen tests that pin the drop start at "an arc local declared in a
-# while body is released at the end of every iteration" in src/cell/codegen.zig.
+# while body is released at the end of every iteration" in src/cell/codegen/tests_arc.zig.
 LEAK_BLOCK_SCOPED_LOCAL=0
 # R11 row 5: reassigning an `arc` `var` leaked the previous box.
 # CLOSED 2026-09-15 (night): `emitAssign` evaluates the new value into a

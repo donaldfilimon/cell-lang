@@ -149,7 +149,7 @@ both halves of it are measured over every file here rather than a chosen few:
   side. The seventh and eighth are a value-slot `match` arm at a `let` and the
   same at a `return`, and they were found by asking which positions route
   through the conversion rather than by re-reading the list. The fix is one
-  predicate at one funnel (`codegen.emitConversion`), so a ninth position
+  predicate at one funnel (`emitConversion` in `codegen/conversion.zig`), so a ninth position
   inherits the answer instead of needing a ninth patch; `owned_string.cell`
   exercises all eight and prints 44, the sum of their lengths, so a
   conversion that produced an empty or mis-sized value changes the answer
