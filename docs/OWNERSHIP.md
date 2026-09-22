@@ -1267,6 +1267,31 @@ That closed a measured double free (`match lookup(i) { x => eat(x) }` over a
 `String?` temporary, ASan exit 134 before) and leaves a disclosed leak when
 the body only reads the binding.
 
+**CLOSED 2026-09-21 in C: a discarded owned String call result** (`748df08`).
+A call whose owned `String` result is thrown away in statement position
+(`str_from_int(i)` on its own line) has exactly one owner, the statement, and
+no backend freed it. C now binds it to a temporary and releases it on the
+spot; only a CALL is admitted, by the same predicate as the match scrutinee
+above. `examples/leaks/discarded_result.cell` is pinned at 0 on the C leg
+(2000 before, and 2000 again with the two releases deleted from the emitted C).
+LLVM and MLIR still leak it: they have no drop pass (below). Ruled by Donald
+the same day as the drop-pass spec's open question 2.
+
+**CLOSED 2026-09-21 in part: the old value on a store to an owned field**
+(`673f996`). `r.name = ..` on an owned `String` or list field left the
+previous value unreleased in C. The store now releases the old value first
+when borrowck vouches for it through `field_assign_liveness`.
+`examples/leaks/field_store_old.cell` is pinned at 0 (1000 before). Three
+shapes keep the old behaviour and stay disclosed leaks: a store through an
+`exclusive` root, a record, `T?` or `Result` field, and a store after a loop
+has moved the root.
+
+**OPEN, pinned at 2000: an unbound owned list temporary in a `shared`
+position** (`368266a`). `bytes_len(make())` and `bytes_at(make(), 0)` each
+build a heap list that C never frees (the fixture measures C); this is the list case
+of "nothing drops a call temporary". `examples/leaks/unbound_list_temp.cell`
+(1000 calls, two lists each) pins it, so closing it makes the number drop.
+
 **The IR backends insert no releases at all (measured 2026-09-17).** Both
 accept an owned `String` from a call (`let owned s = str_from_int(i)`, and an
 owned `var` reassigned from a call) and never free it, while the C backend
