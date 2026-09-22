@@ -647,7 +647,10 @@ pub fn emitListLit(
         try self.emitArgLike(&items[i], elem, indent + 1);
         try out.writeAll(";\n");
         try self.writeIndent(indent + 1);
-        try out.print("(void)cell_slice_push(&{s}, sizeof({s}), &{s});\n", .{ list, elem.text, slot });
+        // A push fails only on overflow or out of memory, and `(void)`
+        // built a SHORTER list silently (F4, 2026-09-22). The runtime's own
+        // `cell_bytes_push` and every IR push panic; so does this.
+        try out.print("if (!cell_slice_push(&{s}, sizeof({s}), &{s})) cell_panic(cell_str_from_cstr(\"list literal in {s}: out of memory\"));\n", .{ list, elem.text, slot, self.current_fn });
     }
     try self.writeIndent(indent + 1);
     try out.print("{s};\n", .{list});
