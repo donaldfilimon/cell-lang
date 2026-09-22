@@ -53,6 +53,25 @@ pub fn isDefaultPattern(p: ast.Pattern) bool {
 /// the AST as one of these (see the module doc comment's rule 3), so
 /// `observe(arc label)` reaches here as a wrapper around the identifier.
 /// `cell_opt_i64_t` -> `cell_opt_i64`, the constructor prefix.
+/// The element type an UNANNOTATED list literal is built with, from the
+/// type its first item infers to. The declared path (`let owned ss:
+/// [String] = ...`) lowers `[String]` to an owning `cell_string_t` element
+/// and converts each item; the inferred path used to take the item's own
+/// type, so `let owned ss = ["ab", "c"]` (accepted by `cell check` as
+/// `[String]`) allocated 16-byte `cell_str_t` views where a `shared
+/// [String]` reader walks 24-byte owning elements. Measured: a host summing
+/// `.len` printed 2256 (garbage) where the annotated twin printed 3000 per
+/// 1000 calls. A string view therefore becomes the owning element here, so
+/// both spellings build the same buffer; an unknown or unit item falls to
+/// `int64_t`, which is what this always did.
+pub fn inferredListElem(first: CType) CType {
+    return switch (first.shape) {
+        .unknown, .unit => CType.int64,
+        .str => CType.string,
+        else => first,
+    };
+}
+
 pub fn optBase(ty: CType) []const u8 {
     std.debug.assert(ty.shape == .optional);
     return ty.text[0 .. ty.text.len - "_t".len];
@@ -66,7 +85,7 @@ pub fn optBaseForPayload(t: CType) ?[]const u8 {
         .{ "int32_t", "cell_opt_i32" },   .{ "uint16_t", "cell_opt_u16" },
         .{ "uint32_t", "cell_opt_u32" },  .{ "double", "cell_opt_f64" },
         .{ "bool", "cell_opt_bool" },     .{ "uint8_t", "cell_opt_byte" },
-        .{ "float", "cell_opt_Float32" },     .{ "cell_string_t", "cell_opt_string" },
+        .{ "float", "cell_opt_Float32" }, .{ "cell_string_t", "cell_opt_string" },
     };
     inline for (map) |row| if (std.mem.eql(u8, t.text, row[0])) return row[1];
     return null;

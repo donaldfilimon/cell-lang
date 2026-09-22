@@ -626,12 +626,12 @@ pub fn emitListLit(
         try out.writeAll("cell_slice_empty()");
         return;
     }
-    var elem = want_elem orelse try self.inferExpr(&items[0]);
     // The normalization is for the INFERRED path only. A declared type
     // that lowers to `void*` is this backend's deliberate "visible rather
     // than silently wrong", and quietly turning it into an int64 buffer
-    // would be the opposite.
-    if (want_elem == null and (elem.shape == .unknown or elem.shape == .unit)) elem = CType.int64;
+    // would be the opposite. `inferredListElem` also turns a string view
+    // into the owning element the declared `[String]` path builds.
+    const elem = want_elem orelse cg_helpers.inferredListElem(try self.inferExpr(&items[0]));
     const list = try self.nextTemp();
     const slot = try self.nextTemp();
 

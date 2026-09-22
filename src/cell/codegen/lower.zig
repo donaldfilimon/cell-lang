@@ -264,10 +264,8 @@ pub fn inferExpr(self: *Generator, e: *const ast.Expr) Alloc!CType {
             // same rule `emitListLit` applies, so an inferred `let` can
             // be indexed with the right stride.
             if (items.len == 0) return CType.slice;
-            var elem = try self.inferExpr(&items[0]);
-            if (elem.shape == .unknown or elem.shape == .unit) elem = CType.int64;
             const p = try self.arena.create(CType);
-            p.* = elem;
+            p.* = cg_helpers.inferredListElem(try self.inferExpr(&items[0]));
             return .{ .text = CType.slice.text, .shape = .slice, .elem = p };
         },
         .block => |stmts| {

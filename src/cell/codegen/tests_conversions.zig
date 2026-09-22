@@ -380,6 +380,94 @@ test "an unbound arc temporary's release balances, compiled and run under ASan" 
 // where LLVM and MLIR print 14242, and the second aborts under
 // AddressSanitizer at exit 134 with `attempting double-free`.
 
+test "an unannotated string-literal list builds the owning element the declared path builds" {
+    // F2 (2026-09-22): `let owned ss = ["ab", "c"]` passes `cell check` as
+    // `[String]`, and a `shared [String]` reader walks 24-byte owning
+    // elements, so a 16-byte view buffer is a silent miscompile. Both
+    // spellings must emit the same allocation and the same conversion.
+    var e = try emitSource(
+        \\pub fn lens(shared xs: [String]) -> Int;
+        \\pub fn annotated() -> Int {
+        \\  let owned ss: [String] = ["ab", "c"]
+        \\  return lens(ss)
+        \\}
+        \\pub fn inferred() -> Int {
+        \\  let owned ss = ["ab", "c"]
+        \\  return lens(ss)
+        \\}
+    );
+    defer e.deinit();
+    try expectCompiles(e.text);
+    const a = try fnDef(e.text, "annotated");
+    const b = try fnDef(e.text, "inferred");
+    try expectContains(a, "cell_slice_alloc(sizeof(cell_string_t), 2)");
+    try expectContains(b, "cell_slice_alloc(sizeof(cell_string_t), 2)");
+    try expectContains(b, "cell_string_from_str(cell_str_from_parts(\"ab\", 2))");
+    try expectAbsent(b, "sizeof(cell_str_t)");
+}
+
+test "an unannotated string-literal list reads back its lengths, compiled and run" {
+    // The execution twin of the text pin above: the host walks the buffer
+    // as `cell_string_t` and sums `.len`. Broken, this printed 2256 for
+    // one call's worth of garbage strides; the answer is 3.
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn lens(shared xs: [String]) -> Int;
+        \\pub fn main() {
+        \\  let owned ss = ["ab", "c"]
+        \\  print_int(lens(ss))
+        \\}
+    );
+    defer e.deinit();
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.c", .data = e.text });
+    try tmp.dir.writeFile(io, .{ .sub_path = "host.c", .data =
+        \\#include "cell_rt.h"
+        \\int64_t cell_lens(cell_slice_t xs) {
+        \\    const cell_string_t *p = xs.ptr;
+        \\    int64_t s = 0;
+        \\    for (size_t i = 0; i < xs.len; i++) s += (int64_t)p[i].len;
+        \\    return s;
+        \\}
+        \\
+    });
+
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const root = cwd_buf[0..cwd_len];
+    const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{root});
+    defer gpa.free(include);
+    const rt_c = try std.fmt.allocPrint(gpa, "{s}/runtime/cell_rt.c", .{root});
+    defer gpa.free(rt_c);
+
+    const cc_result = try std.process.run(gpa, io, .{
+        .argv = &.{ "cc", "-std=c11", "-Wall", "-Wextra", "body.c", "host.c", rt_c, "-I", include, "-o", "body" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(cc_result.stdout);
+    defer gpa.free(cc_result.stderr);
+    if (!cc_result.term.success()) {
+        std.debug.print("cc rejected emitted C:\n{s}\n--- source ---\n{s}\n", .{ cc_result.stderr, e.text });
+        return error.CcRejectedEmittedC;
+    }
+
+    const run_result = try std.process.run(gpa, io, .{
+        .argv = &.{"./body"},
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer gpa.free(run_result.stdout);
+    defer gpa.free(run_result.stderr);
+    if (!run_result.term.success()) {
+        std.debug.print("emitted program did not exit cleanly:\nstdout:\n{s}\nstderr:\n{s}\n", .{ run_result.stdout, run_result.stderr });
+        return error.ProgramCrashed;
+    }
+    try std.testing.expectEqualStrings("3\n", run_result.stdout);
+}
+
 test "every unique-borrow spelling in a let initializer binds the lender" {
     // examples/borrows.cell declares these five identical, and
     // write_through.cell pins that for the ARGUMENT position. A `let`
