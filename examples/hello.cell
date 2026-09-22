@@ -30,6 +30,7 @@ pub fn add(shared a: Int, shared b: Int) -> Int {
     return a + b
 }
 
+// EXPECT-OUTPUT: 42
 pub fn main() {
     let owned p = Point { x: 1.0, y: 2.0 }
     let copy n = add(shared 40, shared 2)

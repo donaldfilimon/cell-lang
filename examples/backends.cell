@@ -47,6 +47,7 @@ pub fn choose(shared n: Int) -> Int {
     }
 }
 
+// EXPECT-OUTPUT: 24
 pub fn main() {
     let copy a = choose(shared 3)
     let copy b = classify(copy Color.Green)

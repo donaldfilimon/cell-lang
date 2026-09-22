@@ -47,6 +47,7 @@ pub fn first_multiple(copy limit: Int) -> Int {
     return i
 }
 
+// EXPECT-OUTPUT: 55
 pub fn main() {
     print_int(sum_to(copy 10))
 }

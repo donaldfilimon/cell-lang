@@ -32,6 +32,7 @@ pub fn count_up(copy n: Int) -> Int {
     return total
 }
 
+// EXPECT-OUTPUT: 10
 pub fn main() {
     print_int(count_up(copy 10))
 }

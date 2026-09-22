@@ -20,7 +20,7 @@ source spans.
 Cell is a systems language that blends Rust ownership and algebraic data types,
 Swift value/reference clarity and ergonomics, and Zig explicit control with a
 C-ABI-first ethos. The reference toolchain is written in Zig
-`0.17.0-dev.2131+d08989840` and emits C.
+`0.17.0-dev.2251+1175a3e99` and emits C.
 
 This document specifies the language. It is not a description of a finished
 compiler. Every construct carries a status tag, assigned by reading `src/` and

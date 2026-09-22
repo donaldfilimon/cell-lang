@@ -60,6 +60,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$src" ] || { printf 'usage: driver.sh [options] <file.cell>\n' >&2; exit 2; }
+# Same convention as the gate's backend-answers stage: a `<stem>_host.c`
+# beside the program is its host. Without this, examples/arc.cell run bare
+# reported a C link FAILURE that was only the missing host.
+if [ -z "$hosts" ]; then
+    sibling="${src%.*}_host.c"
+    [ -f "$sibling" ] && hosts=" $sibling"
+fi
 [ -f "$src" ] || { printf 'no such file: %s\n' "$src" >&2; exit 2; }
 
 TMP=$(mktemp -d) || exit 2

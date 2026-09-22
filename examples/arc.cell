@@ -52,6 +52,7 @@ pub fn share_name(arc name: String) -> arc String {
 /// The C side returns the borrowed view's length, which is 7.
 pub fn inspect(shared name: String) -> Int;
 
+// EXPECT-OUTPUT: 13
 pub fn main() {
     let arc label = "session"
     let arc alias = share_name(arc label)
