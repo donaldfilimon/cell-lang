@@ -54,8 +54,10 @@
 //     let owned s2: String = match c { 0 => mk(), _ => mk() }   fresh arms
 //     let owned n: Int = match c { 0 => 1, _ => 2 }             scalar arms
 //
-// The named over-refusal is a `match` over `copy` places in an `owned` slot,
-// which was accepted before and is not now. Bind it to a `copy` name first.
+// A place whose TYPE owns no resource (an `Int`, a record of scalars) is
+// exempt since 2026-09-22 by Donald's ruling: it is read, not moved, so
+// `match c { 0 => a, _ => b }` over two `Int` places is accepted again. This
+// file's `String` places still own a buffer and are still refused.
 
 pub fn mk() -> String;
 pub fn use_it(shared s: String) -> Int;

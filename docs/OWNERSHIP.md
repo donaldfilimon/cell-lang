@@ -560,28 +560,31 @@ let owned n: Int = match c { 0 => 1, _ => 2 }               // scalar arms
 let owned b: Box = Box { s: mk() }                          // fresh field value
 ```
 
-**The named over-refusal.** A `match` over `copy` places in an `owned` slot was
-accepted before this rule and is not now:
+**Resource-free places are exempt (ruled by Donald 2026-09-22).** A place
+reached through a branch whose TYPE owns no resource is READ, not moved:
+`ownedMoveBranch` asks `placeResourceShape`, the classifier R12 and the
+struct-field site already use, and a `.no_resources` answer yields
+`no_owned_place`. Reading such a place copies no buffer and nothing drops it,
+so no path can free it twice. So this compiles again, as it did before
+`0e82266`:
 
 ```cell
 pub fn pick(copy c: Int, copy a: Int, copy b: Int) -> Int {
-    return match c { 0 => a, _ => b }        // refused
+    return match c { 0 => a, _ => b }        // accepted
 }
 ```
 
-A `copy` place is exempt from R2 by R12 and `pendingDrops` never drops one, so
-an exemption looks free. It was considered and rejected: the exemption would be
-an enumeration of the ownership modes this backend drops today asserted over
-every `copy` place, which is the reasoning failure this rule is an instance of,
-and the neighbouring claim is already false, because `copy String` is spellable
-and `let owned s: String = a` over one emits a shallow header copy and frees
-`a`'s buffer through `s`. Bind the value to a `copy` name and hand the name
-over:
-
-```cell
-let copy r = match c { 0 => a, _ => b }
-return copy r
-```
+The exemption is asked of the type and never of the mode. An exemption for
+every `copy` place was considered and rejected when this rule landed, and that
+rejection stands: `copy String` is spellable, and a shallow header copy of one
+frees a live buffer (R12 now refuses the `copy String` declaration itself). A
+`String`, a list, an `arc` aggregate, or a record holding any of them is still
+refused through a branch, and a place whose shape does not resolve falls to the
+refusal too. One consequence to know: a resource-free place read through a
+branch is not marked moved, so it stays usable afterwards, while the same place
+moved directly (`let owned n = a`) is moved. Neither frees anything.
+Tests: `R2.b exempts a place whose type owns no resource, and still refuses one
+that does` in `src/cell/borrowck/tests_arc.zig`.
 
 Corpus: `examples/rejected/owned_move_through_match.cell`, which carries the
 measurements.

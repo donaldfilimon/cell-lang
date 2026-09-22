@@ -1009,40 +1009,49 @@ test "R2.b moves bindings but owning resource fields refuse place transfers" {
     );
 }
 
-test "R2.b over-refuses a match over copy places, and the workaround is a name" {
-    // NAMED RATHER THAN LEFT TO BE DISCOVERED. This program was accepted at
-    // `0e82266`, runs clean, and is now REFUSED:
+test "R2.b exempts a place whose type owns no resource, and still refuses one that does" {
+    // RULED BY DONALD 2026-09-22: exempt no-resource TYPES at R2.b's six
+    // sites. This program was refused from `0e82266` until then:
     //
     //     pub fn pick(copy c: Int, copy a: Int, copy b: Int) -> Int {
     //         return match c { 0 => a, _ => b }
     //     }
     //
-    // A `copy` place is exempt from R2 by R12 and `pendingDrops` never drops
-    // one, so an exemption for it looks free. It was considered and REJECTED.
-    // The exemption would be an enumeration of the ownership modes this
-    // backend drops today, asserted over every `copy` place, which is exactly
-    // the reasoning failure this rule is the sixteenth instance of; and the
-    // neighbouring claim is already false, because `copy String` is spellable
-    // and `let owned s: String = a` over one emits a shallow header copy and
-    // frees `a`'s buffer through `s`. Refusing costs a program that can be
-    // spelled with a name. Accepting costs a free of something still live.
-    try expectDiagnostics(
+    // The exemption asked of a MODE (every `copy` place) was rejected, and
+    // that rejection stands: `copy String` is spellable and a shallow header
+    // copy of one frees a live buffer. This exemption is asked of the TYPE,
+    // through `placeResourceShape`, the classifier R12 and the struct-field
+    // site already use, so `copy String` is still refused below. A place of a
+    // type with no drop is read, not moved: reading it frees nothing and
+    // copies no resource, so there is no second owner to free twice.
+    try expectAccepted(
         \\pub fn pick(copy c: Int, copy a: Int, copy b: Int) -> Int {
         \\    return match c { 0 => a, _ => b }
         \\}
-    ,
-        \\t.cell:2:27: error: cannot return the place 'a' reached through a branch from 'owned' function 'pick': which owned place it gives up cannot be resolved here
-        \\t.cell:2:27: note: R2 moves a place, not a value that may yield one on some paths and not others; bind the value to a name first, or produce a fresh value on every path
-        \\
     );
-    // The workaround, verified rather than asserted: bind the value to a name
-    // whose annotation says what it is, then hand the name over.
+    // Every site, over owned scalar and resource-free record places.
     try expectAccepted(
-        \\pub fn pick(copy c: Int, copy a: Int, copy b: Int) -> Int {
-        \\    let copy r = match c { 0 => a, _ => b }
-        \\    return copy r
+        \\pub struct P { copy x: Int, copy y: Int }
+        \\pub fn take(owned p: P) -> Int { return p.x }
+        \\pub fn f(copy c: Int) -> Int {
+        \\    let owned a = 1
+        \\    let owned b = 2
+        \\    let owned n: Int = match c { 0 => a, _ => b }
+        \\    var owned m: Int = 0
+        \\    m = if c == 0 { a } else { b }
+        \\    let owned p = P { x: 1, y: 2 }
+        \\    let owned q = P { x: 3, y: 4 }
+        \\    let owned r: P = match c { 0 => p, _ => q }
+        \\    return n + m + take(match c { 0 => r, _ => p }) + a + b
         \\}
     );
+    // A type that owns a resource is still refused. (A `copy String`
+    // parameter never reaches here: R12 refuses the declaration first.)
+    try expectRejectedWith(
+        \\pub fn pick(copy c: Int, owned a: String, owned b: String) -> String {
+        \\    return match c { 0 => a, _ => b }
+        \\}
+    , "cannot return the place 'a' reached through a branch");
 }
 
 test "R12 refuses a copy place whose type owns resources, by all three routes" {

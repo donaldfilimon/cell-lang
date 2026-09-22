@@ -370,7 +370,12 @@ pub fn wrapPayloadBody(arm: ast.MatchArm) bool {
 pub fn ownedMoveBranch(self: *Checker, e: *const ast.Expr) Error!OwnedMove {
     return switch (try self.ownedMoveSource(e)) {
         .no_owned_place => .no_owned_place,
-        .place => |p| .{ .unknown = .{
+        // Ruled 2026-09-22: a place whose TYPE owns no resource is read, not
+        // moved. Reading it copies no buffer and nothing drops it, so no
+        // path can free it twice. Asked of the type through
+        // `placeResourceShape` (never of the mode: `copy String` owns a
+        // buffer), and an unresolved shape still falls to the refusal.
+        .place => |p| if (try placeIsResourceFree(self, p)) .no_owned_place else .{ .unknown = .{
             .display = try self.msg("the place '{s}' reached through a branch", .{p.display}),
             .span = p.span,
         } },
@@ -382,6 +387,14 @@ pub fn ownedMoveBranch(self: *Checker, e: *const ast.Expr) Error!OwnedMove {
         // names the arm binding and its scrutinee, so nothing is lost.
         .aliases_place => |s| .{ .unknown = s },
     };
+}
+
+/// True only when the place's type resolves to `.no_resources`. Null or
+/// `.unknown` answers false, which keeps the refusal.
+fn placeIsResourceFree(self: *Checker, p: Place) Error!bool {
+    const b = self.bindingById(p.binding) orelse return false;
+    const shape = (try self.placeResourceShape(b, p.path)) orelse return false;
+    return shape == .no_resources;
 }
 
 /// R7's one question, asked once, at the single point every `owned`
