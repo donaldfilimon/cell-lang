@@ -308,9 +308,14 @@ const Emitter = struct {
                 return;
             };
             try self.out.writeAll(t);
-            // A C `_Bool` is passed zero-extended. Getting this wrong on a
-            // boundary call is silent and platform-specific, so it is spelled.
-            if (p.ty.tag() == .boolean) try self.out.writeAll(" zeroext");
+            // A narrow integer or `_Bool` is extended by the caller. Getting
+            // this wrong on a boundary call is silent and platform-specific,
+            // so it is spelled (see `abi.paramExt`).
+            switch (abi.paramExt(p.ty)) {
+                .none => {},
+                .zero => try self.out.writeAll(" zeroext"),
+                .sign => try self.out.writeAll(" signext"),
+            }
         }
         try self.out.writeAll(")\n");
     }
@@ -2060,6 +2065,16 @@ test "a bodyless declaration becomes a declare, and a Bool parameter is zeroext"
     try expectContains(e.text, "declare void @cell_print_int(i64)");
 }
 
+test "narrow integer parameters of a declaration carry the C caller extension" {
+    var e = try emitSource(
+        \\pub fn is7(copy b: Byte) -> Bool;
+        \\pub fn narrow(copy a: UInt8, copy b: Int8, copy c: UInt16, copy d: Int16, copy e: Int32);
+    );
+    defer e.deinit();
+    try expectContains(e.text, "(i8 zeroext)");
+    try expectContains(e.text, "(i8 zeroext, i8 signext, i16 zeroext, i16 signext, i32)");
+}
+
 test "a module with a zero-parameter main gets a C entry point" {
     var e = try emitSource(
         \\pub fn main() { }
@@ -2103,7 +2118,7 @@ test "a UInt32 parameter lowers to i32" {
     defer e.deinit();
     try std.testing.expect(!e.bag.hasErrors());
     try expectContains(e.text, "declare i32 @cell_take(i32)");
-    try expectContains(e.text, "declare i8 @cell_take8(i8)");
+    try expectContains(e.text, "declare i8 @cell_take8(i8 signext)");
 }
 
 test "an untyped integer literal in an Int8 slot lowers as i8" {

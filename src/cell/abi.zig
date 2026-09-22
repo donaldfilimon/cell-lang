@@ -519,6 +519,24 @@ pub fn renderParam(
     return renderClass(arena, classifyParam(m, ty, own), ty, false);
 }
 
+/// The integer extension a C caller applies to a narrow parameter.
+///
+/// On Apple arm64 the CALLER extends an argument narrower than 32 bits, and a
+/// declaration that omits the attribute lets LLVM pass garbage in the upper
+/// bits. Measured: `is7(250 + 13)` passed a `Byte` of 263 to a C host that
+/// printed 0 where the C backend printed 1. clang declares
+/// `h(uint8_t, int8_t, uint16_t, int16_t, _Bool)` as
+/// `(i8 zeroext, i8 signext, i16 zeroext, i16 signext, i1 zeroext)`.
+pub const Ext = enum { none, zero, sign };
+
+pub fn paramExt(ty: hir.Ty) Ext {
+    return switch (ty.tag()) {
+        .boolean, .byte, .uint8, .uint16 => .zero,
+        .int8, .int16 => .sign,
+        else => .none,
+    };
+}
+
 /// Render a return's LLVM type, or null when this module cannot place it.
 /// An `.indirect` return renders as "void"; the caller adds the `sret`
 /// parameter, because that changes the signature rather than the type.

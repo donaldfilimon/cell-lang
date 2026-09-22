@@ -256,6 +256,13 @@ const Emitter = struct {
                     break;
                 };
                 try self.out.writeAll(t);
+                // Same caller-extension rule as the LLVM backend; the
+                // attribute survives convert-func-to-llvm into the `declare`.
+                switch (abi.paramExt(p.ty)) {
+                    .none => {},
+                    .zero => try self.out.writeAll(" {llvm.zeroext}"),
+                    .sign => try self.out.writeAll(" {llvm.signext}"),
+                }
             }
             if (!ok) {
                 try self.unsupported(f.span, "declared parameter type");
@@ -2326,7 +2333,19 @@ test "a UInt32 parameter lowers to i32" {
     );
     defer e.deinit();
     try expectContains(e.text, "func.func private @cell_take(i32) -> i32");
-    try expectContains(e.text, "func.func private @cell_take8(i8) -> i8");
+    try expectContains(e.text, "func.func private @cell_take8(i8 {llvm.signext}) -> i8");
+}
+
+test "narrow integer parameters of a declaration carry the C caller extension" {
+    var e = try emitSource(
+        \\pub fn is7(copy b: Byte) -> Bool;
+        \\pub fn narrow(copy a: UInt8, copy b: Int8, copy c: UInt16, copy d: Int16, copy e: Int32);
+        \\pub fn assert(copy cond: Bool);
+    );
+    defer e.deinit();
+    try expectContains(e.text, "(i8 {llvm.zeroext})");
+    try expectContains(e.text, "(i8 {llvm.zeroext}, i8 {llvm.signext}, i16 {llvm.zeroext}, i16 {llvm.signext}, i32)");
+    try expectContains(e.text, "(i1 {llvm.zeroext})");
 }
 
 test "an untyped integer literal in an Int8 slot lowers as i8" {
