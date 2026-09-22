@@ -1,6 +1,11 @@
 # Aggregate ABI for the LLVM and MLIR backends
 
-**Status: design, approved 2026-09-07. Not implemented.**
+**Status: design, approved 2026-09-07; implemented.** The classifier landed in
+`src/cell/abi.zig` (`d54c68b`, pinned against clang in `e86f12e`), the LLVM
+backend adopted it from `27d3748` and `457d2b6`, and `1e295f0` (2026-09-17)
+placed aggregates like clang in both IR backends. Gate stage 10 (declared
+signatures) is the standing check. The status line said "Not implemented" until
+2026-09-21, long after all of this landed.
 
 ## The problem
 

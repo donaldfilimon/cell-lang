@@ -103,6 +103,11 @@ python3 tools/tests/test_qualify.py     # tests qualify.py's report
 sh tools/measure-result-layouts.sh      # clang's layout for Result structs;
                                         # run by hand after changing the layout
                                         # rule in src/cell/abi.zig
+sh tools/prelude-signatures.sh ./zig-out/bin/cell
+                                        # stage 13's input: every prototype the
+                                        # C backend emits for stdlib/prelude.cell,
+                                        # each of which must appear verbatim in
+                                        # runtime/cell_rt.h
 sh tools/check-rule-lists.sh            # stage 11 alone: needs no build, exits 1
                                         # on drift. Run it after editing THIS file,
                                         # which it reads
@@ -135,6 +140,11 @@ output; the count is the one thing this file cannot keep current.
 - A `<name>_host.c` beside an example is the hand-written host for its
   bodyless declarations; the gate's `run_c_host` rows and `cell run` accept
   it as a `.c` positional.
+- `examples/signatures/*.cell` are signature fixtures with no `main`,
+  written to pin a declared-signature contract rather than an answer (the
+  first, `arc_string_return.cell`, is the former unsafe `arc String` return
+  disagreement). `tools/check.sh` includes them in `accepted_examples()` and
+  in stage 10's loop, and `docs/FEATURES.md` OWN-04 cites one.
 - `examples/leaks/` is a separate directory on purpose, invisible to the
   corpus loops. Each fixture loops one retain/release shape 1000 times and
   its count is a **pinned constant in `tools/check.sh`**, measured by two
@@ -182,9 +192,30 @@ always one higher than the number of named tests that matched.
 its four `extern fn`s are supplied by `build.zig`, so its tests run only under
 `zig build test`.
 
+The borrow checker's and the C backend's tests no longer live in their
+modules: `798d50c` moved them to `src/cell/borrowck/tests_*.zig` and
+`84dde77` to `src/cell/codegen/tests_*.zig`, and each set is reached only
+through a `comptime { _ = ...; }` block in its parent module, so a filtered
+`zig test src/cell/borrowck.zig` still runs them. Measured 2026-09-22:
+`zig test src/cell/borrowck.zig --test-filter "R5"` printed four named
+`borrowck.tests_core.test.R5:` lines and `All 4 tests passed`, with no
+anonymous test in the count, so a count read off `borrowck.zig` is exact
+where one read off `src/root.zig` is one high. `codegen.zig` was not measured
+the same way.
+
 ## Architecture
 
 One compilation unit, two lowering paths.
+
+**Direction, ruled by Donald 2026-09-21:** `.cell -> HIR -> LLVM IR / MLIR` is
+the primary pipeline, and C is emitted only where it is still needed. C stays
+the default `--target` because it is still the only backend that lowers the
+whole language; the default flips to `llvm` when every LLVM/MLIR leak pin in
+gate stage 7 reads 0. New lowering work therefore lands in `hir.lower` first
+unless a ruling says otherwise, and the open IR work (list indexing step (b),
+the IR drop pass with its `DropFacts` interface) is specified in
+`docs/superpowers/specs/2026-09-17-ir-*.md`, each carrying its own dated
+rulings block.
 
 `load.zig` resolves a path to a unit: it classifies the extension and pairs a
 `.body`/`.bod` file with its same-directory `.cell`/`.cel` stem-mate, merging
@@ -225,8 +256,10 @@ in explains most surprises:
   return answer is a fact about the position, not the type, and merging them
   means passing a mode flag into a clean type-directed conversion.
 - **`--target=llvm` and `--target=mlir` go through `hir.lower`** and are
-  deliberately **scalar-first**. They refuse `[T]`, most `T?` and `Result`,
-  `arc`, and most aggregates crossing the C boundary with a `cannot lower`
+  deliberately **scalar-first**. They refuse `[T]`, any `T?` or `Result`
+  beyond scalar `Some`/`None`/`Ok`/`Err` payloads, `arc` (`docs/FEATURES.md`
+  OWN-04 records the 2026-09-21 aggregate and nonprimitive-return refusals),
+  and most aggregates crossing the C boundary with a `cannot lower`
   diagnostic at the span. They never emit plausible wrong code. `String` is
   the widest exception since 2026-09-17: owned and borrowed Strings and the
   view-to-owned conversion lower in both (`hir.lower` inserts the

@@ -652,6 +652,11 @@ Under the call-argument exception in 0.3, `read(shared buf)` followed by
 first loan ended when its call finished. Only loans bound to a name persist to
 the end of the block.
 
+**CLOSED; the paragraph below is history.** Measured 2026-09-21: the example
+above reports exactly the two diagnostics shown, because `borrowck.zig` records
+`let exclusive e = &mut buf` as a named loan of `buf`, and R5 is in its
+header's enforced list.
+
 **Still blocked, but only halfway.** `let exclusive e = &mut buf` parses and
 builds a `unary` node with `UnaryOp.ref_exclusive` over an `ident`, so the
 provenance *is* recoverable from the AST: walk the initializer, and if it is a
@@ -971,8 +976,8 @@ revision can relax the rule without invalidating existing programs.
 | `arc` place to an `arc` parameter | yes | retains; both holders live afterward |
 | `arc` place to a `shared` parameter | yes | borrows the pointee for the call; no retain |
 | `arc` place to an `exclusive` parameter | no | R9. **IMPLEMENTED** in `borrowck/loans.zig` as of the R9 work above, at `createLoan`, which covers every spelling of an exclusive borrow rather than this position alone |
-| `arc` place to an `owned` parameter | no | see below. **IMPLEMENTED** in `borrowck.zig`, the only clause of R10 that is, and enforced at four positions rather than just this one |
-| `owned` place to an `arc` parameter | **designed, not implemented** | R10 designs this as a move into a fresh `arc` box with the source dead by R2, and the checker does not do it: the source is NOT consumed. **Refused with an explicit diagnostic as of 2026-09-16** at five positions, rather than left to a `cc` type error. See below |
+| `arc` place to an `owned` parameter | no | see below. **IMPLEMENTED** in `borrowck.zig` (the header's "ONE clause of R10"), and enforced at six positions rather than just this one (below) |
+| `owned` place to an `arc` parameter | **implemented for a whole `owned` `String` or list binding** | R10 designs this as a move into a fresh `arc` box with the source dead by R2. Refused with an explicit diagnostic at five positions from 2026-09-16, then implemented the same day for that one source shape at all five (`let arc`, a direct `-> arc T` return, assignment into a whole `var arc`, this parameter, a struct literal's `arc` field); every other source is still refused as not implemented. See below |
 | `shared` or `exclusive` borrow to an `arc` parameter | no | see below |
 | `copy` and `arc` on the same declaration | no | see below |
 
@@ -1368,7 +1373,10 @@ refuse `arc` outright and emit no drops at all):
   `.owned` and an `.arc` call argument only reads it. R10's "moved into a
   fresh `arc` box; the source is dead by R2" is therefore unimplemented in the
   front end, and until it lands the backend leaves a C type error rather than
-  emitting a silent double free.
+  emitting a silent double free. (Superseded 2026-09-16: for a whole `owned`
+  String or list binding it did land, at five positions, and
+  `isMovedOwnedBinding` lets this rule box that place; see the emptied table
+  under "Still broken" below. Every other owned source is still refused.)
 - Retain rules 2, 3, and 4 emit `cell_arc_clone`, at the call site before the
   call, at the binding, and at the struct field store.
 - The `shared`-parameter non-retain holds, and is asserted by an explicit
@@ -1567,7 +1575,10 @@ moved local 1/1/0; an uninitialized `var owned b: Box` 1/1/0. One shape
 still leaked by design then: a struct moved into an `owned` parameter 1/0/1
 (the callee never dropped a parameter, which was row 1's shape, closed
 2026-09-16 above). A field
-STORE still does not pre-drop the old value, as before.
+STORE still does not pre-drop the old value, as before. (Closed in part
+2026-09-21 by `673f996`: a store to an owned `String` or list field that
+borrowck vouches for pre-drops the old value; three shapes still leak, see the
+`field_store_old` paragraph in R11 above.)
 
 **The partial-move residual is CLOSED (2026-09-16).** It read: a struct with
 one field moved out (`let owned m = p.a`) is skipped entirely, which leaks any
@@ -1920,7 +1931,11 @@ each for a bare identifier, a field path including a nested one
 of those in initializer, return, and call-argument position, plus a `match`
 scrutinee. A program exercising five of them at once runs clean under
 AddressSanitizer and UndefinedBehaviorSanitizer, and its `leaks` output
-accounts for exactly the three disclosed leaks above and nothing else. Two
+accounts for exactly the three disclosed leaks above and nothing else. (That
+was measured when the "Still broken" table held three rows; it has been empty
+since 2026-09-16. The C leaks still open are pinned in `tools/check.sh`'s
+leaks stage, `unbound_list_temp` at 2000 among them, and the IR backends
+leak every owned String they build.) Two
 value paths cannot be reached at all today for an unrelated reason:
 typecheck gives every `if`-expression the type `()`, so an if-derived value
 cannot flow into a typed parameter or an annotated binding, and the
@@ -2473,8 +2488,11 @@ poisoning. Every double-free and use-after-free guarantee this document
 describes rests entirely on the static rules above being implemented and
 correct. R2 is not the only rule carrying that weight: R2.b, R10's unique
 clause and **R18** each closed a measured double free of their own, and each
-one was a rule R2 was assumed to cover and did not. **Until the checker exists, Cell provides no memory-safety guarantee
-of any kind**, and no document in this repository should say otherwise.
+one was a rule R2 was assumed to cover and did not. **The checker exists and enforces only the rules `borrowck.zig`'s header
+lists. Outside that list, and wherever a backend still carries a disclosed
+gap, Cell provides no memory-safety guarantee of any kind**, and no document
+in this repository should say otherwise. (Reworded 2026-09-21 from "Until the
+checker exists", written before it did.)
 
 ---
 

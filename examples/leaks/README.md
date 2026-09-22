@@ -12,7 +12,8 @@ pin; the owned scalar wrappers and the three owning-payload pins
 regression pins for implemented features (`arc_box_move.cell` and
 `early_return.cell`, below); and four gaps disclosed on 2026-09-17
 (`discarded_result`, `field_store_old`, `match_string_temp`,
-`unbound_list_temp`), of which `match_string_temp` closed the same day. Each isolates exactly one
+`unbound_list_temp`), of which `match_string_temp` closed the same day and
+`discarded_result` (C leg) and `field_store_old` closed on 2026-09-21. Each isolates exactly one
 disclosed retain/release shape and loops it many times so a leak is a
 stable count, not noise.
 
@@ -30,14 +31,16 @@ specifically so these fixtures are invisible to the top-level corpus,
 backend-agreement, and MLIR-lowering loops in `tools/check.sh` and
 `examples/README.md`: they exist to be measured by `leaks`, not to declare a
 `cell check` or backend-agreement contract of their own (though every one of
-them does pass `cell check`, and LLVM/MLIR refuse all of them outright, the
-same as `examples/arc.cell`, since none lowers a scalar-only program).
+them does pass `cell check`). They used to say LLVM/MLIR refuse all of them;
+measured 2026-09-21 with `cell emit --target=llvm` and `--target=mlir`, 18 of
+the 31 emit through both and 13 (the `arc` and owning-payload shapes) are
+refused by both. Only the two IR pins below are measured on an IR backend.
 
 | Fixture | R11 row |
 |---|---|
 | `param_never_released.cell` | 1: a Cell body never released its own `arc` parameter; **CLOSED 2026-09-16** by admitting `owned` and `arc` parameters to the drop pass, kept and pinned at 0 |
 | `struct_arc_field.cell` | 2: a struct holding an `arc` field was never dropped. CLOSED 2026-09-15 by per-struct drop glue, pinned at 0 |
-| `unbound_shared_temp.cell` | 3: an unbound `arc` temporary unboxed for a `shared` parameter |
+| `unbound_shared_temp.cell` | 3: an unbound `arc` temporary unboxed for a `shared` parameter; **CLOSED @ `460b9a3`**, kept and pinned at 0 (`LEAK_UNBOUND_SHARED_TEMP`) |
 | `block_scoped_local.cell` | 4: a block-scoped `arc` local is never released; **CLOSED 2026-09-15**, kept and pinned at 0 |
 | `reassigned_var.cell` | 5: reassigning an `arc` `var` leaked the previous box; **CLOSED 2026-09-15** by the reassignment pre-drop in `emitAssign` (`src/cell/codegen/stmts.zig`), kept and pinned at 0 |
 | `reassigned_owned_var.cell` | not an R11 row: row 5's `owned` twin. Reassigning an `owned` String or list var leaked the old value (4000 before on both witnesses, including two stores whose var is moved only afterwards); **CLOSED 2026-09-16** by extending `emitAssign`'s (`src/cell/codegen/stmts.zig`) pre-drop, decided per store from borrowck's `assign_liveness`, pinned at 0. A store whose target was already moved (R3a revival), or that sits in a `while` body moving it, keeps its leak by design and is not measured here |

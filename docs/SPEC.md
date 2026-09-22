@@ -19,8 +19,11 @@ source spans.
 
 Cell is a systems language that blends Rust ownership and algebraic data types,
 Swift value/reference clarity and ergonomics, and Zig explicit control with a
-C-ABI-first ethos. The reference toolchain is written in Zig
-`0.17.0-dev.2251+1175a3e99` and emits C.
+C-ABI-first ethos. The toolchain is written in Zig
+`0.17.0-dev.2251+1175a3e99`. Its primary pipeline is `.cell -> HIR -> LLVM IR /
+MLIR` (ruled 2026-09-21); it also emits C, which today is the only backend that
+lowers the whole language and stays the default `--target` until every LLVM
+and MLIR leak pin in gate stage 7 reads 0, when the default flips to LLVM.
 
 This document specifies the language. It is not a description of a finished
 compiler. Every construct carries a status tag, assigned by reading `src/` and
@@ -55,13 +58,17 @@ lowered (sections 3.2 and 3.3); `[T]?` still does not parse.
 
 | Status | Constructs |
 |---|---|
-| implemented | 109 |
+| implemented | 118 |
 | partially implemented | 2 |
 | parsed, not enforced | 3 |
-| designed, not implemented | 41 |
-| **total** | **155** |
+| designed, not implemented | 35 |
+| **total** | **158** |
 
 Counted from the section 12 index on 2026-09-08, not estimated. Recounted
+2026-09-21 with the command below: the table held 116 / 2 / 3 / 37 / 158 while
+this summary still said 109 / 2 / 3 / 41 / 155, and five rows then moved on
+evidence (loops, the two optional rows, wrap patterns, parser diagnostics),
+giving 118 / 2 / 3 / 35 / 158. Recounted
 2026-09-16 after optional/Result/list rows left the parser-only and
 designed buckets (97/5/49/153 to 106/3/44/155). On 2026-09-08, when R2.b
 added an `implemented` row, 96 to 97 and 152 to 153; the
@@ -82,12 +89,15 @@ awk '/^## 12\. Status index/,/^## 13\./' docs/SPEC.md \
   | awk -F'|' '{gsub(/^ +| +$/,"",$3); print $3}' | sort | uniq -c
 ```
 
-The headline consequence: **the front end, a typechecker, a borrow checker for R1/R2/R2.a/R2.b/R3/R3a/R4/R5/R6/R8/R9/R14/R15/R18 plus one
+The headline consequence: **the front end, a typechecker, a borrow checker for R1/R2/R2.a/R2.b/R3/R3a/R4/R5/R6/R7 (its consumption clause)/R8/R9/R14/R15/R18 plus one
 clause of R10, and C lowering for the flagship examples are real.** As of
 the working tree the lexer, parser, AST, diagnostics, typechecker, and
 borrowck are wired into `cell check`. `if` / `else`, `match`, blocks, struct
 literals, list literals, and mangled calls lower to C. What is still designed
-includes loops other than `while`, generics, `Result<T,E>`, and NLL. `arc`
+includes loops other than `while`, generics, and NLL beyond named loans.
+(Corrected 2026-09-21: this sentence also listed `Result<T,E>`, which section
+12 counts as implemented for scalar pairs on all three backends, and all NLL,
+which `borrowck.zig` enforces for named loans; see `docs/OWNERSHIP.md` 0.3.) `arc`
 retain/release is implemented in the C backend, with the gaps R11 of
 `docs/OWNERSHIP.md` names. Stem
 pairing (section 1.2) and R15 call-site prefixes (section 0.7) have since
@@ -304,7 +314,8 @@ called that. `load.zig` now renders it, and a syntax error reads like every
 other diagnostic.
 
 **Three backends.** `cell emit` now takes `--target=c|llvm|mlir`. C remains the
-only backend that lowers the whole language. The LLVM IR and MLIR backends go
+only backend that lowers the whole language today; the LLVM IR and MLIR path is
+the primary direction (see the opening of this document). The LLVM IR and MLIR backends go
 through a typed IR (`src/cell/hir.zig`) and are scalar-first: `String`, `[T]`,
 `T?`, `Result`, `arc`, and (for MLIR) structs mostly produce a `cannot lower`
 diagnostic at the offending span rather than wrong output. **Mostly, because
@@ -312,7 +323,11 @@ this sentence was a blanket claim and is no longer one:** an `exclusive`
 `String`/`[T]`/`T?` parameter, and a whole-value write through it, lower in
 both backends as of `a6c41e8`, which made them pointers agreeing with
 `abi.classifyParam` and with the C ABI. Read the backends' refusals as a list
-that shrinks, and check the emitter rather than this paragraph. Both are verified by
+that shrinks, and check the emitter rather than this paragraph. (2026-09-21: the
+list has shrunk further. Scalar `T?` and `Result<T, E>` construct and match in
+both, and so do the wrap patterns `Some`/`None`/`Ok`/`Err`, see `docs/FEATURES.md`
+TYPE-04, TYPE-06 and PAT-02; an owning payload, `arc`, indexing and most list
+use are still refused.) Both are verified by
 executing what they emit. `examples/backends.cell` prints `24` through all
 three. Section 10's C ABI contract is unchanged and remains normative for the
 C backend.
@@ -766,7 +781,8 @@ optionals (`T??`) also do not parse. Both are **designed, not implemented**.
 
 ### 3.3 List types
 
-**Status: implemented as a type; there is still no way to use a list value.**
+**Status: implemented as a type, with list literals and scalar indexing in the
+C backend (section 6.11); no iteration.**
 
 ```cell
 [Int]
@@ -795,7 +811,10 @@ type, and at 24 bytes a `cell_slice_t` takes the same indirect path
 What remains genuinely missing is the *use* of a list: no indexing, no
 iteration, and only the empty literal `[]` is constructible, because a
 non-empty one needs a constant global for its elements that no backend emits
-yet.
+yet. **Superseded 2026-09-21** for the C backend: non-empty list literals
+lower (`emitListLit`; `examples/index.cell` builds `[seven, nine]` and
+`[40, 2]`) and scalar indexing is implemented (section 6.11). LLVM and MLIR
+still refuse indexing, and nothing iterates a list.
 
 ### 3.4 Result
 
@@ -2172,8 +2191,8 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Additional integer widths (`Int8`, `Int16`, `UInt8`, `UInt16`, `UInt32`) | implemented |
 | `Char` | designed, not implemented |
 | `T?` optional syntax | implemented (scalar payloads typechecked; `[T]?` and `T??` still do not parse) |
-| Optional lowering to the tagged struct | implemented (scalar payloads, C backend; LLVM/MLIR refuse constructors and patterns) |
-| Optional construction and unwrapping | implemented (scalar payloads, C backend; LLVM/MLIR refuse) |
+| Optional lowering to the tagged struct | implemented (scalar payloads on all three backends, `optionals.cell` prints 43 on each; an owning `String?` in C only; LLVM/MLIR refuse `Float32?` and `String?`, see FEATURES.md TYPE-04) |
+| Optional construction and unwrapping | implemented (scalar payloads on all three backends; owning `String?` payloads in C only) |
 | `[T]?` | designed, not implemented |
 | `[T]` list syntax | implemented as a type (no indexing; see 3.3) |
 | List lowering to `cell_slice_t` | implemented (C backend; LLVM/MLIR lower exclusive list parameters) |
@@ -2262,7 +2281,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Return-type checking | implemented |
 | Expression statement | implemented |
 | Unused-result diagnostic | designed, not implemented |
-| Loops and `break` / `continue` | designed, not implemented |
+| Loops and `break` / `continue` | implemented: `while`, `break` and `continue` on all three backends (FEATURES.md FLOW-02); `for`, `loop` and labels are FLOW-03, still reserved |
 
 ### Items
 
@@ -2292,7 +2311,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Binding pattern | implemented |
 | Enum variant pattern, bare and qualified | implemented |
 | Literal patterns, including negative numbers | implemented |
-| Wrap patterns `Some`/`None`/`Ok`/`Err` | implemented (scalar payloads, C backend; LLVM/MLIR refuse) |
+| Wrap patterns `Some`/`None`/`Ok`/`Err` | implemented (scalar payloads on all three backends; owning String payloads in C only, see FEATURES.md PAT-02) |
 | Uppercase-first variant heuristic replaced by resolution | designed, not implemented |
 | Payload, struct, tuple and slice patterns | designed, not implemented |
 | Or-patterns and guards | designed, not implemented |
@@ -2334,7 +2353,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Diagnostic record, bag, levels and spans | implemented |
 | Caret rendering with the source line | implemented |
 | Parser records a span and a message on failure | implemented |
-| CLI surfaces parser diagnostics | designed, not implemented |
+| CLI surfaces parser diagnostics | implemented (`cell check` prints the span, the source line and a caret for a parse error; checked 2026-09-21) |
 | Check diagnostics rendered through `Bag.render` | implemented |
 | Error recovery past the first failure | designed, not implemented |
 

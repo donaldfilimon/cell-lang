@@ -112,7 +112,13 @@ Two notes on the build, both worth knowing before you trust a green result:
 
 ## Status
 
-Cell has three backends with different current coverage. Parsing, checking,
+Cell has three backends with different current coverage. The primary pipeline
+is `.cell -> HIR -> LLVM IR / MLIR` (ruled 2026-09-21), with C emitted only
+where it is still needed: C is today the only backend that lowers the whole
+language, and it stays the default `--target` until every LLVM and MLIR leak
+pin in gate stage 7 reads 0 (at the ruling, `LEAK_IR_OWNED_STRING_*` 3000,
+`LEAK_IR_STRING_CONVERSION_*` 9000 and `LEAK_OWNED_STRING_*` 8 per backend in
+`tools/check.sh`), when the default flips to LLVM. Parsing, checking,
 lowering, execution and resource cleanup are separate capabilities. See
 [the capability matrix](docs/FEATURES.md) for current boundaries and the
 [completion program](docs/superpowers/plans/2026-09-08-full-language-completion.md)
@@ -131,15 +137,18 @@ of the runtime with `$CC` (default `cc`) in a temporary directory, executes
 it, and returns the program's own exit status (a signal death comes back as
 128 plus the signal number, the shell convention). `cell build -o hello
 examples/hello.cell` leaves the executable behind instead; without `-o` the
-output is the source stem. Both are the C path only (`--target=llvm`/`mlir`
-are refused with a pointer to `emit`). A positional ending in `.c` is a
+output is the source stem. Both are the C path only today (`--target=llvm`/`mlir`
+are refused with a pointer to `emit`), because C is still the only backend
+that lowers the whole language. A positional ending in `.c` is a
 hand-written host for the program's bodyless declarations, handed to cc as
 given between the emitted C and the runtime, so
 `cell run examples/arc.cell examples/arc_host.c` prints the live refcount 13
 and `examples/owned_string.cell` with its host prints 44. Scalar `T?` and
 `Result<T, E>` values construct and match through the C backend
-(`examples/optionals.cell` prints 43, `examples/results.cell` prints 9);
-LLVM and MLIR refuse those programs together with `cannot lower`. Every other
+(`examples/optionals.cell` prints 43, `examples/results.cell` prints 9),
+and since 2026-09-17 through LLVM and MLIR too, for scalar payloads; an owning
+`String?` or String-sided Result is C only (`docs/FEATURES.md` TYPE-04,
+TYPE-06, PAT-02). Every other
 command refuses a `.c` positional rather than loading it as Cell source.
 `cell test [dir]` runs every `.cell` program in a directory (default
 `tests/`) through the run recipe, honours `// EXPECT-OUTPUT:`, and exits 0
@@ -155,7 +164,8 @@ contracts expect `examples/backends.cell` to print `24` through all three
 backends and `examples/hello.cell` to print `42`. The gate tests those outputs;
 this paragraph does not claim a fresh run.
 
-Both newer backends are deliberately **scalar-first**, with selected aggregate
+The LLVM and MLIR backends, the primary direction but not yet complete, are
+deliberately **scalar-first**, with selected aggregate
 operations. Support depends on ownership, expression position and ABI placement,
 not just the type name. Unsupported operations should produce `cannot lower`;
 the gate separately records disclosed ABI defects where this contract is still
@@ -182,8 +192,8 @@ even contradicted itself, since the paragraph below names R2.a as a rule that
 loops brought in. Cite the header; do not copy it.
 
 Still designed and not implemented: generics and enum payloads. Scalar
-`Result<T, E>` constructs and matches in C (`examples/results.cell`);
-LLVM and MLIR refuse those programs. `.cell`/`.cel` modules pair with
+`Result<T, E>` constructs and matches in all three backends
+(`examples/results.cell` prints 9 on each). `.cell`/`.cel` modules pair with
 `.body`/`.bod` by stem. See `docs/SPEC.md` section 12 and `docs/OWNERSHIP.md`.
 
 **Loops exist.** `while` is a keyword, with `break` and `continue`; the retained

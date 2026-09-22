@@ -514,6 +514,18 @@ or an existing refusal.
    its fixture, so that slice 2 ports a correct `after_loop`. Defect 5 is
    in this step, as commit 5a.
 
+**Ruled 2026-09-21 by Donald.** Q1 is moot: defect 1 was fixed in C by
+`938960f`. Q2: fix discarded owned results in C now (`748df08`); the IR legs
+wait for this pass. Q3: the IR drops a shadowed binding correctly, so the leak
+fixture pins a count per backend (C keeps its disclosed leak). Q4: record drops
+are inline per field, with no glue symbols. Q5: a narrow `DropFacts` interface
+that borrowck implements; `hir.zig` does not import `borrowck.zig`. Q6 and Q7
+stay open and are asked when slice 2 starts. Defects 2 to 5 are fixed or
+pinned: `748df08` (C only), `673f996` (three shapes still disclosed),
+`23942c8`, `7e8491f` (this document's commit 5a). Slice 1 waits for the
+borrowck/codegen split, since `DropFacts` lives in borrowck. The default
+`--target` flips to LLVM when every LLVM/MLIR leak pin in gate stage 7 reads 0.
+
 ## Open questions for Donald
 
 1. **Should defect 1 be fixed in C before step (c) starts, or in

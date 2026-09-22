@@ -7,7 +7,7 @@ turns "it parses" into something a reader can trust.
 
 Verified with a binary built by `~/.zvm/bin/zig build -Dswift=false`.
 
-## The four directories
+## The five directories
 
 | Directory | Expectation | If it breaks |
 |---|---|---|
@@ -15,6 +15,7 @@ Verified with a binary built by `~/.zvm/bin/zig build -Dswift=false`.
 | `examples/future/` | must **fail** `cell check` | the parser grew a feature: move the file up and rewrite its header |
 | `examples/rejected/` | each file declares `// EXPECT: currently-accepted` or `// EXPECT: currently-rejected` | a checker rule landed, or one regressed |
 | `examples/pairing/` | both `geometry.cell` and `geometry.body` must **pass** now that stem pairing is implemented | `geometry.body` failing means pairing regressed |
+| `examples/signatures/` | signature fixtures with no `main`: each must **pass** `cell check`, and gate stage 10 compares the declared signatures every backend emits for it against C's | a backend changed a calling convention, or a pinned disagreement closed |
 
 ## Running the checks
 
@@ -95,8 +96,11 @@ cc /tmp/b_m.o /tmp/drv.c runtime/cell_rt.c -I runtime -o /tmp/b_mlir && /tmp/b_m
 
 Note `hello.cell` is NOT in this set. It declares a struct, and the MLIR
 backend carried no structs. It does now (`!llvm.struct`), so `hello.cell`
-runs through all three and prints `42` from each. What all three still refuse
-is `[T]`, which SPEC 3.3 says has no representation at all.
+runs through all three and prints `42` from each. (Corrected 2026-09-21: this
+paragraph used to end "what all three still refuse is `[T]`, which SPEC 3.3
+says has no representation at all". SPEC 3.3 was corrected on 2026-09-07:
+`[T]` is `cell_slice_t`, C builds and indexes lists, and LLVM/MLIR lower an
+`exclusive` list parameter while refusing indexing.)
 
 `owned_string.cell` runs through all three backends and prints `44` from
 each since IR String step (a) (2026-09-17). It was C only until then.
@@ -112,7 +116,7 @@ counts.
 `results_wide.cell` (prints -8999999983, a 64-bit error) run on all three
 backends since 2026-09-17: scalar `Some`/`None`/`Ok`/`Err` payloads only.
 
-`index.cell` (prints 1142125) is C only by the same contract: postfix `a[i]` for
+`index.cell` (prints 1142125) is C only: postfix `a[i]` for
 `String` and `[Byte]` lowers through `cell_str_byte_at` / `cell_bytes_at`,
 and for `[Int]`/`[Int32]`/`[Float]`/`[Bool]` through `cell_list_*_at`; LLVM and
 MLIR refuse indexing together with `cannot lower`.
@@ -242,8 +246,10 @@ handed (3 each time, the original plus the `alias` handle plus that call's own
 retain) and `inspect` returns the borrowed view's length, 7. Under `leaks` the
 program reports `0 leaks for 0 total leaked bytes`, because the host releases
 its `arc` parameter as `runtime/cell_rt.h` section 7 requires. A Cell body
-would not: the C backend drops no parameter, so a Cell-bodied `arc` parameter
-leaks its caller's retain. `tools/check.sh` runs this case through
+does too since R11 row 1 closed on 2026-09-16: the C backend now releases
+`owned` and `arc` parameters (`examples/leaks/param_never_released.cell`,
+pinned at 0). Until then a Cell-bodied `arc` parameter leaked its caller's
+retain. `tools/check.sh` runs this case through
 `run_c_host`.
 
 The LLVM and MLIR backends refuse this file, identically and on purpose.

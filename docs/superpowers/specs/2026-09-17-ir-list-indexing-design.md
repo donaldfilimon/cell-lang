@@ -4,6 +4,16 @@ Status: direction approved by Donald 2026-09-17 ("pin the IR leak, then
 build": conversions, indexing, list literals, then a drop pass ported onto
 HIR). Step (a) landed in merge `4aca38b`. This document is step (b).
 
+**Ruled 2026-09-21 by Donald: approved with this document's recommendations.**
+Q3: C learns to view an owned-String value-block base (a codegen change, so it
+waits for the borrowck/codegen split); `mk()[0]` stays refused. Q4: reusing a
+user declaration of a reader stays exact-match only. Q5: `runEmitted` takes a
+host, so all six readers run under `zig build test`. Q6: `ir_index` merges into
+`index.cell` after step (d). Q1 was answered by `4a1f055`; Q2 by `368266a`,
+which pinned `unbound_list_temp.cell` as its own fixture. Commit 1 below is
+already done as `f4cc32e` and is dropped. Re-measure every line anchor before
+building: they date from `4aca38b`.
+
 A planning pass measured it on 2026-09-17, in a `git archive` export of
 `4aca38b` under `/private/tmp/claude-501/stepb/tree`. The canonical checkout
 had moved to `f68e948` by then. The two commits after `4aca38b` touch the
