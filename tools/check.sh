@@ -498,7 +498,10 @@ LEAK_OWNED_STRING_ERR=0
 LEAK_OWNED_STRING_OPTIONAL=0
 # Disclosed C leaks found 2026-09-17 while grounding IR String steps (b)
 # and (c). Measured before pinning; a drop means the gap closed.
-LEAK_DISCARDED_RESULT=2000
+# CLOSED 2026-09-21 (drop-pass spec open question 2, ruled: fix in C now):
+# a discarded owned String call result is bound to a temporary and
+# released on the spot; 2000 before. C only: LLVM/MLIR have no drop pass.
+LEAK_DISCARDED_RESULT=0
 # CLOSED 2026-09-21: a field store releases the old owned String/list
 # value first when borrowck vouches (`field_assign_liveness`). Measured
 # 0 leaks, ALLOC=2000 FREE=2000, ASan clean; 1000 before the fix.
@@ -1052,7 +1055,7 @@ else
     run_c_leaks owned_string_result "" "$LEAK_OWNED_STRING_RESULT" "owning String Ok, 2026-09-17"
     run_c_leaks owned_string_err "" "$LEAK_OWNED_STRING_ERR" "owning String Err and both sides, 2026-09-17"
     run_c_leaks owned_string_optional "" "$LEAK_OWNED_STRING_OPTIONAL" "owning String?, 2026-09-17"
-    run_c_leaks discarded_result "" "$LEAK_DISCARDED_RESULT" "discarded owned String results, disclosed 2026-09-17"
+    run_c_leaks discarded_result "" "$LEAK_DISCARDED_RESULT" "discarded owned String results, CLOSED 2026-09-21; 2000 -> 0"
     run_c_leaks field_store_old "" "$LEAK_FIELD_STORE_OLD" "field store releases the old value, CLOSED 2026-09-21"
     run_c_leaks match_string_temp "" "$LEAK_MATCH_STRING_TEMP" "match on an owned String temporary, CLOSED 2026-09-17; 4997 -> 0"
     run_c_leaks unbound_list_temp "" "$LEAK_UNBOUND_LIST_TEMP" "unbound list temporaries, disclosed 2026-09-17"

@@ -8,6 +8,10 @@
 // a discarded result now or keep the pin is open question 2 of the step
 // (c) spec. A drop means discarded results are released; update the pin.
 //
+// CLOSED 2026-09-21 in C (question 2 ruled: fix now): a discarded owned
+// String CALL result is bound to a temporary and freed at once, so this
+// measures 0 and is a regression pin. LLVM/MLIR still leak it (no drop pass).
+//
 // Status: parses, passes `cell check`; lives under examples/leaks/.
 
 pub fn print_int(copy value: Int);

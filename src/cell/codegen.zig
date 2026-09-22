@@ -2516,8 +2516,33 @@ pub const Generator = struct {
     /// expression ends on a void `cell_arc_drop` exactly as the void-callee
     /// case already did, and the drops are unaffected.
     fn emitDiscarded(self: *Generator, e: *const ast.Expr, indent: usize) EmitError!void {
+        // A discarded owned String CALL result has exactly one owner, this
+        // statement, so it is bound to a temporary and released on the spot
+        // (drop-pass spec open question 2, ruled 2026-09-21: fix in C now).
+        // Only a call is admitted, by the same predicate a match scrutinee
+        // uses: a str literal owns nothing, and a block or if of type String
+        // may name an existing owner. Before this, `str_from_int(i)` as a
+        // statement leaked its String (examples/leaks/discarded_result.cell).
+        const inner = unwrapAnnotated(e);
+        if (inner.kind == .call) {
+            const ty = try self.inferExpr(e);
+            if (ty.shape == .string and !ty.pointer) {
+                const temp = try self.nextTemp();
+                try self.writeIndent(indent);
+                try self.writer.writeAll("{\n");
+                try self.writeIndent(indent + 1);
+                try self.writeDecl(ty, temp);
+                try self.writer.writeAll(" = ");
+                try self.emitExpr(e, indent + 1);
+                try self.writer.writeAll(";\n");
+                try self.emitTempRelease(indent + 1, ty, temp);
+                try self.writeIndent(indent);
+                try self.writer.writeAll("}\n");
+                return;
+            }
+        }
         try self.writeIndent(indent);
-        switch (unwrapAnnotated(e).kind) {
+        switch (inner.kind) {
             .call => |c| try self.emitCallValued(c, indent, false),
             else => try self.emitExpr(e, indent),
         }
