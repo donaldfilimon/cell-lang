@@ -815,14 +815,12 @@ LLVM and MLIR backends refused lists only because each returned null for the
 type, and at 24 bytes a `cell_slice_t` takes the same indirect path
 `cell_string_t` already used. Three lines, not a feature.
 
-What remains genuinely missing is the *use* of a list: no indexing, no
-iteration, and only the empty literal `[]` is constructible, because a
-non-empty one needs a constant global for its elements that no backend emits
-yet. **Superseded 2026-09-21** for the C backend: non-empty list literals
-lower (`emitListLit`; `examples/index.cell` builds `[seven, nine]` and
-`[40, 2]`) and scalar indexing is implemented (section 6.11). LLVM and MLIR
-index since 2026-09-22 but still refuse list literals, and nothing iterates a
-list.
+That historical gap has been superseded. C lowers non-empty list literals
+through checked runtime pushes. Since 2026-09-24, HIR lowers literals of
+`Byte`, `Int`, `Int32`, `Float`, and `Bool` through the same typed pushes for
+LLVM and MLIR; `examples/ir_list_literal.cell` exercises each. All three
+backends index those scalar lists (section 6.11). Resource-bearing elements
+still require recursive element cleanup, and list iteration is not present.
 
 ### 3.4 Result
 

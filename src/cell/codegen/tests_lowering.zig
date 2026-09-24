@@ -418,9 +418,9 @@ test "list literals lower to slice headers" {
     defer e.deinit();
     try expectContains(e.text, ".data = cell_slice_empty()");
     try expectContains(e.text, "cell_slice_t _cell_t0 = cell_slice_alloc(sizeof(int64_t), 2);");
-    try expectContains(e.text, "if (!cell_slice_push(&_cell_t0, sizeof(int64_t), &_cell_t1)) cell_panic(cell_str_from_cstr(\"list literal in main: out of memory\"));");
+    try expectContains(e.text, "cell_list_i64_push(&_cell_t0, _cell_t1);");
     // F4 (2026-09-22): a `(void)` push built a shorter list when the
-    // allocation failed. Every push now panics, like `cell_bytes_push`.
+    // allocation failed. Typed pushes panic on failure.
     try expectAbsent(e.text, "(void)cell_slice_push");
     try expectCompiles(e.text);
 }

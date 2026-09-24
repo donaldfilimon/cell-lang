@@ -1,0 +1,26 @@
+// IR step (d): five scalar list constructors per call, 1000 calls. C drops
+// the owned buffers; the IR backends must release them in the drop pass.
+// The list-literal scratch is a non-owner and must not be dropped separately.
+
+pub fn print_int(copy value: Int);
+
+pub fn once(copy i: Int) -> Int {
+    let copy b: Byte = 7
+    let copy w: Int32 = 9
+    let owned bytes: [Byte] = [b]
+    let owned ints: [Int] = [i]
+    let owned widths: [Int32] = [w]
+    let owned floats: [Float] = [1.5]
+    let owned bools: [Bool] = [true]
+    return i + 1
+}
+
+pub fn main() {
+    var copy i = 0
+    var copy n = 0
+    while i < 1000 {
+        n = n + once(i)
+        i = i + 1
+    }
+    print_int(n)
+}

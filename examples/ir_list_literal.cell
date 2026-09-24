@@ -1,0 +1,58 @@
+// Scalar list construction through C, LLVM and MLIR. The first list records
+// the elements' order. The remaining
+// cases exercise every typed push, a return, owned argument, reassignment,
+// and a loop-local list. IR cleanup is tracked separately in leaks fixtures.
+// EXPECT-OUTPUT: 15157
+
+pub fn print_int(copy value: Int);
+pub fn bytes_push(exclusive xs: [Byte], copy value: Byte);
+pub fn list_i64_push(exclusive xs: [Int], copy value: Int);
+pub fn list_i32_push(exclusive xs: [Int32], copy value: Int32);
+pub fn list_f64_push(exclusive xs: [Float], copy value: Float);
+pub fn list_bool_push(exclusive xs: [Bool], copy value: Bool);
+
+pub fn or_zero(copy o: Int?) -> Int {
+    return match o { Some(v) => v, None => 0, }
+}
+
+pub fn make() -> [Int] { return [4, 5] }
+
+pub fn take(owned xs: [Int]) -> Int {
+    return or_zero(xs[0]) + or_zero(xs[1])
+}
+
+pub fn main() {
+    let owned ordered = [1, 2, 3]
+    let copy a = or_zero(ordered[0]) * 100 + or_zero(ordered[1]) * 10 + or_zero(ordered[2])
+
+    let copy small: Int32 = -5
+    let copy big: Int32 = 700
+    let owned widths: [Int32] = [small, big]
+    let copy b = match widths[1] { Some(v) => if v == big { 1000 } else { 0 }, None => 0, }
+
+    let owned floats: [Float] = [2.5]
+    let copy c = match floats[0] { Some(v) => if v == 2.5 { 2000 } else { 0 }, None => 0, }
+
+    let owned bools: [Bool] = [true, false]
+    let copy d = match bools[0] { Some(v) => if v { 4000 } else { 0 }, None => 0, }
+
+    let copy byte: Byte = 72
+    let owned bytes: [Byte] = [byte]
+    let copy e = match bytes[0] { Some(v) => if v == byte { 8000 } else { 0 }, None => 0, }
+
+    let copy f = take(owned [4, 5])
+    var owned replacement: [Int] = [1]
+    replacement = [6, 7]
+    let copy g = or_zero(replacement[0]) + or_zero(replacement[1])
+    let owned returned = make()
+    let copy h = or_zero(returned[0])
+
+    var copy i = 0
+    var copy loop_value = 0
+    while i < 1 {
+        let owned local: [Int] = [8]
+        loop_value = or_zero(local[0])
+        i = i + 1
+    }
+    print_int(a + b + c + d + e + f + g + h + loop_value)
+}

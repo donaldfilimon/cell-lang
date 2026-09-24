@@ -3,10 +3,9 @@
 // optional. Out of bounds, including a negative index, is None; never a
 // panic. [String][i] stays refused.
 //
-// Status: parses, passes `cell check`, and the emitted C compiles, links and
-// runs, printing 1142125 (see EXPECT-OUTPUT). C backend only: LLVM and MLIR index
-// since 2026-09-22 (examples/ir_index.cell) but refuse this file's list
-// literals and its unannotated `let owned s = "Hi"` (IR step (d)).
+// Status: parses, passes `cell check`, and all three backends run it,
+// printing 1142125 (see EXPECT-OUTPUT). Scalar list literals lower through
+// typed runtime pushes on LLVM and MLIR since IR step (d).
 // Indexed assignment `a[i] = x` is not implemented.
 // EXPECT-OUTPUT: 1142125
 
@@ -31,7 +30,7 @@ pub fn second(shared ns: [Int]) -> Int {
 }
 
 pub fn main() {
-    let owned s = "Hi"
+    let owned s: String = "Hi"
     let copy H: Byte = 72
     let copy i_byte: Byte = 105
     let copy seven: Byte = 7

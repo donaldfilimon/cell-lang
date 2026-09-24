@@ -1319,6 +1319,13 @@ build the IR String work (conversions, indexing, list literals) with these
 leaks pinned, then port the C backend's drop decisions onto HIR so both IR
 backends share them.
 
+**IR scalar list step (d), construction, landed 2026-09-24 on those terms.**
+HIR desugars `Byte`, `Int`, `Int32`, `Float`, and `Bool` literals to typed,
+checked runtime pushes and marks the transfer scratch nondroppable. The
+`ir_list_literal` fixture measures five list buffers per call over 1000 calls:
+C releases all 5000; LLVM and MLIR release none and each pin LIVE=5000. This
+is a disclosed cleanup deficit, not a baseline to accept for completion.
+
 **IR String step (a), the conversions, landed 2026-09-17 on those terms.**
 Both IR backends now call `cell_string_from_str` wherever C converts a
 borrowed view into an owned `String`, and free none of the results. Measured

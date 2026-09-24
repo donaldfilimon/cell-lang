@@ -116,11 +116,11 @@ counts.
 `results_wide.cell` (prints -8999999983, a 64-bit error) run on all three
 backends since 2026-09-17: scalar `Some`/`None`/`Ok`/`Err` payloads only.
 
-`index.cell` (prints 1142125) is C only: postfix `a[i]` for
+`index.cell` (prints 1142125) runs on all three backends: postfix `a[i]` for
 `String` and `[Byte]` lowers through `cell_str_byte_at` / `cell_bytes_at`,
 and for `[Int]`/`[Int32]`/`[Float]`/`[Bool]` through `cell_list_*_at`. LLVM and
-MLIR index since 2026-09-22 (IR step (b)) but refuse this file's list literals
-and its unannotated owned `let`. `ir_index.cell` (prints 1838, with
+MLIR index since 2026-09-22 (IR step (b)); scalar list construction followed
+in step (d). `ir_index.cell` (prints 1838, with
 `ir_index_host.c` supplying the lists) runs every reader and base form through
 all three backends.
 
@@ -224,8 +224,10 @@ are not.
 | `unit_type.cell` | explicit `()` in type position: `-> ()` is the same unit as an omitted `->`; a `let` of `()` is refused |
 | `escapes.cell` | SPEC 2.8 simple escapes: `"\n"` is one newline byte and `"\\"` is one backslash; prints 11 through all three backends |
 | `silent_literals.cell` | SPEC 2.6/2.7: `0x1F` is 31, `1_000` is 1000, `1e9` is a Float; prints 31 through all three backends |
-| `index.cell` | postfix `a[i]` for `String` and `[Byte]` as `Byte?`, and for `[Int]`/`[Int32]`/`[Float]`/`[Bool]` as the element's optional; prints 1142125 through C; LLVM and MLIR refuse its list literals |
+| `index.cell` | postfix `a[i]` for `String` and `[Byte]` as `Byte?`, and for `[Int]`/`[Int32]`/`[Float]`/`[Bool]` as the element's optional; prints 1142125 through all three backends |
 | `ir_index.cell` | every index reader and base form, lists from `ir_index_host.c`; prints 1838 through C, LLVM and MLIR (IR step (b), 2026-09-22) |
+| `ir_list_literal.cell` | all five scalar list writers, return, owned argument, reassignment and loop local; prints 15157 through all three backends (IR step (d), 2026-09-24) |
+| `ir_list_order.cell` | host-observed source-order, exactly-once element evaluation; prints 246 through all three backends |
 | `early_return.cell` | an `if` branch or `match` arm that always leaves keeps its moves out of the code after it; prints 1124 through all three backends |
 | `results_wide.cell` | 16-byte per-pair Results with a 64-bit error; prints -8999999983 through all three backends |
 | `results_small.cell` | 8-byte and 2-byte per-pair Results crossing calls in one word; prints 7533 through all three backends |

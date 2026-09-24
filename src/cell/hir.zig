@@ -129,6 +129,9 @@ pub const Binding = struct {
     mutable: bool,
     is_param: bool,
     slot: u32,
+    /// Scratch slots and pattern aliases are not independent owners. The IR
+    /// drop pass must positively confirm this flag before releasing a slot.
+    droppable: bool = true,
 };
 
 pub const Fn = struct {
@@ -209,9 +212,8 @@ pub const RuntimeCallee = struct {
 };
 
 /// The runtime callees, indexed by `Runtime`: the String conversion (IR
-/// step (a)) and the six bounds-checked index readers (IR step (b)). An index
-/// is a call to one of these, not a node: the same reader C calls, with the
-/// same `i64`, so bounds and out-of-range `None` agree by construction.
+/// step (a)), six bounds-checked index readers (step (b)), and scalar-list
+/// pushes (step (d)). Calls use the C runtime's signatures on every backend.
 pub const Runtime = enum {
     /// `cell_string_t cell_string_from_str(cell_str_t view)`: copies a
     /// borrowed view into a fresh heap buffer the caller owns.
@@ -228,6 +230,11 @@ pub const Runtime = enum {
     list_f64_at,
     /// `cell_opt_bool_t cell_list_bool_at(cell_slice_t xs, int64_t index)`.
     list_bool_at,
+    bytes_push,
+    list_i64_push,
+    list_i32_push,
+    list_f64_push,
+    list_bool_push,
 
     pub fn callee(self: Runtime) RuntimeCallee {
         return runtime_callees[@backingInt(self)];
@@ -248,6 +255,11 @@ pub const runtime_callees = [_]RuntimeCallee{
     indexReader("$rt.list_i32_at", "cell_list_i32_at", .{ .list = &types.t_int32 }, &types.t_int32),
     indexReader("$rt.list_f64_at", "cell_list_f64_at", .{ .list = &types.t_float }, &types.t_float),
     indexReader("$rt.list_bool_at", "cell_list_bool_at", .{ .list = &types.t_bool }, &types.t_bool),
+    pushEntry("$rt.bytes_push", "cell_bytes_push", &types.t_byte),
+    pushEntry("$rt.list_i64_push", "cell_list_i64_push", &types.t_int),
+    pushEntry("$rt.list_i32_push", "cell_list_i32_push", &types.t_int32),
+    pushEntry("$rt.list_f64_push", "cell_list_f64_push", &types.t_float),
+    pushEntry("$rt.list_bool_push", "cell_list_bool_push", &types.t_bool),
 };
 
 /// One index reader: `(shared xs: <base>, copy index: Int) -> <elem>?`.
@@ -260,6 +272,20 @@ fn indexReader(comptime name: []const u8, comptime symbol: []const u8, comptime 
             .{ .name = "index", .ty = types.t_int, .ownership = .copy },
         },
         .ret = .{ .optional = elem },
+        .ret_ownership = .owned,
+    };
+}
+
+/// One checked builder: `(exclusive xs: [T], copy value: T) -> ()`.
+fn pushEntry(comptime name: []const u8, comptime symbol: []const u8, comptime elem: *const Ty) RuntimeCallee {
+    return .{
+        .name = name,
+        .symbol = symbol,
+        .params = &.{
+            .{ .name = "xs", .ty = .{ .list = elem }, .ownership = .exclusive },
+            .{ .name = "value", .ty = elem.*, .ownership = .copy },
+        },
+        .ret = types.t_unit,
         .ret_ownership = .owned,
     };
 }
@@ -1031,13 +1057,7 @@ const Lowerer = struct {
                 };
             },
 
-            .list_lit => |elems| {
-                var out = try self.arena.alloc(Expr, elems.len);
-                for (elems, 0..) |el, i| out[i] = try self.lowerExpr(&el);
-                const elem_ty = try self.arena.create(Ty);
-                elem_ty.* = if (out.len > 0) out[0].ty else types.t_unknown;
-                return .{ .ty = .{ .list = elem_ty }, .span = e.span, .kind = .{ .list_lit = out } };
-            },
+            .list_lit => |elems| return self.lowerList(e.span, elems, expected),
 
             .block => |stmts| {
                 self.pushScope();
@@ -1180,6 +1200,77 @@ const Lowerer = struct {
         };
         if (id == .str_byte_at) base = try self.convertTo(base, types.t_string, .shared);
         return self.runtimeCall(id, e.span, &.{ base, index });
+    }
+
+    /// A non-empty scalar list is a value block: start with an empty owned
+    /// header, append each element in source order, then yield the header.
+    /// The scratch is a transfer source, never a second owner for the drop
+    /// pass. It is intentionally absent from the name scope and borrowck IDs.
+    fn lowerList(self: *Lowerer, span: Span, elems: []const ast.Expr, expected: ?Ty) LowerError!Expr {
+        const expected_elem: ?Ty = if (expected) |want| switch (want) {
+            .list => |p| p.*,
+            else => null,
+        } else null;
+        if (elems.len == 0) {
+            const p = try self.arena.create(Ty);
+            p.* = expected_elem orelse types.t_unknown;
+            return .{ .ty = .{ .list = p }, .span = span, .kind = .{ .list_lit = &.{} }, .own = .owned };
+        }
+
+        var values = try self.arena.alloc(Expr, elems.len);
+        values[0] = try self.lowerExprIn(&elems[0], expected_elem);
+        const elem_ty = expected_elem orelse values[0].ty;
+        const push: Runtime = switch (elem_ty) {
+            .byte => .bytes_push,
+            .int => .list_i64_push,
+            .int32 => .list_i32_push,
+            .float => .list_f64_push,
+            .boolean => .list_bool_push,
+            else => {
+                try self.cannotLower(span, "a list literal whose element has no runtime push");
+                return self.emptyList(span, elem_ty);
+            },
+        };
+        if (!sameType(values[0].ty, elem_ty)) {
+            try self.cannotLower(span, "a list literal element does not match its destination type");
+            return self.emptyList(span, elem_ty);
+        }
+        for (elems[1..], 1..) |el, i| {
+            values[i] = try self.lowerExprIn(&el, elem_ty);
+            if (!sameType(values[i].ty, elem_ty)) {
+                try self.cannotLower(el.span, "a list literal element does not match its destination type");
+                return self.emptyList(span, elem_ty);
+            }
+        }
+
+        const p = try self.arena.create(Ty);
+        p.* = elem_ty;
+        const list_ty: Ty = .{ .list = p };
+        const slot: u32 = @intCast(self.bindings.items.len);
+        try self.bindings.append(self.arena, .{
+            .name = "$list",
+            .ty = list_ty,
+            .ownership = .owned,
+            .mutable = true,
+            .is_param = false,
+            .slot = slot,
+            .droppable = false,
+        });
+
+        var stmts = try self.arena.alloc(Stmt, values.len + 1);
+        stmts[0] = .{ .span = span, .kind = .{ .let = .{ .slot = slot, .value = try self.emptyList(span, elem_ty) } } };
+        for (values, 0..) |value, i| {
+            const base: Expr = .{ .ty = list_ty, .span = span, .kind = .{ .ref = slot }, .own = .owned };
+            stmts[i + 1] = .{ .span = elems[i].span, .kind = .{ .expr = try self.runtimeCall(push, elems[i].span, &.{ base, value }) } };
+        }
+        const tail: Expr = .{ .ty = list_ty, .span = span, .kind = .{ .ref = slot }, .own = .owned };
+        return .{ .ty = list_ty, .span = span, .kind = .{ .block = .{ .stmts = stmts, .tail = try self.box(tail) } }, .own = .owned };
+    }
+
+    fn emptyList(self: *Lowerer, span: Span, elem_ty: Ty) LowerError!Expr {
+        const p = try self.arena.create(Ty);
+        p.* = elem_ty;
+        return .{ .ty = .{ .list = p }, .span = span, .kind = .{ .list_lit = &.{} }, .own = .owned };
     }
 
     fn lowerCall(self: *Lowerer, span: Span, callee: *const ast.Expr, args: []const ast.Expr) LowerError!Expr {
@@ -1388,6 +1479,7 @@ const Lowerer = struct {
                     .mutable = false,
                     .is_param = false,
                     .slot = slot,
+                    .droppable = false,
                 });
                 try self.scope.append(self.arena, .{ .name = name, .slot = slot, .depth = self.depth });
                 return .{ .kind = .{ .binding = slot }, .span = p.span };
@@ -1423,6 +1515,7 @@ const Lowerer = struct {
                         .mutable = false,
                         .is_param = false,
                         .slot = slot,
+                        .droppable = false,
                     });
                     try self.scope.append(self.arena, .{ .name = name, .slot = slot, .depth = self.depth });
                     binding = slot;
@@ -1472,6 +1565,7 @@ const Lowerer = struct {
                 .mutable = false,
                 .is_param = false,
                 .slot = slot,
+                .droppable = false,
             });
             try self.scope.append(self.arena, .{ .name = n, .slot = slot, .depth = self.depth });
             binding = slot;
@@ -2206,6 +2300,77 @@ test "an index with no reader, or over an arc base, is cannot lower" {
         if (!found) {
             std.debug.print("case {d} was not refused:\n{s}\n", .{ i, src });
             return error.MissingRefusal;
+        }
+    }
+}
+
+test "scalar list literals lower to ordered typed pushes and a nondroppable scratch" {
+    var l = try lowerSource(
+        \\pub fn f() {
+        \\    let owned ints: [Int] = [1, 2, 3]
+        \\    let owned bytes: [Byte] = []
+        \\    let owned bools = [true, false]
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const f = l.module.findFn("f").?;
+    const body = f.body.?;
+    const ints = body[0].kind.let.value.?;
+    try std.testing.expectEqual(.block, std.meta.activeTag(ints.kind));
+    try std.testing.expectEqual(@as(usize, 4), ints.kind.block.stmts.len);
+    const scratch = ints.kind.block.stmts[0].kind.let.slot;
+    try std.testing.expect(!f.bindings[scratch].droppable);
+    try std.testing.expectEqual(Ownership.owned, f.bindings[scratch].ownership);
+    for (ints.kind.block.stmts[1..], 1..) |stmt, index| {
+        const call = stmt.kind.expr.kind.call;
+        try std.testing.expectEqualStrings("cell_list_i64_push", call.symbol.?);
+        try std.testing.expectEqual(@as(i64, @intCast(index)), call.args[1].kind.int_const);
+    }
+    try std.testing.expectEqual(scratch, ints.kind.block.tail.?.kind.ref);
+    try std.testing.expectEqual(.list_lit, std.meta.activeTag(body[1].kind.let.value.?.kind));
+    try std.testing.expectEqual(.byte, body[1].kind.let.value.?.ty.list.tag());
+    const bools = body[2].kind.let.value.?;
+    try std.testing.expectEqualStrings("cell_list_bool_push", bools.kind.block.stmts[1].kind.expr.kind.call.symbol.?);
+    try std.testing.expectEqualStrings("cell_list_bool_push", bools.kind.block.stmts[2].kind.expr.kind.call.symbol.?);
+    try std.testing.expectEqual(@as(usize, 1), countSymbol(l.module, "cell_list_i64_push"));
+    try std.testing.expectEqual(@as(usize, 1), countSymbol(l.module, "cell_list_bool_push"));
+}
+
+test "unsupported list elements refuse once before an emitter sees a nonempty literal" {
+    const cases = [_][]const u8{
+        \\pub fn f() { let owned xs: [String] = ["a"] }
+        ,
+        \\pub fn f() { let owned xs: [[Int]] = [[1]] }
+        ,
+        \\pub fn f() { let owned xs: [Int8] = [1] }
+        ,
+    };
+    for (cases) |source| {
+        var l = try lowerSource(source);
+        defer l.deinit();
+        try std.testing.expectEqual(@as(usize, 1), l.diagnostics.list.items.len);
+        try std.testing.expect(std.mem.indexOf(u8, l.diagnostics.list.items[0].message, "list literal whose element has no runtime push") != null);
+        const init = l.module.findFn("f").?.body.?[0].kind.let.value.?;
+        try std.testing.expectEqual(.list_lit, std.meta.activeTag(init.kind));
+        try std.testing.expectEqual(@as(usize, 0), init.kind.list_lit.len);
+    }
+}
+
+test "pattern bindings are aliases and never droppable owners" {
+    var l = try lowerSource(
+        \\pub fn f(copy n: Int, copy r: Result<Int, Int>, copy o: Int?) {
+        \\    let copy a = match n { x => x, }
+        \\    let copy b = match r { Ok(v) => v, Err(e) => e, }
+        \\    let copy c = match o { Some(v) => v, None => 0, }
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const f = l.module.findFn("f").?;
+    for (f.bindings[f.param_count..]) |binding| {
+        if (std.mem.eql(u8, binding.name, "x") or std.mem.eql(u8, binding.name, "v") or std.mem.eql(u8, binding.name, "e")) {
+            try std.testing.expect(!binding.droppable);
         }
     }
 }

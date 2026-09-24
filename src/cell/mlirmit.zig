@@ -64,8 +64,9 @@
 //! hir.lower inserts), owned String places read as themselves, borrowed views
 //! of them, and String-valued `if`/`match` (on an `llvm.alloca` slot). No
 //! owned String this backend builds is freed: there is no IR drop pass.
-//! STILL REFUSED with `cannot lower to MLIR`: non-empty list literals,
-//! indexing, and `arc` over an aggregate. (Assignment through a field path
+//! STILL REFUSED with `cannot lower to MLIR`: resource-bearing list literals
+//! and `arc` over an aggregate. Scalar list literals and indexing lower
+//! through HIR runtime calls. (Assignment through a field path
 //! lowers since the `into_field` destination; this line listed it until
 //! 2026-09-22.)
 //!

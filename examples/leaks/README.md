@@ -82,6 +82,7 @@ landed.
 | `ir_owned_string.cell` | owned Strings the IR backends accepted before any conversion existed: C 0, LLVM and MLIR 3000 (2026-09-17) |
 | `ir_string_conversion.cell` | the eight borrowed-view to owned-`String` positions of `examples/owned_string.cell`, which the IR backends convert through `cell_string_from_str` since IR String step (a): nine allocations per call, C 0, LLVM and MLIR 9000 (2026-09-17) |
 | `ir_list_index.cell` | IR step (b): indexing allocates nothing, so what leaks is the owner the program already had (two host lists and an owned String per call); C 0 on both witnesses, LLVM and MLIR 3000 (2026-09-22) |
+| `ir_list_literal.cell` | IR step (d): five scalar list buffers per call, 1000 calls; C 0 on both witnesses, LLVM and MLIR 5000 on the malloc counter (2026-09-24). The HIR scratch is not a second owner |
 | `labelled_break.cell` | FLOW-03: `break :outer` from a nested loop crossing an owning local in each body; C releases both on the jump, 0 on both witnesses (a requirement, spec invariant 13); LLVM and MLIR 3000 (2026-09-22) |
 | `labelled_continue.cell` | FLOW-03: `continue :outer` from a nested loop, the same shape; C 0 on both witnesses; LLVM and MLIR 6000 (2026-09-22) |
 

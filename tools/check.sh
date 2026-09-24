@@ -485,6 +485,12 @@ LEAK_OWNED_STRING_MLIR=8
 LEAK_IR_LIST_INDEX_C=0
 LEAK_IR_LIST_INDEX_LLVM=3000
 LEAK_IR_LIST_INDEX_MLIR=3000
+# IR step (d), scalar list construction (2026-09-24): five owned buffers per
+# call, 1000 calls. Measured with the malloc counter: C ALLOC=5000 FREE=5000
+# LIVE=0; LLVM and MLIR ALLOC=5000 FREE=0 LIVE=5000. The scratch is not owner.
+LEAK_IR_LIST_LITERAL_C=0
+LEAK_IR_LIST_LITERAL_LLVM=5000
+LEAK_IR_LIST_LITERAL_MLIR=5000
 # R16 residual: a `return` inside a loop after the outer var's revival.
 # Measured 500 before (2026-09-17, ALLOC=2500 FREE=2000 LIVE=500); CLOSED
 # the same day by sparing an accepted loop's `return` records.
@@ -981,6 +987,18 @@ run_c_host ir_index 1838 examples/ir_index_host.c
 run_llvm ir_index 1838 examples/ir_index_host.c
 run_mlir ir_index 1838 examples/ir_index_host.c
 
+# IR step (d): all five scalar list builders, indexed reads, a return,
+# owned argument, reassignment and loop-local storage.
+run_c index 1142125
+run_llvm index 1142125
+run_mlir index 1142125
+run_c ir_list_literal 15157
+run_llvm ir_list_literal 15157
+run_mlir ir_list_literal 15157
+run_c_host ir_list_order 246 examples/ir_list_order_host.c
+run_llvm ir_list_order 246 examples/ir_list_order_host.c
+run_mlir ir_list_order 246 examples/ir_list_order_host.c
+
 # -------------------------------------------------------------- 7. leaks --
 # THESE FIXTURES ASSERT LEAKS THAT CURRENTLY EXIST. Read this script's header
 # comment (stage 7) before touching anything below: a fixture failing because
@@ -1164,6 +1182,9 @@ else
     run_c_leaks ir_list_index examples/ir_index_host.c "$LEAK_IR_LIST_INDEX_C" "C frees what the IR backends leak, IR step (b), 2026-09-22"
     run_ir_leaks ir_list_index llvm "$LEAK_IR_LIST_INDEX_LLVM" "IR step (b) indexing; no IR drop pass; joins the flip criterion, 2026-09-22" examples/leaks/ir_list_index.cell examples/ir_index_host.c
     run_ir_leaks ir_list_index mlir "$LEAK_IR_LIST_INDEX_MLIR" "IR step (b) indexing; no IR drop pass; joins the flip criterion, 2026-09-22" examples/leaks/ir_list_index.cell examples/ir_index_host.c
+    run_c_leaks ir_list_literal "" "$LEAK_IR_LIST_LITERAL_C" "scalar list construction, scratch non-owner, 2026-09-24"
+    run_ir_leaks ir_list_literal llvm "$LEAK_IR_LIST_LITERAL_LLVM" "IR step (d) list construction; no IR drop pass; joins the flip criterion, 2026-09-24"
+    run_ir_leaks ir_list_literal mlir "$LEAK_IR_LIST_LITERAL_MLIR" "IR step (d) list construction; no IR drop pass; joins the flip criterion, 2026-09-24"
     run_c_leaks labelled_break "" "$LEAK_LABELLED_BREAK_C" "FLOW-03 break :outer releases the outer and inner bodies' locals, 2026-09-22"
     run_ir_leaks labelled_break llvm "$LEAK_LABELLED_BREAK_LLVM" "FLOW-03 break :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
     run_ir_leaks labelled_break mlir "$LEAK_LABELLED_BREAK_MLIR" "FLOW-03 break :outer; no IR drop pass; joins the flip criterion, 2026-09-22"

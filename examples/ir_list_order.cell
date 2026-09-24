@@ -1,0 +1,16 @@
+// A C host records every element evaluation. The answer is 123 from the
+// host's call order plus 123 read back from the constructed list.
+// EXPECT-OUTPUT: 246
+
+pub fn print_int(copy value: Int);
+pub fn mark(copy value: Int) -> Int;
+pub fn order() -> Int;
+
+pub fn at_int(shared xs: [Int], copy at: Int) -> Int {
+    return match xs[at] { Some(v) => v, None => 0, }
+}
+
+pub fn main() {
+    let owned xs = [mark(1), mark(2), mark(3)]
+    print_int(order() + at_int(xs, 0) * 100 + at_int(xs, 1) * 10 + at_int(xs, 2))
+}

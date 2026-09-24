@@ -656,10 +656,26 @@ pub fn emitListLit(
         try self.emitArgLike(&items[i], elem, indent + 1);
         try out.writeAll(";\n");
         try self.writeIndent(indent + 1);
-        // A push fails only on overflow or out of memory, and `(void)`
-        // built a SHORTER list silently (F4, 2026-09-22). The runtime's own
-        // `cell_bytes_push` and every IR push panic; so does this.
-        try out.print("if (!cell_slice_push(&{s}, sizeof({s}), &{s})) cell_panic(cell_str_from_cstr(\"list literal in {s}: out of memory\"));\n", .{ list, elem.text, slot, self.current_fn });
+        // Pair every scalar writer with its IR reader's element stride. Other
+        // element types still use the checked generic push until recursive
+        // element destruction is represented in HIR.
+        const typed_push: ?[]const u8 = if (elem.shape == .byte and std.mem.eql(u8, elem.text, "uint8_t"))
+            "cell_bytes_push"
+        else if (elem.shape == .integer and std.mem.eql(u8, elem.text, "int64_t"))
+            "cell_list_i64_push"
+        else if (elem.shape == .integer and std.mem.eql(u8, elem.text, "int32_t"))
+            "cell_list_i32_push"
+        else if (elem.shape == .floating and std.mem.eql(u8, elem.text, "double"))
+            "cell_list_f64_push"
+        else if (elem.shape == .boolean)
+            "cell_list_bool_push"
+        else
+            null;
+        if (typed_push) |push| {
+            try out.print("{s}(&{s}, {s});\n", .{ push, list, slot });
+        } else {
+            try out.print("if (!cell_slice_push(&{s}, sizeof({s}), &{s})) cell_panic(cell_str_from_cstr(\"list literal in {s}: out of memory\"));\n", .{ list, elem.text, slot, self.current_fn });
+        }
     }
     try self.writeIndent(indent + 1);
     try out.print("{s};\n", .{list});
