@@ -147,6 +147,7 @@
 //! which rejects, and rejecting is always safe here.
 
 const std = @import("std");
+const dropfacts = @import("dropfacts.zig");
 const ast = @import("ast.zig");
 const diag = @import("diag.zig");
 const types = @import("types.zig");
@@ -498,6 +499,46 @@ pub const Checker = struct {
     pub const fieldWasMovedWhole = bk_scope.fieldWasMovedWhole;
     pub const fieldWasMoved = bk_scope.fieldWasMoved;
     pub const bindingName = bk_scope.bindingName;
+
+    /// Read-only evidence for HIR's future shared cleanup insertion. The
+    /// concrete checker stays behind this interface so HIR cannot silently
+    /// depend on its mutable analysis state or rule implementation details.
+    pub fn dropFacts(self: *const Checker) dropfacts.DropFacts {
+        return .{ .context = self, .vtable = &drop_facts_vtable };
+    }
+};
+
+const drop_facts_vtable: dropfacts.DropFacts.VTable = .{
+    .next_binding_id = struct {
+        fn read(context: *const anyopaque) u32 {
+            const checker: *const Checker = @ptrCast(@alignCast(context));
+            return checker.next_binding_id;
+        }
+    }.read,
+    .binding_name = struct {
+        fn read(context: *const anyopaque, id: u32) ?[]const u8 {
+            const checker: *const Checker = @ptrCast(@alignCast(context));
+            return checker.bindingName(id);
+        }
+    }.read,
+    .was_moved = struct {
+        fn read(context: *const anyopaque, id: u32) bool {
+            const checker: *const Checker = @ptrCast(@alignCast(context));
+            return checker.wasMoved(id);
+        }
+    }.read,
+    .live_at_exit = struct {
+        fn read(context: *const anyopaque, kind: dropfacts.ExitKind, key: usize, id: u32) bool {
+            const checker: *const Checker = @ptrCast(@alignCast(context));
+            return checker.liveAtExit(kind, key, id);
+        }
+    }.read,
+    .assign_releases_old_value = struct {
+        fn read(context: *const anyopaque, name_ptr: [*]const u8) bool {
+            const checker: *const Checker = @ptrCast(@alignCast(context));
+            return checker.assignReleasesOldValue(name_ptr);
+        }
+    }.read,
 };
 
 /// Borrow-check `module`, rendering every diagnostic to `writer`. Deliberately

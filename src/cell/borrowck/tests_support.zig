@@ -250,3 +250,21 @@ pub const prelude =
 ;
 // The prelude occupies lines 1 through 8, so a test body's first line is 9.
 pub const prelude_lines = 8;
+
+test "drop facts expose confirmed ids and fail closed on unknown exits" {
+    var h = try LiveHarness.init(
+        \\pub fn f(owned s: String) {
+        \\    let owned t: String = "x"
+        \\}
+    );
+    defer h.deinit();
+    const facts = h.checker.dropFacts();
+    const t = h.binding("t");
+    try std.testing.expectEqual(h.checker.next_binding_id, facts.nextBindingId());
+    try std.testing.expectEqualStrings("t", facts.bindingName(t).?);
+    try std.testing.expect(facts.bindingName(h.checker.next_binding_id) == null);
+    try std.testing.expect(!facts.wasMoved(t));
+    try std.testing.expect(facts.liveAtExit(.block_end, h.fnBodyKey("f"), t));
+    try std.testing.expect(!facts.liveAtExit(.block_end, 0, t));
+    try std.testing.expect(!facts.assignReleasesOldValue("unknown".ptr));
+}

@@ -8,6 +8,7 @@ pub const lexer = @import("cell/lexer.zig");
 pub const parser = @import("cell/parser.zig");
 pub const typecheck = @import("cell/typecheck.zig");
 pub const borrowck = @import("cell/borrowck.zig");
+pub const dropfacts = @import("cell/dropfacts.zig");
 pub const codegen = @import("cell/codegen.zig");
 pub const diag = @import("cell/diag.zig");
 pub const load_file = @import("cell/load.zig");
