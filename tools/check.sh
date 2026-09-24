@@ -458,12 +458,13 @@ LEAK_LOOP_CROSS=0
 # revived after it). Measured 500 before (2026-09-17, ALLOC=2000
 # FREE=1500 LIVE=500); CLOSED the same day by after_loop_skip releases.
 LEAK_SKIP_REVIVAL_BREAK=0
-# The IR backends insert no drops (2026-09-17): examples/leaks/ir_owned_string.cell
-# allocates three owned Strings per call, 1000 calls. C frees them all; LLVM and
-# MLIR free none. IR rows have one witness (the malloc counter).
+# examples/leaks/ir_owned_string.cell allocates three owned Strings per call,
+# 1000 calls: one direct let, one var initializer, one call replacement.
+# Terminal scalar-return cleanup and call replacement now free all three.
+# IR rows have one witness (the malloc counter).
 LEAK_IR_OWNED_STRING_C=0
-LEAK_IR_OWNED_STRING_LLVM=3000
-LEAK_IR_OWNED_STRING_MLIR=3000
+LEAK_IR_OWNED_STRING_LLVM=0
+LEAK_IR_OWNED_STRING_MLIR=0
 # IR String step (a) (2026-09-17): the IR backends convert a borrowed view
 # into an owned String with cell_string_from_str.
 # examples/leaks/ir_string_conversion.cell runs the eight conversion
@@ -1209,9 +1210,9 @@ else
         fi
     }
 
-    run_c_leaks ir_owned_string "" "$LEAK_IR_OWNED_STRING_C" "C frees what the IR backends leak, 2026-09-17"
-    run_ir_leaks ir_owned_string llvm "$LEAK_IR_OWNED_STRING_LLVM" "no IR drop pass, 2026-09-17"
-    run_ir_leaks ir_owned_string mlir "$LEAK_IR_OWNED_STRING_MLIR" "no IR drop pass, 2026-09-17"
+    run_c_leaks ir_owned_string "" "$LEAK_IR_OWNED_STRING_C" "three direct String owners and a call replacement, 2026-09-24"
+    run_ir_leaks ir_owned_string llvm "$LEAK_IR_OWNED_STRING_LLVM" "call replacement and terminal scalar-return cleanup, 2026-09-24"
+    run_ir_leaks ir_owned_string mlir "$LEAK_IR_OWNED_STRING_MLIR" "call replacement and terminal scalar-return cleanup, 2026-09-24"
     run_c_leaks ir_string_conversion "" "$LEAK_IR_STRING_CONVERSION_C" "C frees every converted String, 2026-09-17"
     run_ir_leaks ir_string_conversion llvm "$LEAK_IR_STRING_CONVERSION_LLVM" "terminal scalar-return cleanup; record-owned field remains, 2026-09-24"
     run_ir_leaks ir_string_conversion mlir "$LEAK_IR_STRING_CONVERSION_MLIR" "terminal scalar-return cleanup; record-owned field remains, 2026-09-24"
@@ -1558,12 +1559,13 @@ else
     # the runtime allocator and release called by that IR are. This catches
     # a duplicate/wrong release but is not whole-program IR instrumentation.
     if cc -fsanitize=address -g -c runtime/cell_rt.c -o "$TMP/san_drop_rt.o" 2>/dev/null; then
-      for drop_src in examples/leaks/ir_fallthrough_string.cell examples/leaks/ir_reassign_string.cell examples/leaks/ir_fallthrough_list.cell examples/leaks/ir_list_literal.cell examples/leaks/ir_string_conversion.cell; do
+      for drop_src in examples/leaks/ir_fallthrough_string.cell examples/leaks/ir_reassign_string.cell examples/leaks/ir_fallthrough_list.cell examples/leaks/ir_list_literal.cell examples/leaks/ir_string_conversion.cell examples/leaks/ir_owned_string.cell; do
         drop_name=$(basename "$drop_src" .cell)
         drop_expected=1000
         case "$drop_name" in
             ir_list_literal) drop_expected=500500 ;;
             ir_string_conversion) drop_expected=44000 ;;
+            ir_owned_string) drop_expected=4890 ;;
         esac
         if $CELL emit --target=llvm "$drop_src" > "$TMP/san_drop.ll" 2>/dev/null \
             && cc -Wno-override-module -x ir "$TMP/san_drop.ll" -c -o "$TMP/san_drop_l.o" 2>/dev/null \

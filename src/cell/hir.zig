@@ -711,7 +711,7 @@ const Lowerer = struct {
         return id;
     }
 
-    /// Straight-line cleanup slice: lets and literal String reassignments,
+    /// Straight-line cleanup slice: lets and literal or call String reassignments,
     /// optionally followed by a scalar return. Evaluate replacements and the
     /// return value before releasing confirmed live owners at the exit.
     /// Structured exits still wait for explicit HIR control-flow drops.
@@ -733,7 +733,7 @@ const Lowerer = struct {
             switch (src.kind) {
                 .let => {},
                 .assign => |a| {
-                    if (a.target.kind != .ident or a.value.kind != .string or lowered.kind != .assign) return body;
+                    if (a.target.kind != .ident or (a.value.kind != .string and a.value.kind != .call) or lowered.kind != .assign) return body;
                     const place = lowered.kind.assign.place;
                     if (place.path.len != 0 or place.slot >= self.bindings.items.len) return body;
                     const binding = self.bindings.items[place.slot];

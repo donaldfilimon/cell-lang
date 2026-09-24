@@ -1315,7 +1315,9 @@ owned `var` reassigned from a call) and never free it, while the C backend
 frees every one. Stage 8 still reports agreement, because the printed answer is
 the same. `examples/leaks/ir_owned_string.cell` pins it in stage 7: C 0 on both
 witnesses, LLVM and MLIR 3000 on the malloc counter (one witness; an IR object
-cannot take `leak_host.c`'s renamed `main`). Donald's decision the same day:
+cannot take `leak_host.c`'s renamed `main`). The 2026-09-24 direct-call
+replacement and terminal scalar-return slices bring all three to zero.
+Donald's decision the same day:
 build the IR String work (conversions, indexing, list literals) with these
 leaks pinned, then port the C backend's drop decisions onto HIR so both IR
 backends share them.
@@ -1329,12 +1331,12 @@ LLVM/MLIR LIVE=0 afterward, with C still 0. No other control-flow or
 resource family is covered by this slice, so the older nonzero fixtures stay
 disclosed until their own releases are implemented and measured.
 
-A second straight-line slice evaluates a literal String replacement into a
+A second straight-line slice evaluates a literal or direct-call String replacement into a
 nondroppable scratch slot, consults `assignReleasesOldValue` before releasing
 the old owner, then transfers the replacement to the original slot. The final
-slot is released at fallthrough. `ir_reassign_string` runs 1000 replacements
-and pins zero live allocations on C, LLVM, and MLIR; nonliteral assignments
-and structured exits remain outside this IR cleanup path.
+slot is released at fallthrough or terminal scalar return. `ir_reassign_string`
+and `ir_owned_string` pin zero live allocations on C, LLVM, and MLIR; other
+reassignment expressions and structured exits remain outside this IR cleanup path.
 
 **IR scalar list step (d), construction, landed 2026-09-24 on those terms.**
 HIR desugars `Byte`, `Int`, `Int32`, `Float`, and `Bool` literals to typed,
@@ -1369,7 +1371,7 @@ was released: `ir_string_conversion` measured 9000 live allocations over
 1000 calls. Terminal scalar-return cleanup reduced that pin to 1000, while
 C remains zero; the remaining record-owned field needs drop glue.
 `examples/owned_string.cell` with its host remains C 0 and LLVM/MLIR 8,
-and `ir_owned_string` remains at 3000. A separate C and IR defect persists:
+while `ir_owned_string` now pins zero. A separate C and IR defect persists:
 a write through an `exclusive String` borrow overwrites the old buffer
 without releasing it. The narrow cleanup slices above do not address that
 write-through path.

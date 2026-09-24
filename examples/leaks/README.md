@@ -80,7 +80,7 @@ landed and must be checked against answer and sanitizer evidence.
 
 | Fixture | What it pins |
 |---|---|
-| `ir_owned_string.cell` | owned Strings the IR backends accepted before any conversion existed: C 0, LLVM and MLIR 3000 (2026-09-17) |
+| `ir_owned_string.cell` | three owned Strings per call, including a direct-call replacement; C, LLVM and MLIR now pin 0 over 1000 calls (LLVM/MLIR previously 3000) |
 | `ir_string_conversion.cell` | nine owned String allocations per call; terminal scalar-return cleanup reduced LLVM/MLIR LIVE from 9000 to 1000 over 1000 calls. The record-owned field still lacks IR drop glue; C pins 0 |
 | `ir_list_index.cell` | indexing allocates nothing; terminal scalar-return cleanup releases two host lists and an owned String per call. C, LLVM and MLIR pin 0 (LLVM/MLIR previously 3000) |
 | `ir_list_literal.cell` | five scalar list buffers per call, 1000 calls; terminal scalar-return cleanup releases all five after evaluating the result. C, LLVM and MLIR pin 0 (LLVM/MLIR previously 5000); HIR scratch is not a second owner |
