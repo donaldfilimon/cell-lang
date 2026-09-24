@@ -637,6 +637,12 @@ cell_opt_i64_t cell_list_i64_at(cell_slice_t xs, int64_t index);
 cell_opt_i32_t cell_list_i32_at(cell_slice_t xs, int64_t index);
 cell_opt_f64_t cell_list_f64_at(cell_slice_t xs, int64_t index);
 cell_opt_bool_t cell_list_bool_at(cell_slice_t xs, int64_t index);
+/* Typed scalar-list builders use the same element stride as the readers.
+ * Allocation failure aborts; a literal must never become a shorter list. */
+void cell_list_i64_push(cell_slice_t *xs, int64_t value);
+void cell_list_i32_push(cell_slice_t *xs, int32_t value);
+void cell_list_f64_push(cell_slice_t *xs, double value);
+void cell_list_bool_push(cell_slice_t *xs, bool value);
 cell_slice_t cell_bytes_empty(void);
 cell_slice_t cell_bytes_with_capacity(int64_t cap);
 cell_arc_t cell_arc_retain_string(cell_arc_t value);

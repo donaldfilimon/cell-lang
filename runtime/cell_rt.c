@@ -478,6 +478,17 @@ void cell_bytes_push(cell_slice_t *xs, uint8_t value) {
         cell_panic(cell_str_from_cstr("cell_bytes_push: out of memory"));
 }
 
+#define CELL_LIST_PUSH(fn, T)                                                   \
+    void fn(cell_slice_t *xs, T value) {                                        \
+        if (!cell_slice_push(xs, sizeof(T), &value))                            \
+            cell_panic(cell_str_from_cstr(#fn ": out of memory"));              \
+    }
+CELL_LIST_PUSH(cell_list_i64_push, int64_t)
+CELL_LIST_PUSH(cell_list_i32_push, int32_t)
+CELL_LIST_PUSH(cell_list_f64_push, double)
+CELL_LIST_PUSH(cell_list_bool_push, bool)
+#undef CELL_LIST_PUSH
+
 cell_opt_byte_t cell_bytes_pop(cell_slice_t *xs) {
     if (xs->len == 0) return cell_opt_byte_none();
     xs->len -= 1;

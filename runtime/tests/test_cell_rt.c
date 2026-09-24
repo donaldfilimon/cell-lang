@@ -805,6 +805,33 @@ static void test_list_scalar_at(void) {
     cell_slice_free(&bs);
 }
 
+static void test_list_scalar_push(void) {
+    cell_slice_t ints = cell_slice_empty();
+    for (int64_t i = 0; i < 9; ++i) cell_list_i64_push(&ints, i * 11);
+    CHECK(ints.len == 9 && ints.cap >= 9);
+    CHECK(cell_list_i64_at(ints, 0).value == 0);
+    CHECK(cell_list_i64_at(ints, 4).value == 44);
+    CHECK(cell_list_i64_at(ints, 8).value == 88);
+    cell_slice_free(&ints);
+
+    cell_slice_t i32s = cell_slice_empty();
+    cell_list_i32_push(&i32s, -123);
+    CHECK(cell_list_i32_at(i32s, 0).value == -123);
+    cell_slice_free(&i32s);
+
+    cell_slice_t floats = cell_slice_empty();
+    cell_list_f64_push(&floats, 2.5);
+    CHECK(cell_list_f64_at(floats, 0).value == 2.5);
+    cell_slice_free(&floats);
+
+    cell_slice_t bools = cell_slice_empty();
+    cell_list_bool_push(&bools, true);
+    cell_list_bool_push(&bools, false);
+    CHECK(cell_list_bool_at(bools, 0).value);
+    CHECK(!cell_list_bool_at(bools, 1).value);
+    cell_slice_free(&bools);
+}
+
 static void test_prelude_bytes_and_arc(void) {
     cell_slice_t xs = cell_bytes_empty();
     CHECK(cell_bytes_len(xs) == 0);
@@ -856,6 +883,7 @@ int main(void) {
     test_prelude_numeric();
     test_prelude_strings();
     test_list_scalar_at();
+    test_list_scalar_push();
     test_prelude_bytes_and_arc();
 
     if (g_failures != 0) {
