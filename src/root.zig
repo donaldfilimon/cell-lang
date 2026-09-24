@@ -593,3 +593,67 @@ test "shipped check refuses a jump to a label no enclosing loop carries" {
         \\}
     , "error: no enclosing loop is labelled 'outr'");
 }
+
+test "checked HIR matches borrow IDs across bodyless declarations and list scratch" {
+    const source =
+        \\pub fn foreign(owned arg: String);
+        \\pub fn f(owned input: String) {
+        \\    let owned xs: [Int] = [1]
+        \\    let owned s: String = "x"
+        \\    let copy matched = match 1 { x => x }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var module = try compile(a, source, "t.cell");
+    var checker = borrowck.Checker.init(a, "t.cell", source);
+    defer checker.deinit();
+    try checker.checkModule(&module);
+    try std.testing.expect(!checker.hasErrors());
+    var bag: diag.Bag = .init("t.cell", source);
+    defer bag.deinit(a);
+    const lowered = try hir.lowerChecked(a, &module, &bag, checker.dropFacts());
+    try std.testing.expect(!bag.hasErrors());
+    const f = lowered.findFn("f").?;
+    try std.testing.expectEqual(@as(?u32, 0), f.bindings[0].bc_id);
+    const scratch = f.body.?[0].kind.let.value.?.kind.block.stmts[0].kind.let.slot;
+    try std.testing.expect(f.bindings[scratch].bc_id == null);
+    try std.testing.expectEqual(@as(?u32, 1), f.bindings[f.body.?[0].kind.let.slot].bc_id);
+    try std.testing.expectEqual(@as(?u32, 2), f.bindings[f.body.?[1].kind.let.slot].bc_id);
+    const match_value = f.body.?[2].kind.let.value.?;
+    const alias_slot = match_value.kind.match_expr.arms[0].pattern.kind.binding;
+    try std.testing.expect(!f.bindings[alias_slot].droppable);
+    try std.testing.expectEqual(@as(?u32, 3), f.bindings[alias_slot].bc_id);
+    try std.testing.expectEqual(@as(?u32, 4), f.bindings[f.body.?[2].kind.let.slot].bc_id);
+    try std.testing.expectEqual(@as(u32, 5), checker.next_binding_id);
+}
+
+test "checked HIR refuses mismatched borrow identity for every slot" {
+    const source =
+        \\pub fn f(owned input: String) {
+        \\    let owned s: String = "x"
+        \\}
+    ;
+    const other =
+        \\pub fn f(owned different: String) {
+        \\    let owned s: String = "x"
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var module = try compile(a, source, "t.cell");
+    var other_module = try compile(a, other, "other.cell");
+    var checker = borrowck.Checker.init(a, "other.cell", other);
+    defer checker.deinit();
+    try checker.checkModule(&other_module);
+    try std.testing.expect(!checker.hasErrors());
+    var bag: diag.Bag = .init("t.cell", source);
+    defer bag.deinit(a);
+    const lowered = try hir.lowerChecked(a, &module, &bag, checker.dropFacts());
+    try std.testing.expect(!bag.hasErrors());
+    for (lowered.findFn("f").?.bindings) |binding| {
+        try std.testing.expect(binding.bc_id == null);
+    }
+}

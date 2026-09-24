@@ -45,6 +45,7 @@
 //! calls, and emitting a `cannot lower` diagnostic instead of a placeholder.
 
 const std = @import("std");
+const dropfacts = @import("dropfacts.zig");
 const Io = std.Io;
 const ast = @import("ast.zig");
 const types = @import("types.zig");
@@ -132,6 +133,9 @@ pub const Binding = struct {
     /// Scratch slots and pattern aliases are not independent owners. The IR
     /// drop pass must positively confirm this flag before releasing a slot.
     droppable: bool = true,
+    /// Borrow-checker identity, positively matched by name and order. Null
+    /// for compiler scratch, bodyless parameters, or any numbering mismatch.
+    bc_id: ?u32 = null,
 };
 
 pub const Fn = struct {
@@ -480,10 +484,23 @@ pub fn lower(
     module: *const ast.Module,
     diagnostics: *diag.Bag,
 ) LowerError!Module {
+    return lowerChecked(allocator, module, diagnostics, null);
+}
+
+/// Lower with optional read-only borrow facts. Checked bindings receive an
+/// identity only when their name and declaration order agree with borrowck.
+/// Existing unchecked callers receive no identity or ownership-driven drops.
+pub fn lowerChecked(
+    allocator: std.mem.Allocator,
+    module: *const ast.Module,
+    diagnostics: *diag.Bag,
+    facts: ?dropfacts.DropFacts,
+) LowerError!Module {
     var l: Lowerer = .{
         .arena = allocator,
         .diagnostics = diagnostics,
         .module = module,
+        .facts = facts,
     };
     return l.run();
 }
@@ -492,6 +509,9 @@ const Lowerer = struct {
     arena: std.mem.Allocator,
     diagnostics: *diag.Bag,
     module: *const ast.Module,
+    facts: ?dropfacts.DropFacts = null,
+    next_bc_id: u32 = 0,
+    identity_failed: bool = false,
 
     structs: std.ArrayList(Struct) = .empty,
     enums: std.ArrayList(Enum) = .empty,
@@ -577,6 +597,16 @@ const Lowerer = struct {
                 else => {},
             }
         }
+        if (self.facts) |facts| {
+            if (self.next_bc_id != facts.nextBindingId() or self.identity_failed) {
+                // An unpaired identity cannot authorize a future release.
+                // Clear the whole module, not just the first mismatch, since
+                // every later id could name a different binding.
+                for (self.fns.items) |*f| {
+                    for (f.bindings) |*binding| binding.bc_id = null;
+                }
+            }
+        }
         try self.resolveRuntime();
 
         return .{
@@ -604,6 +634,7 @@ const Lowerer = struct {
                 .mutable = p.ownership == .owned or p.ownership == .exclusive,
                 .is_param = true,
                 .slot = slot,
+                .bc_id = if (f.body != null) self.claimId(p.name) else null,
             });
             try self.scope.append(self.arena, .{ .name = p.name, .slot = slot, .depth = self.depth });
         }
@@ -629,6 +660,21 @@ const Lowerer = struct {
             .is_public = f.is_public,
             .span = span,
         });
+    }
+
+    fn claimId(self: *Lowerer, name: []const u8) ?u32 {
+        const facts = self.facts orelse return null;
+        const id = self.next_bc_id;
+        self.next_bc_id += 1;
+        const checked_name = facts.bindingName(id) orelse {
+            self.identity_failed = true;
+            return null;
+        };
+        if (!std.mem.eql(u8, checked_name, name)) {
+            self.identity_failed = true;
+            return null;
+        }
+        return id;
     }
 
     /// Declare each runtime callee a conversion used, once.
@@ -775,6 +821,7 @@ const Lowerer = struct {
                     .mutable = l.mutable,
                     .is_param = false,
                     .slot = slot,
+                    .bc_id = self.claimId(l.name),
                 });
                 try self.scope.append(self.arena, .{ .name = l.name, .slot = slot, .depth = self.depth });
 
@@ -1480,6 +1527,7 @@ const Lowerer = struct {
                     .is_param = false,
                     .slot = slot,
                     .droppable = false,
+                    .bc_id = self.claimId(name),
                 });
                 try self.scope.append(self.arena, .{ .name = name, .slot = slot, .depth = self.depth });
                 return .{ .kind = .{ .binding = slot }, .span = p.span };
@@ -1516,6 +1564,7 @@ const Lowerer = struct {
                         .is_param = false,
                         .slot = slot,
                         .droppable = false,
+                        .bc_id = self.claimId(name),
                     });
                     try self.scope.append(self.arena, .{ .name = name, .slot = slot, .depth = self.depth });
                     binding = slot;
@@ -1566,6 +1615,7 @@ const Lowerer = struct {
                 .is_param = false,
                 .slot = slot,
                 .droppable = false,
+                .bc_id = self.claimId(n),
             });
             try self.scope.append(self.arena, .{ .name = n, .slot = slot, .depth = self.depth });
             binding = slot;

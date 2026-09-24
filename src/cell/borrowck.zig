@@ -500,9 +500,9 @@ pub const Checker = struct {
     pub const fieldWasMoved = bk_scope.fieldWasMoved;
     pub const bindingName = bk_scope.bindingName;
 
-    /// Read-only evidence for HIR's future shared cleanup insertion. The
-    /// concrete checker stays behind this interface so HIR cannot silently
-    /// depend on its mutable analysis state or rule implementation details.
+    /// Read-only evidence for HIR identity matching and shared cleanup
+    /// insertion. The concrete checker stays behind this interface so HIR
+    /// cannot depend on mutable analysis state or rule implementation details.
     pub fn dropFacts(self: *const Checker) dropfacts.DropFacts {
         return .{ .context = self, .vtable = &drop_facts_vtable };
     }
