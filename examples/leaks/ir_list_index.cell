@@ -1,0 +1,53 @@
+// IR step (b), indexing (2026-09-22). Indexing allocates nothing, so what an
+// IR backend leaks here is the owner the program already had, which the IR
+// drop pass (step (c)) must free. Per call: a bound owned host list indexed
+// directly, the same list handed to a `shared` callee that indexes it, an
+// annotated owned `String` indexed, and a string literal indexed (which owns
+// nothing). Three owners per call, 1000 calls.
+//
+// Pinned: C 0 on both witnesses; LLVM and MLIR on the malloc counter. A DROP
+// in an IR pin means the IR drop pass landed; update the pin and
+// docs/OWNERSHIP.md together. The lists come from examples/ir_index_host.c.
+//
+// Status: parses, passes `cell check`; C, LLVM and MLIR; lives under
+// examples/leaks/.
+
+pub fn print_int(copy value: Int);
+pub fn host_ints() -> [Int];
+
+pub fn or_zero(copy o: Int?) -> Int {
+    return match o {
+        Some(v) => v,
+        None => 0,
+    }
+}
+
+pub fn second(shared ns: [Int]) -> Int {
+    return or_zero(ns[1])
+}
+
+pub fn once(copy i: Int) -> Int {
+    let owned ns = host_ints()
+    let owned ms = host_ints()
+    var owned s: String = "abc"
+    let copy a = or_zero(ns[0]) + second(ms)
+    let copy b = match s[1] {
+        Some(_) => 1,
+        None => 0,
+    }
+    let copy c = match "xy"[5] {
+        Some(_) => 0,
+        None => 1,
+    }
+    return a + b + c + i
+}
+
+pub fn main() {
+    var i = 0
+    var n = 0
+    while i < 1000 {
+        n = n + once(i)
+        i = i + 1
+    }
+    print_int(n)
+}

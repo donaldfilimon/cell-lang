@@ -2257,6 +2257,13 @@ fn expectDiagnosticContains(bag: *const diag.Bag, needle: []const u8) !void {
 /// what it printed. Uses `cc`, not `zig cc`: measured, `zig cc -x ir` fails
 /// outright with "language not recognized: ir".
 fn runEmitted(text: []const u8) ![]const u8 {
+    return runEmittedHost(text, null);
+}
+
+/// `runEmitted` with an optional hand-written C host, a path relative to the
+/// repository root (IR step (b) Q5), linked between the program and the
+/// runtime exactly as the gate's `run_llvm` links one.
+fn runEmittedHost(text: []const u8, host: ?[]const u8) ![]const u8 {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2282,8 +2289,15 @@ fn runEmitted(text: []const u8) ![]const u8 {
         return error.ClangRejectedEmittedIr;
     }
 
+    const host_path: ?[]u8 = if (host) |h| try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, h }) else null;
+    defer if (host_path) |h| gpa.free(h);
+    var link_argv: std.ArrayList([]const u8) = .empty;
+    defer link_argv.deinit(gpa);
+    try link_argv.appendSlice(gpa, &.{ "cc", "prog.o" });
+    if (host_path) |h| try link_argv.append(gpa, h);
+    try link_argv.appendSlice(gpa, &.{ rt_c, "-I", include, "-o", "prog" });
     const link = try std.process.run(gpa, io, .{
-        .argv = &.{ "cc", "prog.o", rt_c, "-I", include, "-o", "prog" },
+        .argv = link_argv.items,
         .cwd = .{ .dir = tmp.dir },
     });
     defer gpa.free(link.stdout);
@@ -3546,4 +3560,96 @@ test "labelled jumps compute the same answer the C backend does" {
     const out = try runEmitted(e.text);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("218\n", out);
+}
+
+test "each index reader is declared once with the C ABI clang gives it" {
+    // IR step (b). The shapes gate stage 10 compares by name against C's
+    // declarations: an optional of a byte-sized payload is `i16`, an
+    // `Int?`/`Float?` is `[2 x i64]`, an `Int32?` packs into `i64`, a
+    // `String` view is `[2 x i64]`, and a slice is passed by pointer.
+    var e = try emitSource(
+        \\pub fn f(shared s: String, shared b: [Byte], shared n: [Int], shared w: [Int32], shared x: [Float], shared y: [Bool]) -> Int {
+        \\  let copy a = s[0]
+        \\  let copy c = b[0]
+        \\  let copy d = n[0]
+        \\  let copy g = w[0]
+        \\  let copy h = x[0]
+        \\  let copy k = y[0]
+        \\  let copy m = n[1]
+        \\  return 0
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    const decls = [_][]const u8{
+        "declare i16 @cell_str_byte_at([2 x i64], i64)\n",
+        "declare i16 @cell_bytes_at(ptr, i64)\n",
+        "declare [2 x i64] @cell_list_i64_at(ptr, i64)\n",
+        "declare i64 @cell_list_i32_at(ptr, i64)\n",
+        "declare [2 x i64] @cell_list_f64_at(ptr, i64)\n",
+        "declare i16 @cell_list_bool_at(ptr, i64)\n",
+    };
+    for (decls) |d| {
+        try expectContains(e.text, d);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, e.text, d));
+    }
+}
+
+test "all six index readers run against the runtime and a host, in and out of range" {
+    // IR step (b) Q5: the host supplies the lists no Cell constructor builds
+    // (examples/ir_index_host.c). ns = [3, 40, 2], ws = [-5, 700],
+    // fs = [2.5, 0.25], bs = [false, true]. 40 + 0 + 0 + 100 + 200 + 400 +
+    // 1000 + 3000 + 5000 = 9740.
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn host_ints() -> [Int];
+        \\pub fn host_i32s() -> [Int32];
+        \\pub fn host_floats() -> [Float];
+        \\pub fn host_bools() -> [Bool];
+        \\pub fn bytes_empty() -> owned [Byte];
+        \\pub fn bytes_push(exclusive xs: [Byte], copy value: Byte);
+        \\pub fn z(copy o: Int?) -> Int { return match o { Some(v) => v, None => 0, } }
+        \\pub fn main() {
+        \\  let owned ns = host_ints()
+        \\  let owned ws = host_i32s()
+        \\  let owned fs = host_floats()
+        \\  let owned bs = host_bools()
+        \\  var owned by = bytes_empty()
+        \\  bytes_push(exclusive by, 72)
+        \\  let owned s: String = "Hi"
+        \\  let copy big: Int32 = 700
+        \\  let copy a = z(ns[1]) + z(ns[3]) + z(ns[-1])
+        \\  let copy b = match ws[1] { Some(v) => if v == big { 100 } else { 0 }, None => 0, }
+        \\  let copy c = match fs[1] { Some(v) => if v == 0.25 { 200 } else { 0 }, None => 0, }
+        \\  let copy d = match bs[1] { Some(v) => if v { 400 } else { 0 }, None => 0, }
+        \\  let copy e = match by[0] { Some(_) => 1000, None => 0, }
+        \\  let copy f = match s[1] { Some(_) => 3000, None => 0, }
+        \\  let copy g = match "x"[1] { Some(_) => 0, None => 5000, }
+        \\  print_int(a + b + c + d + e + f + g)
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    const out = try runEmittedHost(e.text, "examples/ir_index_host.c");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("9740\n", out);
+}
+
+test "an owned String temporary and an arc list are refused as index bases" {
+    {
+        // A view of a temporary would outlive its only owner.
+        var e = try emitSource(
+            \\pub fn mk() -> String;
+            \\pub fn f() -> Int { return match mk()[0] { Some(_) => 1, None => 0, } }
+        );
+        defer e.deinit();
+        try expectDiagnosticContains(&e.bag, "%cell_string where %cell_str is expected, in a call argument");
+    }
+    {
+        var e = try emitSource(
+            \\pub fn f(arc xs: [Int]) -> Int { return match xs[0] { Some(v) => v, None => 0, } }
+        );
+        defer e.deinit();
+        try std.testing.expect(e.bag.hasErrors());
+    }
 }

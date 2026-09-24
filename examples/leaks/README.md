@@ -1,6 +1,6 @@
 # `examples/leaks/`
 
-Thirty-three fixtures: twenty-nine measured on the C backend only, two IR
+Thirty-four fixtures: twenty-nine measured on the C backend only, three IR
 backend pins, and two FLOW-03 labelled-jump fixtures measured on all three
 backends (both below). The C ones are: R11's measurable gaps and their CLOSED
 pins (seven, including the value-block residual and the `owned` twin of row
@@ -35,7 +35,7 @@ backend-agreement, and MLIR-lowering loops in `tools/check.sh` and
 them does pass `cell check`). They used to say LLVM/MLIR refuse all of them;
 measured 2026-09-21 with `cell emit --target=llvm` and `--target=mlir`, 18 of
 the 31 emit through both and 13 (the `arc` and owning-payload shapes) are
-refused by both. Only the two IR pins below are measured on an IR backend.
+refused by both. Only the three IR pins below are measured on an IR backend.
 
 | Fixture | R11 row |
 |---|---|
@@ -81,6 +81,7 @@ landed.
 |---|---|
 | `ir_owned_string.cell` | owned Strings the IR backends accepted before any conversion existed: C 0, LLVM and MLIR 3000 (2026-09-17) |
 | `ir_string_conversion.cell` | the eight borrowed-view to owned-`String` positions of `examples/owned_string.cell`, which the IR backends convert through `cell_string_from_str` since IR String step (a): nine allocations per call, C 0, LLVM and MLIR 9000 (2026-09-17) |
+| `ir_list_index.cell` | IR step (b): indexing allocates nothing, so what leaks is the owner the program already had (two host lists and an owned String per call); C 0 on both witnesses, LLVM and MLIR 3000 (2026-09-22) |
 | `labelled_break.cell` | FLOW-03: `break :outer` from a nested loop crossing an owning local in each body; C releases both on the jump, 0 on both witnesses (a requirement, spec invariant 13); LLVM and MLIR 3000 (2026-09-22) |
 | `labelled_continue.cell` | FLOW-03: `continue :outer` from a nested loop, the same shape; C 0 on both witnesses; LLVM and MLIR 6000 (2026-09-22) |
 

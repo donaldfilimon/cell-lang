@@ -4,8 +4,9 @@
 // panic. [String][i] stays refused.
 //
 // Status: parses, passes `cell check`, and the emitted C compiles, links and
-// runs, printing 1142125 (see EXPECT-OUTPUT). C backend only: LLVM and MLIR refuse
-// indexing together with `cannot lower`, so the agreement contract holds.
+// runs, printing 1142125 (see EXPECT-OUTPUT). C backend only: LLVM and MLIR index
+// since 2026-09-22 (examples/ir_index.cell) but refuse this file's list
+// literals and its unannotated `let owned s = "Hi"` (IR step (d)).
 // Indexed assignment `a[i] = x` is not implemented.
 // EXPECT-OUTPUT: 1142125
 

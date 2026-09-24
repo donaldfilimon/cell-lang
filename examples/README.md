@@ -118,8 +118,11 @@ backends since 2026-09-17: scalar `Some`/`None`/`Ok`/`Err` payloads only.
 
 `index.cell` (prints 1142125) is C only: postfix `a[i]` for
 `String` and `[Byte]` lowers through `cell_str_byte_at` / `cell_bytes_at`,
-and for `[Int]`/`[Int32]`/`[Float]`/`[Bool]` through `cell_list_*_at`; LLVM and
-MLIR refuse indexing together with `cannot lower`.
+and for `[Int]`/`[Int32]`/`[Float]`/`[Bool]` through `cell_list_*_at`. LLVM and
+MLIR index since 2026-09-22 (IR step (b)) but refuse this file's list literals
+and its unannotated owned `let`. `ir_index.cell` (prints 1838, with
+`ir_index_host.c` supplying the lists) runs every reader and base form through
+all three backends.
 
 `prelude.cell` (prints 123) runs on all three backends since 2026-09-17. It
 calls prelude functions that return `Byte?`, a 2-byte optional clang returns
@@ -167,10 +170,11 @@ both halves of it are measured over every file here rather than a chosen few:
 - **Link and run**, measured 2026-09-08: seven link on their own
   (`hello` 42, `backends` 24, `loops` 55, `while_is_now_a_loop` 10,
   `arc_return_field` 7, and `ownership` and `borrows` both silent at exit 0);
-  three more link once their host is added (`arc` 13 with `arc_host.c`,
+  four more link once their host is added (`arc` 13 with `arc_host.c`,
   `write_through` 142 with `write_through_host.c`, `owned_string` 44 with
   `owned_string_host.c`, which gate stage 6 also runs through LLVM and MLIR
-  since 2026-09-17); the rest do not link for
+  since 2026-09-17; and `ir_index` 1838 with `ir_index_host.c`, through C,
+  LLVM and MLIR since IR step (b), 2026-09-22); the rest do not link for
   one reason, and it is not a codegen defect: they declare no `pub fn main()`
   with a body, so no C `main` is emitted and the link stops at `_main`.
 
@@ -220,7 +224,8 @@ are not.
 | `unit_type.cell` | explicit `()` in type position: `-> ()` is the same unit as an omitted `->`; a `let` of `()` is refused |
 | `escapes.cell` | SPEC 2.8 simple escapes: `"\n"` is one newline byte and `"\\"` is one backslash; prints 11 through all three backends |
 | `silent_literals.cell` | SPEC 2.6/2.7: `0x1F` is 31, `1_000` is 1000, `1e9` is a Float; prints 31 through all three backends |
-| `index.cell` | postfix `a[i]` for `String` and `[Byte]` as `Byte?`, and for `[Int]`/`[Int32]`/`[Float]`/`[Bool]` as the element's optional; prints 1142125 through C; LLVM and MLIR refuse together |
+| `index.cell` | postfix `a[i]` for `String` and `[Byte]` as `Byte?`, and for `[Int]`/`[Int32]`/`[Float]`/`[Bool]` as the element's optional; prints 1142125 through C; LLVM and MLIR refuse its list literals |
+| `ir_index.cell` | every index reader and base form, lists from `ir_index_host.c`; prints 1838 through C, LLVM and MLIR (IR step (b), 2026-09-22) |
 | `early_return.cell` | an `if` branch or `match` arm that always leaves keeps its moves out of the code after it; prints 1124 through all three backends |
 | `results_wide.cell` | 16-byte per-pair Results with a 64-bit error; prints -8999999983 through all three backends |
 | `results_small.cell` | 8-byte and 2-byte per-pair Results crossing calls in one word; prints 7533 through all three backends |

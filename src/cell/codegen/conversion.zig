@@ -756,8 +756,17 @@ pub fn emitArgLike(self: *Generator, arg: *const ast.Expr, want: CType, indent: 
             try out.writeAll("cell_string_as_str(&");
             try self.emitExpr(arg, indent);
             try out.writeAll(")");
-        } else {
-            try self.emitExpr(arg, indent);
+        } else switch (unwrapAnnotated(arg).kind) {
+            // A value block over owned places (IR step (b) Q3, ruled
+            // 2026-09-21): typed as the VIEW, so each arm converts its own
+            // place with the rule above, and the block copies no owning
+            // header. An arm that is an owned temporary still reaches the
+            // `else` leaf and is refused at `cc`, as `mk()[0]` is: a view of
+            // a temporary would outlive its only owner. LLVM and MLIR accept
+            // the same shapes through `convertTo`, which pushes the view
+            // into each branch.
+            .block, .if_expr, .match_expr => try self.emitValueExpr(unwrapAnnotated(arg), want, indent),
+            else => try self.emitExpr(arg, indent),
         }
         return;
     }

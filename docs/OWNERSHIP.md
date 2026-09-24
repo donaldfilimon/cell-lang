@@ -1330,6 +1330,13 @@ than new: a write through an `exclusive String` borrow overwrites the old
 buffer without freeing it (the IR converts `s = "cd"` there, as C does), and
 nothing is freed on any IR path until the drop pass is ported.
 
+**IR step (b), indexing, landed 2026-09-22 on the same terms.** An index is a
+call to the bounds-checked runtime reader C calls, and allocates nothing, so
+it adds no leak of its own: `examples/leaks/ir_list_index.cell` pins the owners
+the program already had (two host lists and an owned `String` per call), C 0
+on both witnesses and LLVM and MLIR 3000. That pin joins the default-flip
+criterion with the others.
+
 The checker decides where these go; codegen emits them. The runtime functions
 exist and work: `cell_arc_new`, `cell_arc_clone` (increment), and
 `cell_arc_drop` (decrement, and call the drop function at zero), all in

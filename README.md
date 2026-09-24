@@ -196,13 +196,13 @@ Still designed and not implemented: generics and enum payloads. Scalar
 (`examples/results.cell` prints 9 on each). `.cell`/`.cel` modules pair with
 `.body`/`.bod` by stem. See `docs/SPEC.md` section 12 and `docs/OWNERSHIP.md`.
 
-**Loops exist.** `while` is a keyword, with `break` and `continue`; the retained
-`examples/loops.cell` contract expects `55` from all three backends. An earlier
+**Loops exist.** `while` and `loop` are statements, with `break`, `continue`,
+and labelled exits; the retained `examples/loops.cell` contract expects `55`
+from all three backends. An earlier
 version of this section said the opposite and cited a rejected
 example that no longer exists, which is the kind of claim this project's own
 status-honesty standard exists to prevent. Loops also brought their own
-ownership rule, R2.a, for a move inside a loop body. `for` and `loop` are not
-implemented.
+ownership rule, R2.a, for a move inside a loop body. `for` is not implemented.
 
 Cell has no measured performance characteristics and no ABI-stability
 guarantee. Memory-safety claims cover only the rules the checker actually

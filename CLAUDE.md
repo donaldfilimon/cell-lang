@@ -264,7 +264,8 @@ in explains most surprises:
   the widest exception since 2026-09-17: owned and borrowed Strings and the
   view-to-owned conversion lower in both (`hir.lower` inserts the
   `cell_string_from_str` call), and neither frees an owned String yet,
-  because neither has a drop pass. Because they
+  because neither has a drop pass. Indexing lowers in both since IR step (b)
+  (2026-09-22) as a call to the same `cell_*_at` runtime reader C calls. Because they
   share `hir`, a disagreement between them means one is wrong, which is what
   the gate's agreement stage exists to catch.
 

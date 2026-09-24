@@ -16,6 +16,7 @@ const Callee = cg_model.Callee;
 const optBase = cg_helpers.optBase;
 const optBaseForPayload = cg_helpers.optBaseForPayload;
 const unwrapAnnotated = cg_helpers.unwrapAnnotated;
+const isPlace = cg_helpers.isPlace;
 const resultBase = cg_helpers.resultBase;
 const listReader = cg_helpers.listReader;
 const endsInJump = cg_helpers.endsInJump;
@@ -162,6 +163,14 @@ pub fn emitValueInto(self: *Generator, e: *const ast.Expr, dest: Dest, indent: u
                     },
                     else => {},
                 }
+            }
+            // A view slot fed an owned String PLACE (a value block typed as
+            // the view, IR step (b) Q3): `emitArgLike`'s place rule takes
+            // `cell_string_as_str(&place)`, a borrow that copies no header.
+            if (dest.ty.shape == .str and !dest.ty.pointer and have.shape == .string and isPlace(e)) {
+                try self.emitArgLike(e, dest.ty, indent);
+                try out.writeAll(";\n");
+                return;
             }
             if (!try self.emitConversion(e, dest.ty, have, indent)) {
                 try self.emitExpr(e, indent);

@@ -2233,6 +2233,12 @@ fn expectContains(text: []const u8, needle: []const u8) !void {
 /// absent: they live in the Homebrew LLVM keg and are not on PATH here, and a
 /// test that quietly succeeds when its subject is missing is worse than none.
 fn runThroughMlir(gpa: std.mem.Allocator, mlir_text: []const u8) ![]u8 {
+    return runThroughMlirHost(gpa, mlir_text, null);
+}
+
+/// `runThroughMlir` with an optional hand-written C host, a path relative to
+/// the repository root (IR step (b) Q5).
+fn runThroughMlirHost(gpa: std.mem.Allocator, mlir_text: []const u8, host: ?[]const u8) ![]u8 {
     const io = std.testing.io;
 
     const mlir_opt = (try findTool(gpa, "mlir-opt")) orelse return error.SkipZigTest;
@@ -2295,8 +2301,15 @@ fn runThroughMlir(gpa: std.mem.Allocator, mlir_text: []const u8) ![]u8 {
     const include = try std.fmt.allocPrint(gpa, "{s}/runtime", .{cwd_buf[0..cwd_len]});
     defer gpa.free(include);
 
+    const host_path: ?[]u8 = if (host) |h| try std.fmt.allocPrint(gpa, "{s}/{s}", .{ cwd_buf[0..cwd_len], h }) else null;
+    defer if (host_path) |h| gpa.free(h);
+    var link_argv: std.ArrayList([]const u8) = .empty;
+    defer link_argv.deinit(gpa);
+    try link_argv.appendSlice(gpa, &.{ "cc", "m.o", "drv.c" });
+    if (host_path) |h| try link_argv.append(gpa, h);
+    try link_argv.appendSlice(gpa, &.{ rt_c, "-I", include, "-o", "prog" });
     const linked = try std.process.run(gpa, io, .{
-        .argv = &.{ "cc", "m.o", "drv.c", rt_c, "-I", include, "-o", "prog" },
+        .argv = link_argv.items,
         .cwd = .{ .dir = tmp.dir },
     });
     defer gpa.free(linked.stdout);
@@ -3476,4 +3489,87 @@ test "labelled jumps lower through MLIR to the same answer the C backend prints"
     const out = try runThroughMlir(gpa, e.text);
     defer gpa.free(out);
     try std.testing.expectEqualStrings("218\n", out);
+}
+
+test "each index reader is declared once as a private func" {
+    var e = try emitSource(
+        \\pub fn f(shared s: String, shared b: [Byte], shared n: [Int], shared w: [Int32], shared x: [Float], shared y: [Bool]) -> Int {
+        \\  let copy a = s[0]
+        \\  let copy c = b[0]
+        \\  let copy d = n[0]
+        \\  let copy g = w[0]
+        \\  let copy h = x[0]
+        \\  let copy k = y[0]
+        \\  let copy m = n[1]
+        \\  return 0
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    const decls = [_][]const u8{
+        "func.func private @cell_str_byte_at(!llvm.array<2 x i64>, i64) -> i16\n",
+        "func.func private @cell_bytes_at(!llvm.ptr, i64) -> i16\n",
+        "func.func private @cell_list_i64_at(!llvm.ptr, i64) -> !llvm.array<2 x i64>\n",
+        "func.func private @cell_list_i32_at(!llvm.ptr, i64) -> i64\n",
+        "func.func private @cell_list_f64_at(!llvm.ptr, i64) -> !llvm.array<2 x i64>\n",
+        "func.func private @cell_list_bool_at(!llvm.ptr, i64) -> i16\n",
+    };
+    for (decls) |d| {
+        try expectContains(e.text, d);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, e.text, d));
+    }
+}
+
+test "all six index readers run through mlir-opt, the runtime and a host" {
+    var e = try emitSource(
+        \\pub fn print_int(copy value: Int);
+        \\pub fn host_ints() -> [Int];
+        \\pub fn host_i32s() -> [Int32];
+        \\pub fn host_floats() -> [Float];
+        \\pub fn host_bools() -> [Bool];
+        \\pub fn bytes_empty() -> owned [Byte];
+        \\pub fn bytes_push(exclusive xs: [Byte], copy value: Byte);
+        \\pub fn z(copy o: Int?) -> Int { return match o { Some(v) => v, None => 0, } }
+        \\pub fn main() {
+        \\  let owned ns = host_ints()
+        \\  let owned ws = host_i32s()
+        \\  let owned fs = host_floats()
+        \\  let owned bs = host_bools()
+        \\  var owned by = bytes_empty()
+        \\  bytes_push(exclusive by, 72)
+        \\  let owned s: String = "Hi"
+        \\  let copy big: Int32 = 700
+        \\  let copy a = z(ns[1]) + z(ns[3]) + z(ns[-1])
+        \\  let copy b = match ws[1] { Some(v) => if v == big { 100 } else { 0 }, None => 0, }
+        \\  let copy c = match fs[1] { Some(v) => if v == 0.25 { 200 } else { 0 }, None => 0, }
+        \\  let copy d = match bs[1] { Some(v) => if v { 400 } else { 0 }, None => 0, }
+        \\  let copy e = match by[0] { Some(_) => 1000, None => 0, }
+        \\  let copy f = match s[1] { Some(_) => 3000, None => 0, }
+        \\  let copy g = match "x"[1] { Some(_) => 0, None => 5000, }
+        \\  print_int(a + b + c + d + e + f + g)
+        \\}
+    );
+    defer e.deinit();
+    try std.testing.expect(!e.bag.hasErrors());
+    const out = try runThroughMlirHost(std.testing.allocator, e.text, "examples/ir_index_host.c");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("9740\n", out);
+}
+
+test "an owned String temporary and an arc list are refused as index bases in MLIR" {
+    {
+        var e = try emitSource(
+            \\pub fn mk() -> String;
+            \\pub fn f() -> Int { return match mk()[0] { Some(_) => 1, None => 0, } }
+        );
+        defer e.deinit();
+        try std.testing.expect(e.bag.hasErrors());
+    }
+    {
+        var e = try emitSource(
+            \\pub fn f(arc xs: [Int]) -> Int { return match xs[0] { Some(v) => v, None => 0, } }
+        );
+        defer e.deinit();
+        try std.testing.expect(e.bag.hasErrors());
+    }
 }

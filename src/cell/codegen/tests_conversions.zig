@@ -1332,3 +1332,27 @@ test "a revived record is released whole at scope end" {
     try expectOccurrences(g, "cell_string_free(&b.s);", 0);
     try expectCompiles(e.text);
 }
+
+test "an index on a value block of owned String places views each arm, and compiles" {
+    // IR step (b) Q3, ruled 2026-09-21: the block is typed as the VIEW, so
+    // each arm takes `cell_string_as_str(&place)` and no owning header is
+    // copied. Before, the block built a `cell_string_t` and handed it to a
+    // `cell_str_t` parameter, which `cc` refused.
+    var e = try emitSource(
+        \\pub fn f(copy c: Int) -> Int {
+        \\  let owned a: String = "Hi"
+        \\  let owned b: String = "Yo"
+        \\  return match (if c == 0 { a } else { b })[1] {
+        \\    Some(_) => 7,
+        \\    None => 0,
+        \\  }
+        \\}
+    );
+    defer e.deinit();
+    const f = try fnDef(e.text, "f");
+    try expectContains(f, "cell_str_t _cell_t");
+    try expectContains(f, "= cell_string_as_str(&a);");
+    try expectContains(f, "= cell_string_as_str(&b);");
+    try expectAbsent(f, "cell_string_t _cell_t");
+    try expectCompiles(e.text);
+}

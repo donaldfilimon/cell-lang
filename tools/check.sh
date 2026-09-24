@@ -479,6 +479,12 @@ LEAK_IR_STRING_CONVERSION_MLIR=9000
 LEAK_OWNED_STRING_C=0
 LEAK_OWNED_STRING_LLVM=8
 LEAK_OWNED_STRING_MLIR=8
+# IR step (b), indexing (2026-09-22): examples/leaks/ir_list_index.cell,
+# three owners per call (two host lists and an owned String), 1000 calls.
+# Indexing allocates nothing; the IR counts are the owners step (c) must free.
+LEAK_IR_LIST_INDEX_C=0
+LEAK_IR_LIST_INDEX_LLVM=3000
+LEAK_IR_LIST_INDEX_MLIR=3000
 # R16 residual: a `return` inside a loop after the outer var's revival.
 # Measured 500 before (2026-09-17, ALLOC=2500 FREE=2000 LIVE=500); CLOSED
 # the same day by sparing an accepted loop's `return` records.
@@ -965,6 +971,16 @@ run_c_host owned_string 44 examples/owned_string_host.c
 run_llvm owned_string 44 examples/owned_string_host.c
 run_mlir owned_string 44 examples/owned_string_host.c
 
+# ir_index runs through ALL THREE backends since IR step (b) (2026-09-22):
+# an index is a call to the same bounds-checked runtime reader C calls, so
+# every reader (String, [Byte], [Int], [Int32], [Float], [Bool]) and every
+# base form measured in the step (b) spec answers identically. 1838 is
+# computed by hand in the example; a reader bound with the wrong ABI or
+# stride moves it. The host builds the four lists no Cell constructor can.
+run_c_host ir_index 1838 examples/ir_index_host.c
+run_llvm ir_index 1838 examples/ir_index_host.c
+run_mlir ir_index 1838 examples/ir_index_host.c
+
 # -------------------------------------------------------------- 7. leaks --
 # THESE FIXTURES ASSERT LEAKS THAT CURRENTLY EXIST. Read this script's header
 # comment (stage 7) before touching anything below: a fixture failing because
@@ -1145,6 +1161,9 @@ else
     run_c_leaks owned_string examples/owned_string_host.c "$LEAK_OWNED_STRING_C" "C frees what the IR backends leak, 2026-09-17" examples/owned_string.cell
     run_ir_leaks owned_string llvm "$LEAK_OWNED_STRING_LLVM" "the host frees take's argument; no IR drop pass, 2026-09-17" examples/owned_string.cell examples/owned_string_host.c
     run_ir_leaks owned_string mlir "$LEAK_OWNED_STRING_MLIR" "the host frees take's argument; no IR drop pass, 2026-09-17" examples/owned_string.cell examples/owned_string_host.c
+    run_c_leaks ir_list_index examples/ir_index_host.c "$LEAK_IR_LIST_INDEX_C" "C frees what the IR backends leak, IR step (b), 2026-09-22"
+    run_ir_leaks ir_list_index llvm "$LEAK_IR_LIST_INDEX_LLVM" "IR step (b) indexing; no IR drop pass; joins the flip criterion, 2026-09-22" examples/leaks/ir_list_index.cell examples/ir_index_host.c
+    run_ir_leaks ir_list_index mlir "$LEAK_IR_LIST_INDEX_MLIR" "IR step (b) indexing; no IR drop pass; joins the flip criterion, 2026-09-22" examples/leaks/ir_list_index.cell examples/ir_index_host.c
     run_c_leaks labelled_break "" "$LEAK_LABELLED_BREAK_C" "FLOW-03 break :outer releases the outer and inner bodies' locals, 2026-09-22"
     run_ir_leaks labelled_break llvm "$LEAK_LABELLED_BREAK_LLVM" "FLOW-03 break :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
     run_ir_leaks labelled_break mlir "$LEAK_LABELLED_BREAK_MLIR" "FLOW-03 break :outer; no IR drop pass; joins the flip criterion, 2026-09-22"

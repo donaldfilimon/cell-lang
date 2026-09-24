@@ -326,8 +326,8 @@ both backends as of `a6c41e8`, which made them pointers agreeing with
 that shrinks, and check the emitter rather than this paragraph. (2026-09-21: the
 list has shrunk further. Scalar `T?` and `Result<T, E>` construct and match in
 both, and so do the wrap patterns `Some`/`None`/`Ok`/`Err`, see `docs/FEATURES.md`
-TYPE-04, TYPE-06 and PAT-02; an owning payload, `arc`, indexing and most list
-use are still refused.) Both are verified by
+TYPE-04, TYPE-06 and PAT-02; an owning payload, `arc` and most list use are
+still refused. Indexing lowers since 2026-09-22, IR step (b).) Both are verified by
 executing what they emit. `examples/backends.cell` prints `24` through all
 three. Section 10's C ABI contract is unchanged and remains normative for the
 C backend.
@@ -821,7 +821,8 @@ non-empty one needs a constant global for its elements that no backend emits
 yet. **Superseded 2026-09-21** for the C backend: non-empty list literals
 lower (`emitListLit`; `examples/index.cell` builds `[seven, nine]` and
 `[40, 2]`) and scalar indexing is implemented (section 6.11). LLVM and MLIR
-still refuse indexing, and nothing iterates a list.
+index since 2026-09-22 but still refuse list literals, and nothing iterates a
+list.
 
 ### 3.4 Result
 
@@ -1478,7 +1479,11 @@ let copy c: Byte? = xs[i]
   is use-after-move.
 - Indexed assignment `a[i] = x` parses and is refused. General `[T]`
   indexing is not implemented.
-- LLVM and MLIR refuse indexing together with `cannot lower` at the span.
+- LLVM and MLIR lower indexing since 2026-09-22 (IR step (b)): `hir.lower`
+  turns `a[i]` into a call to the same bounds-checked runtime reader C calls,
+  so bounds and out-of-range `None` agree by construction
+  (`examples/ir_index.cell`). An `arc` base and an owned `String` temporary
+  base (`mk()[0]`) stay refused in every backend.
 
 ---
 
@@ -1655,8 +1660,9 @@ unit values are not first-class.
 
 `for` and iteration over a collection remain designed. There is no
 iteration protocol and no range value, so `for` needs both before it needs
-syntax. (Postfix indexing `a[i]` exists since 2026-09-21, section 6.11, C
-backend only; this sentence used to say there was no indexing operator.)
+syntax. (Postfix indexing `a[i]` exists since 2026-09-17, section 6.11, on
+all three backends since 2026-09-22; this sentence used to say there was no
+indexing operator.)
 
 **Loops interact with ownership, and that interaction is a rule, not a
 detail.** See `docs/OWNERSHIP.md` R2.a: a place declared outside a loop and
@@ -2308,7 +2314,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Block expression parsing | implemented |
 | Block expression lowering | implemented |
 | Block expression typing (tail expression is the value; `if` branches must agree) | implemented 2026-09-15 |
-| Indexing `a[i]` | implemented for `String` and `[Byte]` as `Byte?`, and for `[Int]`/`[Int32]`/`[Float]`/`[Bool]` as the element's optional (C, 2026-09-17); LLVM/MLIR refuse; `[String]` and indexed assignment refused |
+| Indexing `a[i]` | implemented for `String` and `[Byte]` as `Byte?`, and for `[Int]`/`[Int32]`/`[Float]`/`[Bool]` as the element's optional (C, 2026-09-17; LLVM and MLIR since 2026-09-22, IR step (b), calling the same runtime readers); `[String]`, an `arc` base and indexed assignment refused |
 
 ### Statements
 
@@ -2332,7 +2338,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Return-type checking | implemented |
 | Expression statement | implemented |
 | Unused-result diagnostic | designed, not implemented |
-| Loops and `break` / `continue` | implemented: `while`, `break` and `continue` on all three backends (FEATURES.md FLOW-02); `for`, `loop` and labels are FLOW-03, still reserved |
+| Loops and `break` / `continue` | implemented: `while`, `loop`, `break`, `continue` and labels on all three backends (FEATURES.md FLOW-02/FLOW-03); `for` remains reserved |
 | `loop`, loop labels, `break :label` / `continue :label` | implemented 2026-09-22 on all three backends (7.6, 7.7) |
 
 ### Items

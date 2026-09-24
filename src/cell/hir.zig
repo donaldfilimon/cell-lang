@@ -208,12 +208,26 @@ pub const RuntimeCallee = struct {
     pub const Param = struct { name: []const u8, ty: Ty, ownership: Ownership };
 };
 
-/// The runtime callees, indexed by `Runtime`. Step (b) of the IR String
-/// work adds the indexing helpers here.
+/// The runtime callees, indexed by `Runtime`: the String conversion (IR
+/// step (a)) and the six bounds-checked index readers (IR step (b)). An index
+/// is a call to one of these, not a node: the same reader C calls, with the
+/// same `i64`, so bounds and out-of-range `None` agree by construction.
 pub const Runtime = enum {
     /// `cell_string_t cell_string_from_str(cell_str_t view)`: copies a
     /// borrowed view into a fresh heap buffer the caller owns.
     string_from_str,
+    /// `cell_opt_byte_t cell_str_byte_at(cell_str_t s, int64_t index)`.
+    str_byte_at,
+    /// `cell_opt_byte_t cell_bytes_at(cell_slice_t xs, int64_t index)`.
+    bytes_at,
+    /// `cell_opt_i64_t cell_list_i64_at(cell_slice_t xs, int64_t index)`.
+    list_i64_at,
+    /// `cell_opt_i32_t cell_list_i32_at(cell_slice_t xs, int64_t index)`.
+    list_i32_at,
+    /// `cell_opt_f64_t cell_list_f64_at(cell_slice_t xs, int64_t index)`.
+    list_f64_at,
+    /// `cell_opt_bool_t cell_list_bool_at(cell_slice_t xs, int64_t index)`.
+    list_bool_at,
 
     pub fn callee(self: Runtime) RuntimeCallee {
         return runtime_callees[@backingInt(self)];
@@ -228,7 +242,27 @@ pub const runtime_callees = [_]RuntimeCallee{
         .ret = types.t_string,
         .ret_ownership = .owned,
     },
+    indexReader("$rt.str_byte_at", "cell_str_byte_at", types.t_string, &types.t_byte),
+    indexReader("$rt.bytes_at", "cell_bytes_at", .{ .list = &types.t_byte }, &types.t_byte),
+    indexReader("$rt.list_i64_at", "cell_list_i64_at", .{ .list = &types.t_int }, &types.t_int),
+    indexReader("$rt.list_i32_at", "cell_list_i32_at", .{ .list = &types.t_int32 }, &types.t_int32),
+    indexReader("$rt.list_f64_at", "cell_list_f64_at", .{ .list = &types.t_float }, &types.t_float),
+    indexReader("$rt.list_bool_at", "cell_list_bool_at", .{ .list = &types.t_bool }, &types.t_bool),
 };
+
+/// One index reader: `(shared xs: <base>, copy index: Int) -> <elem>?`.
+fn indexReader(comptime name: []const u8, comptime symbol: []const u8, comptime base: Ty, comptime elem: *const Ty) RuntimeCallee {
+    return .{
+        .name = name,
+        .symbol = symbol,
+        .params = &.{
+            .{ .name = "xs", .ty = base, .ownership = .shared },
+            .{ .name = "index", .ty = types.t_int, .ownership = .copy },
+        },
+        .ret = .{ .optional = elem },
+        .ret_ownership = .owned,
+    };
+}
 
 comptime {
     std.debug.assert(runtime_callees.len == @typeInfo(Runtime).@"enum".field_names.len);
@@ -588,7 +622,7 @@ const Lowerer = struct {
                 if (f.body != null or !sameSignature(f, c)) {
                     try self.cannotLower(f.span, try std.fmt.allocPrint(
                         self.arena,
-                        "'{s}' conflicts with the runtime's {s}, which a String conversion in this module calls",
+                        "'{s}' conflicts with the runtime's {s}, which a String conversion or an index in this module calls",
                         .{ f.name, c.symbol },
                     ));
                 }
@@ -1109,11 +1143,43 @@ const Lowerer = struct {
                 };
             },
 
-            .index => {
-                try self.cannotLower(e.span, "indexing is not lowered by the IR backends");
+            .index => |ix| return self.lowerIndex(e, ix.base, ix.index),
+        }
+    }
+
+    /// `a[i]` as a call to the bounds-checked runtime reader C calls. The
+    /// reader is picked from the base's HIR type, naming every accepted
+    /// element; anything else is refused, as is an `arc` base (no retain or
+    /// release in the IR, and an `arc [T]` is a box, not a slice). A String
+    /// base goes through `convertTo`, so an owned place becomes a view and an
+    /// owned temporary stays owning, which the emitters' `fits` refuses.
+    fn lowerIndex(self: *Lowerer, e: *const ast.Expr, base_ast: *const ast.Expr, index_ast: *const ast.Expr) LowerError!Expr {
+        var base = try self.lowerExpr(base_ast);
+        const index = try self.lowerExprIn(index_ast, types.t_int);
+        if (base.own == .arc) {
+            try self.cannotLower(e.span, "indexing an 'arc' value (no retain or release in the IR backends)");
+            return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "index" });
+        }
+        const id: Runtime = switch (base.ty) {
+            .string => .str_byte_at,
+            .list => |elem| switch (elem.*) {
+                .byte => .bytes_at,
+                .int => .list_i64_at,
+                .int32 => .list_i32_at,
+                .float => .list_f64_at,
+                .boolean => .list_bool_at,
+                else => {
+                    try self.cannotLower(e.span, "indexing a value with no bounds-checked runtime reader");
+                    return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "index" });
+                },
+            },
+            else => {
+                try self.cannotLower(e.span, "indexing a value with no bounds-checked runtime reader");
                 return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "index" });
             },
-        }
+        };
+        if (id == .str_byte_at) base = try self.convertTo(base, types.t_string, .shared);
+        return self.runtimeCall(id, e.span, &.{ base, index });
     }
 
     fn lowerCall(self: *Lowerer, span: Span, callee: *const ast.Expr, args: []const ast.Expr) LowerError!Expr {
@@ -2039,6 +2105,133 @@ test "a conflicting source declaration of the runtime symbol is refused" {
             return error.MissingConflict;
         }
         try std.testing.expectEqual(@as(usize, 1), countSymbol(l.module, "cell_string_from_str"));
+    }
+}
+
+fn isReaderCall(e: Expr, symbol: []const u8, elem: std.meta.Tag(Ty)) bool {
+    return e.kind == .call and e.kind.call.symbol != null and
+        std.mem.eql(u8, e.kind.call.symbol.?, symbol) and
+        e.kind.call.args.len == 2 and e.kind.call.args[1].ty.tag() == .int and
+        e.ty.tag() == .optional and e.ty.optional.tag() == elem;
+}
+
+test "an index lowers to a call to the runtime reader C calls, declared once" {
+    var l = try lowerSource(
+        \\pub fn f(shared s: String, shared b: [Byte], shared n: [Int], shared w: [Int32], shared x: [Float], shared y: [Bool]) {
+        \\    let copy a = s[0]
+        \\    let copy c = b[1]
+        \\    let copy d = n[2]
+        \\    let copy e = w[3]
+        \\    let copy g = x[4]
+        \\    let copy h = y[5]
+        \\    let copy k = n[-1]
+        \\    let copy m = n[1 + 1]
+        \\}
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    const body = l.module.findFn("f").?.body.?;
+    try std.testing.expect(isReaderCall(body[0].kind.let.value.?, "cell_str_byte_at", .byte));
+    try std.testing.expect(isReaderCall(body[1].kind.let.value.?, "cell_bytes_at", .byte));
+    try std.testing.expect(isReaderCall(body[2].kind.let.value.?, "cell_list_i64_at", .int));
+    try std.testing.expect(isReaderCall(body[3].kind.let.value.?, "cell_list_i32_at", .int32));
+    try std.testing.expect(isReaderCall(body[4].kind.let.value.?, "cell_list_f64_at", .float));
+    try std.testing.expect(isReaderCall(body[5].kind.let.value.?, "cell_list_bool_at", .boolean));
+    // The index is `Int` whatever its spelling.
+    try std.testing.expect(isReaderCall(body[6].kind.let.value.?, "cell_list_i64_at", .int));
+    try std.testing.expect(isReaderCall(body[7].kind.let.value.?, "cell_list_i64_at", .int));
+    // Each reader is declared exactly once, however many uses.
+    for ([_][]const u8{ "cell_str_byte_at", "cell_bytes_at", "cell_list_i64_at", "cell_list_i32_at", "cell_list_f64_at", "cell_list_bool_at" }) |sym| {
+        try std.testing.expectEqual(@as(usize, 1), countSymbol(l.module, sym));
+    }
+    const rt = l.module.findFn("$rt.list_i64_at").?;
+    try std.testing.expectEqual(Fn.Origin.runtime, rt.origin);
+    try std.testing.expectEqual(Ownership.shared, rt.params()[0].ownership);
+    try std.testing.expectEqual(Ownership.copy, rt.params()[1].ownership);
+}
+
+test "a String index base is viewed when it is an owned place, and left alone otherwise" {
+    var l = try lowerSource(
+        \\pub struct T { owned name: String }
+        \\pub fn mk() -> String;
+        \\pub fn f(shared v: String, owned o: String, exclusive x: String) {
+        \\    let owned s: String = "ab"
+        \\    let owned t: T = T { name: "cd" }
+        \\    let copy a = s[0]
+        \\    let copy b = o[0]
+        \\    let copy c = x[0]
+        \\    let copy d = t.name[0]
+        \\    let copy e = v[0]
+        \\    let copy g = "lit"[0]
+        \\    let copy h = mk()[0]
+        \\}
+    );
+    defer l.deinit();
+    const body = l.module.findFn("f").?.body.?;
+    for (body[2..6]) |st| {
+        const base = st.kind.let.value.?.kind.call.args[0];
+        try std.testing.expectEqual(.string_view, std.meta.activeTag(base.kind));
+    }
+    for (body[6..8]) |st| {
+        const base = st.kind.let.value.?.kind.call.args[0];
+        try std.testing.expect(std.meta.activeTag(base.kind) != .string_view);
+        try std.testing.expectEqual(@as(?Ownership, .shared), base.own);
+    }
+    // An owned temporary stays owning, for the emitters' `fits` to refuse:
+    // a view of it would outlive its only owner.
+    const tmp = body[8].kind.let.value.?.kind.call.args[0];
+    try std.testing.expectEqual(@as(?Ownership, .owned), tmp.own);
+}
+
+test "an index with no reader, or over an arc base, is cannot lower" {
+    const cases = [_][]const u8{
+        \\pub fn f(shared xs: [String]) { let copy a = xs[0] }
+        ,
+        \\pub fn f(shared xs: [Int8]) { let copy a = xs[0] }
+        ,
+        \\pub fn f(copy n: Int) { let copy a = n[0] }
+        ,
+        \\pub fn f(arc xs: [Int]) { let copy a = xs[0] }
+        ,
+        \\pub fn f(arc s: String) { let copy a = s[0] }
+        ,
+    };
+    for (cases, 0..) |src, i| {
+        var l = try lowerSource(src);
+        defer l.deinit();
+        var found = false;
+        for (l.diagnostics.list.items) |d| {
+            if (std.mem.indexOf(u8, d.message, "cannot lower: indexing") != null) found = true;
+        }
+        if (!found) {
+            std.debug.print("case {d} was not refused:\n{s}\n", .{ i, src });
+            return error.MissingRefusal;
+        }
+    }
+}
+
+test "a matching reader declaration is reused and a conflicting one is refused as an index's" {
+    {
+        var l = try lowerSource(
+            \\pub fn list_i64_at(shared xs: [Int], copy index: Int) -> Int?;
+            \\pub fn f(shared n: [Int]) -> Int? { return n[0] }
+        );
+        defer l.deinit();
+        try std.testing.expect(!l.diagnostics.hasErrors());
+        try std.testing.expectEqual(@as(usize, 1), countSymbol(l.module, "cell_list_i64_at"));
+        try std.testing.expect(l.module.findFn("$rt.list_i64_at") == null);
+    }
+    {
+        var l = try lowerSource(
+            \\pub fn list_i64_at(owned xs: [Int], copy index: Int) -> Int?;
+            \\pub fn f(shared n: [Int]) -> Int? { return n[0] }
+        );
+        defer l.deinit();
+        var found = false;
+        for (l.diagnostics.list.items) |d| {
+            if (std.mem.indexOf(u8, d.message, "conflicts with the runtime's cell_list_i64_at, which a String conversion or an index") != null) found = true;
+        }
+        try std.testing.expect(found);
     }
 }
 

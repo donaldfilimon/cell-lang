@@ -1,0 +1,88 @@
+// Postfix indexing through all three backends (IR step (b), 2026-09-22):
+// every reader (String, [Byte], [Int], [Int32], [Float], [Bool]) and every
+// base form the step (b) spec measured: a literal, a shared parameter, an
+// annotated owned local, an exclusive parameter, a struct field, the
+// borrow sigil and a value block over owned places. Out of range and negative indices are None on every backend.
+// The lists come from examples/ir_index_host.c; no list literal, no
+// unannotated owned `let`, and no index with a side effect appear here.
+// EXPECT-OUTPUT: 1838
+
+pub fn print_int(copy value: Int);
+pub fn host_ints() -> [Int];
+pub fn host_i32s() -> [Int32];
+pub fn host_floats() -> [Float];
+pub fn host_bools() -> [Bool];
+pub fn bytes_empty() -> owned [Byte];
+pub fn bytes_push(exclusive xs: [Byte], copy value: Byte);
+
+pub struct Named { owned name: String, copy n: Int }
+
+pub fn or_zero(copy o: Int?) -> Int {
+    return match o {
+        Some(v) => v,
+        None => 0,
+    }
+}
+
+pub fn byte_or(copy o: Byte?, copy none: Int) -> Int {
+    let copy H: Byte = 72
+    return match o {
+        Some(v) => if v == H { 1 } else { 2 },
+        None => none,
+    }
+}
+
+pub fn shared_second(shared ns: [Int]) -> Int {
+    return or_zero(ns[1])
+}
+
+pub fn excl_first(exclusive ns: [Int]) -> Int {
+    return or_zero(ns[0])
+}
+
+pub fn shared_str(shared s: String) -> Int {
+    return byte_or(s[0], 9)
+}
+
+pub fn excl_str(exclusive s: String) -> Int {
+    return byte_or(s[5], 30)
+}
+
+pub fn main() {
+    let owned ns = host_ints()
+    let owned ws = host_i32s()
+    let owned fs = host_floats()
+    let owned bs = host_bools()
+    var owned bytes = bytes_empty()
+    bytes_push(exclusive bytes, 72)
+    var owned name: String = "Hello"
+    let owned rec = Named { name: "Hat", n: 4 }
+
+    let copy a = or_zero(ns[0]) + shared_second(ns) + or_zero(ns[2]) + or_zero(ns[3]) + or_zero(ns[-1])
+    let copy b = excl_first(exclusive ns)
+    let copy big: Int32 = 700
+    let copy c = match ws[1] {
+        Some(v) => if v == big { 100 } else { 0 },
+        None => 0,
+    }
+    let copy d = match fs[0] {
+        Some(v) => if v == 2.5 { 200 } else { 0 },
+        None => 0,
+    }
+    let copy e = match bs[1] {
+        Some(v) => if v { 400 } else { 0 },
+        None => 0,
+    }
+    let copy f = match bs[0] {
+        Some(v) => if v { 0 } else { 1000 },
+        None => 0,
+    }
+    let copy g = byte_or(bytes[0], 0) + byte_or(bytes[1], 10)
+    let copy h = byte_or("Hi"[0], 0) + shared_str("Hi") + excl_str(exclusive name)
+    let copy k = byte_or(name[0], 0) + byte_or(rec.name[0], 0) + or_zero((&ns)[1])
+    // A value block over owned places as the base (step (b) Q3): C views
+    // each arm's place, and LLVM/MLIR push the view into each branch.
+    var copy pick = 0
+    let copy q = byte_or((if pick == 0 { name } else { rec.name })[0], 0)
+    print_int(a + b + c + d + e + f + g + h + k + q + rec.n)
+}
