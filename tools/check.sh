@@ -710,6 +710,27 @@ fi
 # green run. `zig build test` prints nothing on success, so ask root.zig.
 collect_root_test_count "$TMP/count.log"
 
+# Inject a deterministic realloc failure at the first scalar-list push.
+# A checked writer must panic; returning would silently truncate the value.
+if cc -std=c11 -Wall -Wextra -Werror -I runtime \
+    -include runtime/tests/fail_list_alloc.h \
+    runtime/cell_rt.c runtime/tests/list_push_oom.c \
+    -o "$TMP/list_push_oom" > "$TMP/list_push_oom_build.log" 2>&1; then
+    for kind in byte i64 i32 f64 bool; do
+        CELL_NO_CRASH_REPORTER=1 "$TMP/list_push_oom" "$kind" \
+            > "$TMP/list_push_oom_$kind.log" 2>&1
+        oom_status=$?
+        if [ "$oom_status" -eq 134 ] && grep -q '^cell panic: cell_.*_push: out of memory$' "$TMP/list_push_oom_$kind.log"; then
+            pass "typed list push $kind aborts on injected allocation failure"
+        else
+            fail "typed list push $kind: expected panic/abort on injected allocation failure (exit $oom_status)"
+        fi
+    done
+else
+    fail "typed list allocation-failure probe did not compile"
+    sed -n '1,12p' "$TMP/list_push_oom_build.log"
+fi
+
 # --------------------------------------------------------------- 3. corpus --
 # The four contracts declared in examples/README.md.
 printf '\n== corpus ==\n'
