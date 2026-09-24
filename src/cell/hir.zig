@@ -224,6 +224,8 @@ pub const Runtime = enum {
     string_from_str,
     /// `void cell_string_free(cell_string_t *value)`.
     string_free,
+    /// `void cell_slice_free(cell_slice_t *value)` for scalar-element lists.
+    slice_free,
     /// `cell_opt_byte_t cell_str_byte_at(cell_str_t s, int64_t index)`.
     str_byte_at,
     /// `cell_opt_byte_t cell_bytes_at(cell_slice_t xs, int64_t index)`.
@@ -262,6 +264,15 @@ pub const runtime_callees = [_]RuntimeCallee{
         .ret = types.t_unit,
         .ret_ownership = .owned,
     },
+    .{
+        .name = "$rt.slice_free",
+        .symbol = "cell_slice_free",
+        // Every supported scalar list has the same cell_slice_t pointer ABI;
+        // [Int] is the internal representative for this runtime callee.
+        .params = &.{.{ .name = "value", .ty = .{ .list = &types.t_int }, .ownership = .exclusive }},
+        .ret = types.t_unit,
+        .ret_ownership = .owned,
+    },
     indexReader("$rt.str_byte_at", "cell_str_byte_at", types.t_string, &types.t_byte),
     indexReader("$rt.bytes_at", "cell_bytes_at", .{ .list = &types.t_byte }, &types.t_byte),
     indexReader("$rt.list_i64_at", "cell_list_i64_at", .{ .list = &types.t_int }, &types.t_int),
@@ -286,6 +297,15 @@ fn indexReader(comptime name: []const u8, comptime symbol: []const u8, comptime 
         },
         .ret = .{ .optional = elem },
         .ret_ownership = .owned,
+    };
+}
+
+/// `cell_slice_free` releases only the backing allocation, so this cleanup
+/// slice admits exactly the element types that need no per-element drop glue.
+fn scalarListElement(elem: Ty) bool {
+    return switch (elem) {
+        .byte, .int, .int32, .float, .boolean => true,
+        else => false,
     };
 }
 
@@ -747,7 +767,12 @@ const Lowerer = struct {
         while (i > 0) {
             i -= 1;
             const binding = self.bindings.items[i];
-            if (!binding.droppable or binding.ownership != .owned or binding.ty.tag() != .string) continue;
+            if (!binding.droppable or binding.ownership != .owned) continue;
+            const release: Runtime = switch (binding.ty) {
+                .string => .string_free,
+                .list => |elem| if (scalarListElement(elem.*)) .slice_free else continue,
+                else => continue,
+            };
             // Only parameters and direct top-level lets. A nested initializer
             // can create slots, but its lifetime is not this function scope.
             if (!binding.is_param) {
@@ -760,7 +785,7 @@ const Lowerer = struct {
             const id = binding.bc_id orelse continue;
             if (facts.wasMoved(id) or !facts.liveAtExit(.block_end, key, id)) continue;
             const place: Expr = .{ .ty = binding.ty, .span = .none, .own = .owned, .kind = .{ .ref = binding.slot } };
-            const call = try self.runtimeCall(.string_free, .none, &.{place});
+            const call = try self.runtimeCall(release, .none, &.{place});
             try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
             self.drop_inserted = true;
         }

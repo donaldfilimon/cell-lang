@@ -71,8 +71,8 @@ refused by both. Only the three IR pins below are measured on an IR backend.
 
 ## IR backend pins
 
-The LLVM and MLIR backends now share one narrow HIR fall-through String
-release. Other owned String and list exit paths still lack IR cleanup. These
+The LLVM and MLIR backends now share narrow HIR fall-through String and
+scalar-list releases. Other owned String and list exit paths still lack IR cleanup. These
 rows are measured with ONE witness, the malloc
 counter, because an IR object cannot take `leak_host.c`'s renamed `main`; each
 also has a C row on both witnesses. A drop in an IR pin means a cleanup slice
@@ -85,6 +85,7 @@ landed and must be checked against answer and sanitizer evidence.
 | `ir_list_index.cell` | IR step (b): indexing allocates nothing, so what leaks is the owner the program already had (two host lists and an owned String per call); C 0 on both witnesses, LLVM and MLIR 3000 (2026-09-22) |
 | `ir_list_literal.cell` | IR step (d): five scalar list buffers per call, 1000 calls; C 0 on both witnesses, LLVM and MLIR 5000 on the malloc counter (2026-09-24). The HIR scratch is not a second owner |
 | `ir_fallthrough_string.cell` | First shared HIR cleanup: one owned String in an all-let fall-through body, 1000 calls. C 0 on both witnesses; LLVM/MLIR fell from LIVE=1000 to 0 after HIR inserted `cell_string_free` (2026-09-24) |
+| `ir_fallthrough_list.cell` | Five owned scalar lists in an all-let fall-through body, 1000 calls. C 0 on both witnesses; LLVM/MLIR release each confirmed owner through `cell_slice_free` and pin LIVE=0. The list-literal scratch is not an owner (2026-09-24) |
 | `ir_reassign_string.cell` | Straight-line owned String replacement: evaluate into nondroppable scratch, release the vouched old owner, then release the final owner at fallthrough. C, LLVM, and MLIR pin LIVE=0 for 1000 calls (2026-09-24) |
 | `labelled_break.cell` | FLOW-03: `break :outer` from a nested loop crossing an owning local in each body; C releases both on the jump, 0 on both witnesses (a requirement, spec invariant 13); LLVM and MLIR 3000 (2026-09-22) |
 | `labelled_continue.cell` | FLOW-03: `continue :outer` from a nested loop, the same shape; C 0 on both witnesses; LLVM and MLIR 6000 (2026-09-22) |

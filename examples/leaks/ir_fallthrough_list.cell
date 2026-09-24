@@ -1,0 +1,25 @@
+// An all-let fall-through body owns one list of each scalar element type.
+// Each call allocates five buffers; HIR must release all five before return.
+// The list-literal scratch is a transfer source, not a second owner.
+// EXPECT-OUTPUT: 1000
+
+pub fn print_int(copy value: Int);
+
+pub fn once() {
+    let copy byte: Byte = 7
+    let copy width: Int32 = 9
+    let owned bytes: [Byte] = [byte]
+    let owned ints: [Int] = [42]
+    let owned widths: [Int32] = [width]
+    let owned floats: [Float] = [1.5]
+    let owned bools: [Bool] = [true]
+}
+
+pub fn main() {
+    var copy i = 0
+    while i < 1000 {
+        once()
+        i = i + 1
+    }
+    print_int(i)
+}

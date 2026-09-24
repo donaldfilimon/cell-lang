@@ -690,6 +690,70 @@ test "checked HIR releases a live owned String on simple fallthrough" {
     try std.testing.expectEqual(body[0].kind.let.slot, body[1].kind.expr.kind.call.args[0].kind.ref);
 }
 
+test "checked HIR releases scalar list owners once at simple fallthrough" {
+    const source =
+        \\pub fn f() {
+        \\    let copy b: Byte = 7
+        \\    let copy w: Int32 = 9
+        \\    let owned bytes: [Byte] = [b]
+        \\    let owned ints: [Int] = [42]
+        \\    let owned widths: [Int32] = [w]
+        \\    let owned floats: [Float] = [1.5]
+        \\    let owned bools: [Bool] = [true]
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var module = try compile(a, source, "t.cell");
+    var checker = borrowck.Checker.init(a, "t.cell", source);
+    defer checker.deinit();
+    try checker.checkModule(&module);
+    try std.testing.expect(!checker.hasErrors());
+    var bag: diag.Bag = .init("t.cell", source);
+    defer bag.deinit(a);
+    const lowered = try hir.lowerChecked(a, &module, &bag, checker.dropFacts());
+    try std.testing.expect(!bag.hasErrors());
+    const f = lowered.findFn("f").?;
+    const body = f.body.?;
+    try std.testing.expectEqual(@as(usize, 12), body.len);
+    for (0..5) |i| {
+        const owner = body[6 - i].kind.let.slot;
+        const call = body[7 + i].kind.expr.kind.call;
+        try std.testing.expectEqualStrings("cell_slice_free", call.symbol.?);
+        try std.testing.expectEqual(ast.Ownership.exclusive, call.modes[0].param);
+        try std.testing.expectEqual(owner, call.args[0].kind.ref);
+        try std.testing.expect(f.bindings[owner].droppable);
+    }
+    for (f.bindings) |binding| {
+        if (std.mem.startsWith(u8, binding.name, "$list")) try std.testing.expect(!binding.droppable);
+    }
+}
+
+test "checked HIR does not release a scalar list after transferring it" {
+    const source =
+        \\pub fn f(owned input: [Int]) {
+        \\    let owned output: [Int] = input
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var module = try compile(a, source, "t.cell");
+    var checker = borrowck.Checker.init(a, "t.cell", source);
+    defer checker.deinit();
+    try checker.checkModule(&module);
+    try std.testing.expect(!checker.hasErrors());
+    var bag: diag.Bag = .init("t.cell", source);
+    defer bag.deinit(a);
+    const lowered = try hir.lowerChecked(a, &module, &bag, checker.dropFacts());
+    try std.testing.expect(!bag.hasErrors());
+    const body = lowered.findFn("f").?.body.?;
+    try std.testing.expectEqual(@as(usize, 2), body.len);
+    try std.testing.expectEqualStrings("cell_slice_free", body[1].kind.expr.kind.call.symbol.?);
+    try std.testing.expectEqual(body[0].kind.let.slot, body[1].kind.expr.kind.call.args[0].kind.ref);
+}
+
 test "checked HIR skips a moved String and releases its new owner" {
     const source =
         \\pub fn f() {

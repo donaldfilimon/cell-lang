@@ -1343,6 +1343,16 @@ checked runtime pushes and marks the transfer scratch nondroppable. The
 C releases all 5000; LLVM and MLIR release none and each pin LIVE=5000. This
 is a disclosed cleanup deficit, not a baseline to accept for completion.
 
+**A narrow scalar-list fall-through slice landed 2026-09-24.** A function
+body made of direct `let` bindings now releases confirmed, live, unmoved
+owned `[Byte]`, `[Int]`, `[Int32]`, `[Float]`, and `[Bool]` locals and body
+parameters on its fall-through path. `cell_slice_free` releases the buffer;
+the list-literal scratch is nondroppable, so it cannot free the same buffer
+again. `ir_fallthrough_list` pins five allocations per call over 1000 calls
+at zero live allocations on C, LLVM, and MLIR. This does not close the
+`ir_list_literal` pin: that fixture returns from its body and still leaves
+5000 buffers live on each IR backend.
+
 **IR String step (a), the conversions, landed 2026-09-17 on those terms.**
 Both IR backends now call `cell_string_from_str` wherever C converts a
 borrowed view into an owned `String`, and free none of the results. Measured
