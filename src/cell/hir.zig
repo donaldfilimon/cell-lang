@@ -711,14 +711,25 @@ const Lowerer = struct {
         return id;
     }
 
-    /// Straight-line cleanup slice: lets and literal String reassignments have
-    /// no structured exit. Materialize a replacement before releasing the old
-    /// slot, then release confirmed live owners at fallthrough. Everything
-    /// else waits for explicit HIR exits.
+    /// Straight-line cleanup slice: lets and literal String reassignments,
+    /// optionally followed by a scalar return. Evaluate replacements and the
+    /// return value before releasing confirmed live owners at the exit.
+    /// Structured exits still wait for explicit HIR control-flow drops.
     fn appendSimpleFallthroughDrops(self: *Lowerer, fn_name: []const u8, source: []const ast.Stmt, body: []Stmt) LowerError![]Stmt {
         const facts = self.facts orelse return body;
         if (self.identity_failed) return body;
-        for (source, body) |src, lowered| {
+        var terminal_return = false;
+        if (source.len != 0 and source[source.len - 1].kind == .return_stmt and body[body.len - 1].kind == .ret) {
+            if (body[body.len - 1].kind.ret) |value| {
+                switch (value.ty) {
+                    .byte, .int, .int8, .int16, .int32, .uint, .uint8, .uint16, .uint32, .float, .float32, .boolean => {},
+                    else => return body,
+                }
+            }
+            terminal_return = true;
+        }
+        for (source, body, 0..) |src, lowered, index| {
+            if (terminal_return and index == source.len - 1) continue;
             switch (src.kind) {
                 .let => {},
                 .assign => |a| {
@@ -732,7 +743,8 @@ const Lowerer = struct {
             }
         }
         var out: std.ArrayList(Stmt) = .empty;
-        for (source, body) |src, lowered| {
+        for (source, body, 0..) |src, lowered, index| {
+            if (terminal_return and index == source.len - 1) continue;
             if (src.kind == .assign) {
                 const a = src.kind.assign;
                 const original = lowered.kind.assign;
@@ -762,7 +774,25 @@ const Lowerer = struct {
                 try out.append(self.arena, lowered);
             }
         }
-        const key = if (source.len == 0) @intFromPtr(fn_name.ptr) else @intFromPtr(source.ptr);
+        var return_value: ?Expr = null;
+        if (terminal_return) {
+            if (body[body.len - 1].kind.ret) |value| {
+                const scratch: u32 = @intCast(self.bindings.items.len);
+                try self.bindings.append(self.arena, .{
+                    .name = "$drop.return",
+                    .ty = value.ty,
+                    .ownership = .owned,
+                    .mutable = false,
+                    .is_param = false,
+                    .slot = scratch,
+                    .droppable = false,
+                });
+                try out.append(self.arena, .{ .span = source[source.len - 1].span, .kind = .{ .let = .{ .slot = scratch, .value = value } } });
+                return_value = .{ .ty = value.ty, .span = source[source.len - 1].span, .own = .owned, .kind = .{ .ref = scratch } };
+            }
+        }
+        const exit_kind: dropfacts.ExitKind = if (terminal_return) .return_stmt else .block_end;
+        const key = if (terminal_return) @intFromPtr(&source[source.len - 1]) else if (source.len == 0) @intFromPtr(fn_name.ptr) else @intFromPtr(source.ptr);
         var i = self.bindings.items.len;
         while (i > 0) {
             i -= 1;
@@ -783,12 +813,13 @@ const Lowerer = struct {
                 if (!is_direct) continue;
             }
             const id = binding.bc_id orelse continue;
-            if (facts.wasMoved(id) or !facts.liveAtExit(.block_end, key, id)) continue;
+            if (facts.wasMoved(id) or !facts.liveAtExit(exit_kind, key, id)) continue;
             const place: Expr = .{ .ty = binding.ty, .span = .none, .own = .owned, .kind = .{ .ref = binding.slot } };
             const call = try self.runtimeCall(release, .none, &.{place});
             try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
             self.drop_inserted = true;
         }
+        if (terminal_return) try out.append(self.arena, .{ .span = source[source.len - 1].span, .kind = .{ .ret = return_value } });
         return out.items;
     }
 

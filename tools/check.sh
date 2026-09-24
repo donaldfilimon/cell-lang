@@ -465,14 +465,15 @@ LEAK_IR_OWNED_STRING_C=0
 LEAK_IR_OWNED_STRING_LLVM=3000
 LEAK_IR_OWNED_STRING_MLIR=3000
 # IR String step (a) (2026-09-17): the IR backends convert a borrowed view
-# into an owned String with cell_string_from_str and still free nothing.
+# into an owned String with cell_string_from_str.
 # examples/leaks/ir_string_conversion.cell runs the eight conversion
 # positions 1000 times, nine allocations per call. Measured on first run:
 # C ALLOC=9000 FREE=9000 LIVE=0 (and 0 leaks); LLVM and MLIR ALLOC=9000
-# FREE=0 LIVE=9000.
+# FREE=0 LIVE=9000 before terminal scalar-return cleanup. That cleanup now
+# releases eight of the nine per call; a record-owned field remains live.
 LEAK_IR_STRING_CONVERSION_C=0
-LEAK_IR_STRING_CONVERSION_LLVM=9000
-LEAK_IR_STRING_CONVERSION_MLIR=9000
+LEAK_IR_STRING_CONVERSION_LLVM=1000
+LEAK_IR_STRING_CONVERSION_MLIR=1000
 # examples/owned_string.cell once, with its host (whose `take` frees the one
 # owned argument it is handed). Measured on first run: C ALLOC=9 FREE=9
 # LIVE=0 (and 0 leaks); LLVM and MLIR ALLOC=9 FREE=1 LIVE=8.
@@ -481,16 +482,16 @@ LEAK_OWNED_STRING_LLVM=8
 LEAK_OWNED_STRING_MLIR=8
 # IR step (b), indexing (2026-09-22): examples/leaks/ir_list_index.cell,
 # three owners per call (two host lists and an owned String), 1000 calls.
-# Indexing allocates nothing; the IR counts are the owners step (c) must free.
+# Indexing allocates nothing; terminal scalar-return cleanup frees the owners.
 LEAK_IR_LIST_INDEX_C=0
-LEAK_IR_LIST_INDEX_LLVM=3000
-LEAK_IR_LIST_INDEX_MLIR=3000
+LEAK_IR_LIST_INDEX_LLVM=0
+LEAK_IR_LIST_INDEX_MLIR=0
 # IR step (d), scalar list construction (2026-09-24): five owned buffers per
-# call, 1000 calls. Measured with the malloc counter: C ALLOC=5000 FREE=5000
-# LIVE=0; LLVM and MLIR ALLOC=5000 FREE=0 LIVE=5000. The scratch is not owner.
+# call, 1000 calls. A terminal scalar return now evaluates into a scratch,
+# releases the five list owners, and returns that scalar. Scratch is not owner.
 LEAK_IR_LIST_LITERAL_C=0
-LEAK_IR_LIST_LITERAL_LLVM=5000
-LEAK_IR_LIST_LITERAL_MLIR=5000
+LEAK_IR_LIST_LITERAL_LLVM=0
+LEAK_IR_LIST_LITERAL_MLIR=0
 # First shared HIR drop slice: one owning String per call, 1000 calls.
 # Before insertion LLVM measured ALLOC=1000 FREE=0 LIVE=1000; after insertion
 # both IR backends measure ALLOC=1000 FREE=1000 LIVE=0. C remains 0.
@@ -1212,17 +1213,17 @@ else
     run_ir_leaks ir_owned_string llvm "$LEAK_IR_OWNED_STRING_LLVM" "no IR drop pass, 2026-09-17"
     run_ir_leaks ir_owned_string mlir "$LEAK_IR_OWNED_STRING_MLIR" "no IR drop pass, 2026-09-17"
     run_c_leaks ir_string_conversion "" "$LEAK_IR_STRING_CONVERSION_C" "C frees every converted String, 2026-09-17"
-    run_ir_leaks ir_string_conversion llvm "$LEAK_IR_STRING_CONVERSION_LLVM" "IR String step (a) converts, no IR drop pass, 2026-09-17"
-    run_ir_leaks ir_string_conversion mlir "$LEAK_IR_STRING_CONVERSION_MLIR" "IR String step (a) converts, no IR drop pass, 2026-09-17"
+    run_ir_leaks ir_string_conversion llvm "$LEAK_IR_STRING_CONVERSION_LLVM" "terminal scalar-return cleanup; record-owned field remains, 2026-09-24"
+    run_ir_leaks ir_string_conversion mlir "$LEAK_IR_STRING_CONVERSION_MLIR" "terminal scalar-return cleanup; record-owned field remains, 2026-09-24"
     run_c_leaks owned_string examples/owned_string_host.c "$LEAK_OWNED_STRING_C" "C frees what the IR backends leak, 2026-09-17" examples/owned_string.cell
     run_ir_leaks owned_string llvm "$LEAK_OWNED_STRING_LLVM" "the host frees take's argument; no IR drop pass, 2026-09-17" examples/owned_string.cell examples/owned_string_host.c
     run_ir_leaks owned_string mlir "$LEAK_OWNED_STRING_MLIR" "the host frees take's argument; no IR drop pass, 2026-09-17" examples/owned_string.cell examples/owned_string_host.c
-    run_c_leaks ir_list_index examples/ir_index_host.c "$LEAK_IR_LIST_INDEX_C" "C frees what the IR backends leak, IR step (b), 2026-09-22"
-    run_ir_leaks ir_list_index llvm "$LEAK_IR_LIST_INDEX_LLVM" "IR step (b) indexing; no IR drop pass; joins the flip criterion, 2026-09-22" examples/leaks/ir_list_index.cell examples/ir_index_host.c
-    run_ir_leaks ir_list_index mlir "$LEAK_IR_LIST_INDEX_MLIR" "IR step (b) indexing; no IR drop pass; joins the flip criterion, 2026-09-22" examples/leaks/ir_list_index.cell examples/ir_index_host.c
+    run_c_leaks ir_list_index examples/ir_index_host.c "$LEAK_IR_LIST_INDEX_C" "two host lists and a String released at terminal return, 2026-09-24"
+    run_ir_leaks ir_list_index llvm "$LEAK_IR_LIST_INDEX_LLVM" "terminal scalar-return cleanup releases two lists and a String, 2026-09-24" examples/leaks/ir_list_index.cell examples/ir_index_host.c
+    run_ir_leaks ir_list_index mlir "$LEAK_IR_LIST_INDEX_MLIR" "terminal scalar-return cleanup releases two lists and a String, 2026-09-24" examples/leaks/ir_list_index.cell examples/ir_index_host.c
     run_c_leaks ir_list_literal "" "$LEAK_IR_LIST_LITERAL_C" "scalar list construction, scratch non-owner, 2026-09-24"
-    run_ir_leaks ir_list_literal llvm "$LEAK_IR_LIST_LITERAL_LLVM" "IR step (d) list construction; no IR drop pass; joins the flip criterion, 2026-09-24"
-    run_ir_leaks ir_list_literal mlir "$LEAK_IR_LIST_LITERAL_MLIR" "IR step (d) list construction; no IR drop pass; joins the flip criterion, 2026-09-24"
+    run_ir_leaks ir_list_literal llvm "$LEAK_IR_LIST_LITERAL_LLVM" "five scalar lists released after a terminal scalar return, 2026-09-24"
+    run_ir_leaks ir_list_literal mlir "$LEAK_IR_LIST_LITERAL_MLIR" "five scalar lists released after a terminal scalar return, 2026-09-24"
     run_c_leaks ir_fallthrough_string "" "$LEAK_IR_FALLTHROUGH_STRING_C" "simple fallthrough owned String cleanup, 2026-09-24"
     run_ir_leaks ir_fallthrough_string llvm "$LEAK_IR_FALLTHROUGH_STRING_LLVM" "shared HIR String drop at simple fallthrough, 2026-09-24"
     run_ir_leaks ir_fallthrough_string mlir "$LEAK_IR_FALLTHROUGH_STRING_MLIR" "shared HIR String drop at simple fallthrough, 2026-09-24"
@@ -1557,15 +1558,20 @@ else
     # the runtime allocator and release called by that IR are. This catches
     # a duplicate/wrong release but is not whole-program IR instrumentation.
     if cc -fsanitize=address -g -c runtime/cell_rt.c -o "$TMP/san_drop_rt.o" 2>/dev/null; then
-      for drop_src in examples/leaks/ir_fallthrough_string.cell examples/leaks/ir_reassign_string.cell examples/leaks/ir_fallthrough_list.cell; do
+      for drop_src in examples/leaks/ir_fallthrough_string.cell examples/leaks/ir_reassign_string.cell examples/leaks/ir_fallthrough_list.cell examples/leaks/ir_list_literal.cell examples/leaks/ir_string_conversion.cell; do
         drop_name=$(basename "$drop_src" .cell)
+        drop_expected=1000
+        case "$drop_name" in
+            ir_list_literal) drop_expected=500500 ;;
+            ir_string_conversion) drop_expected=44000 ;;
+        esac
         if $CELL emit --target=llvm "$drop_src" > "$TMP/san_drop.ll" 2>/dev/null \
             && cc -Wno-override-module -x ir "$TMP/san_drop.ll" -c -o "$TMP/san_drop_l.o" 2>/dev/null \
             && cc -fsanitize=address "$TMP/san_drop_l.o" "$TMP/san_drop_rt.o" -o "$TMP/san_drop_l" 2>/dev/null; then
             ASAN_OPTIONS=detect_leaks=0 "$TMP/san_drop_l" > "$TMP/san_drop_l.out" 2> "$TMP/san_drop_l.err"
             st=$?
             asan_ran=$((asan_ran + 1))
-            if [ "$st" -eq 0 ] && [ "$(cat "$TMP/san_drop_l.out")" = 1000 ] \
+            if [ "$st" -eq 0 ] && [ "$(cat "$TMP/san_drop_l.out")" = "$drop_expected" ] \
                 && ! grep -q 'ERROR: AddressSanitizer' "$TMP/san_drop_l.err"; then
                 pass "IR $drop_name cleanup (LLVM) is runtime-ASan clean"
             else
@@ -1584,7 +1590,7 @@ else
                     ASAN_OPTIONS=detect_leaks=0 "$TMP/san_drop_m" > "$TMP/san_drop_m.out" 2> "$TMP/san_drop_m.err"
                     st=$?
                     asan_ran=$((asan_ran + 1))
-                    if [ "$st" -eq 0 ] && [ "$(cat "$TMP/san_drop_m.out")" = 1000 ] \
+                    if [ "$st" -eq 0 ] && [ "$(cat "$TMP/san_drop_m.out")" = "$drop_expected" ] \
                         && ! grep -q 'ERROR: AddressSanitizer' "$TMP/san_drop_m.err"; then
                         pass "IR $drop_name cleanup (MLIR) is runtime-ASan clean"
                     else

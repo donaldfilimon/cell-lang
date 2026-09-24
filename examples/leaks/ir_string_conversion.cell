@@ -5,7 +5,8 @@
 // backend frees each result where its owner goes out of scope (the `owned`
 // locals, the record's drop glue, the `owned` parameter, the reassignment's
 // pre-drop). The LLVM and MLIR backends make the same calls since IR String
-// step (a) and have no drop pass, so nothing they convert is freed.
+// step (a). Terminal scalar-return cleanup frees direct String owners; the
+// record-owned field still lacks IR drop glue.
 //
 // Nine allocations per call: rows 1 to 8 are one conversion each, plus the
 // initial `d = label()` that row 6's assignment overwrites. Measured counts

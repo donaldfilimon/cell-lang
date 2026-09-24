@@ -754,6 +754,59 @@ test "checked HIR does not release a scalar list after transferring it" {
     try std.testing.expectEqual(body[0].kind.let.slot, body[1].kind.expr.kind.call.args[0].kind.ref);
 }
 
+test "checked HIR evaluates a scalar return before releasing list owners" {
+    const source =
+        \\pub fn f(owned input: [Int], copy i: Int) -> Int {
+        \\    let owned local: [Int] = [7]
+        \\    return i + 1
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var module = try compile(a, source, "t.cell");
+    var checker = borrowck.Checker.init(a, "t.cell", source);
+    defer checker.deinit();
+    try checker.checkModule(&module);
+    try std.testing.expect(!checker.hasErrors());
+    var bag: diag.Bag = .init("t.cell", source);
+    defer bag.deinit(a);
+    const lowered = try hir.lowerChecked(a, &module, &bag, checker.dropFacts());
+    try std.testing.expect(!bag.hasErrors());
+    const body = lowered.findFn("f").?.body.?;
+    try std.testing.expectEqual(@as(usize, 5), body.len);
+    const local = body[0].kind.let.slot;
+    const result = body[1].kind.let.slot;
+    try std.testing.expectEqualStrings("cell_slice_free", body[2].kind.expr.kind.call.symbol.?);
+    try std.testing.expectEqual(local, body[2].kind.expr.kind.call.args[0].kind.ref);
+    try std.testing.expectEqualStrings("cell_slice_free", body[3].kind.expr.kind.call.symbol.?);
+    try std.testing.expectEqual(@as(u32, 0), body[3].kind.expr.kind.call.args[0].kind.ref);
+    try std.testing.expectEqual(result, body[4].kind.ret.?.kind.ref);
+}
+
+test "checked HIR keeps a returned owned list for the caller" {
+    const source =
+        \\pub fn f(owned input: [Int]) -> [Int] {
+        \\    return input
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var module = try compile(a, source, "t.cell");
+    var checker = borrowck.Checker.init(a, "t.cell", source);
+    defer checker.deinit();
+    try checker.checkModule(&module);
+    try std.testing.expect(!checker.hasErrors());
+    var bag: diag.Bag = .init("t.cell", source);
+    defer bag.deinit(a);
+    const lowered = try hir.lowerChecked(a, &module, &bag, checker.dropFacts());
+    try std.testing.expect(!bag.hasErrors());
+    const body = lowered.findFn("f").?.body.?;
+    try std.testing.expectEqual(@as(usize, 1), body.len);
+    try std.testing.expectEqual(@as(u32, 0), body[0].kind.ret.?.kind.ref);
+}
+
 test "checked HIR skips a moved String and releases its new owner" {
     const source =
         \\pub fn f() {

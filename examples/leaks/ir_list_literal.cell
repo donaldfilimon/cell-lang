@@ -1,6 +1,7 @@
-// IR step (d): five scalar list constructors per call, 1000 calls. C drops
-// the owned buffers; the IR backends must release them in the drop pass.
+// IR step (d): five scalar list constructors per call, 1000 calls. C and
+// both IR backends release the owners after saving the terminal scalar result.
 // The list-literal scratch is a non-owner and must not be dropped separately.
+// EXPECT-OUTPUT: 500500
 
 pub fn print_int(copy value: Int);
 

@@ -71,9 +71,9 @@ refused by both. Only the three IR pins below are measured on an IR backend.
 
 ## IR backend pins
 
-The LLVM and MLIR backends now share narrow HIR fall-through String and
-scalar-list releases. Other owned String and list exit paths still lack IR cleanup. These
-rows are measured with ONE witness, the malloc
+The LLVM and MLIR backends now share narrow HIR fall-through and terminal
+scalar-return cleanup for String and scalar lists. Other exit paths still
+lack IR cleanup. These rows are measured with ONE witness, the malloc
 counter, because an IR object cannot take `leak_host.c`'s renamed `main`; each
 also has a C row on both witnesses. A drop in an IR pin means a cleanup slice
 landed and must be checked against answer and sanitizer evidence.
@@ -81,9 +81,9 @@ landed and must be checked against answer and sanitizer evidence.
 | Fixture | What it pins |
 |---|---|
 | `ir_owned_string.cell` | owned Strings the IR backends accepted before any conversion existed: C 0, LLVM and MLIR 3000 (2026-09-17) |
-| `ir_string_conversion.cell` | the eight borrowed-view to owned-`String` positions of `examples/owned_string.cell`, which the IR backends convert through `cell_string_from_str` since IR String step (a): nine allocations per call, C 0, LLVM and MLIR 9000 (2026-09-17) |
-| `ir_list_index.cell` | IR step (b): indexing allocates nothing, so what leaks is the owner the program already had (two host lists and an owned String per call); C 0 on both witnesses, LLVM and MLIR 3000 (2026-09-22) |
-| `ir_list_literal.cell` | IR step (d): five scalar list buffers per call, 1000 calls; C 0 on both witnesses, LLVM and MLIR 5000 on the malloc counter (2026-09-24). The HIR scratch is not a second owner |
+| `ir_string_conversion.cell` | nine owned String allocations per call; terminal scalar-return cleanup reduced LLVM/MLIR LIVE from 9000 to 1000 over 1000 calls. The record-owned field still lacks IR drop glue; C pins 0 |
+| `ir_list_index.cell` | indexing allocates nothing; terminal scalar-return cleanup releases two host lists and an owned String per call. C, LLVM and MLIR pin 0 (LLVM/MLIR previously 3000) |
+| `ir_list_literal.cell` | five scalar list buffers per call, 1000 calls; terminal scalar-return cleanup releases all five after evaluating the result. C, LLVM and MLIR pin 0 (LLVM/MLIR previously 5000); HIR scratch is not a second owner |
 | `ir_fallthrough_string.cell` | First shared HIR cleanup: one owned String in an all-let fall-through body, 1000 calls. C 0 on both witnesses; LLVM/MLIR fell from LIVE=1000 to 0 after HIR inserted `cell_string_free` (2026-09-24) |
 | `ir_fallthrough_list.cell` | Five owned scalar lists in an all-let fall-through body, 1000 calls. C 0 on both witnesses; LLVM/MLIR release each confirmed owner through `cell_slice_free` and pin LIVE=0. The list-literal scratch is not an owner (2026-09-24) |
 | `ir_reassign_string.cell` | Straight-line owned String replacement: evaluate into nondroppable scratch, release the vouched old owner, then release the final owner at fallthrough. C, LLVM, and MLIR pin LIVE=0 for 1000 calls (2026-09-24) |

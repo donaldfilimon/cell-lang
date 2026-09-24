@@ -1339,9 +1339,10 @@ and structured exits remain outside this IR cleanup path.
 **IR scalar list step (d), construction, landed 2026-09-24 on those terms.**
 HIR desugars `Byte`, `Int`, `Int32`, `Float`, and `Bool` literals to typed,
 checked runtime pushes and marks the transfer scratch nondroppable. The
-`ir_list_literal` fixture measures five list buffers per call over 1000 calls:
-C releases all 5000; LLVM and MLIR release none and each pin LIVE=5000. This
-is a disclosed cleanup deficit, not a baseline to accept for completion.
+`ir_list_literal` fixture measures five list buffers per call over 1000 calls.
+Before terminal scalar-return cleanup, C released all 5000 while LLVM and
+MLIR each pinned LIVE=5000. All three now pin zero for this straight-line
+return shape; the scratch remains a nondroppable transfer source.
 
 **A narrow scalar-list fall-through slice landed 2026-09-24.** A function
 body made of direct `let` bindings now releases confirmed, live, unmoved
@@ -1349,28 +1350,36 @@ owned `[Byte]`, `[Int]`, `[Int32]`, `[Float]`, and `[Bool]` locals and body
 parameters on its fall-through path. `cell_slice_free` releases the buffer;
 the list-literal scratch is nondroppable, so it cannot free the same buffer
 again. `ir_fallthrough_list` pins five allocations per call over 1000 calls
-at zero live allocations on C, LLVM, and MLIR. This does not close the
-`ir_list_literal` pin: that fixture returns from its body and still leaves
-5000 buffers live on each IR backend.
+at zero live allocations on C, LLVM, and MLIR.
+
+**A terminal scalar-return slice landed 2026-09-24.** After direct bindings
+and supported literal String replacement, HIR evaluates a final scalar
+return into a nondroppable scratch, releases only owned String and scalar
+list bindings the borrow checker records live at that return, and returns
+the saved scalar. `ir_list_literal` and `ir_list_index` now pin zero on all
+three backends. `ir_string_conversion` falls from 9000 to 1000 live IR
+allocations over 1000 calls; its record-owned field still lacks IR drop glue.
+Structured returns, resource-valued returns, other reassignment forms, and
+temporary ownership remain outside this slice.
 
 **IR String step (a), the conversions, landed 2026-09-17 on those terms.**
-Both IR backends now call `cell_string_from_str` wherever C converts a
-borrowed view into an owned `String`, and free none of the results. Measured
-and pinned in stage 7: `examples/leaks/ir_string_conversion.cell` (the eight
-positions, 1000 calls) is C 0 on both witnesses and LLVM and MLIR 9000;
-`examples/owned_string.cell` with its host is C 0 and LLVM and MLIR 8.
-`ir_owned_string` stays at 3000. Two leaks C also has are inherited rather
-than new: a write through an `exclusive String` borrow overwrites the old
-buffer without freeing it (the IR converts `s = "cd"` there, as C does), and
-nothing was freed on any IR path at that measurement. The first narrow
-fall-through release is recorded above; the listed fixtures remain nonzero.
+Both IR backends call `cell_string_from_str` wherever C converts a borrowed
+view into an owned `String`. At the initial step, none of these IR results
+was released: `ir_string_conversion` measured 9000 live allocations over
+1000 calls. Terminal scalar-return cleanup reduced that pin to 1000, while
+C remains zero; the remaining record-owned field needs drop glue.
+`examples/owned_string.cell` with its host remains C 0 and LLVM/MLIR 8,
+and `ir_owned_string` remains at 3000. A separate C and IR defect persists:
+a write through an `exclusive String` borrow overwrites the old buffer
+without releasing it. The narrow cleanup slices above do not address that
+write-through path.
 
 **IR step (b), indexing, landed 2026-09-22 on the same terms.** An index is a
 call to the bounds-checked runtime reader C calls, and allocates nothing, so
 it adds no leak of its own: `examples/leaks/ir_list_index.cell` pins the owners
-the program already had (two host lists and an owned `String` per call), C 0
-on both witnesses and LLVM and MLIR 3000. That pin joins the default-flip
-criterion with the others.
+the program already had (two host lists and an owned `String` per call).
+Before terminal scalar-return cleanup, C pinned zero and LLVM/MLIR pinned
+3000 over 1000 calls. All three now pin zero for this fixture.
 
 The checker decides where these go; codegen emits them. The runtime functions
 exist and work: `cell_arc_new`, `cell_arc_clone` (increment), and

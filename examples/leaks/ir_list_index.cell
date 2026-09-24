@@ -1,13 +1,12 @@
 // IR step (b), indexing (2026-09-22). Indexing allocates nothing, so what an
-// IR backend leaks here is the owner the program already had, which the IR
-// drop pass (step (c)) must free. Per call: a bound owned host list indexed
+// IR backend would leak here is the owner the program already had. Terminal
+// scalar-return cleanup now frees it. Per call: a bound owned host list indexed
 // directly, the same list handed to a `shared` callee that indexes it, an
 // annotated owned `String` indexed, and a string literal indexed (which owns
 // nothing). Three owners per call, 1000 calls.
 //
-// Pinned: C 0 on both witnesses; LLVM and MLIR on the malloc counter. A DROP
-// in an IR pin means the IR drop pass landed; update the pin and
-// docs/OWNERSHIP.md together. The lists come from examples/ir_index_host.c.
+// Pinned at 0: C on both witnesses; LLVM and MLIR on the malloc counter.
+// A rise is a cleanup regression. The lists come from examples/ir_index_host.c.
 //
 // Status: parses, passes `cell check`; C, LLVM and MLIR; lives under
 // examples/leaks/.
