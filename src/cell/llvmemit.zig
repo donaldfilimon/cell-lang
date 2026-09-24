@@ -22,8 +22,9 @@
 //!      `cell_str_eq` are real symbols in `runtime/cell_rt.c`. Since IR
 //!      String step (a) the view-to-owning conversion CALLS the first: hir.lower
 //!      inserts the call (and its declaration, through `hir.runtime_callees`),
-//!      and this backend lowers it like any other bodyless callee. It has no
-//!      drop pass, so no owned String it builds is freed;
+//!      and this backend lowers it like any other bodyless callee. A first
+//!      shared HIR cleanup slice frees simple fall-through Strings, but
+//!      return, branch, loop and temporary cleanup remain absent;
 //!      `examples/leaks/ir_owned_string.cell` and `ir_string_conversion.cell`
 //!      pin that leak in gate stage 7.
 //!
@@ -3222,8 +3223,8 @@ test "every conversion position runs and computes the owned lengths" {
     // examples/owned_string.cell with its host written in Cell, so the run
     // needs only the runtime: 2+3+4+5+6+7+8+9 = 44, the length of each of the
     // eight conversions. A position that produced an empty or mis-sized
-    // value changes the answer. Nothing here is freed: the IR backends have
-    // no drop pass, and examples/leaks pins that.
+    // value changes the answer. These return and complex-body positions are
+    // not covered by the first fall-through HIR drop slice; leak pins remain.
     var e = try emitSource(
         \\pub fn print_int(copy value: Int);
         \\pub fn str_len(shared s: String) -> Int;

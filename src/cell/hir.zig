@@ -222,6 +222,8 @@ pub const Runtime = enum {
     /// `cell_string_t cell_string_from_str(cell_str_t view)`: copies a
     /// borrowed view into a fresh heap buffer the caller owns.
     string_from_str,
+    /// `void cell_string_free(cell_string_t *value)`.
+    string_free,
     /// `cell_opt_byte_t cell_str_byte_at(cell_str_t s, int64_t index)`.
     str_byte_at,
     /// `cell_opt_byte_t cell_bytes_at(cell_slice_t xs, int64_t index)`.
@@ -251,6 +253,13 @@ pub const runtime_callees = [_]RuntimeCallee{
         .symbol = "cell_string_from_str",
         .params = &.{.{ .name = "view", .ty = types.t_string, .ownership = .shared }},
         .ret = types.t_string,
+        .ret_ownership = .owned,
+    },
+    .{
+        .name = "$rt.string_free",
+        .symbol = "cell_string_free",
+        .params = &.{.{ .name = "value", .ty = types.t_string, .ownership = .exclusive }},
+        .ret = types.t_unit,
         .ret_ownership = .owned,
     },
     indexReader("$rt.str_byte_at", "cell_str_byte_at", types.t_string, &types.t_byte),
@@ -512,6 +521,7 @@ const Lowerer = struct {
     facts: ?dropfacts.DropFacts = null,
     next_bc_id: u32 = 0,
     identity_failed: bool = false,
+    drop_inserted: bool = false,
 
     structs: std.ArrayList(Struct) = .empty,
     enums: std.ArrayList(Enum) = .empty,
@@ -605,6 +615,9 @@ const Lowerer = struct {
                 for (self.fns.items) |*f| {
                     for (f.bindings) |*binding| binding.bc_id = null;
                 }
+                if (self.drop_inserted) {
+                    try self.cannotLower(.none, "HIR and borrow-checker binding identities diverged after cleanup insertion");
+                }
             }
         }
         try self.resolveRuntime();
@@ -647,6 +660,7 @@ const Lowerer = struct {
         var body: ?[]Stmt = null;
         if (f.body) |stmts| {
             body = try self.lowerStmts(stmts);
+            body = try self.appendSimpleFallthroughDrops(f.name, stmts, body.?);
         }
 
         try self.fns.append(self.arena, .{
@@ -675,6 +689,40 @@ const Lowerer = struct {
             return null;
         }
         return id;
+    }
+
+    /// First cleanup slice: an all-let body has no structured exit. Release
+    /// only confirmed, live, unmoved top-level owning String slots in reverse
+    /// order. Every other control-flow shape waits for explicit HIR exits.
+    fn appendSimpleFallthroughDrops(self: *Lowerer, fn_name: []const u8, source: []const ast.Stmt, body: []Stmt) LowerError![]Stmt {
+        const facts = self.facts orelse return body;
+        if (self.identity_failed) return body;
+        for (source) |stmt| if (stmt.kind != .let) return body;
+        var out: std.ArrayList(Stmt) = .empty;
+        try out.appendSlice(self.arena, body);
+        const key = if (source.len == 0) @intFromPtr(fn_name.ptr) else @intFromPtr(source.ptr);
+        var i = self.bindings.items.len;
+        while (i > 0) {
+            i -= 1;
+            const binding = self.bindings.items[i];
+            if (!binding.droppable or binding.ownership != .owned or binding.ty.tag() != .string) continue;
+            // Only parameters and direct top-level lets. A nested initializer
+            // can create slots, but its lifetime is not this function scope.
+            if (!binding.is_param) {
+                var is_direct = false;
+                for (body) |stmt| {
+                    if (stmt.kind == .let and stmt.kind.let.slot == binding.slot and stmt.kind.let.value != null) is_direct = true;
+                }
+                if (!is_direct) continue;
+            }
+            const id = binding.bc_id orelse continue;
+            if (facts.wasMoved(id) or !facts.liveAtExit(.block_end, key, id)) continue;
+            const place: Expr = .{ .ty = binding.ty, .span = .none, .own = .owned, .kind = .{ .ref = binding.slot } };
+            const call = try self.runtimeCall(.string_free, .none, &.{place});
+            try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
+            self.drop_inserted = true;
+        }
+        return out.items;
     }
 
     /// Declare each runtime callee a conversion used, once.
@@ -1402,8 +1450,8 @@ const Lowerer = struct {
     /// `cell_string_from_str` (`Runtime.string_from_str`). Any source is safe,
     /// because the call COPIES: it takes no ownership from its operand and
     /// makes no second owner of a buffer. The result is owned by the
-    /// destination; the IR backends have no drop pass yet, so it leaks, and
-    /// `examples/leaks/` pins how much.
+    /// destination; only the narrow all-let fall-through shape has IR cleanup
+    /// so far, and `examples/leaks/` pins the remaining unfreed positions.
     ///
     /// An owning String PLACE where a view is wanted is wrapped in a
     /// `string_view`. An owning TEMPORARY is left alone: a view of it would

@@ -1308,7 +1308,8 @@ build a heap list that C never frees (the fixture measures C); this is the list 
 of "nothing drops a call temporary". `examples/leaks/unbound_list_temp.cell`
 (1000 calls, two lists each) pins it, so closing it makes the number drop.
 
-**The IR backends insert no releases at all (measured 2026-09-17).** Both
+**Before shared HIR cleanup, the IR backends inserted no releases (measured
+2026-09-17).** Both
 accept an owned `String` from a call (`let owned s = str_from_int(i)`, and an
 owned `var` reassigned from a call) and never free it, while the C backend
 frees every one. Stage 8 still reports agreement, because the printed answer is
@@ -1318,6 +1319,15 @@ cannot take `leak_host.c`'s renamed `main`). Donald's decision the same day:
 build the IR String work (conversions, indexing, list literals) with these
 leaks pinned, then port the C backend's drop decisions onto HIR so both IR
 backends share them.
+
+**The first narrow shared HIR release landed 2026-09-24.** A read-only
+`DropFacts` interface confirms borrow-checker IDs and exit liveness; HIR
+inserts `cell_string_free` for an unmoved owned String local or body parameter
+at the end of an all-let fall-through function. The new
+`ir_fallthrough_string` fixture measured LLVM LIVE=1000 before insertion and
+LLVM/MLIR LIVE=0 afterward, with C still 0. No other control-flow or
+resource family is covered by this slice, so the older nonzero fixtures stay
+disclosed until their own releases are implemented and measured.
 
 **IR scalar list step (d), construction, landed 2026-09-24 on those terms.**
 HIR desugars `Byte`, `Int`, `Int32`, `Float`, and `Bool` literals to typed,
@@ -1335,7 +1345,8 @@ positions, 1000 calls) is C 0 on both witnesses and LLVM and MLIR 9000;
 `ir_owned_string` stays at 3000. Two leaks C also has are inherited rather
 than new: a write through an `exclusive String` borrow overwrites the old
 buffer without freeing it (the IR converts `s = "cd"` there, as C does), and
-nothing is freed on any IR path until the drop pass is ported.
+nothing was freed on any IR path at that measurement. The first narrow
+fall-through release is recorded above; the listed fixtures remain nonzero.
 
 **IR step (b), indexing, landed 2026-09-22 on the same terms.** An index is a
 call to the bounds-checked runtime reader C calls, and allocates nothing, so

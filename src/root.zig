@@ -111,7 +111,14 @@ pub fn emitFor(
     defer buf.deinit(allocator);
     var collector = Io.Writer.Allocating.fromArrayList(allocator, &buf);
 
-    var lowered = try hir.lower(allocator, module, &bag);
+    var bc = borrowck.Checker.init(allocator, module.path, source);
+    defer bc.deinit();
+    try bc.checkModule(module);
+    if (bc.hasErrors()) {
+        try bc.diagnostics.printAll(diag_writer);
+        return error.TypeError;
+    }
+    var lowered = try hir.lowerChecked(allocator, module, &bag, bc.dropFacts());
     switch (target) {
         .c => unreachable,
         .llvm => try llvmemit.emitModule(allocator, &lowered, &collector.writer, &bag),
@@ -656,4 +663,89 @@ test "checked HIR refuses mismatched borrow identity for every slot" {
     for (lowered.findFn("f").?.bindings) |binding| {
         try std.testing.expect(binding.bc_id == null);
     }
+}
+
+test "checked HIR releases a live owned String on simple fallthrough" {
+    const source =
+        \\pub fn f() {
+        \\    let owned s: String = "x"
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var module = try compile(a, source, "t.cell");
+    var checker = borrowck.Checker.init(a, "t.cell", source);
+    defer checker.deinit();
+    try checker.checkModule(&module);
+    try std.testing.expect(!checker.hasErrors());
+    var bag: diag.Bag = .init("t.cell", source);
+    defer bag.deinit(a);
+    const lowered = try hir.lowerChecked(a, &module, &bag, checker.dropFacts());
+    try std.testing.expect(!bag.hasErrors());
+    const body = lowered.findFn("f").?.body.?;
+    try std.testing.expectEqual(@as(usize, 2), body.len);
+    try std.testing.expectEqualStrings("cell_string_free", body[1].kind.expr.kind.call.symbol.?);
+    try std.testing.expectEqual(ast.Ownership.exclusive, body[1].kind.expr.kind.call.modes[0].param);
+    try std.testing.expectEqual(body[0].kind.let.slot, body[1].kind.expr.kind.call.args[0].kind.ref);
+}
+
+test "checked HIR skips a moved String and releases its new owner" {
+    const source =
+        \\pub fn f() {
+        \\    let owned a: String = "x"
+        \\    let owned b: String = a
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var module = try compile(a, source, "t.cell");
+    var checker = borrowck.Checker.init(a, "t.cell", source);
+    defer checker.deinit();
+    try checker.checkModule(&module);
+    try std.testing.expect(!checker.hasErrors());
+    var bag: diag.Bag = .init("t.cell", source);
+    defer bag.deinit(a);
+    const lowered = try hir.lowerChecked(a, &module, &bag, checker.dropFacts());
+    try std.testing.expect(!bag.hasErrors());
+    const body = lowered.findFn("f").?.body.?;
+    try std.testing.expectEqual(@as(usize, 3), body.len);
+    try std.testing.expectEqual(body[1].kind.let.slot, body[2].kind.expr.kind.call.args[0].kind.ref);
+}
+
+test "checked HIR releases an owned String body parameter" {
+    const source = "pub fn f(owned s: String) {}";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var module = try compile(a, source, "t.cell");
+    var checker = borrowck.Checker.init(a, "t.cell", source);
+    defer checker.deinit();
+    try checker.checkModule(&module);
+    try std.testing.expect(!checker.hasErrors());
+    var bag: diag.Bag = .init("t.cell", source);
+    defer bag.deinit(a);
+    const lowered = try hir.lowerChecked(a, &module, &bag, checker.dropFacts());
+    try std.testing.expect(!bag.hasErrors());
+    const body = lowered.findFn("f").?.body.?;
+    try std.testing.expectEqual(@as(usize, 1), body.len);
+    try std.testing.expectEqual(@as(u32, 0), body[0].kind.expr.kind.call.args[0].kind.ref);
+}
+
+test "checked HIR never drops an uninitialized owned String slot" {
+    const source = "pub fn f() { var owned s: String }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var module = try compile(a, source, "t.cell");
+    var checker = borrowck.Checker.init(a, "t.cell", source);
+    defer checker.deinit();
+    try checker.checkModule(&module);
+    try std.testing.expect(!checker.hasErrors());
+    var bag: diag.Bag = .init("t.cell", source);
+    defer bag.deinit(a);
+    const lowered = try hir.lowerChecked(a, &module, &bag, checker.dropFacts());
+    try std.testing.expect(!bag.hasErrors());
+    try std.testing.expectEqual(@as(usize, 1), lowered.findFn("f").?.body.?.len);
 }

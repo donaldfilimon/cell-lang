@@ -62,8 +62,8 @@
 //! through them. Since IR String step (a) (2026-09-17), also the
 //! borrowed-view to owning-`String` conversion (a `cell_string_from_str` call
 //! hir.lower inserts), owned String places read as themselves, borrowed views
-//! of them, and String-valued `if`/`match` (on an `llvm.alloca` slot). No
-//! owned String this backend builds is freed: there is no IR drop pass.
+//! of them, and String-valued `if`/`match` (on an `llvm.alloca` slot). The
+//! first shared HIR drop slice frees simple fall-through Strings only.
 //! STILL REFUSED with `cannot lower to MLIR`: resource-bearing list literals
 //! and `arc` over an aggregate. Scalar list literals and indexing lower
 //! through HIR runtime calls. (Assignment through a field path

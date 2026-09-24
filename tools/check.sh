@@ -491,6 +491,12 @@ LEAK_IR_LIST_INDEX_MLIR=3000
 LEAK_IR_LIST_LITERAL_C=0
 LEAK_IR_LIST_LITERAL_LLVM=5000
 LEAK_IR_LIST_LITERAL_MLIR=5000
+# First shared HIR drop slice: one owning String per call, 1000 calls.
+# Before insertion LLVM measured ALLOC=1000 FREE=0 LIVE=1000; after insertion
+# both IR backends measure ALLOC=1000 FREE=1000 LIVE=0. C remains 0.
+LEAK_IR_FALLTHROUGH_STRING_C=0
+LEAK_IR_FALLTHROUGH_STRING_LLVM=0
+LEAK_IR_FALLTHROUGH_STRING_MLIR=0
 # R16 residual: a `return` inside a loop after the outer var's revival.
 # Measured 500 before (2026-09-17, ALLOC=2500 FREE=2000 LIVE=500); CLOSED
 # the same day by sparing an accepted loop's `return` records.
@@ -1206,6 +1212,9 @@ else
     run_c_leaks ir_list_literal "" "$LEAK_IR_LIST_LITERAL_C" "scalar list construction, scratch non-owner, 2026-09-24"
     run_ir_leaks ir_list_literal llvm "$LEAK_IR_LIST_LITERAL_LLVM" "IR step (d) list construction; no IR drop pass; joins the flip criterion, 2026-09-24"
     run_ir_leaks ir_list_literal mlir "$LEAK_IR_LIST_LITERAL_MLIR" "IR step (d) list construction; no IR drop pass; joins the flip criterion, 2026-09-24"
+    run_c_leaks ir_fallthrough_string "" "$LEAK_IR_FALLTHROUGH_STRING_C" "simple fallthrough owned String cleanup, 2026-09-24"
+    run_ir_leaks ir_fallthrough_string llvm "$LEAK_IR_FALLTHROUGH_STRING_LLVM" "shared HIR String drop at simple fallthrough, 2026-09-24"
+    run_ir_leaks ir_fallthrough_string mlir "$LEAK_IR_FALLTHROUGH_STRING_MLIR" "shared HIR String drop at simple fallthrough, 2026-09-24"
     run_c_leaks labelled_break "" "$LEAK_LABELLED_BREAK_C" "FLOW-03 break :outer releases the outer and inner bodies' locals, 2026-09-22"
     run_ir_leaks labelled_break llvm "$LEAK_LABELLED_BREAK_LLVM" "FLOW-03 break :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
     run_ir_leaks labelled_break mlir "$LEAK_LABELLED_BREAK_MLIR" "FLOW-03 break :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
@@ -1477,10 +1486,10 @@ fi
 # appears to. The C backend is also where all eight of those defects were, it
 # being the only backend that implements `arc` at all.
 #
-# examples/leaks/ is not covered here. Its fixtures take examples/arc_host.c
-# under a different convention that stage 7 owns and passes explicitly, and
-# they exist to leak; four of the five were measured ASan-clean, and the fifth
-# does not link under the `<stem>_host.c` rule this stage shares with stage 8.
+# The ordinary examples/leaks/ fixtures are not covered here: stage 7 owns
+# their hosts and disclosed leak counts. The narrow ir_fallthrough_string
+# exception below instruments the runtime allocator/release used by both IR
+# objects. It does not claim that emitted LLVM/MLIR instructions are sanitized.
 printf '\n== sanitized execution (AddressSanitizer) ==\n'
 asan_before=$fails
 asan_ran=0
@@ -1526,6 +1535,55 @@ else
             sed -n '1,6p' "$TMP/san_$n.err"
         fi
     done
+
+    # First HIR String-drop witness. Generated IR is not ASan-instrumented;
+    # the runtime allocator and release called by that IR are. This catches
+    # a duplicate/wrong release but is not whole-program IR instrumentation.
+    if cc -fsanitize=address -g -c runtime/cell_rt.c -o "$TMP/san_drop_rt.o" 2>/dev/null; then
+        drop_src=examples/leaks/ir_fallthrough_string.cell
+        if $CELL emit --target=llvm "$drop_src" > "$TMP/san_drop.ll" 2>/dev/null \
+            && cc -Wno-override-module -x ir "$TMP/san_drop.ll" -c -o "$TMP/san_drop_l.o" 2>/dev/null \
+            && cc -fsanitize=address "$TMP/san_drop_l.o" "$TMP/san_drop_rt.o" -o "$TMP/san_drop_l" 2>/dev/null; then
+            ASAN_OPTIONS=detect_leaks=0 "$TMP/san_drop_l" > "$TMP/san_drop_l.out" 2> "$TMP/san_drop_l.err"
+            st=$?
+            asan_ran=$((asan_ran + 1))
+            if [ "$st" -eq 0 ] && [ "$(cat "$TMP/san_drop_l.out")" = 1000 ] \
+                && ! grep -q 'ERROR: AddressSanitizer' "$TMP/san_drop_l.err"; then
+                pass "IR fallthrough String drop (LLVM) is runtime-ASan clean"
+            else
+                fail "IR fallthrough String drop (LLVM) failed runtime-ASan (exit $st)"
+            fi
+        else
+            fail "IR fallthrough String drop (LLVM) did not build for runtime-ASan"
+        fi
+        if [ -x "$LLVM_BIN/mlir-opt" ] && [ -x "$LLVM_BIN/mlir-translate" ] && [ -x "$LLVM_BIN/llc" ]; then
+            if $CELL emit --target=mlir "$drop_src" > "$TMP/san_drop.mlir" 2>/dev/null; then
+                pipeline=$(mlir_pipeline "$TMP/san_drop.mlir")
+                if [ -n "$pipeline" ] \
+                    && mlir_to_llvm "$TMP/san_drop.mlir" "$pipeline" "$TMP/san_drop_low.mlir" "$TMP/san_drop_m.ll" "$TMP/san_drop_m" \
+                    && "$LLVM_BIN/llc" -filetype=obj "$TMP/san_drop_m.ll" -o "$TMP/san_drop_m.o" 2>/dev/null \
+                    && cc -fsanitize=address "$TMP/san_drop_m.o" "$TMP/drv.c" "$TMP/san_drop_rt.o" -o "$TMP/san_drop_m" 2>/dev/null; then
+                    ASAN_OPTIONS=detect_leaks=0 "$TMP/san_drop_m" > "$TMP/san_drop_m.out" 2> "$TMP/san_drop_m.err"
+                    st=$?
+                    asan_ran=$((asan_ran + 1))
+                    if [ "$st" -eq 0 ] && [ "$(cat "$TMP/san_drop_m.out")" = 1000 ] \
+                        && ! grep -q 'ERROR: AddressSanitizer' "$TMP/san_drop_m.err"; then
+                        pass "IR fallthrough String drop (MLIR) is runtime-ASan clean"
+                    else
+                        fail "IR fallthrough String drop (MLIR) failed runtime-ASan (exit $st)"
+                    fi
+                else
+                    fail "IR fallthrough String drop (MLIR) did not lower for runtime-ASan"
+                fi
+            else
+                fail "IR fallthrough String drop (MLIR) did not emit for runtime-ASan"
+            fi
+        else
+            skip "IR fallthrough String drop (MLIR) runtime-ASan (MLIR tools unavailable)"
+        fi
+    else
+        fail "IR fallthrough String drop: runtime did not compile with AddressSanitizer"
+    fi
 
     # A stage that sanitized nothing has proved nothing, and must say so.
     printf '  ....  %d program(s) run under AddressSanitizer\n' "$asan_ran"

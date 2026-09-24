@@ -147,6 +147,10 @@ pub fn checkFn(self: *Checker, span: Span, f: *const ast.FnDef) Error!void {
         });
     }
     try self.checkBlockStmts(body);
+    // An empty body still has owning parameters. The block walker has no
+    // statement address to key, so use this function name's source address
+    // as a stable, per-function empty-body exit key for HIR cleanup.
+    if (body.len == 0) try self.recordExit(.block_end, @intFromPtr(f.name.ptr));
 }
 
 // ── scopes ──────────────────────────────────────────────────────────
