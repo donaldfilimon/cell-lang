@@ -1329,6 +1329,13 @@ LLVM/MLIR LIVE=0 afterward, with C still 0. No other control-flow or
 resource family is covered by this slice, so the older nonzero fixtures stay
 disclosed until their own releases are implemented and measured.
 
+A second straight-line slice evaluates a literal String replacement into a
+nondroppable scratch slot, consults `assignReleasesOldValue` before releasing
+the old owner, then transfers the replacement to the original slot. The final
+slot is released at fallthrough. `ir_reassign_string` runs 1000 replacements
+and pins zero live allocations on C, LLVM, and MLIR; nonliteral assignments
+and structured exits remain outside this IR cleanup path.
+
 **IR scalar list step (d), construction, landed 2026-09-24 on those terms.**
 HIR desugars `Byte`, `Int`, `Int32`, `Float`, and `Bool` literals to typed,
 checked runtime pushes and marks the transfer scratch nondroppable. The

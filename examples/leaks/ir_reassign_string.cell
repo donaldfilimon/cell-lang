@@ -1,0 +1,18 @@
+// Straight-line replacement must release the old and final String once each.
+// EXPECT-OUTPUT: 1000
+
+pub fn print_int(copy value: Int);
+
+pub fn once() {
+    var owned s: String = "old"
+    s = "new"
+}
+
+pub fn main() {
+    var copy i = 0
+    while i < 1000 {
+        once()
+        i = i + 1
+    }
+    print_int(i)
+}

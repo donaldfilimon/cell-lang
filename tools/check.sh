@@ -497,6 +497,11 @@ LEAK_IR_LIST_LITERAL_MLIR=5000
 LEAK_IR_FALLTHROUGH_STRING_C=0
 LEAK_IR_FALLTHROUGH_STRING_LLVM=0
 LEAK_IR_FALLTHROUGH_STRING_MLIR=0
+# Straight-line owned String replacement: two allocations per call, both
+# released by the shared HIR path after borrowck vouches for the old value.
+LEAK_IR_REASSIGN_STRING_C=0
+LEAK_IR_REASSIGN_STRING_LLVM=0
+LEAK_IR_REASSIGN_STRING_MLIR=0
 # R16 residual: a `return` inside a loop after the outer var's revival.
 # Measured 500 before (2026-09-17, ALLOC=2500 FREE=2000 LIVE=500); CLOSED
 # the same day by sparing an accepted loop's `return` records.
@@ -1215,6 +1220,9 @@ else
     run_c_leaks ir_fallthrough_string "" "$LEAK_IR_FALLTHROUGH_STRING_C" "simple fallthrough owned String cleanup, 2026-09-24"
     run_ir_leaks ir_fallthrough_string llvm "$LEAK_IR_FALLTHROUGH_STRING_LLVM" "shared HIR String drop at simple fallthrough, 2026-09-24"
     run_ir_leaks ir_fallthrough_string mlir "$LEAK_IR_FALLTHROUGH_STRING_MLIR" "shared HIR String drop at simple fallthrough, 2026-09-24"
+    run_c_leaks ir_reassign_string "" "$LEAK_IR_REASSIGN_STRING_C" "straight-line owned String replacement, 2026-09-24"
+    run_ir_leaks ir_reassign_string llvm "$LEAK_IR_REASSIGN_STRING_LLVM" "shared HIR String replacement cleanup, 2026-09-24"
+    run_ir_leaks ir_reassign_string mlir "$LEAK_IR_REASSIGN_STRING_MLIR" "shared HIR String replacement cleanup, 2026-09-24"
     run_c_leaks labelled_break "" "$LEAK_LABELLED_BREAK_C" "FLOW-03 break :outer releases the outer and inner bodies' locals, 2026-09-22"
     run_ir_leaks labelled_break llvm "$LEAK_LABELLED_BREAK_LLVM" "FLOW-03 break :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
     run_ir_leaks labelled_break mlir "$LEAK_LABELLED_BREAK_MLIR" "FLOW-03 break :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
@@ -1487,9 +1495,9 @@ fi
 # being the only backend that implements `arc` at all.
 #
 # The ordinary examples/leaks/ fixtures are not covered here: stage 7 owns
-# their hosts and disclosed leak counts. The narrow ir_fallthrough_string
-# exception below instruments the runtime allocator/release used by both IR
-# objects. It does not claim that emitted LLVM/MLIR instructions are sanitized.
+# their hosts and disclosed leak counts. The narrow straight-line String
+# exceptions below instrument the runtime allocator/release used by both IR
+# objects. They do not claim that emitted LLVM/MLIR instructions are sanitized.
 printf '\n== sanitized execution (AddressSanitizer) ==\n'
 asan_before=$fails
 asan_ran=0
@@ -1536,11 +1544,12 @@ else
         fi
     done
 
-    # First HIR String-drop witness. Generated IR is not ASan-instrumented;
+    # Straight-line HIR String-drop witnesses. Generated IR is not ASan-instrumented;
     # the runtime allocator and release called by that IR are. This catches
     # a duplicate/wrong release but is not whole-program IR instrumentation.
     if cc -fsanitize=address -g -c runtime/cell_rt.c -o "$TMP/san_drop_rt.o" 2>/dev/null; then
-        drop_src=examples/leaks/ir_fallthrough_string.cell
+      for drop_src in examples/leaks/ir_fallthrough_string.cell examples/leaks/ir_reassign_string.cell; do
+        drop_name=$(basename "$drop_src" .cell)
         if $CELL emit --target=llvm "$drop_src" > "$TMP/san_drop.ll" 2>/dev/null \
             && cc -Wno-override-module -x ir "$TMP/san_drop.ll" -c -o "$TMP/san_drop_l.o" 2>/dev/null \
             && cc -fsanitize=address "$TMP/san_drop_l.o" "$TMP/san_drop_rt.o" -o "$TMP/san_drop_l" 2>/dev/null; then
@@ -1549,12 +1558,12 @@ else
             asan_ran=$((asan_ran + 1))
             if [ "$st" -eq 0 ] && [ "$(cat "$TMP/san_drop_l.out")" = 1000 ] \
                 && ! grep -q 'ERROR: AddressSanitizer' "$TMP/san_drop_l.err"; then
-                pass "IR fallthrough String drop (LLVM) is runtime-ASan clean"
+                pass "IR $drop_name String drop (LLVM) is runtime-ASan clean"
             else
-                fail "IR fallthrough String drop (LLVM) failed runtime-ASan (exit $st)"
+                fail "IR $drop_name String drop (LLVM) failed runtime-ASan (exit $st)"
             fi
         else
-            fail "IR fallthrough String drop (LLVM) did not build for runtime-ASan"
+            fail "IR $drop_name String drop (LLVM) did not build for runtime-ASan"
         fi
         if [ -x "$LLVM_BIN/mlir-opt" ] && [ -x "$LLVM_BIN/mlir-translate" ] && [ -x "$LLVM_BIN/llc" ]; then
             if $CELL emit --target=mlir "$drop_src" > "$TMP/san_drop.mlir" 2>/dev/null; then
@@ -1568,19 +1577,20 @@ else
                     asan_ran=$((asan_ran + 1))
                     if [ "$st" -eq 0 ] && [ "$(cat "$TMP/san_drop_m.out")" = 1000 ] \
                         && ! grep -q 'ERROR: AddressSanitizer' "$TMP/san_drop_m.err"; then
-                        pass "IR fallthrough String drop (MLIR) is runtime-ASan clean"
+                        pass "IR $drop_name String drop (MLIR) is runtime-ASan clean"
                     else
-                        fail "IR fallthrough String drop (MLIR) failed runtime-ASan (exit $st)"
+                        fail "IR $drop_name String drop (MLIR) failed runtime-ASan (exit $st)"
                     fi
                 else
-                    fail "IR fallthrough String drop (MLIR) did not lower for runtime-ASan"
+                    fail "IR $drop_name String drop (MLIR) did not lower for runtime-ASan"
                 fi
             else
-                fail "IR fallthrough String drop (MLIR) did not emit for runtime-ASan"
+                fail "IR $drop_name String drop (MLIR) did not emit for runtime-ASan"
             fi
         else
-            skip "IR fallthrough String drop (MLIR) runtime-ASan (MLIR tools unavailable)"
+            skip "IR $drop_name String drop (MLIR) runtime-ASan (MLIR tools unavailable)"
         fi
+      done
     else
         fail "IR fallthrough String drop: runtime did not compile with AddressSanitizer"
     fi

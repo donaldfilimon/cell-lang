@@ -691,15 +691,57 @@ const Lowerer = struct {
         return id;
     }
 
-    /// First cleanup slice: an all-let body has no structured exit. Release
-    /// only confirmed, live, unmoved top-level owning String slots in reverse
-    /// order. Every other control-flow shape waits for explicit HIR exits.
+    /// Straight-line cleanup slice: lets and literal String reassignments have
+    /// no structured exit. Materialize a replacement before releasing the old
+    /// slot, then release confirmed live owners at fallthrough. Everything
+    /// else waits for explicit HIR exits.
     fn appendSimpleFallthroughDrops(self: *Lowerer, fn_name: []const u8, source: []const ast.Stmt, body: []Stmt) LowerError![]Stmt {
         const facts = self.facts orelse return body;
         if (self.identity_failed) return body;
-        for (source) |stmt| if (stmt.kind != .let) return body;
+        for (source, body) |src, lowered| {
+            switch (src.kind) {
+                .let => {},
+                .assign => |a| {
+                    if (a.target.kind != .ident or a.value.kind != .string or lowered.kind != .assign) return body;
+                    const place = lowered.kind.assign.place;
+                    if (place.path.len != 0 or place.slot >= self.bindings.items.len) return body;
+                    const binding = self.bindings.items[place.slot];
+                    if (binding.ownership != .owned or binding.ty.tag() != .string or !binding.droppable) return body;
+                },
+                else => return body,
+            }
+        }
         var out: std.ArrayList(Stmt) = .empty;
-        try out.appendSlice(self.arena, body);
+        for (source, body) |src, lowered| {
+            if (src.kind == .assign) {
+                const a = src.kind.assign;
+                const original = lowered.kind.assign;
+                const binding = self.bindings.items[original.place.slot];
+                // The replacement's constructor may allocate. Keep the old
+                // owner alive until that expression has finished evaluating.
+                const scratch: u32 = @intCast(self.bindings.items.len);
+                try self.bindings.append(self.arena, .{
+                    .name = "$drop.replacement",
+                    .ty = binding.ty,
+                    .ownership = .owned,
+                    .mutable = false,
+                    .is_param = false,
+                    .slot = scratch,
+                    .droppable = false,
+                });
+                try out.append(self.arena, .{ .span = src.span, .kind = .{ .let = .{ .slot = scratch, .value = original.value } } });
+                if (facts.assignReleasesOldValue(a.target.kind.ident.ptr)) {
+                    const old: Expr = .{ .ty = binding.ty, .span = .none, .own = .owned, .kind = .{ .ref = binding.slot } };
+                    const call = try self.runtimeCall(.string_free, .none, &.{old});
+                    try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
+                    self.drop_inserted = true;
+                }
+                const replacement: Expr = .{ .ty = binding.ty, .span = src.span, .own = .owned, .kind = .{ .ref = scratch } };
+                try out.append(self.arena, .{ .span = src.span, .kind = .{ .assign = .{ .place = original.place, .value = replacement } } });
+            } else {
+                try out.append(self.arena, lowered);
+            }
+        }
         const key = if (source.len == 0) @intFromPtr(fn_name.ptr) else @intFromPtr(source.ptr);
         var i = self.bindings.items.len;
         while (i > 0) {
