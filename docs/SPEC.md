@@ -20,7 +20,7 @@ source spans.
 Cell is a systems language that blends Rust ownership and algebraic data types,
 Swift value/reference clarity and ergonomics, and Zig explicit control with a
 C-ABI-first ethos. The toolchain is written in Zig
-`0.17.0-dev.2251+1175a3e99`. Its primary pipeline is `.cell -> HIR -> LLVM IR /
+`0.17.0-dev.2320+1e770dbef`. Its primary pipeline is `.cell -> HIR -> LLVM IR /
 MLIR` (ruled 2026-09-21); it also emits C, which today is the only backend that
 lowers the whole language and stays the default `--target` until every LLVM
 and MLIR leak pin in gate stage 7 reads 0, when the default flips to LLVM.
