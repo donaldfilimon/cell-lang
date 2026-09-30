@@ -966,11 +966,10 @@ const Lowerer = struct {
             self.drop_inserted = true;
         }
         // Direct top-level record lets. The whole binding is not a String,
-        // so the loop above skipped it. Release each remaining direct owned
-        // String or scalar-list field once, the same admission C uses in
-        // `emitPartialFields`: not wholly moved, not moved whole, not dead
-        // at this exit, and not moved in part. Nested records, `arc`, and
-        // a record that is not a direct `let` stay leaks.
+        // so the loop above skipped it. Release each remaining owned String
+        // or scalar-list field, including a field of a nested record, once.
+        // There is no whole-record IR drop. `arc`, a wholly moved record,
+        // and a record that is not a direct `let` stay leaks.
         var j = self.bindings.items.len;
         while (j > 0) {
             j -= 1;
@@ -1437,10 +1436,13 @@ const Lowerer = struct {
         }
     }
 
-    /// Direct owned fields still held at a function or block exit. Reverse
-    /// declaration order. A field the branch-end drop already released is
-    /// dead at this exit and is not freed again. A moved field that is not
-    /// a nested record fails closed. Nested records and `arc` are not spelled.
+    /// Owned String and scalar-list fields still held at a function exit,
+    /// including fields of a nested record. Reverse declaration order. A
+    /// field the branch-end drop already released is dead at this exit and
+    /// is not freed again. A moved String or list fails closed. A nested
+    /// record is not freed whole: IR has no `cell_drop_*` glue, so the walk
+    /// frees its remaining leaves instead. `arc` is not spelled. Depth 16
+    /// matches C's `emitPartialFields`.
     fn appendScopeEndFieldDrops(
         self: *Lowerer,
         out: *std.ArrayList(Stmt),
@@ -1450,6 +1452,27 @@ const Lowerer = struct {
         exit_kind: dropfacts.ExitKind,
         key: usize,
     ) LowerError!void {
+        const base = try self.box(.{
+            .ty = binding.ty,
+            .span = .none,
+            .own = binding.ownership,
+            .kind = .{ .ref = binding.slot },
+        });
+        try self.appendScopeEndFields(out, id, struct_name, "", base, exit_kind, key, 0);
+    }
+
+    fn appendScopeEndFields(
+        self: *Lowerer,
+        out: *std.ArrayList(Stmt),
+        id: u32,
+        struct_name: []const u8,
+        path_prefix: []const u8,
+        base: *Expr,
+        exit_kind: dropfacts.ExitKind,
+        key: usize,
+        depth: usize,
+    ) LowerError!void {
+        if (depth > 16) return;
         const facts = self.facts orelse return;
         const def = self.findStructDecl(struct_name) orelse return;
         var i = def.fields.len;
@@ -1457,21 +1480,13 @@ const Lowerer = struct {
             i -= 1;
             const field = def.fields[i];
             if (field.ownership != .owned) continue;
-            const release: Runtime = switch (field.ty) {
-                .string => .string_free,
-                .list => |elem| if (scalarListElement(elem.*)) .slice_free else continue,
-                else => continue,
-            };
-            if (facts.fieldWasMovedWhole(id, field.name)) continue;
-            if (facts.fieldDeadAtExit(exit_kind, key, id, field.name)) continue;
-            if (facts.fieldWasMoved(id, field.name)) continue;
-            const base = try self.box(.{
-                .ty = binding.ty,
-                .span = .none,
-                .own = binding.ownership,
-                .kind = .{ .ref = binding.slot },
-            });
-            const place: Expr = .{
+            const field_path: []const u8 = if (path_prefix.len == 0)
+                field.name
+            else
+                try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ path_prefix, field.name });
+            if (facts.fieldWasMovedWhole(id, field_path)) continue;
+            if (facts.fieldDeadAtExit(exit_kind, key, id, field_path)) continue;
+            const place = try self.box(.{
                 .ty = field.ty,
                 .span = .none,
                 .own = field.ownership,
@@ -1484,10 +1499,29 @@ const Lowerer = struct {
                         .ownership = field.ownership,
                     },
                 } },
-            };
-            const call = try self.runtimeCall(release, .none, &.{place});
-            try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
-            self.drop_inserted = true;
+            });
+            switch (field.ty) {
+                .string => {
+                    if (facts.fieldWasMoved(id, field_path)) continue;
+                    const call = try self.runtimeCall(.string_free, .none, &.{place.*});
+                    try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
+                    self.drop_inserted = true;
+                },
+                .list => |elem| {
+                    if (!scalarListElement(elem.*)) continue;
+                    if (facts.fieldWasMoved(id, field_path)) continue;
+                    const call = try self.runtimeCall(.slice_free, .none, &.{place.*});
+                    try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
+                    self.drop_inserted = true;
+                },
+                .struct_type => |nested| {
+                    // A partial move of one leaf still walks the rest.
+                    // `fieldWasMoved` on this path is true in that case and
+                    // must not skip the sibling.
+                    try self.appendScopeEndFields(out, id, nested, field_path, place, exit_kind, key, depth + 1);
+                },
+                else => {},
+            }
         }
     }
 

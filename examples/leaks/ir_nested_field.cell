@@ -1,0 +1,36 @@
+// A nested record field of a top-level `let`. `p.inner.a` moves into
+// `moved`. `p.tag` is a direct field. `p.inner.b` is the nested sibling.
+// The record is not declared inside the loop. 1000 calls.
+// EXPECT-OUTPUT: 1000
+//
+// BEFORE the nested scope-end walk, on the post-scope-end compiler: C
+// ALLOC=3000 FREE=3000 LIVE=0; LLVM and MLIR ALLOC=3000 FREE=2000 LIVE=1000
+// (`p.inner.b`). After the walk they measure ALLOC=3000 FREE=3000 LIVE=0.
+// C already freed the sibling through `cell_drop_Inner`. IR has no
+// whole-record drop glue, so the walk frees the leaf.
+
+pub struct Inner {
+    owned a: String
+    owned b: String
+}
+
+pub struct Outer {
+    owned inner: Inner
+    owned tag: String
+}
+
+pub fn print_int(copy value: Int);
+
+pub fn once() -> Int {
+    let owned p: Outer = Outer { inner: Inner { a: "aaaaaaaa", b: "bbbbbbbb" }, tag: "tttttttt" }
+    let owned moved: String = p.inner.a
+    return 1
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        i = i + once()
+    }
+    print_int(i)
+}

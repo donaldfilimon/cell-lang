@@ -1603,6 +1603,28 @@ fn countTopLevelFieldFrees(body: []const hir.Stmt, symbol: []const u8, slot: u32
     return n;
 }
 
+fn stmtFreesNestedField(stmt: hir.Stmt, symbol: []const u8, slot: u32, parent: u32, index: u32) bool {
+    if (stmt.kind != .expr) return false;
+    const call = stmt.kind.expr;
+    if (call.kind != .call) return false;
+    const c = call.kind.call;
+    const name = c.symbol orelse return false;
+    if (!std.mem.eql(u8, name, symbol)) return false;
+    if (c.args.len != 1 or c.args[0].kind != .field) return false;
+    const leaf = c.args[0].kind.field;
+    if (leaf.sel.index != index or leaf.base.kind != .field) return false;
+    const parent_field = leaf.base.kind.field;
+    return parent_field.sel.index == parent and parent_field.base.kind == .ref and parent_field.base.kind.ref == slot;
+}
+
+fn countNestedFieldFrees(body: []const hir.Stmt, symbol: []const u8, slot: u32, parent: u32, index: u32) usize {
+    var n: usize = 0;
+    for (body) |stmt| {
+        if (stmtFreesNestedField(stmt, symbol, slot, parent, index)) n += 1;
+    }
+    return n;
+}
+
 test "checked HIR releases an outer owned String on the branch that kept it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1842,4 +1864,103 @@ test "checked HIR does not scope-release a record declared inside a branch" {
     const slot = p_slot orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", slot, 0));
     try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", slot, 1));
+}
+
+test "checked HIR scope-releases the unmoved sibling of a nested field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Inner {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub struct Outer {
+        \\    owned inner: Inner
+        \\    owned tag: String
+        \\}
+        \\pub fn f() -> Int {
+        \\    let owned p: Outer = Outer { inner: Inner { a: "x", b: "y" }, tag: "t" }
+        \\    let owned moved: String = p.inner.a
+        \\    return 1
+        \\}
+    );
+    const p_slot = f.body.?[0].kind.let.slot;
+    try std.testing.expectEqualStrings("p", f.bindings[p_slot].name);
+    // `inner` is index 0, `tag` is index 1. `a` is 0 and `b` is 1 inside Inner.
+    // The moved leaf is not freed. The nested sibling and the direct tag are.
+    try std.testing.expectEqual(@as(usize, 0), countNestedFieldFrees(f.body.?, "cell_string_free", p_slot, 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countNestedFieldFrees(f.body.?, "cell_string_free", p_slot, 0, 1));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", p_slot, 1));
+}
+
+test "checked HIR scope-releases every leaf of an unmoved nested record" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Inner {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub struct Outer {
+        \\    owned inner: Inner
+        \\    owned tag: String
+        \\}
+        \\pub fn f() -> Int {
+        \\    let owned p: Outer = Outer { inner: Inner { a: "x", b: "y" }, tag: "t" }
+        \\    return 1
+        \\}
+    );
+    const p_slot = f.body.?[0].kind.let.slot;
+    try std.testing.expectEqual(@as(usize, 1), countNestedFieldFrees(f.body.?, "cell_string_free", p_slot, 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countNestedFieldFrees(f.body.?, "cell_string_free", p_slot, 0, 1));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", p_slot, 1));
+}
+
+test "checked HIR does not scope-release a wholly moved nested record" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Inner {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub struct Outer {
+        \\    owned inner: Inner
+        \\    owned tag: String
+        \\}
+        \\pub fn f() -> Int {
+        \\    let owned p: Outer = Outer { inner: Inner { a: "x", b: "y" }, tag: "t" }
+        \\    let owned q: Inner = p.inner
+        \\    return 1
+        \\}
+    );
+    const p_slot = f.body.?[0].kind.let.slot;
+    const q_slot = f.body.?[1].kind.let.slot;
+    try std.testing.expectEqual(@as(usize, 0), countNestedFieldFrees(f.body.?, "cell_string_free", p_slot, 0, 0));
+    try std.testing.expectEqual(@as(usize, 0), countNestedFieldFrees(f.body.?, "cell_string_free", p_slot, 0, 1));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", p_slot, 1));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", q_slot, 0));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", q_slot, 1));
+}
+
+test "checked HIR scope-releases an unmoved nested scalar-list sibling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Inner {
+        \\    owned a: [Int]
+        \\    owned b: [Int]
+        \\}
+        \\pub struct Outer {
+        \\    owned inner: Inner
+        \\}
+        \\pub fn f() -> Int {
+        \\    let owned p: Outer = Outer { inner: Inner { a: [1], b: [2] } }
+        \\    let owned moved: [Int] = p.inner.a
+        \\    return 1
+        \\}
+    );
+    const p_slot = f.body.?[0].kind.let.slot;
+    try std.testing.expectEqual(@as(usize, 0), countNestedFieldFrees(f.body.?, "cell_slice_free", p_slot, 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countNestedFieldFrees(f.body.?, "cell_slice_free", p_slot, 0, 1));
 }
