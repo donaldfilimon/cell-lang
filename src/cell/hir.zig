@@ -312,6 +312,45 @@ fn scalarListElement(elem: Ty) bool {
     };
 }
 
+/// Same address borrowck stores for a branch end (`borrowck.branchKeyOf`).
+/// A nonempty block is keyed by its statement slice; anything else, including
+/// an empty block, is keyed by the expression itself.
+fn astBranchKey(e: *const ast.Expr) usize {
+    return switch (e.kind) {
+        .block => |stmts| if (stmts.len > 0) @intFromPtr(stmts.ptr) else @intFromPtr(e),
+        else => @intFromPtr(e),
+    };
+}
+
+/// True when every path through `e` leaves by `return`, `break`, or
+/// `continue`. A release after that jump would not run, and MLIR rejects
+/// instructions after a terminator, so the branch keeps the leak.
+fn astBranchDiverges(e: *const ast.Expr) bool {
+    switch (e.kind) {
+        .block => |stmts| {
+            if (stmts.len == 0) return false;
+            const last = &stmts[stmts.len - 1];
+            return switch (last.kind) {
+                .return_stmt, .break_stmt, .continue_stmt => true,
+                .expr => |*x| astBranchDiverges(x),
+                else => false,
+            };
+        },
+        .if_expr => |x| {
+            const else_body = x.else_body orelse return false;
+            return astBranchDiverges(x.then_body) and astBranchDiverges(else_body);
+        },
+        .match_expr => |x| {
+            if (x.arms.len == 0) return false;
+            for (x.arms) |arm| {
+                if (!astBranchDiverges(arm.body)) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
 /// One checked builder: `(exclusive xs: [T], copy value: T) -> ()`.
 fn pushEntry(comptime name: []const u8, comptime symbol: []const u8, comptime elem: *const Ty) RuntimeCallee {
     return .{
@@ -720,9 +759,11 @@ const Lowerer = struct {
     }
 
     /// Straight-line cleanup slice: lets and literal or call String reassignments,
-    /// optionally followed by a scalar return. Evaluate replacements and the
-    /// return value before releasing confirmed live owners at the exit.
-    /// Structured exits still wait for explicit HIR control-flow drops.
+    /// optionally followed by a scalar return. A statement-position `if` is
+    /// allowed through so an owner neither branch moved still gets this one
+    /// function-end release. A `while`, a `match`, or any other statement
+    /// still leaves that release out. Evaluate replacements and the return
+    /// value before releasing confirmed live owners at the exit.
     fn appendSimpleFallthroughDrops(self: *Lowerer, fn_name: []const u8, source: []const ast.Stmt, body: []Stmt) LowerError![]Stmt {
         const facts = self.facts orelse return body;
         if (self.identity_failed) return body;
@@ -746,6 +787,9 @@ const Lowerer = struct {
                     if (place.path.len != 0 or place.slot >= self.bindings.items.len) return body;
                     const binding = self.bindings.items[place.slot];
                     if (binding.ownership != .owned or binding.ty.tag() != .string or !binding.droppable) return body;
+                },
+                .expr => |ex| {
+                    if (ex.kind != .if_expr) return body;
                 },
                 else => return body,
             }
@@ -979,18 +1023,127 @@ const Lowerer = struct {
         }
     }
 
+    /// Release outer owners at one branch end. The binding is still in scope
+    /// after the branch body is lowered, so it was declared outside that
+    /// branch. Admission matches C's non-record branch rule, not the loop
+    /// exit's `!wasMoved` rule: moved somewhere, live at this branch end, and
+    /// not live after the merge. A missing branch-end record keeps the leak.
+    /// String and scalar lists only. Records, fields, and `arc` stay out.
+    fn collectBranchEndDrops(self: *Lowerer, branch_key: usize, merge_key: usize) LowerError![]Stmt {
+        const facts = self.facts orelse return &.{};
+        if (self.identity_failed) return &.{};
+        var out: std.ArrayList(Stmt) = .empty;
+        var i = self.scope.items.len;
+        while (i > 0) {
+            i -= 1;
+            const slot = self.scope.items[i].slot;
+            if (slot >= self.bindings.items.len) continue;
+            const binding = self.bindings.items[slot];
+            if (!binding.droppable or binding.ownership != .owned) continue;
+            // A parameter arrives initialized. A local without an initializer
+            // may hold nothing, and releasing it would free an empty slot.
+            if (!binding.has_initializer and !binding.is_param) continue;
+            const release: Runtime = switch (binding.ty) {
+                .string => .string_free,
+                .list => |elem| if (scalarListElement(elem.*)) .slice_free else continue,
+                else => continue,
+            };
+            const id = binding.bc_id orelse continue;
+            if (!facts.wasMoved(id)) continue;
+            if (!facts.liveAtExit(.branch_end, branch_key, id)) continue;
+            if (facts.liveAtExit(.after_branch, merge_key, id)) continue;
+            const place: Expr = .{ .ty = binding.ty, .span = .none, .own = .owned, .kind = .{ .ref = binding.slot } };
+            const call = try self.runtimeCall(release, .none, &.{place});
+            try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
+            self.drop_inserted = true;
+        }
+        return out.items;
+    }
+
+    /// Append `drops` after the branch's own statements and after its value
+    /// is computed. A tail is bound to a nondroppable scratch first, so a
+    /// release cannot free a buffer the tail still reads.
+    fn placeDropsBeforeTail(self: *Lowerer, branch: Expr, drops: []const Stmt) LowerError!Expr {
+        switch (branch.kind) {
+            .block => |b| {
+                const extra: usize = if (b.tail != null) 1 else 0;
+                var stmts: std.ArrayList(Stmt) = try .initCapacity(self.arena, b.stmts.len + drops.len + extra);
+                try stmts.appendSlice(self.arena, b.stmts);
+                var out = branch;
+                if (b.tail) |tail| {
+                    const scratch = try self.branchScratch(tail);
+                    try stmts.append(self.arena, .{ .span = tail.span, .kind = .{ .let = .{ .slot = scratch, .value = tail.* } } });
+                    out.kind.block.tail = try self.box(.{
+                        .ty = tail.ty,
+                        .span = tail.span,
+                        .own = tail.own,
+                        .kind = .{ .ref = scratch },
+                    });
+                }
+                try stmts.appendSlice(self.arena, drops);
+                out.kind.block.stmts = stmts.items;
+                return out;
+            },
+            else => {
+                const scratch = try self.branchScratch(&branch);
+                var stmts: std.ArrayList(Stmt) = try .initCapacity(self.arena, drops.len + 1);
+                try stmts.append(self.arena, .{ .span = branch.span, .kind = .{ .let = .{ .slot = scratch, .value = branch } } });
+                try stmts.appendSlice(self.arena, drops);
+                const tail = try self.box(.{
+                    .ty = branch.ty,
+                    .span = branch.span,
+                    .own = branch.own,
+                    .kind = .{ .ref = scratch },
+                });
+                return .{
+                    .ty = branch.ty,
+                    .span = branch.span,
+                    .own = branch.own,
+                    .kind = .{ .block = .{ .stmts = stmts.items, .tail = tail } },
+                };
+            },
+        }
+    }
+
+    /// The scratch a branch value lands in before releases. Not droppable and
+    /// not a borrow-checker identity: it is a copy of the value, not a second
+    /// owner the drop pass may free.
+    fn branchScratch(self: *Lowerer, value: *const Expr) LowerError!u32 {
+        const scratch: u32 = @intCast(self.bindings.items.len);
+        const ownership: Ownership = value.own orelse if (value.ty.tag() == .string) .shared else .owned;
+        try self.bindings.append(self.arena, .{
+            .name = "$drop.branch",
+            .ty = value.ty,
+            .ownership = ownership,
+            .mutable = false,
+            .is_param = false,
+            .slot = scratch,
+            .droppable = false,
+        });
+        return scratch;
+    }
+
+    fn insertBranchEndDrops(self: *Lowerer, branch: *Expr, branch_key: usize, merge_key: usize) LowerError!void {
+        const drops = try self.collectBranchEndDrops(branch_key, merge_key);
+        if (drops.len == 0) return;
+        branch.* = try self.placeDropsBeforeTail(branch.*, drops);
+    }
+
     fn lowerStmt(self: *Lowerer, stmt: *const ast.Stmt) LowerError!Stmt {
         switch (stmt.kind) {
-            .let => |l| {
+            .let => |*l| {
                 // The initializer is lowered BEFORE the binding enters scope,
                 // so `let x = x` reads the outer `x`. That matches
                 // typecheck.zig, which declares after checking the value.
                 // The declared type, when present, is the destination for an
                 // untyped integer literal: `let copy a: Int8 = 3` is i8, not
                 // Int. No other construct is inferred from it.
+                // Pointer capture: an `if` or `match` in the initializer is
+                // keyed by its address in this statement, the same address
+                // borrowck recorded. A by-value capture would miss it.
                 const declared: ?Ty = if (l.ty) |*t| self.resolve(t) else null;
                 var value: ?Expr = null;
-                if (l.value) |v| value = try self.lowerExprIn(&v, declared);
+                if (l.value) |*v| value = try self.lowerExprIn(v, declared);
                 // An ANNOTATED `let` converts to its declared destination. An
                 // unannotated one takes its type from the value, so C keeps
                 // `let owned s = "ab"` a view and this does not copy it
@@ -1023,7 +1176,7 @@ const Lowerer = struct {
 
                 return .{ .span = stmt.span, .kind = .{ .let = .{ .slot = slot, .value = value } } };
             },
-            .assign => |a| {
+            .assign => |*a| {
                 var value = try self.lowerExpr(&a.value);
                 const place = try self.lowerPlace(&a.target);
                 // The destination is the target binding, or the last field
@@ -1038,8 +1191,8 @@ const Lowerer = struct {
                 value = try self.convertTo(value, place.ty, own);
                 return .{ .span = stmt.span, .kind = .{ .assign = .{ .place = place, .value = value } } };
             },
-            .expr => |e| return .{ .span = stmt.span, .kind = .{ .expr = try self.lowerExpr(&e) } },
-            .while_stmt => |w| {
+            .expr => |*e| return .{ .span = stmt.span, .kind = .{ .expr = try self.lowerExpr(e) } },
+            .while_stmt => |*w| {
                 const cond = try self.lowerExpr(&w.cond);
                 self.pushScope();
                 try self.loop_labels.append(self.arena, w.label);
@@ -1063,14 +1216,14 @@ const Lowerer = struct {
             },
             .break_stmt => |j| return .{ .span = stmt.span, .kind = .{ .brk = try self.jumpDepth(stmt.span, j.label) } },
             .continue_stmt => |j| return .{ .span = stmt.span, .kind = .{ .cont = try self.jumpDepth(stmt.span, j.label) } },
-            .return_stmt => |maybe| {
-                if (maybe) |e| {
+            .return_stmt => |*maybe| {
+                if (maybe.*) |*e| {
                     // Destination typing stays let- and call-arg-only for
                     // literals (`return 7` from `-> Int8` is still Int). The
                     // one form that needs the declared return type is
                     // `Ok`/`Err`, which has no type of its own.
                     const expected: ?Ty = if (e.kind == .wrap) self.ret_ty else null;
-                    const value = try self.lowerExprIn(&e, expected);
+                    const value = try self.lowerExprIn(e, expected);
                     return .{ .span = stmt.span, .kind = .{ .ret = try self.convertTo(value, self.ret_ty, self.ret_own) } };
                 }
                 return .{ .span = stmt.span, .kind = .{ .ret = null } };
@@ -1281,7 +1434,7 @@ const Lowerer = struct {
                 if (decl) |d| {
                     for (d.fields, 0..) |df, i| {
                         var found = false;
-                        for (sl.fields) |init_field| {
+                        for (sl.fields) |*init_field| {
                             if (std.mem.eql(u8, init_field.name, df.name)) {
                                 fields[i] = try self.lowerExpr(&init_field.value);
                                 // A field is a destination with a declared
@@ -1302,7 +1455,7 @@ const Lowerer = struct {
                         }
                     }
                 } else {
-                    for (sl.fields, 0..) |init_field, i| {
+                    for (sl.fields, 0..) |*init_field, i| {
                         fields[i] = try self.lowerExpr(&init_field.value);
                     }
                 }
@@ -1338,18 +1491,43 @@ const Lowerer = struct {
 
             .if_expr => |ie| {
                 const cond = try self.box(try self.lowerExpr(ie.cond));
-                const then_body = try self.box(try self.lowerExpr(ie.then_body));
+                var then_lowered = try self.lowerExpr(ie.then_body);
+                const merge_key = @intFromPtr(e);
+                // A source else, not a synthesized one. The if stays unit when
+                // the program had no else, even after a release block is added.
+                const has_source_else = ie.else_body != null;
+                if (!astBranchDiverges(ie.then_body)) {
+                    try self.insertBranchEndDrops(&then_lowered, astBranchKey(ie.then_body), merge_key);
+                }
                 var else_body: ?*Expr = null;
-                if (ie.else_body) |eb| else_body = try self.box(try self.lowerExpr(eb));
+                if (ie.else_body) |eb| {
+                    var else_lowered = try self.lowerExpr(eb);
+                    if (!astBranchDiverges(eb)) {
+                        try self.insertBranchEndDrops(&else_lowered, astBranchKey(eb), merge_key);
+                    }
+                    else_body = try self.box(else_lowered);
+                } else {
+                    // Missing else is keyed by the if expression, the same
+                    // address borrowck recorded. The block holds only releases.
+                    const drops = try self.collectBranchEndDrops(@intFromPtr(e), merge_key);
+                    if (drops.len != 0) {
+                        else_body = try self.box(.{
+                            .ty = types.t_unit,
+                            .span = e.span,
+                            .kind = .{ .block = .{ .stmts = drops, .tail = null } },
+                        });
+                    }
+                }
+                const then_body = try self.box(then_lowered);
                 return .{
-                    // Without an else there is no value, so the if is unit even
-                    // when the then-branch has a type.
-                    .ty = if (else_body != null) then_body.ty else types.t_unit,
+                    // Without a source else there is no value, so the if is
+                    // unit even when the then-branch has a type.
+                    .ty = if (has_source_else) then_body.ty else types.t_unit,
                     .span = e.span,
                     .kind = .{ .if_expr = .{ .cond = cond, .then_body = then_body, .else_body = else_body } },
                     // The first arm's, as C's `inferExpr` types it, until a
                     // destination stamps its own.
-                    .own = if (else_body != null) then_body.own else null,
+                    .own = if (has_source_else) then_body.own else null,
                 };
             },
 
@@ -1366,14 +1544,18 @@ const Lowerer = struct {
                 var arms = try self.arena.alloc(Arm, me.arms.len);
                 var result_ty: Ty = types.t_unit;
                 var result_own: ?Ownership = null;
+                const merge_key = @intFromPtr(me.arms.ptr);
                 for (me.arms, 0..) |arm, i| {
                     self.pushScope();
                     const pat = try self.lowerPattern(&arm.pattern, scrutinee.ty);
                     var guard: ?*Expr = null;
                     if (arm.guard) |g| guard = try self.box(try self.lowerExpr(g));
-                    const body = try self.box(try self.lowerExpr(arm.body));
+                    var body = try self.lowerExpr(arm.body);
                     self.popScope();
-                    arms[i] = .{ .pattern = pat, .guard = guard, .body = body, .span = arm.span };
+                    if (!astBranchDiverges(arm.body)) {
+                        try self.insertBranchEndDrops(&body, astBranchKey(arm.body), merge_key);
+                    }
+                    arms[i] = .{ .pattern = pat, .guard = guard, .body = try self.box(body), .span = arm.span };
                     if (i == 0) {
                         result_ty = body.ty;
                         result_own = body.own;
@@ -1491,8 +1673,8 @@ const Lowerer = struct {
             try self.cannotLower(span, "a list literal element does not match its destination type");
             return self.emptyList(span, elem_ty);
         }
-        for (elems[1..], 1..) |el, i| {
-            values[i] = try self.lowerExprIn(&el, elem_ty);
+        for (elems[1..], 1..) |*el, i| {
+            values[i] = try self.lowerExprIn(el, elem_ty);
             if (!sameType(values[i].ty, elem_ty)) {
                 try self.cannotLower(el.span, "a list literal element does not match its destination type");
                 return self.emptyList(span, elem_ty);
@@ -1547,8 +1729,10 @@ const Lowerer = struct {
 
         var lowered_args = try self.arena.alloc(Expr, args.len);
         var modes = try self.arena.alloc(ArgMode, args.len);
-        for (args, 0..) |a, i| {
+        for (args, 0..) |*a, i| {
             // The written prefix is read off the AST before lowering strips it.
+            // `a` stays the argument in the call's slice: an `if` there is
+            // keyed by that address, which a by-value capture would replace.
             const written: ?Ownership = switch (a.kind) {
                 .annotated => |an| an.ownership,
                 else => null,
@@ -1565,7 +1749,7 @@ const Lowerer = struct {
                 }
                 break :blk null;
             };
-            lowered_args[i] = try self.lowerExprIn(&a, param_ty);
+            lowered_args[i] = try self.lowerExprIn(a, param_ty);
             // An `exclusive` parameter takes the argument's ADDRESS, and a
             // converted temporary has none, so it is left for the emitters to
             // refuse, as C leaves it for `cc` (codegen's `want.pointer`).

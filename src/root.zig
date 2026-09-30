@@ -1013,3 +1013,139 @@ test "checked HIR releases inner then outer owners before continue :outer" {
     try std.testing.expectEqual(a_slot, inner[2].kind.expr.kind.call.args[0].kind.ref);
     try std.testing.expectEqual(@as(u32, 1), inner[3].kind.cont);
 }
+
+fn checkedFn(a: std.mem.Allocator, source: []const u8) !hir.Fn {
+    var module = try compile(a, source, "t.cell");
+    var checker = borrowck.Checker.init(a, "t.cell", source);
+    try checker.checkModule(&module);
+    try std.testing.expect(!checker.hasErrors());
+    var bag: diag.Bag = .init("t.cell", source);
+    const lowered = try hir.lowerChecked(a, &module, &bag, checker.dropFacts());
+    try std.testing.expect(!bag.hasErrors());
+    return lowered.findFn("f").?.*;
+}
+
+fn stmtFreesSlot(stmt: hir.Stmt, symbol: []const u8, slot: u32) bool {
+    if (stmt.kind != .expr) return false;
+    const call = stmt.kind.expr;
+    if (call.kind != .call) return false;
+    const c = call.kind.call;
+    const name = c.symbol orelse return false;
+    if (!std.mem.eql(u8, name, symbol)) return false;
+    if (c.args.len != 1 or c.args[0].kind != .ref) return false;
+    return c.args[0].kind.ref == slot;
+}
+
+fn blockFreesSlot(block_expr: *const hir.Expr, symbol: []const u8, slot: u32) bool {
+    const b = block_expr.kind.block;
+    for (b.stmts) |stmt| {
+        if (stmtFreesSlot(stmt, symbol, slot)) return true;
+    }
+    return false;
+}
+
+fn countTopLevelFrees(body: []const hir.Stmt, symbol: []const u8, slot: u32) usize {
+    var n: usize = 0;
+    for (body) |stmt| {
+        if (stmtFreesSlot(stmt, symbol, slot)) n += 1;
+    }
+    return n;
+}
+
+test "checked HIR releases an outer owned String on the branch that kept it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy c: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    if c > 0 {
+        \\        take(v)
+        \\    } else {
+        \\        i = i + 1
+        \\    }
+        \\}
+    );
+    const v_slot = f.body.?[0].kind.let.slot;
+    try std.testing.expectEqualStrings("v", f.bindings[v_slot].name);
+    const if_stmt = f.body.?[2].kind.expr;
+    const ie = if_stmt.kind.if_expr;
+    try std.testing.expect(ie.then_body.kind == .block);
+    try std.testing.expect(ie.else_body.?.kind == .block);
+    try std.testing.expect(!blockFreesSlot(ie.then_body, "cell_string_free", v_slot));
+    try std.testing.expect(blockFreesSlot(ie.else_body.?, "cell_string_free", v_slot));
+}
+
+test "checked HIR does not branch-release a String neither branch moved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn f(copy c: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    if c > 0 {
+        \\        i = i + 1
+        \\    } else {
+        \\        i = i + 1
+        \\    }
+        \\}
+    );
+    const body = f.body.?;
+    const v_slot = body[0].kind.let.slot;
+    try std.testing.expectEqualStrings("v", f.bindings[v_slot].name);
+    const ie = body[2].kind.expr.kind.if_expr;
+    try std.testing.expect(ie.then_body.kind == .block);
+    try std.testing.expect(ie.else_body.?.kind == .block);
+    try std.testing.expect(!blockFreesSlot(ie.then_body, "cell_string_free", v_slot));
+    try std.testing.expect(!blockFreesSlot(ie.else_body.?, "cell_string_free", v_slot));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(body, "cell_string_free", v_slot));
+}
+
+test "checked HIR releases an outer owned String in a synthesized else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy c: Int) {
+        \\    var owned v: String = "a"
+        \\    if c > 0 {
+        \\        take(v)
+        \\    }
+        \\}
+    );
+    const v_slot = f.body.?[0].kind.let.slot;
+    try std.testing.expectEqualStrings("v", f.bindings[v_slot].name);
+    const if_expr = f.body.?[1].kind.expr;
+    try std.testing.expect(if_expr.ty == .unit);
+    const ie = if_expr.kind.if_expr;
+    try std.testing.expect(ie.then_body.kind == .block);
+    const else_body = ie.else_body orelse return error.TestUnexpectedResult;
+    try std.testing.expect(else_body.kind == .block);
+    try std.testing.expect(!blockFreesSlot(ie.then_body, "cell_string_free", v_slot));
+    try std.testing.expect(blockFreesSlot(else_body, "cell_string_free", v_slot));
+}
+
+test "checked HIR releases an outer owned scalar list on the branch that kept it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn take(owned xs: [Int]) { }
+        \\pub fn f(copy c: Int) {
+        \\    let owned xs: [Int] = [1]
+        \\    var i = 0
+        \\    if c > 0 {
+        \\        take(xs)
+        \\    } else {
+        \\        i = i + 1
+        \\    }
+        \\}
+    );
+    const xs_slot = f.body.?[0].kind.let.slot;
+    try std.testing.expectEqualStrings("xs", f.bindings[xs_slot].name);
+    const ie = f.body.?[2].kind.expr.kind.if_expr;
+    try std.testing.expect(ie.then_body.kind == .block);
+    try std.testing.expect(ie.else_body.?.kind == .block);
+    try std.testing.expect(!blockFreesSlot(ie.then_body, "cell_slice_free", xs_slot));
+    try std.testing.expect(blockFreesSlot(ie.else_body.?, "cell_slice_free", xs_slot));
+}

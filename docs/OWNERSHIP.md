@@ -1351,10 +1351,20 @@ keyed by the body slice). A body whose last statement already leaves gets no
 body-end release. The jump key exposed a latent bug: `lowerStmts` iterated by
 value, so `&s` named a stack copy that no borrow-checker record could match;
 it now iterates by address. `labelled_break` and `labelled_continue` measured
-LLVM/MLIR LIVE 3000/6000 before and 0 after. Still outside this path: owners
-declared before the loop, a `return` from inside a loop, branch-end releases,
-and any owner moved anywhere in the function (kept, so a leak, never a double
-free).
+LLVM/MLIR LIVE 3000/6000 before and 0 after. Branch-end whole-binding
+releases joined this path on 2026-09-30. An owned String or scalar list
+declared outside an `if` or `match` is released inside the branch that still
+holds it when borrowck recorded a move somewhere, liveness at that branch
+end, and no liveness after the merge. An `if` with no else gets a
+synthesized else that contains only those releases, and the `if` stays
+unit-typed. When the branch has a value, that value is bound to a
+nondroppable scratch before the releases. Still outside this path: owners
+declared before the loop, a `return` from inside a loop, field and record
+branch ends, an owner moved on every path, resource-valued returns,
+temporaries, and any owner moved anywhere at a loop exit or function-end
+fall-through (kept, so a leak, never a double free). A branch that always
+leaves by `return`, `break`, or `continue` is not given a release after
+that jump.
 
 **IR scalar list step (d), construction, landed 2026-09-24 on those terms.**
 HIR desugars `Byte`, `Int`, `Int32`, `Float`, and `Bool` literals to typed,
