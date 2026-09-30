@@ -15,6 +15,10 @@ pub const DropFacts = struct {
         was_moved: *const fn (*const anyopaque, u32) bool,
         live_at_exit: *const fn (*const anyopaque, ExitKind, usize, u32) bool,
         assign_releases_old_value: *const fn (*const anyopaque, [*]const u8) bool,
+        /// True when this `break` must jump past the loop's `after_loop_skip`
+        /// release. False for an ordinary break, and when the checker has no
+        /// record: a missing fact keeps the break on the release path.
+        skip_break: *const fn (*const anyopaque, usize) bool,
     };
 
     pub fn nextBindingId(self: DropFacts) u32 {
@@ -35,5 +39,9 @@ pub const DropFacts = struct {
 
     pub fn assignReleasesOldValue(self: DropFacts, name_ptr: [*]const u8) bool {
         return self.vtable.assign_releases_old_value(self.context, name_ptr);
+    }
+
+    pub fn skipBreak(self: DropFacts, break_key: usize) bool {
+        return self.vtable.skip_break(self.context, break_key);
     }
 };

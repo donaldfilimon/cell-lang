@@ -455,7 +455,7 @@ const Walker = struct {
                 self.cur = null;
             },
             .while_loop => |w| try self.walkWhile(w),
-            .brk => |depth| self.jump(depth),
+            .brk => |j| self.jump(j.depth),
             .cont => |depth| self.jump(depth),
         }
     }
@@ -492,6 +492,7 @@ const Walker = struct {
         // condition's false edge, matching `cfg.Builder.lowerWhile`
         // unconditionally setting `self.cur = exit_id` at the end.
         self.cur = exit_id;
+        try self.walkStmts(w.after);
     }
 
     fn walkExpr(self: *Walker, e: *const hir.Expr) LivenessError!void {
@@ -878,7 +879,7 @@ test "break and continue: liveness reaches the loop exit through both" {
 
     var bindings = [_]hir.Binding{dummyBinding(0)};
 
-    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
+    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .{ .brk = .{ .depth = 0 } } };
     var cont_stmt = hir.Stmt{ .span = test_span, .kind = .{ .cont = 0 } };
     var then_body = oneStmtBlock(&brk_stmt);
     var else_body = oneStmtBlock(&cont_stmt);
@@ -972,8 +973,8 @@ test "the zero-predecessor join shape does not destabilize the fixpoint" {
 
     var bindings = [_]hir.Binding{dummyBinding(0)};
 
-    var brk1 = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
-    var brk2 = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
+    var brk1 = hir.Stmt{ .span = test_span, .kind = .{ .brk = .{ .depth = 0 } } };
+    var brk2 = hir.Stmt{ .span = test_span, .kind = .{ .brk = .{ .depth = 0 } } };
     var then_body = oneStmtBlock(&brk1);
     var else_body = oneStmtBlock(&brk2);
     var if_cond = boolExpr(true);
@@ -1165,7 +1166,7 @@ test "a labelled break keeps the walker in lockstep and carries liveness to the 
 
     var bindings = [_]hir.Binding{dummyBinding(0)};
 
-    var inner_body = [_]hir.Stmt{.{ .span = test_span, .kind = .{ .brk = 1 } }};
+    var inner_body = [_]hir.Stmt{.{ .span = test_span, .kind = .{ .brk = .{ .depth = 1 } } }};
     const inner_cond = boolExpr(true);
     var outer_body = [_]hir.Stmt{
         .{ .span = test_span, .kind = .{ .while_loop = .{ .cond = inner_cond, .body = &inner_body } } },

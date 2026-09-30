@@ -165,7 +165,9 @@ const Emitter = struct {
     /// typechecker already rejects.
     loop_targets: std.ArrayList(LoopTarget) = .empty,
 
-    const LoopTarget = struct { brk: []const u8, cont: []const u8 };
+    /// `skip` is the block after `while.after`, present only when a break
+    /// targeting this loop must jump past that release.
+    const LoopTarget = struct { brk: []const u8, cont: []const u8, skip: ?[]const u8 = null };
 
     const StringGlobal = struct { name: []const u8, bytes: []const u8 };
 
@@ -669,6 +671,13 @@ const Emitter = struct {
                 const cond_b = try self.nextLabel("loop.cond");
                 const body_b = try self.nextLabel("loop.body");
                 const end_b = try self.nextLabel("loop.end");
+                // Allocated only when a break of THIS loop is a skip, and
+                // before the body, so an inner `break :outer` can name it.
+                // A loop with no skip break does not consume a label.
+                const skip_b: ?[]const u8 = if (hir.loopHasSkipBreak(w.body, 0))
+                    try self.nextLabel("loop.skip")
+                else
+                    null;
 
                 // The condition needs its own block, because a back edge has
                 // to branch somewhere and LLVM blocks are single-entry.
@@ -684,17 +693,24 @@ const Emitter = struct {
 
                 try self.out.print("{s}:\n", .{body_b});
                 self.terminated = false;
-                try self.loop_targets.append(self.arena, .{ .brk = end_b, .cont = cond_b });
+                try self.loop_targets.append(self.arena, .{ .brk = end_b, .cont = cond_b, .skip = skip_b });
                 for (w.body) |s2| try self.emitStmt(&s2);
                 _ = self.loop_targets.pop();
                 if (!self.terminated) try self.out.print("  br label %{s}\n", .{cond_b});
 
                 try self.out.print("{s}:\n", .{end_b});
                 self.terminated = false;
+                for (w.after) |s2| try self.emitStmt(&s2);
+                if (skip_b) |skip| {
+                    if (!self.terminated) try self.out.print("  br label %{s}\n", .{skip});
+                    try self.out.print("{s}:\n", .{skip});
+                    self.terminated = false;
+                }
             },
-            .brk => |depth| {
-                const target = self.loopTarget(depth) orelse return;
-                try self.out.print("  br label %{s}\n", .{target.brk});
+            .brk => |j| {
+                const target = self.loopTarget(j.depth) orelse return;
+                const label = if (j.skip) target.skip orelse target.brk else target.brk;
+                try self.out.print("  br label %{s}\n", .{label});
                 self.terminated = true;
             },
             .cont => |depth| {

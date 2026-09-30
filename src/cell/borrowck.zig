@@ -539,6 +539,12 @@ const drop_facts_vtable: dropfacts.DropFacts.VTable = .{
             return checker.assignReleasesOldValue(name_ptr);
         }
     }.read,
+    .skip_break = struct {
+        fn read(context: *const anyopaque, break_key: usize) bool {
+            const checker: *const Checker = @ptrCast(@alignCast(context));
+            return checker.skipBreakLoop(break_key) != null;
+        }
+    }.read,
 };
 
 /// Borrow-check `module`, rendering every diagnostic to `writer`. Deliberately

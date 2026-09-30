@@ -138,8 +138,9 @@ pub fn emitModule(
     try e.run();
 }
 
-/// A loop's two jump targets: `brk` is its end block, `cont` its condition.
-const LoopTarget = struct { brk: []const u8, cont: []const u8 };
+/// A loop's jump targets: `brk` is its end block, `cont` its condition,
+/// `skip` the block after the after-loop release when a break must pass it.
+const LoopTarget = struct { brk: []const u8, cont: []const u8, skip: ?[]const u8 = null };
 
 const Emitter = struct {
     arena: std.mem.Allocator,
@@ -600,6 +601,7 @@ const Emitter = struct {
                 const cond_b = self.nextBlock();
                 const body_b = self.nextBlock();
                 const end_b = self.nextBlock();
+                const skip_b: ?[]const u8 = if (hir.loopHasSkipBreak(w.body, 0)) self.nextBlock() else null;
 
                 try self.line("cf.br {s}", .{cond_b});
                 try self.block_label(cond_b);
@@ -608,16 +610,22 @@ const Emitter = struct {
                 try self.line("cf.cond_br {s}, {s}, {s}", .{ cond.text, body_b, end_b });
 
                 try self.block_label(body_b);
-                try self.loop_targets.append(self.arena, .{ .brk = end_b, .cont = cond_b });
+                try self.loop_targets.append(self.arena, .{ .brk = end_b, .cont = cond_b, .skip = skip_b });
                 for (w.body) |s2| try self.emitStmt(&s2);
                 _ = self.loop_targets.pop();
                 if (!self.returned) try self.line("cf.br {s}", .{cond_b});
 
                 try self.block_label(end_b);
+                for (w.after) |s2| try self.emitStmt(&s2);
+                if (skip_b) |skip| {
+                    if (!self.returned) try self.line("cf.br {s}", .{skip});
+                    try self.block_label(skip);
+                }
             },
-            .brk => |depth| {
-                const target = self.loopTarget(depth) orelse return;
-                try self.line("cf.br {s}", .{target.brk});
+            .brk => |j| {
+                const target = self.loopTarget(j.depth) orelse return;
+                const label = if (j.skip) target.skip orelse target.brk else target.brk;
+                try self.line("cf.br {s}", .{label});
                 self.returned = true;
             },
             .cont => |depth| {

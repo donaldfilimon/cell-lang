@@ -528,17 +528,88 @@ pub const Stmt = struct {
         expr: Expr,
         ret: ?Expr,
         /// `while cond { ... }`. A statement, not an expression: a loop
-        /// produces no value.
-        while_loop: struct { cond: Expr, body: []Stmt },
-        /// `break` and `continue`. The payload is how many loops the jump
-        /// leaves BEYOND the innermost enclosing one: 0 is a plain jump (or a
-        /// label naming the innermost loop), 1 targets the loop around it,
-        /// and so on. `lower` resolves the label once; every consumer indexes
-        /// its own loop stack at `len - 1 - n` and never sees a name.
-        brk: u32,
+        /// produces no value. `after` is the release that runs when the
+        /// condition fails or a `break` still holds the revived owner. A
+        /// skip-revival `break` jumps past it.
+        while_loop: struct { cond: Expr, body: []Stmt, after: []const Stmt = &.{} },
+        /// `break` and `continue`. `depth` is how many loops the jump leaves
+        /// BEYOND the innermost enclosing one: 0 is a plain jump (or a label
+        /// naming the innermost loop), 1 targets the loop around it, and so
+        /// on. `lower` resolves the label once; every consumer indexes its
+        /// own loop stack at `len - 1 - n` and never sees a name. `skip` is
+        /// set only on a `break` that borrowck recorded as `after_loop_skip`:
+        /// that jump must land after `while_loop.after`.
+        brk: struct { depth: u32, skip: bool = false },
         cont: u32,
     };
 };
+
+/// True when some `break` that targets the loop `depth` levels out of
+/// `stmts` must jump past that loop's after-loop release. Nested loops are
+/// scanned one level deeper. A loop with no such break keeps a single end
+/// block, so label numbers in a program that never skips stay put.
+pub fn loopHasSkipBreak(stmts: []const Stmt, depth: u32) bool {
+    for (stmts) |*s| {
+        if (stmtHasSkipBreak(s, depth)) return true;
+    }
+    return false;
+}
+
+fn stmtHasSkipBreak(s: *const Stmt, depth: u32) bool {
+    return switch (s.kind) {
+        .brk => |j| j.skip and j.depth == depth,
+        .cont => false,
+        .while_loop => |w| loopHasSkipBreak(w.body, depth + 1) or loopHasSkipBreak(w.after, depth),
+        .expr => |e| exprHasSkipBreak(&e, depth),
+        .let => |l| if (l.value) |v| exprHasSkipBreak(&v, depth) else false,
+        .assign => |a| exprHasSkipBreak(&a.value, depth),
+        .ret => |r| if (r) |v| exprHasSkipBreak(&v, depth) else false,
+    };
+}
+
+fn exprHasSkipBreak(e: *const Expr, depth: u32) bool {
+    return switch (e.kind) {
+        .block => |bl| blk: {
+            if (loopHasSkipBreak(bl.stmts, depth)) break :blk true;
+            if (bl.tail) |t| break :blk exprHasSkipBreak(t, depth);
+            break :blk false;
+        },
+        .if_expr => |i| blk: {
+            if (exprHasSkipBreak(i.cond, depth)) break :blk true;
+            if (exprHasSkipBreak(i.then_body, depth)) break :blk true;
+            if (i.else_body) |eb| break :blk exprHasSkipBreak(eb, depth);
+            break :blk false;
+        },
+        .match_expr => |m| blk: {
+            if (exprHasSkipBreak(m.scrutinee, depth)) break :blk true;
+            for (m.arms) |arm| {
+                if (arm.guard) |g| if (exprHasSkipBreak(g, depth)) break :blk true;
+                if (exprHasSkipBreak(arm.body, depth)) break :blk true;
+            }
+            break :blk false;
+        },
+        .call => |c| blk: {
+            if (exprHasSkipBreak(c.callee, depth)) break :blk true;
+            for (c.args) |*a| if (exprHasSkipBreak(a, depth)) break :blk true;
+            break :blk false;
+        },
+        .binary => |b| exprHasSkipBreak(b.left, depth) or exprHasSkipBreak(b.right, depth),
+        .unary => |u| exprHasSkipBreak(u.operand, depth),
+        .field => |f| exprHasSkipBreak(f.base, depth),
+        .struct_lit => |sl| blk: {
+            for (sl.fields) |*fv| if (exprHasSkipBreak(fv, depth)) break :blk true;
+            break :blk false;
+        },
+        .list_lit => |items| blk: {
+            for (items) |*it| if (exprHasSkipBreak(it, depth)) break :blk true;
+            break :blk false;
+        },
+        .result_ctor => |rc| exprHasSkipBreak(rc.operand, depth),
+        .option_ctor => |oc| if (oc.operand) |o| exprHasSkipBreak(o, depth) else false,
+        .string_view => |operand| exprHasSkipBreak(operand, depth),
+        .int_const, .float_const, .bool_const, .string_const, .ref, .unresolved_ref, .enum_const => false,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Lowering
@@ -762,8 +833,8 @@ const Lowerer = struct {
     /// optionally followed by a scalar return. A statement-position `if` is
     /// allowed through so an owner neither branch moved still gets this one
     /// function-end release. A `while`, a `match`, or any other statement
-    /// still leaves that release out. After-loop releases make `body` longer
-    /// than `source`; this slice cannot zip them and must keep `body`.
+    /// still leaves that release out. A body whose length no longer matches
+    /// the AST cannot be zipped with it and must be kept as lowered.
     /// Evaluate replacements and the return value before releasing confirmed
     /// live owners at the exit.
     fn appendSimpleFallthroughDrops(self: *Lowerer, fn_name: []const u8, source: []const ast.Stmt, body: []Stmt) LowerError![]Stmt {
@@ -981,10 +1052,10 @@ const Lowerer = struct {
     /// releases for the loop bodies it leaves (`appendLoopExitDrops`). A
     /// `return` inside a loop is preceded by the releases for every owner
     /// still live at that return (`appendReturnInLoopDrops`), after the
-    /// returned value has been bound. A `while` is followed by the releases
-    /// for owners declared before it that borrowck proved live on every
-    /// path out (`appendAfterLoopDrops`). Outside a loop a `return` is
-    /// unchanged here; the function-end slice owns that case.
+    /// returned value has been bound. A `while` carries the releases for
+    /// owners declared before it on `while_loop.after`
+    /// (`collectAfterLoopDrops`). Outside a loop a `return` is unchanged
+    /// here; the function-end slice owns that case.
     fn lowerStmts(self: *Lowerer, stmts: []const ast.Stmt) LowerError![]Stmt {
         var out: std.ArrayList(Stmt) = try .initCapacity(self.arena, stmts.len);
         // By address: the borrow checker keys a jump's exit record by the
@@ -992,14 +1063,16 @@ const Lowerer = struct {
         for (stmts, 0..) |*s, index| {
             const lowered = try self.lowerStmt(s);
             switch (lowered.kind) {
-                .brk, .cont => |n| try self.appendLoopExitDrops(&out, .jump, @intFromPtr(s), n),
+                .brk => |j| try self.appendLoopExitDrops(&out, .jump, @intFromPtr(s), j.depth),
+                .cont => |n| try self.appendLoopExitDrops(&out, .jump, @intFromPtr(s), n),
                 .ret => if (self.loop_scope_starts.items.len != 0) {
                     try self.appendReturnInLoopDrops(&out, lowered, @intFromPtr(s));
                     continue;
                 },
                 .while_loop => {
-                    try out.append(self.arena, lowered);
-                    try self.appendAfterLoopDrops(&out, @intFromPtr(s), stmts[index + 1 ..]);
+                    var loop_stmt = lowered;
+                    loop_stmt.kind.while_loop.after = try self.collectAfterLoopDrops(@intFromPtr(s), stmts[index + 1 ..]);
+                    try out.append(self.arena, loop_stmt);
                     continue;
                 },
                 else => {},
@@ -1094,17 +1167,20 @@ const Lowerer = struct {
     }
 
     /// Release an owner declared before this `while` once, after the loop.
-    /// Admission is C's `after_loop`: moved somewhere, and live on every path
-    /// out of this loop. The body's `break` reaches that statement. `continue`
-    /// and the back edge do not, so they are not drop sites for this owner.
-    /// An unmoved owner stays on the function-end path. `after_loop_skip`
-    /// stays a leak: a plain IR `break` would run the release on the dead
-    /// path. A later statement that still reads the name keeps the leak too,
-    /// because the function-end record for a loop-moved owner is poisoned.
-    /// String and scalar lists only. Records, fields, and `arc` stay out.
-    fn appendAfterLoopDrops(self: *Lowerer, out: *std.ArrayList(Stmt), key: usize, later: []const ast.Stmt) LowerError!void {
-        const facts = self.facts orelse return;
-        if (self.identity_failed) return;
+    /// Admission is C's `after_loop` or `after_loop_skip`: moved somewhere,
+    /// and live on the exits borrowck vouched for. The two records are
+    /// exclusive for one binding. The drops hang on `while_loop.after`. A
+    /// failing condition and a `break` that still holds the value run them.
+    /// A skip-revival `break` is marked `skip` and the backends jump past
+    /// them. `continue` and the back edge are not drop sites. An unmoved
+    /// owner stays on the function-end path. A later statement that still
+    /// reads the name keeps the leak, because the function-end record for a
+    /// loop-moved owner is poisoned. String and scalar lists only. Records,
+    /// fields, and `arc` stay out.
+    fn collectAfterLoopDrops(self: *Lowerer, key: usize, later: []const ast.Stmt) LowerError![]const Stmt {
+        const facts = self.facts orelse return &.{};
+        if (self.identity_failed) return &.{};
+        var out: std.ArrayList(Stmt) = .empty;
         var i = self.scope.items.len;
         while (i > 0) {
             i -= 1;
@@ -1119,13 +1195,17 @@ const Lowerer = struct {
                 else => continue,
             };
             const id = binding.bc_id orelse continue;
-            if (!facts.wasMoved(id) or !facts.liveAtExit(.after_loop, key, id)) continue;
+            const on_after = facts.liveAtExit(.after_loop, key, id);
+            const on_skip = facts.liveAtExit(.after_loop_skip, key, id);
+            if (on_after and on_skip) continue;
+            if (!facts.wasMoved(id) or !(on_after or on_skip)) continue;
             if (astStmtsUse(later, binding.name)) continue;
             const place: Expr = .{ .ty = binding.ty, .span = .none, .own = .owned, .kind = .{ .ref = binding.slot } };
             const call = try self.runtimeCall(release, .none, &.{place});
             try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
             self.drop_inserted = true;
         }
+        return out.items;
     }
 
     /// Whether a later statement reads `name`. A false yes only keeps a leak.
@@ -1395,7 +1475,14 @@ const Lowerer = struct {
                 self.popScope();
                 return .{ .span = stmt.span, .kind = .{ .while_loop = .{ .cond = cond, .body = body } } };
             },
-            .break_stmt => |j| return .{ .span = stmt.span, .kind = .{ .brk = try self.jumpDepth(stmt.span, j.label) } },
+            .break_stmt => |j| {
+                const depth = try self.jumpDepth(stmt.span, j.label);
+                const skip = if (self.facts) |facts|
+                    !self.identity_failed and facts.skipBreak(@intFromPtr(stmt))
+                else
+                    false;
+                return .{ .span = stmt.span, .kind = .{ .brk = .{ .depth = depth, .skip = skip } } };
+            },
             .continue_stmt => |j| return .{ .span = stmt.span, .kind = .{ .cont = try self.jumpDepth(stmt.span, j.label) } },
             .return_stmt => |*maybe| {
                 if (maybe.*) |*e| {
@@ -3044,9 +3131,9 @@ test "a labelled jump lowers to how many loops it leaves beyond the innermost" {
     const outer = l.module.findFn("f").?.body.?[0].kind.while_loop;
     const mid = outer.body[0].kind.while_loop;
     const inner = mid.body[0].kind.while_loop;
-    try std.testing.expectEqual(@as(u32, 2), inner.body[0].kind.brk);
+    try std.testing.expectEqual(@as(u32, 2), inner.body[0].kind.brk.depth);
     try std.testing.expectEqual(@as(u32, 1), inner.body[1].kind.cont);
-    try std.testing.expectEqual(@as(u32, 0), inner.body[2].kind.brk);
+    try std.testing.expectEqual(@as(u32, 0), inner.body[2].kind.brk.depth);
     try std.testing.expectEqual(@as(u32, 0), inner.body[3].kind.cont);
 }
 
@@ -3061,7 +3148,7 @@ test "a label naming the innermost loop lowers exactly like a plain jump" {
     defer l.deinit();
     try std.testing.expect(!l.diagnostics.hasErrors());
     const w = l.module.findFn("f").?.body.?[0].kind.while_loop;
-    try std.testing.expectEqual(@as(u32, 0), w.body[0].kind.brk);
+    try std.testing.expectEqual(@as(u32, 0), w.body[0].kind.brk.depth);
 }
 
 test "an unresolvable label is cannot lower, never a guess at the innermost loop" {

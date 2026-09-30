@@ -1,0 +1,36 @@
+// Skip-revival break: the break runs while the outer String is still moved.
+// The revival is on the other path, so the release after the loop is only
+// sound if that break jumps past it. once(0) always takes the dead break.
+// once(5) leaves through the condition holding the revived String.
+// 1000 of each. LLVM before this slice measured LIVE=1000 (the revived
+// exits). A plain break that also ran the release is an AddressSanitizer
+// double free on once(0).
+// EXPECT-OUTPUT: 1000
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn once(copy n: Int) {
+    var owned s: String = "aaaaaaaa"
+    var i = 0
+    while i < 2 {
+        i = i + 1
+        take(s)
+        if i > n {
+            break
+        }
+        s = "bbbbbbbb"
+    }
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        once(0)
+        once(5)
+        i = i + 1
+    }
+    print_int(i)
+}

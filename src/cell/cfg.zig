@@ -287,7 +287,7 @@ const Builder = struct {
                 }
             },
             .while_loop => |w| try self.lowerWhile(w),
-            .brk => |depth| try self.lowerJump(.brk, depth),
+            .brk => |j| try self.lowerJump(.brk, j.depth),
             .cont => |depth| try self.lowerJump(.cont, depth),
         }
     }
@@ -353,6 +353,7 @@ const Builder = struct {
         }
 
         self.cur = exit_id;
+        try self.lowerStmts(w.after);
     }
 
     // -- expressions ------------------------------------------------------
@@ -781,7 +782,7 @@ test "break targets the loop exit, continue targets the condition" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
+    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .{ .brk = .{ .depth = 0 } } };
     var cont_stmt = hir.Stmt{ .span = test_span, .kind = .{ .cont = 0 } };
     var then_body = oneStmtBlock(&brk_stmt);
     var else_body = oneStmtBlock(&cont_stmt);
@@ -829,8 +830,8 @@ test "a fully-diverging if/else inside a loop leaves the condition block's preds
     defer arena.deinit();
     const a = arena.allocator();
 
-    var brk1 = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
-    var brk2 = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
+    var brk1 = hir.Stmt{ .span = test_span, .kind = .{ .brk = .{ .depth = 0 } } };
+    var brk2 = hir.Stmt{ .span = test_span, .kind = .{ .brk = .{ .depth = 0 } } };
     var then_body = oneStmtBlock(&brk1);
     var else_body = oneStmtBlock(&brk2);
     var if_cond = boolExpr(true);
@@ -1052,7 +1053,7 @@ test "nested control flow: an if inside a while inside a match arm" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .{ .brk = 0 } };
+    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .{ .brk = .{ .depth = 0 } } };
     var if_then = oneStmtBlock(&brk_stmt);
     var if_cond = boolExpr(true);
     const if_e = unitExpr(.{ .if_expr = .{
@@ -1104,7 +1105,7 @@ test "a labelled break targets the outer loop's exit, a labelled continue its co
     defer arena.deinit();
     const a = arena.allocator();
 
-    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .{ .brk = 1 } };
+    var brk_stmt = hir.Stmt{ .span = test_span, .kind = .{ .brk = .{ .depth = 1 } } };
     var cont_stmt = hir.Stmt{ .span = test_span, .kind = .{ .cont = 1 } };
     var then_body = oneStmtBlock(&brk_stmt);
     var else_body = oneStmtBlock(&cont_stmt);

@@ -1159,10 +1159,10 @@ test "checked HIR releases a revived outer String once after the loop" {
         \\}
     );
     const v_slot = f.body.?[0].kind.let.slot;
-    const loop = f.body.?[2].kind.while_loop.body;
-    for (loop) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
-    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
-    try std.testing.expect(stmtFreesSlot(f.body.?[f.body.?.len - 1], "cell_string_free", v_slot));
+    const w = f.body.?[2].kind.while_loop;
+    for (w.body) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(w.after, "cell_string_free", v_slot));
 }
 
 test "checked HIR releases a revived outer String after the loop, not before break" {
@@ -1184,10 +1184,12 @@ test "checked HIR releases a revived outer String after the loop, not before bre
         \\}
     );
     const v_slot = f.body.?[0].kind.let.slot;
-    const loop = f.body.?[2].kind.while_loop.body;
-    for (loop) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
-    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
-    try std.testing.expect(stmtFreesSlot(f.body.?[f.body.?.len - 1], "cell_string_free", v_slot));
+    const w = f.body.?[2].kind.while_loop;
+    for (w.body) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
+    const held = w.body[w.body.len - 1].kind.expr.kind.if_expr.then_body.kind.block.stmts[0].kind.brk;
+    try std.testing.expect(!held.skip);
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(w.after, "cell_string_free", v_slot));
 }
 
 test "checked HIR does not release an unmoved outer String after the loop" {
@@ -1203,7 +1205,9 @@ test "checked HIR does not release an unmoved outer String after the loop" {
         \\}
     );
     const v_slot = f.body.?[0].kind.let.slot;
+    const w = f.body.?[2].kind.while_loop;
     try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
+    try std.testing.expectEqual(@as(usize, 0), w.after.len);
 }
 
 test "checked HIR does not release a revived outer String at continue" {
@@ -1223,14 +1227,14 @@ test "checked HIR does not release a revived outer String at continue" {
         \\}
     );
     const v_slot = f.body.?[0].kind.let.slot;
-    const loop = f.body.?[2].kind.while_loop.body;
-    for (loop) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
-    try std.testing.expect(loop[loop.len - 1].kind == .cont);
-    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
-    try std.testing.expect(stmtFreesSlot(f.body.?[f.body.?.len - 1], "cell_string_free", v_slot));
+    const w = f.body.?[2].kind.while_loop;
+    for (w.body) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
+    try std.testing.expect(w.body[w.body.len - 1].kind == .cont);
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(w.after, "cell_string_free", v_slot));
 }
 
-test "checked HIR does not release an outer String on a skip-revival break" {
+test "checked HIR releases an outer String after the loop and skips the dead break" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const f = try checkedFn(arena.allocator(),
@@ -1249,9 +1253,201 @@ test "checked HIR does not release an outer String on a skip-revival break" {
         \\}
     );
     const v_slot = f.body.?[0].kind.let.slot;
+    const w = f.body.?[2].kind.while_loop;
+    for (w.body) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
+    const dead = w.body[2].kind.expr.kind.if_expr.then_body.kind.block.stmts[0].kind.brk;
+    try std.testing.expect(dead.skip);
+    try std.testing.expectEqual(@as(u32, 0), dead.depth);
     try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
-    const loop = f.body.?[2].kind.while_loop.body;
-    for (loop) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(w.after, "cell_string_free", v_slot));
+}
+
+test "llvm branches a skip-revival break past the after-loop release" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source =
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        if i > 5 {
+        \\            break
+        \\        }
+        \\        take(v)
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\}
+    ;
+    var module = try compile(a, source, "t.cell");
+    var buf: [64 * 1024]u8 = undefined;
+    var w = Io.Writer.fixed(&buf);
+    var diag_buf: [4096]u8 = undefined;
+    var dw = Io.Writer.fixed(&diag_buf);
+    try emitFor(a, &module, source, &w, .llvm, &dw);
+    const text = w.buffered();
+    // The body's `v = "b"` also frees the previous String, so the after-loop
+    // release is the call that follows the end block.
+    const end_at = std.mem.indexOf(u8, text, "loop.end.").?;
+    const free_at = std.mem.indexOfPos(u8, text, end_at, "call void @cell_string_free") orelse {
+        std.debug.print("{s}\n", .{text});
+        return error.TestUnexpectedResult;
+    };
+    const skip_at = std.mem.indexOfPos(u8, text, free_at, "loop.skip.") orelse {
+        std.debug.print("{s}\n", .{text});
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(end_at < free_at);
+    try std.testing.expect(free_at < skip_at);
+    try std.testing.expect(std.mem.indexOf(u8, text, "br label %loop.end.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "br label %loop.skip.") != null);
+}
+
+test "checked HIR keeps one after-loop release when one break still holds the String" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        if i > 5 {
+        \\            break
+        \\        }
+        \\        take(v)
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\}
+    );
+    const v_slot = f.body.?[0].kind.let.slot;
+    const w = f.body.?[2].kind.while_loop;
+    const live = w.body[1].kind.expr.kind.if_expr.then_body.kind.block.stmts[0].kind.brk;
+    const dead = w.body[3].kind.expr.kind.if_expr.then_body.kind.block.stmts[0].kind.brk;
+    try std.testing.expect(!live.skip);
+    try std.testing.expect(dead.skip);
+    for (w.body) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(w.after, "cell_string_free", v_slot));
+}
+
+test "checked HIR does not release an outer String when the loop's breaks disagree" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nested = try checkedFn(arena.allocator(),
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var j = 0
+        \\    while j < 2 {
+        \\        j = j + 1
+        \\        var i = 0
+        \\        while i < 3 {
+        \\            i = i + 1
+        \\            take(v)
+        \\            if i > n {
+        \\                break
+        \\            }
+        \\            v = "b"
+        \\        }
+        \\        v = "c"
+        \\    }
+        \\}
+    );
+    const nested_slot = nested.body.?[0].kind.let.slot;
+    try expectNoSkipRelease(nested.body.?, "cell_string_free", nested_slot);
+
+    const mixed = try checkedFn(arena.allocator(),
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var owned w: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\        v = "b"
+        \\        take(w)
+        \\        if i > 1 {
+        \\            break
+        \\        }
+        \\        w = "b"
+        \\    }
+        \\}
+    );
+    try expectNoSkipRelease(mixed.body.?, "cell_string_free", mixed.body.?[0].kind.let.slot);
+    try expectNoSkipRelease(mixed.body.?, "cell_string_free", mixed.body.?[1].kind.let.slot);
+
+    const plain = try checkedFn(arena.allocator(),
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var owned w: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(w)
+        \\        w = "b"
+        \\        take(v)
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\}
+    );
+    // `v` is dead at the break, but `w` is live on every exit, so borrowck
+    // records `after_loop` for `w` and refuses the skip. `v` stays a leak.
+    try expectNoSkipRelease(plain.body.?, "cell_string_free", plain.body.?[0].kind.let.slot);
+    const plain_w = plain.body.?[3].kind.while_loop;
+    try std.testing.expect(!plain_w.body[4].kind.expr.kind.if_expr.then_body.kind.block.stmts[0].kind.brk.skip);
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(plain_w.after, "cell_string_free", plain.body.?[1].kind.let.slot));
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(plain_w.after, "cell_string_free", plain.body.?[0].kind.let.slot));
+}
+
+fn expectNoSkipRelease(stmts: []const hir.Stmt, symbol: []const u8, slot: u32) anyerror!void {
+    for (stmts) |stmt| {
+        try std.testing.expect(!stmtFreesSlot(stmt, symbol, slot));
+        switch (stmt.kind) {
+            .brk => |j| try std.testing.expect(!j.skip),
+            .while_loop => |w| {
+                try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(w.after, symbol, slot));
+                try expectNoSkipRelease(w.body, symbol, slot);
+                try expectNoSkipRelease(w.after, symbol, slot);
+            },
+            .expr => |e| try expectNoSkipExpr(&e),
+            .let => |l| if (l.value) |v| try expectNoSkipExpr(&v),
+            .assign => |a| try expectNoSkipExpr(&a.value),
+            .ret => |r| if (r) |v| try expectNoSkipExpr(&v),
+            .cont => {},
+        }
+    }
+}
+
+fn expectNoSkipExpr(e: *const hir.Expr) anyerror!void {
+    switch (e.kind) {
+        .block => |bl| {
+            try expectNoSkipRelease(bl.stmts, "cell_string_free", 0);
+            if (bl.tail) |t| try expectNoSkipExpr(t);
+        },
+        .if_expr => |i| {
+            try expectNoSkipExpr(i.cond);
+            try expectNoSkipExpr(i.then_body);
+            if (i.else_body) |eb| try expectNoSkipExpr(eb);
+        },
+        else => {},
+    }
 }
 
 test "checked HIR does not release a revived outer String a later statement still uses" {
@@ -1290,10 +1486,10 @@ test "checked HIR releases a revived outer scalar list once after the loop" {
         \\}
     );
     const slot = f.body.?[0].kind.let.slot;
-    const loop = f.body.?[2].kind.while_loop.body;
-    for (loop) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_slice_free", slot));
-    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(f.body.?, "cell_slice_free", slot));
-    try std.testing.expect(stmtFreesSlot(f.body.?[f.body.?.len - 1], "cell_slice_free", slot));
+    const w = f.body.?[2].kind.while_loop;
+    for (w.body) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_slice_free", slot));
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(f.body.?, "cell_slice_free", slot));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(w.after, "cell_slice_free", slot));
 }
 
 fn checkedFn(a: std.mem.Allocator, source: []const u8) !hir.Fn {
