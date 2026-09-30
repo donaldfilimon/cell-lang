@@ -968,8 +968,9 @@ const Lowerer = struct {
         // Direct top-level record lets. The whole binding is not a String,
         // so the loop above skipped it. Release each remaining owned String
         // or scalar-list field, including a field of a nested record, once.
-        // There is no whole-record IR drop. `arc`, a wholly moved record,
-        // and a record that is not a direct `let` stay leaks.
+        // There is no whole-record IR drop. A record declared in a nested
+        // block is released at that block's end, not here. `arc` and a
+        // wholly moved record stay leaks.
         var j = self.bindings.items.len;
         while (j > 0) {
             j -= 1;
@@ -1436,6 +1437,58 @@ const Lowerer = struct {
         }
     }
 
+    /// Slots of direct `let`s in `stmts`. Copied so a later append can reallocate
+    /// the statement slice without losing the list.
+    fn letSlots(self: *Lowerer, stmts: []const Stmt) LowerError![]u32 {
+        var n: usize = 0;
+        for (stmts) |stmt| {
+            if (stmt.kind == .let and stmt.kind.let.value != null) n += 1;
+        }
+        const slots = try self.arena.alloc(u32, n);
+        var i: usize = 0;
+        for (stmts) |stmt| {
+            if (stmt.kind == .let and stmt.kind.let.value != null) {
+                slots[i] = stmt.kind.let.slot;
+                i += 1;
+            }
+        }
+        return slots;
+    }
+
+    /// Record lets that belong to this nested block, not to the function.
+    /// The same field walk as the function-end release, keyed by this block's
+    /// own exit. A wholly moved record is not walked. The function-end pass
+    /// does not see these lets, so the two do not both free one field.
+    fn appendNestedRecordDrops(
+        self: *Lowerer,
+        out: *std.ArrayList(Stmt),
+        slots: []const u32,
+        exit_kind: dropfacts.ExitKind,
+        key: usize,
+    ) LowerError!void {
+        const facts = self.facts orelse return;
+        if (self.identity_failed or slots.len == 0) return;
+        var j = self.bindings.items.len;
+        while (j > 0) {
+            j -= 1;
+            const binding = self.bindings.items[j];
+            if (!binding.droppable or binding.ownership != .owned or binding.is_param) continue;
+            if (!binding.has_initializer) continue;
+            const struct_name = switch (binding.ty) {
+                .struct_type => |name| name,
+                else => continue,
+            };
+            var here = false;
+            for (slots) |slot| {
+                if (slot == binding.slot) here = true;
+            }
+            if (!here) continue;
+            const id = binding.bc_id orelse continue;
+            if (facts.wasWhollyMoved(id)) continue;
+            try self.appendScopeEndFieldDrops(out, binding, id, struct_name, exit_kind, key);
+        }
+    }
+
     /// Owned String and scalar-list fields still held at a function exit,
     /// including fields of a nested record. Reverse declaration order. A
     /// field the branch-end drop already released is dead at this exit and
@@ -1669,8 +1722,11 @@ const Lowerer = struct {
                 if (w.body.len > 0) switch (body[body.len - 1].kind) {
                     .brk, .cont, .ret => {},
                     else => {
+                        const slots = try self.letSlots(body);
                         var out: std.ArrayList(Stmt) = .fromOwnedSlice(body);
-                        try self.appendLoopExitDrops(&out, .block_end, @intFromPtr(w.body.ptr), 0);
+                        const key = @intFromPtr(w.body.ptr);
+                        try self.appendLoopExitDrops(&out, .block_end, key, 0);
+                        try self.appendNestedRecordDrops(&out, slots, .block_end, key);
                         body = out.items;
                     },
                 };
@@ -1944,8 +2000,9 @@ const Lowerer = struct {
                 self.pushScope();
                 defer self.popScope();
                 const saved_exit = self.enclosing_exit;
+                const exit_key: usize = if (stmts.len > 0) @intFromPtr(stmts.ptr) else 0;
                 if (stmts.len > 0) {
-                    self.enclosing_exit = .{ .kind = .block_end, .key = @intFromPtr(stmts.ptr) };
+                    self.enclosing_exit = .{ .kind = .block_end, .key = exit_key };
                 }
                 defer self.enclosing_exit = saved_exit;
                 // A trailing expression statement is the block's value.
@@ -1955,13 +2012,35 @@ const Lowerer = struct {
                     body_len -= 1;
                 }
                 const lowered = try self.lowerStmts(stmts[0..body_len]);
-                if (body_len != stmts.len) {
-                    tail = try self.box(try self.lowerExpr(&stmts[stmts.len - 1].kind.expr));
+                const slots = try self.letSlots(lowered);
+                if (slots.len == 0) {
+                    if (body_len != stmts.len) {
+                        tail = try self.box(try self.lowerExpr(&stmts[stmts.len - 1].kind.expr));
+                    }
+                    return .{
+                        .ty = if (tail) |t| t.ty else types.t_unit,
+                        .span = e.span,
+                        .kind = .{ .block = .{ .stmts = lowered, .tail = tail } },
+                        .own = if (tail) |t| t.own else null,
+                    };
                 }
+                var out: std.ArrayList(Stmt) = .fromOwnedSlice(lowered);
+                if (body_len != stmts.len) {
+                    const value = try self.lowerExpr(&stmts[stmts.len - 1].kind.expr);
+                    const scratch = try self.branchScratch(&value);
+                    try out.append(self.arena, .{ .span = value.span, .kind = .{ .let = .{ .slot = scratch, .value = value } } });
+                    tail = try self.box(.{
+                        .ty = value.ty,
+                        .span = value.span,
+                        .own = value.own,
+                        .kind = .{ .ref = scratch },
+                    });
+                }
+                try self.appendNestedRecordDrops(&out, slots, .block_end, exit_key);
                 return .{
                     .ty = if (tail) |t| t.ty else types.t_unit,
                     .span = e.span,
-                    .kind = .{ .block = .{ .stmts = lowered, .tail = tail } },
+                    .kind = .{ .block = .{ .stmts = out.items, .tail = tail } },
                     .own = if (tail) |t| t.own else null,
                 };
             },

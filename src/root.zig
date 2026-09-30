@@ -1843,7 +1843,7 @@ test "checked HIR does not field-release a wholly moved record" {
     try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", q_slot, 1));
 }
 
-test "checked HIR does not scope-release a record declared inside a branch" {
+test "checked HIR scope-releases a record declared inside a branch" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const f = try checkedFn(arena.allocator(),
@@ -1862,6 +1862,67 @@ test "checked HIR does not scope-release a record declared inside a branch" {
         if (std.mem.eql(u8, b.name, "p")) p_slot = b.slot;
     }
     const slot = p_slot orelse return error.TestUnexpectedResult;
+    const ie = f.body.?[0].kind.expr.kind.if_expr;
+    try std.testing.expect(blockFreesField(ie.then_body, "cell_string_free", slot, 0));
+    try std.testing.expect(blockFreesField(ie.then_body, "cell_string_free", slot, 1));
+    // The function-end walk does not free this record a second time.
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", slot, 0));
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", slot, 1));
+}
+
+test "checked HIR scope-releases only the unmoved field of a record inside a branch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy c: Int) {
+        \\    if c > 0 {
+        \\        let owned p: Pair = Pair { a: "x", b: "y" }
+        \\        take(p.a)
+        \\    }
+        \\}
+    );
+    var p_slot: ?u32 = null;
+    for (f.bindings) |b| {
+        if (std.mem.eql(u8, b.name, "p")) p_slot = b.slot;
+    }
+    const slot = p_slot orelse return error.TestUnexpectedResult;
+    const ie = f.body.?[0].kind.expr.kind.if_expr;
+    try std.testing.expect(!blockFreesField(ie.then_body, "cell_string_free", slot, 0));
+    try std.testing.expect(blockFreesField(ie.then_body, "cell_string_free", slot, 1));
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", slot, 0));
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", slot, 1));
+}
+
+test "checked HIR scope-releases a record declared inside a while" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn f() {
+        \\    var i = 0
+        \\    while i < 2 {
+        \\        let owned p: Pair = Pair { a: "x", b: "y" }
+        \\        i = i + 1
+        \\    }
+        \\}
+    );
+    var p_slot: ?u32 = null;
+    for (f.bindings) |b| {
+        if (std.mem.eql(u8, b.name, "p")) p_slot = b.slot;
+    }
+    const slot = p_slot orelse return error.TestUnexpectedResult;
+    const loop = f.body.?[1];
+    try std.testing.expect(loop.kind == .while_loop);
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(loop.kind.while_loop.body, "cell_string_free", slot, 0));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(loop.kind.while_loop.body, "cell_string_free", slot, 1));
     try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", slot, 0));
     try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", slot, 1));
 }

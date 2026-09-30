@@ -553,6 +553,12 @@ LEAK_IR_BRANCH_FIELD_MLIR=0
 LEAK_IR_NESTED_FIELD_C=0
 LEAK_IR_NESTED_FIELD_LLVM=0
 LEAK_IR_NESTED_FIELD_MLIR=0
+# A record declared inside an if block. LLVM and MLIR on the post-nested-field
+# compiler measured ALLOC=2000 FREE=0 LIVE=2000. The block-end walk frees both
+# fields once. C was already 0.
+LEAK_IR_BLOCK_RECORD_C=0
+LEAK_IR_BLOCK_RECORD_LLVM=0
+LEAK_IR_BLOCK_RECORD_MLIR=0
 # Owning String in Ok (2026-09-17): every shape results_string.cell pins,
 # 1000 times. Measured 0 (ALLOC=8798 FREE=8798); with the temporary
 # scrutinee release removed it measured 2000, so the fixture reaches it.
@@ -1184,6 +1190,7 @@ else
     run_c_leaks ir_unmoved_while "" "$LEAK_IR_UNMOVED_WHILE_C" "unmoved owner in a function whose body contains a while, 2026-09-30"
     run_c_leaks ir_branch_field "" "$LEAK_IR_BRANCH_FIELD_C" "kept String field at the branch end; sibling freed at scope end, 2026-09-30"
     run_c_leaks ir_nested_field "" "$LEAK_IR_NESTED_FIELD_C" "nested record sibling freed at scope end, 2026-09-30"
+    run_c_leaks ir_block_record "" "$LEAK_IR_BLOCK_RECORD_C" "record declared inside a block freed at that block's end, 2026-09-30"
     run_c_leaks owned_string_result "" "$LEAK_OWNED_STRING_RESULT" "owning String Ok, 2026-09-17"
     run_c_leaks owned_string_err "" "$LEAK_OWNED_STRING_ERR" "owning String Err and both sides, 2026-09-17"
     run_c_leaks owned_string_optional "" "$LEAK_OWNED_STRING_OPTIONAL" "owning String?, 2026-09-17"
@@ -1293,6 +1300,8 @@ else
     run_ir_leaks ir_branch_field mlir "$LEAK_IR_BRANCH_FIELD_MLIR" "HIR releases the kept field at the branch end and the sibling at scope end, 2026-09-30"
     run_ir_leaks ir_nested_field llvm "$LEAK_IR_NESTED_FIELD_LLVM" "HIR releases a nested record's remaining leaves at scope end, 2026-09-30"
     run_ir_leaks ir_nested_field mlir "$LEAK_IR_NESTED_FIELD_MLIR" "HIR releases a nested record's remaining leaves at scope end, 2026-09-30"
+    run_ir_leaks ir_block_record llvm "$LEAK_IR_BLOCK_RECORD_LLVM" "HIR releases a block-local record's fields at the block end, 2026-09-30"
+    run_ir_leaks ir_block_record mlir "$LEAK_IR_BLOCK_RECORD_MLIR" "HIR releases a block-local record's fields at the block end, 2026-09-30"
     run_ir_leaks labelled_break llvm "$LEAK_LABELLED_BREAK_LLVM" "FLOW-03 break :outer; HIR loop-exit releases, 2026-09-29"
     run_ir_leaks labelled_break mlir "$LEAK_LABELLED_BREAK_MLIR" "FLOW-03 break :outer; HIR loop-exit releases, 2026-09-29"
     run_c_leaks labelled_continue "" "$LEAK_LABELLED_CONTINUE_C" "FLOW-03 continue :outer releases the outer and inner bodies' locals, 2026-09-22"
@@ -1617,7 +1626,7 @@ else
     # the runtime allocator and release called by that IR are. This catches
     # a duplicate/wrong release but is not whole-program IR instrumentation.
     if cc -fsanitize=address -g -c runtime/cell_rt.c -o "$TMP/san_drop_rt.o" 2>/dev/null; then
-      for drop_src in examples/leaks/ir_fallthrough_string.cell examples/leaks/ir_reassign_string.cell examples/leaks/ir_fallthrough_list.cell examples/leaks/ir_list_literal.cell examples/leaks/ir_string_conversion.cell examples/leaks/ir_owned_string.cell examples/leaks/ir_return_in_loop.cell examples/leaks/ir_after_loop.cell examples/leaks/ir_skip_revival.cell examples/leaks/ir_unmoved_while.cell examples/leaks/ir_branch_field.cell examples/leaks/ir_nested_field.cell; do
+      for drop_src in examples/leaks/ir_fallthrough_string.cell examples/leaks/ir_reassign_string.cell examples/leaks/ir_fallthrough_list.cell examples/leaks/ir_list_literal.cell examples/leaks/ir_string_conversion.cell examples/leaks/ir_owned_string.cell examples/leaks/ir_return_in_loop.cell examples/leaks/ir_after_loop.cell examples/leaks/ir_skip_revival.cell examples/leaks/ir_unmoved_while.cell examples/leaks/ir_branch_field.cell examples/leaks/ir_nested_field.cell examples/leaks/ir_block_record.cell; do
         drop_name=$(basename "$drop_src" .cell)
         drop_expected=1000
         case "$drop_name" in
