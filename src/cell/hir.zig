@@ -136,6 +136,9 @@ pub const Binding = struct {
     /// Borrow-checker identity, positively matched by name and order. Null
     /// for compiler scratch, bodyless parameters, or any numbering mismatch.
     bc_id: ?u32 = null,
+    /// A `let` that bound a value when declared. A loop-exit drop releases
+    /// only these: a declaration without an initializer may hold nothing.
+    has_initializer: bool = false,
 };
 
 pub const Fn = struct {
@@ -564,6 +567,10 @@ const Lowerer = struct {
     /// condition is lowered, so a jump in the condition belongs to the
     /// enclosing loop, as typecheck decides it.
     loop_labels: std.ArrayList(?[]const u8) = .empty,
+    /// Parallel to `loop_labels`: the `scope` length when each enclosing
+    /// loop's body opened. A jump leaving that loop releases the owners
+    /// declared from this index on and still in scope at the jump.
+    loop_scope_starts: std.ArrayList(usize) = .empty,
 
     /// The declared return type of the function being lowered: the expected
     /// type of a `return Ok(..)`/`return Err(..)`, which has no type of its own.
@@ -654,6 +661,7 @@ const Lowerer = struct {
         self.bindings.clearRetainingCapacity();
         self.scope.clearRetainingCapacity();
         self.loop_labels.clearRetainingCapacity();
+        self.loop_scope_starts.clearRetainingCapacity();
         self.depth = 1;
 
         for (f.params) |p| {
@@ -922,12 +930,53 @@ const Lowerer = struct {
         return std.fmt.allocPrint(self.arena, "cell_{s}", .{f.name});
     }
 
+    /// Lower a statement list. A `break` or `continue` is preceded by the
+    /// releases for the loop bodies it leaves (`appendLoopExitDrops`), so
+    /// the result can be longer than `stmts` inside a loop, never outside.
     fn lowerStmts(self: *Lowerer, stmts: []const ast.Stmt) LowerError![]Stmt {
-        var out = try self.arena.alloc(Stmt, stmts.len);
-        for (stmts, 0..) |s, i| {
-            out[i] = try self.lowerStmt(&s);
+        var out: std.ArrayList(Stmt) = try .initCapacity(self.arena, stmts.len);
+        // By address: the borrow checker keys a jump's exit record by the
+        // AST statement, so `&s` of a loop-variable copy would never match.
+        for (stmts) |*s| {
+            const lowered = try self.lowerStmt(s);
+            switch (lowered.kind) {
+                .brk, .cont => |n| try self.appendLoopExitDrops(&out, .jump, @intFromPtr(s), n),
+                else => {},
+            }
+            try out.append(self.arena, lowered);
         }
-        return out;
+        return out.items;
+    }
+
+    /// Release the owners a loop exit leaves: every confirmed-live, unmoved,
+    /// initialized owned String or scalar list declared since the body of the
+    /// loop `n` levels out opened, innermost first. `kind`/`key` name the
+    /// borrow checker's record for this exit; a missing record keeps the leak.
+    fn appendLoopExitDrops(self: *Lowerer, out: *std.ArrayList(Stmt), kind: dropfacts.ExitKind, key: usize, n: u32) LowerError!void {
+        const facts = self.facts orelse return;
+        if (self.identity_failed) return;
+        const loops = self.loop_scope_starts.items.len;
+        if (n >= loops) return;
+        const start = self.loop_scope_starts.items[loops - 1 - n];
+        var i = self.scope.items.len;
+        while (i > start) {
+            i -= 1;
+            const slot = self.scope.items[i].slot;
+            if (slot >= self.bindings.items.len) continue;
+            const binding = self.bindings.items[slot];
+            if (binding.is_param or !binding.droppable or !binding.has_initializer or binding.ownership != .owned) continue;
+            const release: Runtime = switch (binding.ty) {
+                .string => .string_free,
+                .list => |elem| if (scalarListElement(elem.*)) .slice_free else continue,
+                else => continue,
+            };
+            const id = binding.bc_id orelse continue;
+            if (facts.wasMoved(id) or !facts.liveAtExit(kind, key, id)) continue;
+            const place: Expr = .{ .ty = binding.ty, .span = .none, .own = .owned, .kind = .{ .ref = binding.slot } };
+            const call = try self.runtimeCall(release, .none, &.{place});
+            try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
+            self.drop_inserted = true;
+        }
     }
 
     fn lowerStmt(self: *Lowerer, stmt: *const ast.Stmt) LowerError!Stmt {
@@ -968,6 +1017,7 @@ const Lowerer = struct {
                     .is_param = false,
                     .slot = slot,
                     .bc_id = self.claimId(l.name),
+                    .has_initializer = value != null,
                 });
                 try self.scope.append(self.arena, .{ .name = l.name, .slot = slot, .depth = self.depth });
 
@@ -993,7 +1043,20 @@ const Lowerer = struct {
                 const cond = try self.lowerExpr(&w.cond);
                 self.pushScope();
                 try self.loop_labels.append(self.arena, w.label);
-                const body = try self.lowerStmts(w.body);
+                try self.loop_scope_starts.append(self.arena, self.scope.items.len);
+                var body = try self.lowerStmts(w.body);
+                // The body's fall-through end releases its own direct owners
+                // before the next iteration re-binds them. A body whose last
+                // statement already leaves has no fall-through end.
+                if (w.body.len > 0) switch (body[body.len - 1].kind) {
+                    .brk, .cont, .ret => {},
+                    else => {
+                        var out: std.ArrayList(Stmt) = .fromOwnedSlice(body);
+                        try self.appendLoopExitDrops(&out, .block_end, @intFromPtr(w.body.ptr), 0);
+                        body = out.items;
+                    },
+                };
+                _ = self.loop_scope_starts.pop();
                 _ = self.loop_labels.pop();
                 self.popScope();
                 return .{ .span = stmt.span, .kind = .{ .while_loop = .{ .cond = cond, .body = body } } };

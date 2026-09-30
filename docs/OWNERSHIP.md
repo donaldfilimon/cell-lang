@@ -1338,6 +1338,24 @@ slot is released at fallthrough or terminal scalar return. `ir_reassign_string`
 and `ir_owned_string` pin zero live allocations on C, LLVM, and MLIR; other
 reassignment expressions and structured exits remain outside this IR cleanup path.
 
+**Loop exits joined the shared HIR release path on 2026-09-29.** Each loop
+records the `scope` length when its body opens. Before a `break` or
+`continue` (labelled or not), HIR releases, innermost first, every owned
+String or scalar-list local declared since the TARGET loop's body opened and
+still in scope at the jump; at a body's fall-through end it releases that
+body's own direct locals before the back edge. Each release needs the same
+evidence as the fall-through slice: a matched borrow-checker identity, an
+initializer, `droppable`, never moved anywhere in the function (`wasMoved`),
+and `liveAtExit` for that exit (`.jump` keyed by the AST statement, `.block_end`
+keyed by the body slice). A body whose last statement already leaves gets no
+body-end release. The jump key exposed a latent bug: `lowerStmts` iterated by
+value, so `&s` named a stack copy that no borrow-checker record could match;
+it now iterates by address. `labelled_break` and `labelled_continue` measured
+LLVM/MLIR LIVE 3000/6000 before and 0 after. Still outside this path: owners
+declared before the loop, a `return` from inside a loop, branch-end releases,
+and any owner moved anywhere in the function (kept, so a leak, never a double
+free).
+
 **IR scalar list step (d), construction, landed 2026-09-24 on those terms.**
 HIR desugars `Byte`, `Int`, `Int32`, `Float`, and `Bool` literals to typed,
 checked runtime pushes and marks the transfer scratch nondroppable. The

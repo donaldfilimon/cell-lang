@@ -6,11 +6,8 @@
 //
 // Pinned: C 0 on both witnesses; this is a requirement, not a measurement,
 // and a nonzero C count means the labelled jump dropped too little. LLVM and
-// MLIR are pinned at their measured count on the malloc counter (the only
-// witness an IR build carries, see tools/check.sh): they have no drop pass.
-// Those two IR pins join the default-target flip criterion (spec
-// 2026-09-21-mod02-flow03-ir-first-design.md, Rulings): `--target` flips to
-// LLVM only when every LLVM/MLIR leak pin in gate stage 7 reads 0.
+// MLIR are pinned at 0 too since 2026-09-29, when HIR began releasing the
+// owners a jump leaves (they measured 3000 before, with no IR drop pass).
 //
 // Status: parses, passes `cell check`; C, LLVM and MLIR; lives under
 // examples/leaks/.

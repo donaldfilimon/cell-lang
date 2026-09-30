@@ -567,14 +567,15 @@ LEAK_FIELD_REVIVAL=0
 # from inside a nested loop, each crossing an owning local in the outer body
 # and one in the inner. C must release both on the jump: 0 is a requirement
 # (spec invariant 13). The IR rows are the backends' measured counts, one
-# witness, and join the default-target flip criterion (every LLVM/MLIR pin
-# at 0), because the IR has no drop pass yet.
+# witness. They were 3000/6000 until 2026-09-29, when HIR began releasing
+# confirmed-live owned Strings and scalar lists before each jump and at each
+# loop body's fall-through end; both now read 0 on LLVM and MLIR.
 LEAK_LABELLED_BREAK_C=0
-LEAK_LABELLED_BREAK_LLVM=3000
-LEAK_LABELLED_BREAK_MLIR=3000
+LEAK_LABELLED_BREAK_LLVM=0
+LEAK_LABELLED_BREAK_MLIR=0
 LEAK_LABELLED_CONTINUE_C=0
-LEAK_LABELLED_CONTINUE_LLVM=6000
-LEAK_LABELLED_CONTINUE_MLIR=6000
+LEAK_LABELLED_CONTINUE_LLVM=0
+LEAK_LABELLED_CONTINUE_MLIR=0
 
 # ---- stage 10 disclosed signature disagreements, pinned by defect ---------
 # Each line is `<example key>:<function>:<leg>` naming a place where the C
@@ -1235,11 +1236,11 @@ else
     run_ir_leaks ir_fallthrough_list llvm "$LEAK_IR_FALLTHROUGH_LIST_LLVM" "shared HIR scalar-list release at straight-line fallthrough, 2026-09-24"
     run_ir_leaks ir_fallthrough_list mlir "$LEAK_IR_FALLTHROUGH_LIST_MLIR" "shared HIR scalar-list release at straight-line fallthrough, 2026-09-24"
     run_c_leaks labelled_break "" "$LEAK_LABELLED_BREAK_C" "FLOW-03 break :outer releases the outer and inner bodies' locals, 2026-09-22"
-    run_ir_leaks labelled_break llvm "$LEAK_LABELLED_BREAK_LLVM" "FLOW-03 break :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
-    run_ir_leaks labelled_break mlir "$LEAK_LABELLED_BREAK_MLIR" "FLOW-03 break :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
+    run_ir_leaks labelled_break llvm "$LEAK_LABELLED_BREAK_LLVM" "FLOW-03 break :outer; HIR loop-exit releases, 2026-09-29"
+    run_ir_leaks labelled_break mlir "$LEAK_LABELLED_BREAK_MLIR" "FLOW-03 break :outer; HIR loop-exit releases, 2026-09-29"
     run_c_leaks labelled_continue "" "$LEAK_LABELLED_CONTINUE_C" "FLOW-03 continue :outer releases the outer and inner bodies' locals, 2026-09-22"
-    run_ir_leaks labelled_continue llvm "$LEAK_LABELLED_CONTINUE_LLVM" "FLOW-03 continue :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
-    run_ir_leaks labelled_continue mlir "$LEAK_LABELLED_CONTINUE_MLIR" "FLOW-03 continue :outer; no IR drop pass; joins the flip criterion, 2026-09-22"
+    run_ir_leaks labelled_continue llvm "$LEAK_LABELLED_CONTINUE_LLVM" "FLOW-03 continue :outer; HIR loop-exit releases, 2026-09-29"
+    run_ir_leaks labelled_continue mlir "$LEAK_LABELLED_CONTINUE_MLIR" "FLOW-03 continue :outer; HIR loop-exit releases, 2026-09-29"
 fi
 
 # ------------------------------------------- 8. cross-backend answer agreement --

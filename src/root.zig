@@ -925,3 +925,91 @@ test "checked HIR never drops an uninitialized owned String slot" {
     try std.testing.expect(!bag.hasErrors());
     try std.testing.expectEqual(@as(usize, 1), lowered.findFn("f").?.body.?.len);
 }
+
+/// Lower `source` with borrow facts and return the first loop body of `f`.
+fn checkedLoopBody(a: std.mem.Allocator, source: []const u8) ![]hir.Stmt {
+    var module = try compile(a, source, "t.cell");
+    var checker = borrowck.Checker.init(a, "t.cell", source);
+    try checker.checkModule(&module);
+    try std.testing.expect(!checker.hasErrors());
+    var bag: diag.Bag = .init("t.cell", source);
+    const lowered = try hir.lowerChecked(a, &module, &bag, checker.dropFacts());
+    try std.testing.expect(!bag.hasErrors());
+    for (lowered.findFn("f").?.body.?) |stmt| {
+        if (stmt.kind == .while_loop) return stmt.kind.while_loop.body;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "checked HIR releases a loop-body String before break" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = try checkedLoopBody(arena.allocator(),
+        \\pub fn f() {
+        \\    while true {
+        \\        let owned s: String = "x"
+        \\        break
+        \\    }
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 3), body.len);
+    try std.testing.expectEqualStrings("cell_string_free", body[1].kind.expr.kind.call.symbol.?);
+    try std.testing.expectEqual(body[0].kind.let.slot, body[1].kind.expr.kind.call.args[0].kind.ref);
+    try std.testing.expect(body[2].kind == .brk);
+}
+
+test "checked HIR keeps a String moved before break" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = try checkedLoopBody(arena.allocator(),
+        \\pub fn take(owned s: String);
+        \\pub fn f() {
+        \\    while true {
+        \\        let owned s: String = "x"
+        \\        take(s)
+        \\        break
+        \\    }
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 3), body.len);
+    try std.testing.expect(body[2].kind == .brk);
+}
+
+test "checked HIR releases a loop-body String at the body's fall-through end" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = try checkedLoopBody(arena.allocator(),
+        \\pub fn f() {
+        \\    var i = 0
+        \\    while i < 2 {
+        \\        let owned s: String = "x"
+        \\        i = i + 1
+        \\    }
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 3), body.len);
+    try std.testing.expectEqualStrings("cell_string_free", body[2].kind.expr.kind.call.symbol.?);
+    try std.testing.expectEqual(body[0].kind.let.slot, body[2].kind.expr.kind.call.args[0].kind.ref);
+}
+
+test "checked HIR releases inner then outer owners before continue :outer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const outer = try checkedLoopBody(arena.allocator(),
+        \\pub fn f() {
+        \\    outer: loop {
+        \\        let owned a: String = "x"
+        \\        loop {
+        \\            let owned b: String = "y"
+        \\            continue :outer
+        \\        }
+        \\    }
+        \\}
+    );
+    const a_slot = outer[0].kind.let.slot;
+    const inner = outer[1].kind.while_loop.body;
+    try std.testing.expectEqual(@as(usize, 4), inner.len);
+    try std.testing.expectEqual(inner[0].kind.let.slot, inner[1].kind.expr.kind.call.args[0].kind.ref);
+    try std.testing.expectEqual(a_slot, inner[2].kind.expr.kind.call.args[0].kind.ref);
+    try std.testing.expectEqual(@as(u32, 1), inner[3].kind.cont);
+}
