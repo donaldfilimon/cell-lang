@@ -1,0 +1,24 @@
+// An unmoved owned String in a function whose body contains a while.
+// The after-loop release does not take it (that path is moved-only).
+// C already frees it at function end. HIR used to bail the function-end
+// slice on the while, so each call left the String live.
+// 1000 calls. EXPECT-OUTPUT: 1000
+
+pub fn print_int(copy value: Int);
+
+pub fn once() {
+    var owned s: String = "aaaaaaaa"
+    var i = 0
+    while i < 1 {
+        i = i + 1
+    }
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        once()
+        i = i + 1
+    }
+    print_int(i)
+}

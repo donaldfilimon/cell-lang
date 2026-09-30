@@ -832,8 +832,10 @@ const Lowerer = struct {
     /// Straight-line cleanup slice: lets and literal or call String reassignments,
     /// optionally followed by a scalar return. A statement-position `if` is
     /// allowed through so an owner neither branch moved still gets this one
-    /// function-end release. A `while`, a `match`, or any other statement
-    /// still leaves that release out. A body whose length no longer matches
+    /// function-end release. A `while` is allowed through for the same release:
+    /// an unmoved owner is not on `while.after`, and a moved one is skipped
+    /// here because `wasMoved` is set. A `match` or any other statement still
+    /// leaves that release out. A body whose length no longer matches
     /// the AST cannot be zipped with it and must be kept as lowered.
     /// Evaluate replacements and the return value before releasing confirmed
     /// live owners at the exit.
@@ -855,6 +857,7 @@ const Lowerer = struct {
             if (terminal_return and index == source.len - 1) continue;
             switch (src.kind) {
                 .let => {},
+                .while_stmt => {},
                 .assign => |a| {
                     if (a.target.kind != .ident or (a.value.kind != .string and a.value.kind != .call) or lowered.kind != .assign) return body;
                     const place = lowered.kind.assign.place;

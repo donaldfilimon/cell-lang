@@ -1192,7 +1192,7 @@ test "checked HIR releases a revived outer String after the loop, not before bre
     try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(w.after, "cell_string_free", v_slot));
 }
 
-test "checked HIR does not release an unmoved outer String after the loop" {
+test "checked HIR releases an unmoved outer String at function end, not after the loop" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const f = try checkedFn(arena.allocator(),
@@ -1206,8 +1206,52 @@ test "checked HIR does not release an unmoved outer String after the loop" {
     );
     const v_slot = f.body.?[0].kind.let.slot;
     const w = f.body.?[2].kind.while_loop;
-    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
+    for (w.body) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
     try std.testing.expectEqual(@as(usize, 0), w.after.len);
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
+    try std.testing.expect(stmtFreesSlot(f.body.?[f.body.?.len - 1], "cell_string_free", v_slot));
+}
+
+test "checked HIR releases an unmoved scalar list at function end when the body contains a while" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn f() {
+        \\    let owned xs: [Int] = [1]
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\    }
+        \\}
+    );
+    const slot = f.body.?[0].kind.let.slot;
+    const w = f.body.?[2].kind.while_loop;
+    for (w.body) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_slice_free", slot));
+    try std.testing.expectEqual(@as(usize, 0), w.after.len);
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(f.body.?, "cell_slice_free", slot));
+    try std.testing.expect(stmtFreesSlot(f.body.?[f.body.?.len - 1], "cell_slice_free", slot));
+}
+
+test "checked HIR binds a scalar return before releasing an unmoved String beside a while" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn f() -> Int {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\    }
+        \\    return i
+        \\}
+    );
+    const v_slot = f.body.?[0].kind.let.slot;
+    const w = f.body.?[2].kind.while_loop;
+    try std.testing.expectEqual(@as(usize, 0), w.after.len);
+    const body = f.body.?;
+    try std.testing.expect(body[body.len - 1].kind == .ret);
+    try std.testing.expect(stmtFreesSlot(body[body.len - 2], "cell_string_free", v_slot));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(body, "cell_string_free", v_slot));
 }
 
 test "checked HIR does not release a revived outer String at continue" {
