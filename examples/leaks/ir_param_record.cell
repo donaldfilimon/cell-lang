@@ -1,0 +1,30 @@
+// An owned record parameter, not a `let`.
+// Each call receives two owned Strings and then returns.
+// 1000 calls. EXPECT-OUTPUT: 1000
+//
+// BEFORE the parameter walk, on the post-nested-block compiler: C
+// ALLOC=2000 FREE=2000 LIVE=0; LLVM and MLIR ALLOC=2000 FREE=0 LIVE=2000.
+// After the function-end walk they measure ALLOC=2000 FREE=2000 LIVE=0.
+// C already freed the parameter. IR skipped `is_param`, so the same
+// field walk now frees both leaves once. A wholly moved parameter is
+// not walked.
+
+pub struct Pair {
+    owned a: String
+    owned b: String
+}
+
+pub fn print_int(copy value: Int);
+
+pub fn once(owned p: Pair) {
+    let copy n = 0
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        once(Pair { a: "aaaaaaaa", b: "bbbbbbbb" })
+        i = i + 1
+    }
+    print_int(i)
+}

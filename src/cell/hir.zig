@@ -965,26 +965,31 @@ const Lowerer = struct {
             try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
             self.drop_inserted = true;
         }
-        // Direct top-level record lets. The whole binding is not a String,
-        // so the loop above skipped it. Release each remaining owned String
-        // or scalar-list field, including a field of a nested record, once.
-        // There is no whole-record IR drop. A record declared in a nested
-        // block is released at that block's end, not here. `arc` and a
-        // wholly moved record stay leaks.
+        // Direct top-level record lets and owned record parameters. The
+        // whole binding is not a String, so the loop above skipped it.
+        // Release each remaining owned String or scalar-list field,
+        // including a field of a nested record, once. There is no
+        // whole-record IR drop. A record declared in a nested block is
+        // released at that block's end, not here. `arc` and a wholly
+        // moved record stay leaks.
         var j = self.bindings.items.len;
         while (j > 0) {
             j -= 1;
             const binding = self.bindings.items[j];
-            if (!binding.droppable or binding.ownership != .owned or binding.is_param) continue;
+            if (!binding.droppable or binding.ownership != .owned) continue;
             const struct_name = switch (binding.ty) {
                 .struct_type => |name| name,
                 else => continue,
             };
-            var is_direct = false;
-            for (body) |stmt| {
-                if (stmt.kind == .let and stmt.kind.let.slot == binding.slot and stmt.kind.let.value != null) is_direct = true;
+            // A parameter has no `let`. A nested-block record is not a
+            // direct let of this body, so it stays on the block-end walk.
+            if (!binding.is_param) {
+                var is_direct = false;
+                for (body) |stmt| {
+                    if (stmt.kind == .let and stmt.kind.let.slot == binding.slot and stmt.kind.let.value != null) is_direct = true;
+                }
+                if (!is_direct) continue;
             }
-            if (!is_direct) continue;
             const id = binding.bc_id orelse continue;
             if (facts.wasWhollyMoved(id)) continue;
             try self.appendScopeEndFieldDrops(&out, binding, id, struct_name, exit_kind, key);

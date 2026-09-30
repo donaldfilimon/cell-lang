@@ -1927,6 +1927,64 @@ test "checked HIR scope-releases a record declared inside a while" {
     try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", slot, 1));
 }
 
+test "checked HIR scope-releases an owned record parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn f(owned p: Pair) {
+        \\    let copy n = 0
+        \\}
+    );
+    try std.testing.expect(f.bindings[0].is_param);
+    try std.testing.expectEqualStrings("p", f.bindings[0].name);
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", 0, 1));
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(f.body.?, "cell_string_free", 0));
+}
+
+test "checked HIR scope-releases only the unmoved field of an owned record parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn f(owned p: Pair) {
+        \\    let owned moved: String = p.a
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", 0, 1));
+}
+
+test "checked HIR does not scope-release a wholly moved owned record parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn f(owned p: Pair) {
+        \\    let owned q: Pair = p
+        \\}
+    );
+    var q_slot: ?u32 = null;
+    for (f.bindings) |b| {
+        if (std.mem.eql(u8, b.name, "q")) q_slot = b.slot;
+    }
+    const q = q_slot orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", 0, 0));
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", 0, 1));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", q, 0));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", q, 1));
+}
+
 test "checked HIR scope-releases the unmoved sibling of a nested field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
