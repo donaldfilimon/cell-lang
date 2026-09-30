@@ -1,0 +1,37 @@
+// A field moved on only one branch of an if. `take(p.a)` runs when c > 0.
+// On the other path `p.a` is still owned, but the merge records it dead, so
+// a scope-end partial drop skips it. `p.b` is not freed at the branch end:
+// it stays for the scope-end partial drop. IR does not have that partial
+// drop, so `p.b` remains a leak after the branch-end field release.
+// Each iteration calls both paths. 1000 calls. EXPECT-OUTPUT: 1000
+//
+// BEFORE this HIR slice, on the post-unmoved compiler: C ALLOC=4000
+// FREE=4000 LIVE=0; LLVM and MLIR ALLOC=4000 FREE=1000 LIVE=3000. The 1000
+// frees are `take` releasing `p.a` on the moving path.
+
+pub struct Pair {
+    owned a: String
+    owned b: String
+}
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn one_branch(copy c: Int) {
+    let owned p: Pair = Pair { a: "aaaaaaaa", b: "bbbbbbbb" }
+    if c > 0 {
+        take(p.a)
+    }
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        one_branch(1)
+        one_branch(0)
+        i = i + 1
+    }
+    print_int(i)
+}

@@ -1359,7 +1359,8 @@ end, and no liveness after the merge. An `if` with no else gets a
 synthesized else that contains only those releases, and the `if` stays
 unit-typed. When the branch has a value, that value is bound to a
 nondroppable scratch before the releases. Still outside the branch-end and loop-exit paths: a skip-revival
-`break`, field and record branch ends, an owner moved on every path when
+`break`, nested record fields, wholly moved records, and `arc` fields at
+branch ends, an owner moved on every path when
 the breaks do not agree, resource-valued returns, temporaries, and any
 owner moved anywhere at a loop-body jump when revival is not vouched
 (kept, so a leak, never a double free). A branch that always leaves by
@@ -1368,6 +1369,8 @@ owner in a function whose body contains a `while` is released by the
 function-end slice (`ir_unmoved_while`).
 
 **An owner declared before a loop joined the shared HIR release path on 2026-09-30, once, after the loop.** Borrowck's `after_loop` or `after_loop_skip` record is the admission: the owner was moved, and it holds a value on the exits that record vouches for. The two records are exclusive for one binding. HIR stores one `cell_string_free` or `cell_slice_free` on the `while`'s `after` list. A failing condition and a `break` that still holds the value run that release. A skip-revival `break` is marked and the LLVM and MLIR backends branch past it (`ir_skip_revival`). `continue` and the body's back edge do not, so they are not drop sites for this owner (freeing there is a use-after-free on the next iteration). An unmoved owner is not released after the loop, or it would double-free with a function-end drop. A later statement that reads the name keeps the leak, because the function-end record for a loop-moved owner is poisoned. Owners whose breaks do not agree (`mixed`, `nested`, `with_plain`) stay leaks. `ir_after_loop` is the every-path shape. LLVM on the compiler from earlier the same day measured LIVE=1000; the pin after that release is 0. LLVM on the post-after-loop compiler measured `ir_skip_revival` at ALLOC=4000 FREE=3000 LIVE=1000; the pin after the skip branch is 0.
+
+**A direct owned field joined the branch-end release on 2026-09-30.** The whole record is not freed on that path. A direct owned String or scalar-list field is released when it is live at that branch end, not live after the merge, and dead at the enclosing block end. The sibling that was never moved has no field record, so it stays for the scope-end partial drop. A field revived after the `if` is still live at the block end and is not released on the keeping branch. A wholly moved record is not walked. `ir_branch_field` measured LLVM and MLIR ALLOC=4000 FREE=1000 LIVE=3000 on the post-unmoved compiler. After this release the pin is 2000: `p.a` on the keeping path is freed, and `p.b` on both paths remains. C was already 0.
 
 **An unmoved owner beside a `while` joined the function-end release on 2026-09-30.** The function-end slice used to return the body unchanged when it saw a `while`. It now keeps that statement and still releases a confirmed-live, unmoved owned String or scalar list once, after the loop, including before a terminal scalar return. A moved owner is not released there (`wasMoved`), so the after-loop drop is not repeated. `ir_unmoved_while` measured LLVM ALLOC=1000 FREE=0 LIVE=1000 on the post-skip compiler; the pin after this release is 0. C was already 0.
 

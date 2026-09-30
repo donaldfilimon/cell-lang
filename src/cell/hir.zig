@@ -655,6 +655,12 @@ const Lowerer = struct {
     next_bc_id: u32 = 0,
     identity_failed: bool = false,
     drop_inserted: bool = false,
+    /// The statement list that contains the branch being lowered. Borrowck
+    /// records that list as `block_end`. A field drop needs this exit, not
+    /// only the merge: a field revived after the `if` is dead at
+    /// `after_branch` and live at the block end, and freeing it on the
+    /// keeping branch would double-free with the later store.
+    enclosing_exit: ?struct { kind: dropfacts.ExitKind, key: usize } = null,
 
     structs: std.ArrayList(Struct) = .empty,
     enums: std.ArrayList(Enum) = .empty,
@@ -797,7 +803,12 @@ const Lowerer = struct {
 
         var body: ?[]Stmt = null;
         if (f.body) |stmts| {
+            const saved_exit = self.enclosing_exit;
+            if (stmts.len > 0) {
+                self.enclosing_exit = .{ .kind = .block_end, .key = @intFromPtr(stmts.ptr) };
+            }
             body = try self.lowerStmts(stmts);
+            self.enclosing_exit = saved_exit;
             body = try self.appendSimpleFallthroughDrops(f.name, stmts, body.?);
         }
 
@@ -1292,7 +1303,11 @@ const Lowerer = struct {
     /// branch. Admission matches C's non-record branch rule, not the loop
     /// exit's `!wasMoved` rule: moved somewhere, live at this branch end, and
     /// not live after the merge. A missing branch-end record keeps the leak.
-    /// String and scalar lists only. Records, fields, and `arc` stay out.
+    /// Whole bindings are String and scalar lists. A record is not freed
+    /// whole here: that double-frees the sibling the scope-end partial drop
+    /// still owns. Direct owned String and scalar-list fields are released
+    /// when they are live at this branch end and dead at the enclosing
+    /// block end. Nested records, wholly moved records, and `arc` stay out.
     fn collectBranchEndDrops(self: *Lowerer, branch_key: usize, merge_key: usize) LowerError![]Stmt {
         const facts = self.facts orelse return &.{};
         if (self.identity_failed) return &.{};
@@ -1307,6 +1322,19 @@ const Lowerer = struct {
             // A parameter arrives initialized. A local without an initializer
             // may hold nothing, and releasing it would free an empty slot.
             if (!binding.has_initializer and !binding.is_param) continue;
+            switch (binding.ty) {
+                .struct_type => |struct_name| {
+                    const id = binding.bc_id orelse continue;
+                    // A wholly moved record belongs to the destination. Field
+                    // frees would release the destination's buffers. IR has no
+                    // whole-record drop glue on this path, so the record stays
+                    // a leak rather than a double free.
+                    if (facts.wasWhollyMoved(id)) continue;
+                    try self.appendBranchEndFieldDrops(&out, binding, id, struct_name, branch_key, merge_key);
+                    continue;
+                },
+                else => {},
+            }
             const release: Runtime = switch (binding.ty) {
                 .string => .string_free,
                 .list => |elem| if (scalarListElement(elem.*)) .slice_free else continue,
@@ -1322,6 +1350,61 @@ const Lowerer = struct {
             self.drop_inserted = true;
         }
         return out.items;
+    }
+
+    /// Direct owned fields of `binding`, reverse declaration order. A field
+    /// still live after the merge is left for a later use. A field with no
+    /// branch-end record, or still live at the enclosing block end, stays a
+    /// leak. Nested record fields and `arc` fields are not spelled here.
+    fn appendBranchEndFieldDrops(
+        self: *Lowerer,
+        out: *std.ArrayList(Stmt),
+        binding: Binding,
+        id: u32,
+        struct_name: []const u8,
+        branch_key: usize,
+        merge_key: usize,
+    ) LowerError!void {
+        const facts = self.facts orelse return;
+        const after = self.enclosing_exit orelse return;
+        const def = self.findStructDecl(struct_name) orelse return;
+        var i = def.fields.len;
+        while (i > 0) {
+            i -= 1;
+            const field = def.fields[i];
+            if (field.ownership != .owned) continue;
+            const release: Runtime = switch (field.ty) {
+                .string => .string_free,
+                .list => |elem| if (scalarListElement(elem.*)) .slice_free else continue,
+                else => continue,
+            };
+            if (facts.fieldLiveAtExit(.after_branch, merge_key, id, field.name)) continue;
+            if (!facts.fieldLiveAtExit(.branch_end, branch_key, id, field.name)) continue;
+            if (!facts.fieldDeadAtExit(after.kind, after.key, id, field.name)) continue;
+            const base = try self.box(.{
+                .ty = binding.ty,
+                .span = .none,
+                .own = binding.ownership,
+                .kind = .{ .ref = binding.slot },
+            });
+            const place: Expr = .{
+                .ty = field.ty,
+                .span = .none,
+                .own = field.ownership,
+                .kind = .{ .field = .{
+                    .base = base,
+                    .sel = .{
+                        .struct_name = struct_name,
+                        .index = @intCast(i),
+                        .ty = field.ty,
+                        .ownership = field.ownership,
+                    },
+                } },
+            };
+            const call = try self.runtimeCall(release, .none, &.{place});
+            try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
+            self.drop_inserted = true;
+        }
     }
 
     /// Append `drops` after the branch's own statements and after its value
@@ -1742,6 +1825,11 @@ const Lowerer = struct {
             .block => |stmts| {
                 self.pushScope();
                 defer self.popScope();
+                const saved_exit = self.enclosing_exit;
+                if (stmts.len > 0) {
+                    self.enclosing_exit = .{ .kind = .block_end, .key = @intFromPtr(stmts.ptr) };
+                }
+                defer self.enclosing_exit = saved_exit;
                 // A trailing expression statement is the block's value.
                 var tail: ?*Expr = null;
                 var body_len = stmts.len;

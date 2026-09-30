@@ -1566,6 +1566,27 @@ fn blockFreesSlot(block_expr: *const hir.Expr, symbol: []const u8, slot: u32) bo
     return false;
 }
 
+fn stmtFreesField(stmt: hir.Stmt, symbol: []const u8, slot: u32, index: u32) bool {
+    if (stmt.kind != .expr) return false;
+    const call = stmt.kind.expr;
+    if (call.kind != .call) return false;
+    const c = call.kind.call;
+    const name = c.symbol orelse return false;
+    if (!std.mem.eql(u8, name, symbol)) return false;
+    if (c.args.len != 1 or c.args[0].kind != .field) return false;
+    const field = c.args[0].kind.field;
+    if (field.base.kind != .ref or field.base.kind.ref != slot) return false;
+    return field.sel.index == index;
+}
+
+fn blockFreesField(block_expr: *const hir.Expr, symbol: []const u8, slot: u32, index: u32) bool {
+    if (block_expr.kind != .block) return false;
+    for (block_expr.kind.block.stmts) |stmt| {
+        if (stmtFreesField(stmt, symbol, slot, index)) return true;
+    }
+    return false;
+}
+
 fn countTopLevelFrees(body: []const hir.Stmt, symbol: []const u8, slot: u32) usize {
     var n: usize = 0;
     for (body) |stmt| {
@@ -1670,4 +1691,110 @@ test "checked HIR releases an outer owned scalar list on the branch that kept it
     try std.testing.expect(ie.else_body.?.kind == .block);
     try std.testing.expect(!blockFreesSlot(ie.then_body, "cell_slice_free", xs_slot));
     try std.testing.expect(blockFreesSlot(ie.else_body.?, "cell_slice_free", xs_slot));
+}
+
+test "checked HIR releases a kept String field on the synthesized else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy c: Int) {
+        \\    let owned p: Pair = Pair { a: "x", b: "y" }
+        \\    if c > 0 {
+        \\        take(p.a)
+        \\    }
+        \\}
+    );
+    const p_slot = f.body.?[0].kind.let.slot;
+    try std.testing.expectEqualStrings("p", f.bindings[p_slot].name);
+    const ie = f.body.?[1].kind.expr.kind.if_expr;
+    const else_body = ie.else_body orelse return error.TestUnexpectedResult;
+    // `a` is index 0, `b` is index 1. The keeping branch frees `a` only.
+    // Freeing the whole record, or `b`, double-frees with the scope-end drop.
+    try std.testing.expect(!blockFreesField(ie.then_body, "cell_string_free", p_slot, 0));
+    try std.testing.expect(!blockFreesField(ie.then_body, "cell_string_free", p_slot, 1));
+    try std.testing.expect(blockFreesField(else_body, "cell_string_free", p_slot, 0));
+    try std.testing.expect(!blockFreesField(else_body, "cell_string_free", p_slot, 1));
+    try std.testing.expect(!blockFreesSlot(else_body, "cell_string_free", p_slot));
+}
+
+test "checked HIR does not branch-release a String field revived after the if" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy c: Int) {
+        \\    var owned p: Pair = Pair { a: "x", b: "y" }
+        \\    if c > 0 {
+        \\        take(p.a)
+        \\    }
+        \\    p.a = "c"
+        \\}
+    );
+    const p_slot = f.body.?[0].kind.let.slot;
+    const ie = f.body.?[1].kind.expr.kind.if_expr;
+    try std.testing.expect(!blockFreesField(ie.then_body, "cell_string_free", p_slot, 0));
+    if (ie.else_body) |else_body| {
+        try std.testing.expect(!blockFreesField(else_body, "cell_string_free", p_slot, 0));
+        try std.testing.expect(!blockFreesField(else_body, "cell_string_free", p_slot, 1));
+    }
+}
+
+test "checked HIR releases a kept scalar-list field on the synthesized else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: [Int]
+        \\    owned b: [Int]
+        \\}
+        \\pub fn take(owned xs: [Int]) { }
+        \\pub fn f(copy c: Int) {
+        \\    let owned p: Pair = Pair { a: [1], b: [2] }
+        \\    if c > 0 {
+        \\        take(p.a)
+        \\    }
+        \\}
+    );
+    const p_slot = f.body.?[0].kind.let.slot;
+    const ie = f.body.?[1].kind.expr.kind.if_expr;
+    const else_body = ie.else_body orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!blockFreesField(ie.then_body, "cell_slice_free", p_slot, 0));
+    try std.testing.expect(blockFreesField(else_body, "cell_slice_free", p_slot, 0));
+    try std.testing.expect(!blockFreesField(else_body, "cell_slice_free", p_slot, 1));
+}
+
+test "checked HIR does not field-release a wholly moved record" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn f(copy c: Int) {
+        \\    let owned p: Pair = Pair { a: "x", b: "y" }
+        \\    let owned q: Pair = p
+        \\    var i = 0
+        \\    if c > 0 {
+        \\        i = i + 1
+        \\    } else {
+        \\        i = i + 1
+        \\    }
+        \\}
+    );
+    const p_slot = f.body.?[0].kind.let.slot;
+    const ie = f.body.?[3].kind.expr.kind.if_expr;
+    try std.testing.expect(!blockFreesField(ie.then_body, "cell_string_free", p_slot, 0));
+    try std.testing.expect(!blockFreesField(ie.then_body, "cell_string_free", p_slot, 1));
+    try std.testing.expect(!blockFreesField(ie.else_body.?, "cell_string_free", p_slot, 0));
+    try std.testing.expect(!blockFreesField(ie.else_body.?, "cell_string_free", p_slot, 1));
 }

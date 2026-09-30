@@ -19,6 +19,16 @@ pub const DropFacts = struct {
         /// release. False for an ordinary break, and when the checker has no
         /// record: a missing fact keeps the break on the release path.
         skip_break: *const fn (*const anyopaque, usize) bool,
+        /// True when this field path holds a value at the exit. A missing
+        /// record is false, so the drop is omitted. Exact path: `"a"` is not
+        /// `"inner.a"`.
+        field_live_at_exit: *const fn (*const anyopaque, ExitKind, usize, u32, []const u8) bool,
+        /// True when every record of this field path at the exit found it
+        /// dead. A missing record is false.
+        field_dead_at_exit: *const fn (*const anyopaque, ExitKind, usize, u32, []const u8) bool,
+        /// True when the binding itself was moved (path `""`), not merely
+        /// one of its fields.
+        was_wholly_moved: *const fn (*const anyopaque, u32) bool,
     };
 
     pub fn nextBindingId(self: DropFacts) u32 {
@@ -43,5 +53,17 @@ pub const DropFacts = struct {
 
     pub fn skipBreak(self: DropFacts, break_key: usize) bool {
         return self.vtable.skip_break(self.context, break_key);
+    }
+
+    pub fn fieldLiveAtExit(self: DropFacts, kind: ExitKind, key: usize, id: u32, path: []const u8) bool {
+        return self.vtable.field_live_at_exit(self.context, kind, key, id, path);
+    }
+
+    pub fn fieldDeadAtExit(self: DropFacts, kind: ExitKind, key: usize, id: u32, path: []const u8) bool {
+        return self.vtable.field_dead_at_exit(self.context, kind, key, id, path);
+    }
+
+    pub fn wasWhollyMoved(self: DropFacts, id: u32) bool {
+        return self.vtable.was_wholly_moved(self.context, id);
     }
 };

@@ -545,6 +545,24 @@ const drop_facts_vtable: dropfacts.DropFacts.VTable = .{
             return checker.skipBreakLoop(break_key) != null;
         }
     }.read,
+    .field_live_at_exit = struct {
+        fn read(context: *const anyopaque, kind: dropfacts.ExitKind, key: usize, id: u32, path: []const u8) bool {
+            const checker: *const Checker = @ptrCast(@alignCast(context));
+            return checker.fieldLiveAtExit(kind, key, id, path);
+        }
+    }.read,
+    .field_dead_at_exit = struct {
+        fn read(context: *const anyopaque, kind: dropfacts.ExitKind, key: usize, id: u32, path: []const u8) bool {
+            const checker: *const Checker = @ptrCast(@alignCast(context));
+            return checker.fieldDeadAtExit(kind, key, id, path);
+        }
+    }.read,
+    .was_wholly_moved = struct {
+        fn read(context: *const anyopaque, id: u32) bool {
+            const checker: *const Checker = @ptrCast(@alignCast(context));
+            return checker.wasWhollyMoved(id);
+        }
+    }.read,
 };
 
 /// Borrow-check `module`, rendering every diagnostic to `writer`. Deliberately

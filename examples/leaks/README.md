@@ -93,6 +93,7 @@ landed and must be checked against answer and sanitizer evidence.
 | `ir_after_loop.cell` | IR twin of `loop_cross`: one revived String declared before the loop, 1000 calls. C was already 0. LLVM on the compiler from earlier the same day measured LIVE=1000. HIR now releases that owner once after the loop; LLVM and MLIR pin 0. `continue` is not a drop site |
 | `ir_skip_revival.cell` | The dead `break` runs while the outer String is still moved; the other exit holds the revived String. LLVM on the post-after-loop compiler measured ALLOC=4000 FREE=3000 LIVE=1000. The dead break now jumps past the release; LLVM and MLIR pin 0. `once(0)` is the dead break and `once(5)` runs the free |
 | `ir_unmoved_while.cell` | An unmoved owned String in a function whose body contains a `while`, 1000 calls. C was already 0. LLVM on the post-skip compiler measured ALLOC=1000 FREE=0 LIVE=1000. The function-end slice now releases it; LLVM and MLIR pin 0. The after-loop list stays empty |
+| `ir_branch_field.cell` | A String field moved on one side of an `if`, 1000 calls of both paths. C was already 0. LLVM and MLIR on the post-unmoved compiler measured ALLOC=4000 FREE=1000 LIVE=3000. The keeping branch now frees `p.a`. `p.b` stays for the scope-end partial drop, which IR does not emit, so LLVM and MLIR pin 2000 |
 
 Every LLVM/MLIR pin here is part of the default-target flip criterion
 (`docs/superpowers/specs/2026-09-21-mod02-flow03-ir-first-design.md`,
