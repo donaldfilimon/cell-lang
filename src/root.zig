@@ -1014,6 +1014,135 @@ test "checked HIR releases inner then outer owners before continue :outer" {
     try std.testing.expectEqual(@as(u32, 1), inner[3].kind.cont);
 }
 
+test "checked HIR releases a loop-body String before return" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = try checkedLoopBody(arena.allocator(),
+        \\pub fn f() {
+        \\    while true {
+        \\        let owned s: String = "x"
+        \\        return
+        \\    }
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 3), body.len);
+    try std.testing.expectEqualStrings("cell_string_free", body[1].kind.expr.kind.call.symbol.?);
+    try std.testing.expectEqual(body[0].kind.let.slot, body[1].kind.expr.kind.call.args[0].kind.ref);
+    try std.testing.expect(body[2].kind == .ret);
+}
+
+test "checked HIR releases a loop-body scalar list before return" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = try checkedLoopBody(arena.allocator(),
+        \\pub fn f() {
+        \\    while true {
+        \\        let owned xs: [Int] = [1]
+        \\        return
+        \\    }
+        \\}
+    );
+    const owner = body[0].kind.let.slot;
+    var freed = false;
+    for (body[0 .. body.len - 1]) |stmt| {
+        if (stmtFreesSlot(stmt, "cell_slice_free", owner)) freed = true;
+    }
+    try std.testing.expect(freed);
+    try std.testing.expect(body[body.len - 1].kind == .ret);
+}
+
+test "checked HIR releases a revived outer String before return inside a loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        v = "b"
+        \\        if i > n {
+        \\            return
+        \\        }
+        \\    }
+        \\}
+    );
+    const v_slot = f.body.?[0].kind.let.slot;
+    try std.testing.expectEqualStrings("v", f.bindings[v_slot].name);
+    const loop = f.body.?[2].kind.while_loop.body;
+    const branch = loop[loop.len - 1].kind.expr.kind.if_expr.then_body.kind.block;
+    try std.testing.expect(branch.stmts.len >= 2);
+    try std.testing.expect(stmtFreesSlot(branch.stmts[branch.stmts.len - 2], "cell_string_free", v_slot));
+    try std.testing.expect(branch.stmts[branch.stmts.len - 1].kind == .ret);
+}
+
+test "checked HIR does not release a String returned between its move and its revival" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        if i > n {
+        \\            return
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\}
+    );
+    const v_slot = f.body.?[0].kind.let.slot;
+    const loop = f.body.?[2].kind.while_loop.body;
+    const branch = loop[loop.len - 2].kind.expr.kind.if_expr.then_body.kind.block;
+    for (branch.stmts) |stmt| {
+        try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
+    }
+    try std.testing.expect(branch.stmts[branch.stmts.len - 1].kind == .ret);
+}
+
+test "checked HIR evaluates a scalar return before releasing the loop String it reads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = try checkedLoopBody(arena.allocator(),
+        \\pub fn len(shared s: String) -> Int;
+        \\pub fn f() -> Int {
+        \\    while true {
+        \\        let owned s: String = "x"
+        \\        return len(s)
+        \\    }
+        \\}
+    );
+    const owner = body[0].kind.let.slot;
+    try std.testing.expectEqual(@as(usize, 4), body.len);
+    try std.testing.expect(body[1].kind == .let);
+    try std.testing.expectEqualStrings("cell_string_free", body[2].kind.expr.kind.call.symbol.?);
+    try std.testing.expectEqual(owner, body[2].kind.expr.kind.call.args[0].kind.ref);
+    try std.testing.expectEqual(body[1].kind.let.slot, body[3].kind.ret.?.kind.ref);
+}
+
+test "checked HIR keeps a String that a loop return moves to the caller" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = try checkedLoopBody(arena.allocator(),
+        \\pub fn f() -> String {
+        \\    while true {
+        \\        let owned s: String = "x"
+        \\        return s
+        \\    }
+        \\}
+    );
+    const owner = body[0].kind.let.slot;
+    for (body) |stmt| {
+        try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", owner));
+    }
+    try std.testing.expect(body[body.len - 1].kind == .ret);
+}
+
 fn checkedFn(a: std.mem.Allocator, source: []const u8) !hir.Fn {
     var module = try compile(a, source, "t.cell");
     var checker = borrowck.Checker.init(a, "t.cell", source);

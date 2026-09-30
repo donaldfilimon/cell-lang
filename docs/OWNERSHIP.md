@@ -1358,13 +1358,22 @@ holds it when borrowck recorded a move somewhere, liveness at that branch
 end, and no liveness after the merge. An `if` with no else gets a
 synthesized else that contains only those releases, and the `if` stays
 unit-typed. When the branch has a value, that value is bound to a
-nondroppable scratch before the releases. Still outside this path: owners
-declared before the loop, a `return` from inside a loop, field and record
-branch ends, an owner moved on every path, resource-valued returns,
-temporaries, and any owner moved anywhere at a loop exit or function-end
-fall-through (kept, so a leak, never a double free). A branch that always
-leaves by `return`, `break`, or `continue` is not given a release after
-that jump.
+nondroppable scratch before the releases. Still outside the branch-end and loop-exit paths: owners
+declared before the loop (at `break`, `continue`, and the loop's
+fall-through), field and record branch ends, an owner moved on every path,
+resource-valued returns, temporaries, and any owner moved anywhere at a
+loop exit or function-end fall-through (kept, so a leak, never a double
+free). A branch that always leaves by `break` or `continue` is not given a
+release after that jump.
+
+**A `return` inside a loop joined the shared HIR release path on 2026-09-30.**
+The returned value is bound to a nondroppable scratch first. HIR then
+releases, innermost first, every owned String or scalar list still in scope
+whose borrow-checker identity is live at that `return`. A revived owner is
+released. An owner still dead between the move and the revival is not, and
+neither is the owner the `return` itself moved to the caller. A `return`
+outside a loop is left to the function-end slice. `ir_return_in_loop`
+measured LLVM/MLIR LIVE=1000 before this release and 0 after; C was already 0.
 
 **IR scalar list step (d), construction, landed 2026-09-24 on those terms.**
 HIR desugars `Byte`, `Int`, `Int32`, `Float`, and `Bool` literals to typed,

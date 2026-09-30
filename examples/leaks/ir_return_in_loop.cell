@@ -1,0 +1,31 @@
+// A `return` inside a loop after an outer String is moved and revived.
+// `once` always returns on the first iteration, so nothing is left for the
+// loop's own exit to release. 1000 calls, one revived String each.
+// LLVM and MLIR measured LIVE=1000 before HIR released owners live at that
+// return (2026-09-30) and 0 after. C was already 0.
+// EXPECT-OUTPUT: 1000
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn once() {
+    var owned s: String = "aaaaaaaa"
+    var i = 0
+    while i < 2 {
+        i = i + 1
+        take(s)
+        s = "bbbbbbbb"
+        return
+    }
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        once()
+        i = i + 1
+    }
+    print_int(i)
+}

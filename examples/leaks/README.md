@@ -89,6 +89,7 @@ landed and must be checked against answer and sanitizer evidence.
 | `ir_reassign_string.cell` | Straight-line owned String replacement: evaluate into nondroppable scratch, release the vouched old owner, then release the final owner at fallthrough. C, LLVM, and MLIR pin LIVE=0 for 1000 calls (2026-09-24) |
 | `labelled_break.cell` | FLOW-03: `break :outer` from a nested loop crossing an owning local in each body; C releases both on the jump, 0 on both witnesses (a requirement, spec invariant 13); LLVM and MLIR 3000 (2026-09-22), 0 since HIR loop-exit releases (2026-09-29) |
 | `labelled_continue.cell` | FLOW-03: `continue :outer` from a nested loop, the same shape; C 0 on both witnesses; LLVM and MLIR 6000 (2026-09-22), 0 since HIR loop-exit releases (2026-09-29) |
+| `ir_return_in_loop.cell` | A `return` on the first iteration after an outer String is moved and revived, 1000 calls. C was already 0. LLVM/MLIR were LIVE=1000 until 2026-09-30, when HIR began releasing owners live at a `return` inside a loop; both now pin 0 |
 
 Every LLVM/MLIR pin here is part of the default-target flip criterion
 (`docs/superpowers/specs/2026-09-21-mod02-flow03-ir-first-design.md`,

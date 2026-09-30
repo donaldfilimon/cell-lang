@@ -975,8 +975,12 @@ const Lowerer = struct {
     }
 
     /// Lower a statement list. A `break` or `continue` is preceded by the
-    /// releases for the loop bodies it leaves (`appendLoopExitDrops`), so
-    /// the result can be longer than `stmts` inside a loop, never outside.
+    /// releases for the loop bodies it leaves (`appendLoopExitDrops`). A
+    /// `return` inside a loop is preceded by the releases for every owner
+    /// still live at that return (`appendReturnInLoopDrops`), after the
+    /// returned value has been bound. Outside a loop a `return` is unchanged
+    /// here; the function-end slice owns that case. The result can be longer
+    /// than `stmts` inside a loop, never outside.
     fn lowerStmts(self: *Lowerer, stmts: []const ast.Stmt) LowerError![]Stmt {
         var out: std.ArrayList(Stmt) = try .initCapacity(self.arena, stmts.len);
         // By address: the borrow checker keys a jump's exit record by the
@@ -985,6 +989,10 @@ const Lowerer = struct {
             const lowered = try self.lowerStmt(s);
             switch (lowered.kind) {
                 .brk, .cont => |n| try self.appendLoopExitDrops(&out, .jump, @intFromPtr(s), n),
+                .ret => if (self.loop_scope_starts.items.len != 0) {
+                    try self.appendReturnInLoopDrops(&out, lowered, @intFromPtr(s));
+                    continue;
+                },
                 else => {},
             }
             try out.append(self.arena, lowered);
@@ -1021,6 +1029,59 @@ const Lowerer = struct {
             try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
             self.drop_inserted = true;
         }
+    }
+
+    /// Release owners a `return` inside a loop still holds. The value is
+    /// bound first: it may read a local this return is about to free.
+    /// Admission is liveness at this return, not the loop-exit `!wasMoved`
+    /// rule, so a revived owner is released and an owner still dead between
+    /// the move and the revival is not. A missing record keeps the leak.
+    /// String and scalar lists only. The returned owner itself is dead at
+    /// this exit and is not released. Records, fields, and `arc` stay out.
+    fn appendReturnInLoopDrops(self: *Lowerer, out: *std.ArrayList(Stmt), ret: Stmt, key: usize) LowerError!void {
+        const facts = self.facts orelse {
+            try out.append(self.arena, ret);
+            return;
+        };
+        if (self.identity_failed) {
+            try out.append(self.arena, ret);
+            return;
+        }
+        var returning = ret;
+        if (ret.kind.ret) |value| {
+            const scratch = try self.branchScratch(&value);
+            try out.append(self.arena, .{ .span = value.span, .kind = .{ .let = .{ .slot = scratch, .value = value } } });
+            returning = .{
+                .span = ret.span,
+                .kind = .{ .ret = .{
+                    .ty = value.ty,
+                    .span = value.span,
+                    .own = value.own,
+                    .kind = .{ .ref = scratch },
+                } },
+            };
+        }
+        var i = self.scope.items.len;
+        while (i > 0) {
+            i -= 1;
+            const slot = self.scope.items[i].slot;
+            if (slot >= self.bindings.items.len) continue;
+            const binding = self.bindings.items[slot];
+            if (!binding.droppable or binding.ownership != .owned) continue;
+            if (!binding.has_initializer and !binding.is_param) continue;
+            const release: Runtime = switch (binding.ty) {
+                .string => .string_free,
+                .list => |elem| if (scalarListElement(elem.*)) .slice_free else continue,
+                else => continue,
+            };
+            const id = binding.bc_id orelse continue;
+            if (!facts.liveAtExit(.return_stmt, key, id)) continue;
+            const place: Expr = .{ .ty = binding.ty, .span = .none, .own = .owned, .kind = .{ .ref = binding.slot } };
+            const call = try self.runtimeCall(release, .none, &.{place});
+            try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
+            self.drop_inserted = true;
+        }
+        try out.append(self.arena, returning);
     }
 
     /// Release outer owners at one branch end. The binding is still in scope
