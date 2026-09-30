@@ -1755,6 +1755,51 @@ test "checked HIR releases a kept String field on the synthesized else" {
     try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", p_slot, 1));
 }
 
+test "checked HIR releases a kept nested String field on the synthesized else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Inner {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub struct Outer {
+        \\    owned inner: Inner
+        \\    owned tag: String
+        \\}
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy c: Int) {
+        \\    let owned p: Outer = Outer { inner: Inner { a: "x", b: "y" }, tag: "t" }
+        \\    if c > 0 {
+        \\        take(p.inner.a)
+        \\    }
+        \\}
+    );
+    const p_slot = f.body.?[0].kind.let.slot;
+    const ie = f.body.?[1].kind.expr.kind.if_expr;
+    const else_body = ie.else_body orelse return error.TestUnexpectedResult;
+    // `inner` is index 0. `a` is its index 0, `b` is index 1.
+    // The keeping branch frees `inner.a` only. `inner.b` and `tag` stay
+    // for the function-end walk.
+    var then_a = false;
+    var else_a = false;
+    var else_b = false;
+    for (ie.then_body.kind.block.stmts) |stmt| {
+        if (stmtFreesNestedField(stmt, "cell_string_free", p_slot, 0, 0)) then_a = true;
+    }
+    for (else_body.kind.block.stmts) |stmt| {
+        if (stmtFreesNestedField(stmt, "cell_string_free", p_slot, 0, 0)) else_a = true;
+        if (stmtFreesNestedField(stmt, "cell_string_free", p_slot, 0, 1)) else_b = true;
+    }
+    try std.testing.expect(!then_a);
+    try std.testing.expect(else_a);
+    try std.testing.expect(!else_b);
+    try std.testing.expect(!blockFreesField(else_body, "cell_string_free", p_slot, 1));
+    try std.testing.expectEqual(@as(usize, 0), countNestedFieldFrees(f.body.?, "cell_string_free", p_slot, 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countNestedFieldFrees(f.body.?, "cell_string_free", p_slot, 0, 1));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", p_slot, 1));
+}
+
 test "checked HIR does not branch-release a String field revived after the if" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

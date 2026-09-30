@@ -1340,9 +1340,10 @@ const Lowerer = struct {
     /// not live after the merge. A missing branch-end record keeps the leak.
     /// Whole bindings are String and scalar lists. A record is not freed
     /// whole here: that double-frees the sibling the scope-end partial drop
-    /// still owns. Direct owned String and scalar-list fields are released
-    /// when they are live at this branch end and dead at the enclosing
-    /// block end. Nested records, wholly moved records, and `arc` stay out.
+    /// still owns. Owned String and scalar-list fields, including a nested
+    /// record's leaves, are released when they are live at this branch end
+    /// and dead at the enclosing block end. Wholly moved records and `arc`
+    /// stay out.
     fn collectBranchEndDrops(self: *Lowerer, branch_key: usize, merge_key: usize) LowerError![]Stmt {
         const facts = self.facts orelse return &.{};
         if (self.identity_failed) return &.{};
@@ -1387,10 +1388,11 @@ const Lowerer = struct {
         return out.items;
     }
 
-    /// Direct owned fields of `binding`, reverse declaration order. A field
-    /// still live after the merge is left for a later use. A field with no
-    /// branch-end record, or still live at the enclosing block end, stays a
-    /// leak. Nested record fields and `arc` fields are not spelled here.
+    /// Owned fields of `binding`, reverse declaration order, including the
+    /// leaves of a nested record. A field still live after the merge is left
+    /// for a later use. A field with no branch-end record, or still live at
+    /// the enclosing block end, stays a leak. A nested record is not freed
+    /// whole. `arc` fields are not spelled here.
     fn appendBranchEndFieldDrops(
         self: *Lowerer,
         out: *std.ArrayList(Stmt),
@@ -1400,6 +1402,27 @@ const Lowerer = struct {
         branch_key: usize,
         merge_key: usize,
     ) LowerError!void {
+        const base = try self.box(.{
+            .ty = binding.ty,
+            .span = .none,
+            .own = binding.ownership,
+            .kind = .{ .ref = binding.slot },
+        });
+        try self.appendBranchEndFields(out, id, struct_name, "", base, branch_key, merge_key, 0);
+    }
+
+    fn appendBranchEndFields(
+        self: *Lowerer,
+        out: *std.ArrayList(Stmt),
+        id: u32,
+        struct_name: []const u8,
+        path_prefix: []const u8,
+        base: *Expr,
+        branch_key: usize,
+        merge_key: usize,
+        depth: usize,
+    ) LowerError!void {
+        if (depth > 16) return;
         const facts = self.facts orelse return;
         const after = self.enclosing_exit orelse return;
         const def = self.findStructDecl(struct_name) orelse return;
@@ -1408,21 +1431,11 @@ const Lowerer = struct {
             i -= 1;
             const field = def.fields[i];
             if (field.ownership != .owned) continue;
-            const release: Runtime = switch (field.ty) {
-                .string => .string_free,
-                .list => |elem| if (scalarListElement(elem.*)) .slice_free else continue,
-                else => continue,
-            };
-            if (facts.fieldLiveAtExit(.after_branch, merge_key, id, field.name)) continue;
-            if (!facts.fieldLiveAtExit(.branch_end, branch_key, id, field.name)) continue;
-            if (!facts.fieldDeadAtExit(after.kind, after.key, id, field.name)) continue;
-            const base = try self.box(.{
-                .ty = binding.ty,
-                .span = .none,
-                .own = binding.ownership,
-                .kind = .{ .ref = binding.slot },
-            });
-            const place: Expr = .{
+            const field_path: []const u8 = if (path_prefix.len == 0)
+                field.name
+            else
+                try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ path_prefix, field.name });
+            const place = try self.box(.{
                 .ty = field.ty,
                 .span = .none,
                 .own = field.ownership,
@@ -1435,10 +1448,26 @@ const Lowerer = struct {
                         .ownership = field.ownership,
                     },
                 } },
-            };
-            const call = try self.runtimeCall(release, .none, &.{place});
-            try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
-            self.drop_inserted = true;
+            });
+            switch (field.ty) {
+                .string, .list => {
+                    const release: Runtime = switch (field.ty) {
+                        .string => .string_free,
+                        .list => |elem| if (scalarListElement(elem.*)) .slice_free else continue,
+                        else => unreachable,
+                    };
+                    if (facts.fieldLiveAtExit(.after_branch, merge_key, id, field_path)) continue;
+                    if (!facts.fieldLiveAtExit(.branch_end, branch_key, id, field_path)) continue;
+                    if (!facts.fieldDeadAtExit(after.kind, after.key, id, field_path)) continue;
+                    const call = try self.runtimeCall(release, .none, &.{place.*});
+                    try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
+                    self.drop_inserted = true;
+                },
+                .struct_type => |nested| {
+                    try self.appendBranchEndFields(out, id, nested, field_path, place, branch_key, merge_key, depth + 1);
+                },
+                else => {},
+            }
         }
     }
 

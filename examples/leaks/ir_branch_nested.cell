@@ -1,0 +1,42 @@
+// A nested String field moved on only one branch of an if.
+// `take(p.inner.a)` runs when c > 0. On the other path `p.inner.a` is
+// still owned, and the merge records it dead, so the function-end walk
+// skips it. `p.inner.b` and `p.tag` are not freed at the branch end.
+// Each iteration calls both paths. 1000 calls. EXPECT-OUTPUT: 1000
+//
+// BEFORE this release, on the post-parameter compiler: C ALLOC=6000
+// FREE=6000 LIVE=0; LLVM and MLIR ALLOC=6000 FREE=5000 LIVE=1000.
+// The keeping branch frees `p.inner.a` once. After that, LLVM and MLIR
+// measure ALLOC=6000 FREE=6000 LIVE=0.
+
+pub struct Inner {
+    owned a: String
+    owned b: String
+}
+
+pub struct Outer {
+    owned inner: Inner
+    owned tag: String
+}
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn one_branch(copy c: Int) {
+    let owned p: Outer = Outer { inner: Inner { a: "aaaaaaaa", b: "bbbbbbbb" }, tag: "tttttttt" }
+    if c > 0 {
+        take(p.inner.a)
+    }
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        one_branch(1)
+        one_branch(0)
+        i = i + 1
+    }
+    print_int(i)
+}

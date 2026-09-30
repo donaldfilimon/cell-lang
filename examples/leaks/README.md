@@ -97,6 +97,7 @@ landed and must be checked against answer and sanitizer evidence.
 | `ir_nested_field.cell` | A nested String field moved out of a top-level record, 1000 calls. C was already 0. LLVM and MLIR on the post-scope-end compiler measured ALLOC=3000 FREE=2000 LIVE=1000. The scope-end walk frees `p.inner.b` once, so LLVM and MLIR pin 0 |
 | `ir_block_record.cell` | A record declared inside an `if` block, 1000 calls. C was already 0. LLVM and MLIR on the post-nested-field compiler measured ALLOC=2000 FREE=0 LIVE=2000. The block-end walk frees both fields once, so LLVM and MLIR pin 0 |
 | `ir_param_record.cell` | An owned record parameter, 1000 calls. C was already 0. LLVM and MLIR on the post-nested-block compiler measured ALLOC=2000 FREE=0 LIVE=2000. The function-end walk frees both fields once, so LLVM and MLIR pin 0 |
+| `ir_branch_nested.cell` | A nested String field moved on one side of an `if`, 1000 calls of both paths. C was already 0. LLVM and MLIR on the post-parameter compiler measured ALLOC=6000 FREE=5000 LIVE=1000. The keeping branch frees `p.inner.a` once, so LLVM and MLIR pin 0 |
 
 Every LLVM/MLIR pin here is part of the default-target flip criterion
 (`docs/superpowers/specs/2026-09-21-mod02-flow03-ir-first-design.md`,

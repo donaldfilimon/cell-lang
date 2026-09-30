@@ -1359,7 +1359,7 @@ end, and no liveness after the merge. An `if` with no else gets a
 synthesized else that contains only those releases, and the `if` stays
 unit-typed. When the branch has a value, that value is bound to a
 nondroppable scratch before the releases. Still outside the branch-end and loop-exit paths: a skip-revival
-`break`, nested record fields, wholly moved records, and `arc` fields at
+`break`, wholly moved records, and `arc` fields at
 branch ends, an owner moved on every path when
 the breaks do not agree, resource-valued returns, temporaries, and any
 owner moved anywhere at a loop-body jump when revival is not vouched
@@ -1378,7 +1378,9 @@ function-end slice (`ir_unmoved_while`).
 
 **A record declared inside a nested block joined that field walk on 2026-09-30, at the block's own end.** The function-end pass only sees a direct `let` of the function, so a `Pair` inside an `if` or a `while` body used to stay allocated. HIR now frees each remaining owned String or scalar-list leaf once when that block falls through, including a nested record's leaves. A moved leaf is not freed. A wholly moved record is not walked. The function-end pass does not free the same fields again. `ir_block_record` measured LLVM and MLIR ALLOC=2000 FREE=0 LIVE=2000 on the post-nested-field compiler. After this release both measure ALLOC=2000 FREE=2000 LIVE=0. C was already 0. `arc` fields stay leaks.
 
-**An owned record parameter joined that same function-end walk on 2026-09-30.** The walk used to skip `is_param`, so a `Pair` parameter kept both Strings. HIR now frees each remaining owned String or scalar-list leaf once at function end, including a nested record's leaves. A moved leaf is not freed. A wholly moved parameter is not walked, so the destination's fields are the ones released. `ir_param_record` measured LLVM and MLIR ALLOC=2000 FREE=0 LIVE=2000 on the post-nested-block compiler. After this release both measure ALLOC=2000 FREE=2000 LIVE=0. C was already 0. `arc` fields stay leaks. A field that is live on only one branch of a parameter is still outside the branch-end path.
+**An owned record parameter joined that same function-end walk on 2026-09-30.** The walk used to skip `is_param`, so a `Pair` parameter kept both Strings. HIR now frees each remaining owned String or scalar-list leaf once at function end, including a nested record's leaves. A moved leaf is not freed. A wholly moved parameter is not walked, so the destination's fields are the ones released. `ir_param_record` measured LLVM and MLIR ALLOC=2000 FREE=0 LIVE=2000 on the post-nested-block compiler. After this release both measure ALLOC=2000 FREE=2000 LIVE=0. C was already 0. `arc` fields stay leaks.
+
+**A nested field joined the branch-end release on 2026-09-30.** The branch-end walk used to free only a direct String or scalar-list field, so `p.inner.a` stayed allocated on the path that kept it. HIR now frees that leaf when it is live at the branch end, not live after the merge, and dead at the enclosing block end. The nested record is not freed whole. `p.inner.b` and `p.tag` stay for the function-end walk. `ir_branch_nested` measured LLVM and MLIR ALLOC=6000 FREE=5000 LIVE=1000 on the post-parameter compiler. After this release both measure ALLOC=6000 FREE=6000 LIVE=0. C was already 0. `arc` fields stay leaks.
 
 **An unmoved owner beside a `while` joined the function-end release on 2026-09-30.** The function-end slice used to return the body unchanged when it saw a `while`. It now keeps that statement and still releases a confirmed-live, unmoved owned String or scalar list once, after the loop, including before a terminal scalar return. A moved owner is not released there (`wasMoved`), so the after-loop drop is not repeated. `ir_unmoved_while` measured LLVM ALLOC=1000 FREE=0 LIVE=1000 on the post-skip compiler; the pin after this release is 0. C was already 0.
 
