@@ -1358,13 +1358,16 @@ holds it when borrowck recorded a move somewhere, liveness at that branch
 end, and no liveness after the merge. An `if` with no else gets a
 synthesized else that contains only those releases, and the `if` stays
 unit-typed. When the branch has a value, that value is bound to a
-nondroppable scratch before the releases. Still outside the branch-end and loop-exit paths: owners
-declared before the loop (at `break`, `continue`, and the loop's
-fall-through), field and record branch ends, an owner moved on every path,
-resource-valued returns, temporaries, and any owner moved anywhere at a
-loop exit or function-end fall-through (kept, so a leak, never a double
-free). A branch that always leaves by `break` or `continue` is not given a
-release after that jump.
+nondroppable scratch before the releases. Still outside the branch-end and loop-exit paths: a skip-revival
+`break`, field and record branch ends, an owner moved on every path when
+the breaks do not agree, resource-valued returns, temporaries, and any
+owner moved anywhere at a loop-body jump when revival is not vouched
+(kept, so a leak, never a double free). A branch that always leaves by
+`break` or `continue` is not given a release after that jump. An unmoved
+owner in a function whose body contains a `while` still waits on the
+function-end slice, which bails on that statement.
+
+**An owner declared before a loop joined the shared HIR release path on 2026-09-30, once, after the loop.** Borrowck's `after_loop` record is the admission: the owner was moved, and it holds a value on every path out. HIR appends one `cell_string_free` or `cell_slice_free` after the `while`. A `break` that still holds the value reaches that statement. `continue` and the body's back edge do not, so they are not drop sites for this owner (freeing there is a use-after-free on the next iteration). An unmoved owner is not released after the loop, or it would double-free with a function-end drop. A later statement that reads the name keeps the leak, because the function-end record for a loop-moved owner is poisoned. `after_loop_skip` is not used: a plain IR `break` cannot jump past the release, and running it on the dead path double-frees. `ir_after_loop` is that shape. LLVM on the compiler from earlier the same day measured LIVE=1000; the pin after this release is 0.
 
 **A `return` inside a loop joined the shared HIR release path on 2026-09-30.**
 The returned value is bound to a nondroppable scratch first. HIR then

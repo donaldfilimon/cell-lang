@@ -519,6 +519,12 @@ LEAK_RETURN_IN_LOOP=0
 LEAK_IR_RETURN_IN_LOOP_C=0
 LEAK_IR_RETURN_IN_LOOP_LLVM=0
 LEAK_IR_RETURN_IN_LOOP_MLIR=0
+# IR twin of loop_cross: the revived owner declared before the loop is
+# released once after the loop. LLVM on the 12:35 binary (no after-loop
+# drop) measured ALLOC=2000 FREE=1000 LIVE=1000. MLIR lowers the same HIR.
+LEAK_IR_AFTER_LOOP_C=0
+LEAK_IR_AFTER_LOOP_LLVM=0
+LEAK_IR_AFTER_LOOP_MLIR=0
 # Owning String in Ok (2026-09-17): every shape results_string.cell pins,
 # 1000 times. Measured 0 (ALLOC=8798 FREE=8798); with the temporary
 # scrutinee release removed it measured 2000, so the fixture reaches it.
@@ -1145,6 +1151,7 @@ else
     run_c_leaks skip_revival_break "" "$LEAK_SKIP_REVIVAL_BREAK" "R16 residual skip-revival break, CLOSED 2026-09-17 by after_loop_skip releases; 500 -> 0"
     run_c_leaks return_in_loop "" "$LEAK_RETURN_IN_LOOP" "R16 residual return inside a loop, CLOSED 2026-09-17 by live return records in accepted loops; 500 -> 0"
     run_c_leaks ir_return_in_loop "" "$LEAK_IR_RETURN_IN_LOOP_C" "return after revival always leaves the loop, 2026-09-30"
+    run_c_leaks ir_after_loop "" "$LEAK_IR_AFTER_LOOP_C" "revived owner declared before the loop, released after it, 2026-09-30"
     run_c_leaks owned_string_result "" "$LEAK_OWNED_STRING_RESULT" "owning String Ok, 2026-09-17"
     run_c_leaks owned_string_err "" "$LEAK_OWNED_STRING_ERR" "owning String Err and both sides, 2026-09-17"
     run_c_leaks owned_string_optional "" "$LEAK_OWNED_STRING_OPTIONAL" "owning String?, 2026-09-17"
@@ -1244,6 +1251,8 @@ else
     run_c_leaks labelled_break "" "$LEAK_LABELLED_BREAK_C" "FLOW-03 break :outer releases the outer and inner bodies' locals, 2026-09-22"
     run_ir_leaks ir_return_in_loop llvm "$LEAK_IR_RETURN_IN_LOOP_LLVM" "HIR releases owners live at a return inside a loop, 2026-09-30"
     run_ir_leaks ir_return_in_loop mlir "$LEAK_IR_RETURN_IN_LOOP_MLIR" "HIR releases owners live at a return inside a loop, 2026-09-30"
+    run_ir_leaks ir_after_loop llvm "$LEAK_IR_AFTER_LOOP_LLVM" "HIR releases a revived owner once after the loop, 2026-09-30"
+    run_ir_leaks ir_after_loop mlir "$LEAK_IR_AFTER_LOOP_MLIR" "HIR releases a revived owner once after the loop, 2026-09-30"
     run_ir_leaks labelled_break llvm "$LEAK_LABELLED_BREAK_LLVM" "FLOW-03 break :outer; HIR loop-exit releases, 2026-09-29"
     run_ir_leaks labelled_break mlir "$LEAK_LABELLED_BREAK_MLIR" "FLOW-03 break :outer; HIR loop-exit releases, 2026-09-29"
     run_c_leaks labelled_continue "" "$LEAK_LABELLED_CONTINUE_C" "FLOW-03 continue :outer releases the outer and inner bodies' locals, 2026-09-22"
@@ -1568,7 +1577,7 @@ else
     # the runtime allocator and release called by that IR are. This catches
     # a duplicate/wrong release but is not whole-program IR instrumentation.
     if cc -fsanitize=address -g -c runtime/cell_rt.c -o "$TMP/san_drop_rt.o" 2>/dev/null; then
-      for drop_src in examples/leaks/ir_fallthrough_string.cell examples/leaks/ir_reassign_string.cell examples/leaks/ir_fallthrough_list.cell examples/leaks/ir_list_literal.cell examples/leaks/ir_string_conversion.cell examples/leaks/ir_owned_string.cell examples/leaks/ir_return_in_loop.cell; do
+      for drop_src in examples/leaks/ir_fallthrough_string.cell examples/leaks/ir_reassign_string.cell examples/leaks/ir_fallthrough_list.cell examples/leaks/ir_list_literal.cell examples/leaks/ir_string_conversion.cell examples/leaks/ir_owned_string.cell examples/leaks/ir_return_in_loop.cell examples/leaks/ir_after_loop.cell; do
         drop_name=$(basename "$drop_src" .cell)
         drop_expected=1000
         case "$drop_name" in

@@ -1,0 +1,31 @@
+// An owner declared before a loop, moved and revived on every path out.
+// The release is the one after the loop. `continue` and the body's back
+// edge do not free it. 1000 calls, one revived String left each time the
+// loop's condition fails.
+// C already released that String (`loop_cross`, 2026-09-16). HIR did not,
+// until the after-loop drop.
+// EXPECT-OUTPUT: 1000
+
+pub fn print_int(copy value: Int);
+
+pub fn take(owned s: String) {
+}
+
+pub fn once() {
+    var owned s: String = "aaaaaaaa"
+    var i = 0
+    while i < 1 {
+        take(s)
+        s = "bbbbbbbb"
+        i = i + 1
+    }
+}
+
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        once()
+        i = i + 1
+    }
+    print_int(i)
+}

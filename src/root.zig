@@ -289,21 +289,21 @@ test "shipped load+check pairs a body with its module so a module-only name reso
     try tmp.dir.writeFile(io, .{
         .sub_path = "geometry.cell",
         .data =
-            \\pub struct Point { copy x: Float64 copy y: Float64 }
-            \\pub enum Quadrant { First, Second, Third, Fourth }
-            \\pub fn origin() -> Point;
-            \\pub fn q() -> Quadrant;
+        \\pub struct Point { copy x: Float64 copy y: Float64 }
+        \\pub enum Quadrant { First, Second, Third, Fourth }
+        \\pub fn origin() -> Point;
+        \\pub fn q() -> Quadrant;
         ,
     });
     try tmp.dir.writeFile(io, .{
         .sub_path = "geometry.body",
         .data =
-            \\pub fn origin() -> Point {
-            \\    return Point { x: 0.0, y: 0.0 }
-            \\}
-            \\pub fn q() -> Quadrant {
-            \\    return Quadrant.First
-            \\}
+        \\pub fn origin() -> Point {
+        \\    return Point { x: 0.0, y: 0.0 }
+        \\}
+        \\pub fn q() -> Quadrant {
+        \\    return Quadrant.First
+        \\}
         ,
     });
     var result = try loadCheckPath(tmp.dir, "geometry.body");
@@ -344,9 +344,9 @@ test "shipped load+check accepts a .cel module alias" {
     try tmp.dir.writeFile(io, .{
         .sub_path = "hello.cel",
         .data =
-            \\pub fn add(shared a: Int, shared b: Int) -> Int {
-            \\    return a + b
-            \\}
+        \\pub fn add(shared a: Int, shared b: Int) -> Int {
+        \\    return a + b
+        \\}
         ,
     });
     var result = try loadCheckPath(tmp.dir, "hello.cel");
@@ -430,14 +430,14 @@ test "shipped load+check rejects a pub definition whose parameter ownership disa
     try tmp.dir.writeFile(io, .{
         .sub_path = "g.cell",
         .data =
-            \\pub struct Buffer { copy len: Int }
-            \\pub fn grow(exclusive buf: Buffer, shared extra: Int);
+        \\pub struct Buffer { copy len: Int }
+        \\pub fn grow(exclusive buf: Buffer, shared extra: Int);
         ,
     });
     try tmp.dir.writeFile(io, .{
         .sub_path = "g.body",
         .data =
-            \\pub fn grow(owned buf: Buffer, shared extra: Int) { }
+        \\pub fn grow(owned buf: Buffer, shared extra: Int) { }
         ,
     });
     var result = try loadCheckPath(tmp.dir, "g.body");
@@ -1141,6 +1141,159 @@ test "checked HIR keeps a String that a loop return moves to the caller" {
         try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", owner));
     }
     try std.testing.expect(body[body.len - 1].kind == .ret);
+}
+
+test "checked HIR releases a revived outer String once after the loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn take(owned s: String) { }
+        \\pub fn f() {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        take(v)
+        \\        v = "b"
+        \\        i = i + 1
+        \\    }
+        \\}
+    );
+    const v_slot = f.body.?[0].kind.let.slot;
+    const loop = f.body.?[2].kind.while_loop.body;
+    for (loop) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
+    try std.testing.expect(stmtFreesSlot(f.body.?[f.body.?.len - 1], "cell_string_free", v_slot));
+}
+
+test "checked HIR releases a revived outer String after the loop, not before break" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        v = "b"
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\    }
+        \\}
+    );
+    const v_slot = f.body.?[0].kind.let.slot;
+    const loop = f.body.?[2].kind.while_loop.body;
+    for (loop) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
+    try std.testing.expect(stmtFreesSlot(f.body.?[f.body.?.len - 1], "cell_string_free", v_slot));
+}
+
+test "checked HIR does not release an unmoved outer String after the loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn f() {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\    }
+        \\}
+    );
+    const v_slot = f.body.?[0].kind.let.slot;
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
+}
+
+test "checked HIR does not release a revived outer String at continue" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn take(owned s: String) { }
+        \\pub fn f() {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        take(v)
+        \\        v = "b"
+        \\        i = i + 1
+        \\        continue
+        \\    }
+        \\}
+    );
+    const v_slot = f.body.?[0].kind.let.slot;
+    const loop = f.body.?[2].kind.while_loop.body;
+    for (loop) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
+    try std.testing.expect(loop[loop.len - 1].kind == .cont);
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
+    try std.testing.expect(stmtFreesSlot(f.body.?[f.body.?.len - 1], "cell_string_free", v_slot));
+}
+
+test "checked HIR does not release an outer String on a skip-revival break" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn take(owned s: String) { }
+        \\pub fn f(copy n: Int) {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        i = i + 1
+        \\        take(v)
+        \\        if i > n {
+        \\            break
+        \\        }
+        \\        v = "b"
+        \\    }
+        \\}
+    );
+    const v_slot = f.body.?[0].kind.let.slot;
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
+    const loop = f.body.?[2].kind.while_loop.body;
+    for (loop) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_string_free", v_slot));
+}
+
+test "checked HIR does not release a revived outer String a later statement still uses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn take(owned s: String) { }
+        \\pub fn f() {
+        \\    var owned v: String = "a"
+        \\    var i = 0
+        \\    while i < 3 {
+        \\        take(v)
+        \\        v = "b"
+        \\        i = i + 1
+        \\    }
+        \\    take(v)
+        \\}
+    );
+    const v_slot = f.body.?[0].kind.let.slot;
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(f.body.?, "cell_string_free", v_slot));
+}
+
+test "checked HIR releases a revived outer scalar list once after the loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn take_xs(owned xs: [Int]) { }
+        \\pub fn f() {
+        \\    var owned xs: [Int] = [1]
+        \\    var i = 0
+        \\    while i < 1 {
+        \\        take_xs(xs)
+        \\        xs = [2]
+        \\        i = i + 1
+        \\    }
+        \\}
+    );
+    const slot = f.body.?[0].kind.let.slot;
+    const loop = f.body.?[2].kind.while_loop.body;
+    for (loop) |stmt| try std.testing.expect(!stmtFreesSlot(stmt, "cell_slice_free", slot));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFrees(f.body.?, "cell_slice_free", slot));
+    try std.testing.expect(stmtFreesSlot(f.body.?[f.body.?.len - 1], "cell_slice_free", slot));
 }
 
 fn checkedFn(a: std.mem.Allocator, source: []const u8) !hir.Fn {

@@ -762,11 +762,14 @@ const Lowerer = struct {
     /// optionally followed by a scalar return. A statement-position `if` is
     /// allowed through so an owner neither branch moved still gets this one
     /// function-end release. A `while`, a `match`, or any other statement
-    /// still leaves that release out. Evaluate replacements and the return
-    /// value before releasing confirmed live owners at the exit.
+    /// still leaves that release out. After-loop releases make `body` longer
+    /// than `source`; this slice cannot zip them and must keep `body`.
+    /// Evaluate replacements and the return value before releasing confirmed
+    /// live owners at the exit.
     fn appendSimpleFallthroughDrops(self: *Lowerer, fn_name: []const u8, source: []const ast.Stmt, body: []Stmt) LowerError![]Stmt {
         const facts = self.facts orelse return body;
         if (self.identity_failed) return body;
+        if (body.len != source.len) return body;
         var terminal_return = false;
         if (source.len != 0 and source[source.len - 1].kind == .return_stmt and body[body.len - 1].kind == .ret) {
             if (body[body.len - 1].kind.ret) |value| {
@@ -978,19 +981,25 @@ const Lowerer = struct {
     /// releases for the loop bodies it leaves (`appendLoopExitDrops`). A
     /// `return` inside a loop is preceded by the releases for every owner
     /// still live at that return (`appendReturnInLoopDrops`), after the
-    /// returned value has been bound. Outside a loop a `return` is unchanged
-    /// here; the function-end slice owns that case. The result can be longer
-    /// than `stmts` inside a loop, never outside.
+    /// returned value has been bound. A `while` is followed by the releases
+    /// for owners declared before it that borrowck proved live on every
+    /// path out (`appendAfterLoopDrops`). Outside a loop a `return` is
+    /// unchanged here; the function-end slice owns that case.
     fn lowerStmts(self: *Lowerer, stmts: []const ast.Stmt) LowerError![]Stmt {
         var out: std.ArrayList(Stmt) = try .initCapacity(self.arena, stmts.len);
         // By address: the borrow checker keys a jump's exit record by the
         // AST statement, so `&s` of a loop-variable copy would never match.
-        for (stmts) |*s| {
+        for (stmts, 0..) |*s, index| {
             const lowered = try self.lowerStmt(s);
             switch (lowered.kind) {
                 .brk, .cont => |n| try self.appendLoopExitDrops(&out, .jump, @intFromPtr(s), n),
                 .ret => if (self.loop_scope_starts.items.len != 0) {
                     try self.appendReturnInLoopDrops(&out, lowered, @intFromPtr(s));
+                    continue;
+                },
+                .while_loop => {
+                    try out.append(self.arena, lowered);
+                    try self.appendAfterLoopDrops(&out, @intFromPtr(s), stmts[index + 1 ..]);
                     continue;
                 },
                 else => {},
@@ -1082,6 +1091,117 @@ const Lowerer = struct {
             self.drop_inserted = true;
         }
         try out.append(self.arena, returning);
+    }
+
+    /// Release an owner declared before this `while` once, after the loop.
+    /// Admission is C's `after_loop`: moved somewhere, and live on every path
+    /// out of this loop. The body's `break` reaches that statement. `continue`
+    /// and the back edge do not, so they are not drop sites for this owner.
+    /// An unmoved owner stays on the function-end path. `after_loop_skip`
+    /// stays a leak: a plain IR `break` would run the release on the dead
+    /// path. A later statement that still reads the name keeps the leak too,
+    /// because the function-end record for a loop-moved owner is poisoned.
+    /// String and scalar lists only. Records, fields, and `arc` stay out.
+    fn appendAfterLoopDrops(self: *Lowerer, out: *std.ArrayList(Stmt), key: usize, later: []const ast.Stmt) LowerError!void {
+        const facts = self.facts orelse return;
+        if (self.identity_failed) return;
+        var i = self.scope.items.len;
+        while (i > 0) {
+            i -= 1;
+            const slot = self.scope.items[i].slot;
+            if (slot >= self.bindings.items.len) continue;
+            const binding = self.bindings.items[slot];
+            if (!binding.droppable or binding.ownership != .owned) continue;
+            if (!binding.has_initializer and !binding.is_param) continue;
+            const release: Runtime = switch (binding.ty) {
+                .string => .string_free,
+                .list => |elem| if (scalarListElement(elem.*)) .slice_free else continue,
+                else => continue,
+            };
+            const id = binding.bc_id orelse continue;
+            if (!facts.wasMoved(id) or !facts.liveAtExit(.after_loop, key, id)) continue;
+            if (astStmtsUse(later, binding.name)) continue;
+            const place: Expr = .{ .ty = binding.ty, .span = .none, .own = .owned, .kind = .{ .ref = binding.slot } };
+            const call = try self.runtimeCall(release, .none, &.{place});
+            try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
+            self.drop_inserted = true;
+        }
+    }
+
+    /// Whether a later statement reads `name`. A false yes only keeps a leak.
+    /// An assignment `name = e` does not count: it writes the slot. Mirrors
+    /// the C emitter's `stmtsUse` so the after-loop release and that emitter
+    /// agree on a use that follows the loop.
+    fn astStmtsUse(stmts: []const ast.Stmt, name: []const u8) bool {
+        for (stmts, 0..) |_, i| {
+            if (astStmtUses(&stmts[i], name)) return true;
+        }
+        return false;
+    }
+
+    fn astStmtUses(s: *const ast.Stmt, name: []const u8) bool {
+        return switch (s.kind) {
+            .let => |l| if (l.value) |v| astExprUses(&v, name) else false,
+            .expr => |e| astExprUses(&e, name),
+            .return_stmt => |opt| if (opt) |v| astExprUses(&v, name) else false,
+            .assign => |a| astTargetReads(&a.target, name) or astExprUses(&a.value, name),
+            .while_stmt => |w| astExprUses(&w.cond, name) or astStmtsUse(w.body, name),
+            .break_stmt, .continue_stmt => false,
+        };
+    }
+
+    fn astTargetReads(e: *const ast.Expr, name: []const u8) bool {
+        return switch (e.kind) {
+            .ident => false,
+            .annotated => |a| astTargetReads(a.value, name),
+            else => astExprUses(e, name),
+        };
+    }
+
+    fn astExprUses(e: *const ast.Expr, name: []const u8) bool {
+        return switch (e.kind) {
+            .ident => |n| std.mem.eql(u8, n, name),
+            .int, .float, .string, .bool => false,
+            .call => |c| blk: {
+                if (astExprUses(c.callee, name)) break :blk true;
+                for (c.args, 0..) |_, i| {
+                    if (astExprUses(&c.args[i], name)) break :blk true;
+                }
+                break :blk false;
+            },
+            .binary => |b| astExprUses(b.left, name) or astExprUses(b.right, name),
+            .unary => |u| astExprUses(u.operand, name),
+            .field => |f| astExprUses(f.base, name),
+            .index => |ix| astExprUses(ix.base, name) or astExprUses(ix.index, name),
+            .struct_lit => |sl| blk: {
+                for (sl.fields, 0..) |_, i| {
+                    if (astExprUses(&sl.fields[i].value, name)) break :blk true;
+                }
+                break :blk false;
+            },
+            .list_lit => |items| blk: {
+                for (items, 0..) |_, i| {
+                    if (astExprUses(&items[i], name)) break :blk true;
+                }
+                break :blk false;
+            },
+            .block => |stmts| astStmtsUse(stmts, name),
+            .if_expr => |i| blk: {
+                if (astExprUses(i.cond, name)) break :blk true;
+                if (astExprUses(i.then_body, name)) break :blk true;
+                if (i.else_body) |eb| break :blk astExprUses(eb, name);
+                break :blk false;
+            },
+            .match_expr => |m| blk: {
+                if (astExprUses(m.scrutinee, name)) break :blk true;
+                for (m.arms) |arm| {
+                    if (astExprUses(arm.body, name)) break :blk true;
+                }
+                break :blk false;
+            },
+            .annotated => |a| astExprUses(a.value, name),
+            .wrap => |w| if (w.operand) |o| astExprUses(o, name) else false,
+        };
     }
 
     /// Release outer owners at one branch end. The binding is still in scope

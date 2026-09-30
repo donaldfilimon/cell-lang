@@ -90,6 +90,7 @@ landed and must be checked against answer and sanitizer evidence.
 | `labelled_break.cell` | FLOW-03: `break :outer` from a nested loop crossing an owning local in each body; C releases both on the jump, 0 on both witnesses (a requirement, spec invariant 13); LLVM and MLIR 3000 (2026-09-22), 0 since HIR loop-exit releases (2026-09-29) |
 | `labelled_continue.cell` | FLOW-03: `continue :outer` from a nested loop, the same shape; C 0 on both witnesses; LLVM and MLIR 6000 (2026-09-22), 0 since HIR loop-exit releases (2026-09-29) |
 | `ir_return_in_loop.cell` | A `return` on the first iteration after an outer String is moved and revived, 1000 calls. C was already 0. LLVM/MLIR were LIVE=1000 until 2026-09-30, when HIR began releasing owners live at a `return` inside a loop; both now pin 0 |
+| `ir_after_loop.cell` | IR twin of `loop_cross`: one revived String declared before the loop, 1000 calls. C was already 0. LLVM on the compiler from earlier the same day measured LIVE=1000. HIR now releases that owner once after the loop; LLVM and MLIR pin 0. `continue` is not a drop site. A skip-revival `break` stays a leak |
 
 Every LLVM/MLIR pin here is part of the default-target flip criterion
 (`docs/superpowers/specs/2026-09-21-mod02-flow03-ir-first-design.md`,
