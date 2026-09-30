@@ -1,13 +1,13 @@
 // A field moved on only one branch of an if. `take(p.a)` runs when c > 0.
 // On the other path `p.a` is still owned, but the merge records it dead, so
-// a scope-end partial drop skips it. `p.b` is not freed at the branch end:
-// it stays for the scope-end partial drop. IR does not have that partial
-// drop, so `p.b` remains a leak after the branch-end field release.
+// a scope-end partial drop skips it. `p.b` is not freed at the branch end.
+// The function-end partial drop frees `p.b` once on both paths.
 // Each iteration calls both paths. 1000 calls. EXPECT-OUTPUT: 1000
 //
-// BEFORE this HIR slice, on the post-unmoved compiler: C ALLOC=4000
-// FREE=4000 LIVE=0; LLVM and MLIR ALLOC=4000 FREE=1000 LIVE=3000. The 1000
-// frees are `take` releasing `p.a` on the moving path.
+// BEFORE the branch-end slice, on the post-unmoved compiler: C ALLOC=4000
+// FREE=4000 LIVE=0; LLVM and MLIR ALLOC=4000 FREE=1000 LIVE=3000. After
+// that slice LLVM and MLIR were ALLOC=4000 FREE=2000 LIVE=2000. After the
+// scope-end drop they measure ALLOC=4000 FREE=4000 LIVE=0.
 
 pub struct Pair {
     owned a: String

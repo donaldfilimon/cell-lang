@@ -563,6 +563,18 @@ const drop_facts_vtable: dropfacts.DropFacts.VTable = .{
             return checker.wasWhollyMoved(id);
         }
     }.read,
+    .field_was_moved = struct {
+        fn read(context: *const anyopaque, id: u32, path: []const u8) bool {
+            const checker: *const Checker = @ptrCast(@alignCast(context));
+            return checker.fieldWasMoved(id, path);
+        }
+    }.read,
+    .field_was_moved_whole = struct {
+        fn read(context: *const anyopaque, id: u32, path: []const u8) bool {
+            const checker: *const Checker = @ptrCast(@alignCast(context));
+            return checker.fieldWasMovedWhole(id, path);
+        }
+    }.read,
 };
 
 /// Borrow-check `module`, rendering every diagnostic to `writer`. Deliberately

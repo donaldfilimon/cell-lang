@@ -29,6 +29,13 @@ pub const DropFacts = struct {
         /// True when the binding itself was moved (path `""`), not merely
         /// one of its fields.
         was_wholly_moved: *const fn (*const anyopaque, u32) bool,
+        /// True when `path` was moved in whole or in part. A missing record
+        /// is false. A revived path is false unless the binding is loop-moved.
+        /// A whole-binding move is not reported here.
+        field_was_moved: *const fn (*const anyopaque, u32, []const u8) bool,
+        /// True when `path` itself was moved (exact match). A missing record
+        /// is false. A whole-binding move is not reported here.
+        field_was_moved_whole: *const fn (*const anyopaque, u32, []const u8) bool,
     };
 
     pub fn nextBindingId(self: DropFacts) u32 {
@@ -65,5 +72,13 @@ pub const DropFacts = struct {
 
     pub fn wasWhollyMoved(self: DropFacts, id: u32) bool {
         return self.vtable.was_wholly_moved(self.context, id);
+    }
+
+    pub fn fieldWasMoved(self: DropFacts, id: u32, path: []const u8) bool {
+        return self.vtable.field_was_moved(self.context, id, path);
+    }
+
+    pub fn fieldWasMovedWhole(self: DropFacts, id: u32, path: []const u8) bool {
+        return self.vtable.field_was_moved_whole(self.context, id, path);
     }
 };

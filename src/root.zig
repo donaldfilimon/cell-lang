@@ -1595,6 +1595,14 @@ fn countTopLevelFrees(body: []const hir.Stmt, symbol: []const u8, slot: u32) usi
     return n;
 }
 
+fn countTopLevelFieldFrees(body: []const hir.Stmt, symbol: []const u8, slot: u32, index: u32) usize {
+    var n: usize = 0;
+    for (body) |stmt| {
+        if (stmtFreesField(stmt, symbol, slot, index)) n += 1;
+    }
+    return n;
+}
+
 test "checked HIR releases an outer owned String on the branch that kept it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1720,6 +1728,9 @@ test "checked HIR releases a kept String field on the synthesized else" {
     try std.testing.expect(blockFreesField(else_body, "cell_string_free", p_slot, 0));
     try std.testing.expect(!blockFreesField(else_body, "cell_string_free", p_slot, 1));
     try std.testing.expect(!blockFreesSlot(else_body, "cell_string_free", p_slot));
+    // `b` is the unmoved sibling. One function-end free, not a second free of `a`.
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", p_slot, 0));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", p_slot, 1));
 }
 
 test "checked HIR does not branch-release a String field revived after the if" {
@@ -1746,6 +1757,9 @@ test "checked HIR does not branch-release a String field revived after the if" {
         try std.testing.expect(!blockFreesField(else_body, "cell_string_free", p_slot, 0));
         try std.testing.expect(!blockFreesField(else_body, "cell_string_free", p_slot, 1));
     }
+    // Both fields hold a value at scope end: `a` was revived, `b` was never moved.
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", p_slot, 0));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", p_slot, 1));
 }
 
 test "checked HIR releases a kept scalar-list field on the synthesized else" {
@@ -1770,6 +1784,8 @@ test "checked HIR releases a kept scalar-list field on the synthesized else" {
     try std.testing.expect(!blockFreesField(ie.then_body, "cell_slice_free", p_slot, 0));
     try std.testing.expect(blockFreesField(else_body, "cell_slice_free", p_slot, 0));
     try std.testing.expect(!blockFreesField(else_body, "cell_slice_free", p_slot, 1));
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_slice_free", p_slot, 0));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_slice_free", p_slot, 1));
 }
 
 test "checked HIR does not field-release a wholly moved record" {
@@ -1792,9 +1808,38 @@ test "checked HIR does not field-release a wholly moved record" {
         \\}
     );
     const p_slot = f.body.?[0].kind.let.slot;
+    const q_slot = f.body.?[1].kind.let.slot;
     const ie = f.body.?[3].kind.expr.kind.if_expr;
     try std.testing.expect(!blockFreesField(ie.then_body, "cell_string_free", p_slot, 0));
     try std.testing.expect(!blockFreesField(ie.then_body, "cell_string_free", p_slot, 1));
     try std.testing.expect(!blockFreesField(ie.else_body.?, "cell_string_free", p_slot, 0));
     try std.testing.expect(!blockFreesField(ie.else_body.?, "cell_string_free", p_slot, 1));
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", p_slot, 0));
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", p_slot, 1));
+    // `q` received the record. Its fields are still owned at scope end.
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", q_slot, 0));
+    try std.testing.expectEqual(@as(usize, 1), countTopLevelFieldFrees(f.body.?, "cell_string_free", q_slot, 1));
+}
+
+test "checked HIR does not scope-release a record declared inside a branch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub struct Pair {
+        \\    owned a: String
+        \\    owned b: String
+        \\}
+        \\pub fn f(copy c: Int) {
+        \\    if c > 0 {
+        \\        let owned p: Pair = Pair { a: "x", b: "y" }
+        \\    }
+        \\}
+    );
+    var p_slot: ?u32 = null;
+    for (f.bindings) |b| {
+        if (std.mem.eql(u8, b.name, "p")) p_slot = b.slot;
+    }
+    const slot = p_slot orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", slot, 0));
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFieldFrees(f.body.?, "cell_string_free", slot, 1));
 }

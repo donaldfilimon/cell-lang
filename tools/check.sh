@@ -471,10 +471,12 @@ LEAK_IR_OWNED_STRING_MLIR=0
 # positions 1000 times, nine allocations per call. Measured on first run:
 # C ALLOC=9000 FREE=9000 LIVE=0 (and 0 leaks); LLVM and MLIR ALLOC=9000
 # FREE=0 LIVE=9000 before terminal scalar-return cleanup. That cleanup now
-# releases eight of the nine per call; a record-owned field remains live.
+# releases eight of the nine per call. The remaining record-owned field
+# is released at scope end (2026-09-30): LLVM and MLIR ALLOC=9000
+# FREE=9000 LIVE=0.
 LEAK_IR_STRING_CONVERSION_C=0
-LEAK_IR_STRING_CONVERSION_LLVM=1000
-LEAK_IR_STRING_CONVERSION_MLIR=1000
+LEAK_IR_STRING_CONVERSION_LLVM=0
+LEAK_IR_STRING_CONVERSION_MLIR=0
 # examples/owned_string.cell once, with its host (whose `take` frees the one
 # owned argument it is handed). Measured on first run: C ALLOC=9 FREE=9
 # LIVE=0 (and 0 leaks); LLVM and MLIR ALLOC=9 FREE=1 LIVE=8.
@@ -539,12 +541,12 @@ LEAK_IR_UNMOVED_WHILE_LLVM=0
 LEAK_IR_UNMOVED_WHILE_MLIR=0
 # A String field moved on one branch of an if. LLVM and MLIR on the
 # post-unmoved compiler measured ALLOC=4000 FREE=1000 LIVE=3000. The
-# keeping branch now frees `p.a`. `p.b` stays with the scope-end partial
-# drop, which IR does not emit, so the pin is 2000 rather than 0. C was
-# already 0 (`branch_field.cell`).
+# keeping branch frees `p.a`. The scope-end partial drop now frees `p.b`
+# once on both paths. After that release LLVM and MLIR measure ALLOC=4000
+# FREE=4000 LIVE=0. C was already 0 (`branch_field.cell`).
 LEAK_IR_BRANCH_FIELD_C=0
-LEAK_IR_BRANCH_FIELD_LLVM=2000
-LEAK_IR_BRANCH_FIELD_MLIR=2000
+LEAK_IR_BRANCH_FIELD_LLVM=0
+LEAK_IR_BRANCH_FIELD_MLIR=0
 # Owning String in Ok (2026-09-17): every shape results_string.cell pins,
 # 1000 times. Measured 0 (ALLOC=8798 FREE=8798); with the temporary
 # scrutinee release removed it measured 2000, so the fixture reaches it.
@@ -1174,7 +1176,7 @@ else
     run_c_leaks ir_after_loop "" "$LEAK_IR_AFTER_LOOP_C" "revived owner declared before the loop, released after it, 2026-09-30"
     run_c_leaks ir_skip_revival "" "$LEAK_IR_SKIP_REVIVAL_C" "skip-revival break jumps past the after-loop release, 2026-09-30"
     run_c_leaks ir_unmoved_while "" "$LEAK_IR_UNMOVED_WHILE_C" "unmoved owner in a function whose body contains a while, 2026-09-30"
-    run_c_leaks ir_branch_field "" "$LEAK_IR_BRANCH_FIELD_C" "kept String field at the branch end; sibling stays for the scope-end drop, 2026-09-30"
+    run_c_leaks ir_branch_field "" "$LEAK_IR_BRANCH_FIELD_C" "kept String field at the branch end; sibling freed at scope end, 2026-09-30"
     run_c_leaks owned_string_result "" "$LEAK_OWNED_STRING_RESULT" "owning String Ok, 2026-09-17"
     run_c_leaks owned_string_err "" "$LEAK_OWNED_STRING_ERR" "owning String Err and both sides, 2026-09-17"
     run_c_leaks owned_string_optional "" "$LEAK_OWNED_STRING_OPTIONAL" "owning String?, 2026-09-17"
@@ -1251,8 +1253,8 @@ else
     run_ir_leaks ir_owned_string llvm "$LEAK_IR_OWNED_STRING_LLVM" "call replacement and terminal scalar-return cleanup, 2026-09-24"
     run_ir_leaks ir_owned_string mlir "$LEAK_IR_OWNED_STRING_MLIR" "call replacement and terminal scalar-return cleanup, 2026-09-24"
     run_c_leaks ir_string_conversion "" "$LEAK_IR_STRING_CONVERSION_C" "C frees every converted String, 2026-09-17"
-    run_ir_leaks ir_string_conversion llvm "$LEAK_IR_STRING_CONVERSION_LLVM" "terminal scalar-return cleanup; record-owned field remains, 2026-09-24"
-    run_ir_leaks ir_string_conversion mlir "$LEAK_IR_STRING_CONVERSION_MLIR" "terminal scalar-return cleanup; record-owned field remains, 2026-09-24"
+    run_ir_leaks ir_string_conversion llvm "$LEAK_IR_STRING_CONVERSION_LLVM" "terminal scalar-return cleanup plus the record field at scope end, 2026-09-30"
+    run_ir_leaks ir_string_conversion mlir "$LEAK_IR_STRING_CONVERSION_MLIR" "terminal scalar-return cleanup plus the record field at scope end, 2026-09-30"
     run_c_leaks owned_string examples/owned_string_host.c "$LEAK_OWNED_STRING_C" "C frees what the IR backends leak, 2026-09-17" examples/owned_string.cell
     run_ir_leaks owned_string llvm "$LEAK_OWNED_STRING_LLVM" "the host frees take's argument; no IR drop pass, 2026-09-17" examples/owned_string.cell examples/owned_string_host.c
     run_ir_leaks owned_string mlir "$LEAK_OWNED_STRING_MLIR" "the host frees take's argument; no IR drop pass, 2026-09-17" examples/owned_string.cell examples/owned_string_host.c
@@ -1280,8 +1282,8 @@ else
     run_ir_leaks ir_skip_revival mlir "$LEAK_IR_SKIP_REVIVAL_MLIR" "a skip-revival break jumps past the after-loop release, 2026-09-30"
     run_ir_leaks ir_unmoved_while llvm "$LEAK_IR_UNMOVED_WHILE_LLVM" "HIR releases an unmoved owner at function end beside a while, 2026-09-30"
     run_ir_leaks ir_unmoved_while mlir "$LEAK_IR_UNMOVED_WHILE_MLIR" "HIR releases an unmoved owner at function end beside a while, 2026-09-30"
-    run_ir_leaks ir_branch_field llvm "$LEAK_IR_BRANCH_FIELD_LLVM" "HIR releases a kept String field at the branch end; sibling field remains, 2026-09-30"
-    run_ir_leaks ir_branch_field mlir "$LEAK_IR_BRANCH_FIELD_MLIR" "HIR releases a kept String field at the branch end; sibling field remains, 2026-09-30"
+    run_ir_leaks ir_branch_field llvm "$LEAK_IR_BRANCH_FIELD_LLVM" "HIR releases the kept field at the branch end and the sibling at scope end, 2026-09-30"
+    run_ir_leaks ir_branch_field mlir "$LEAK_IR_BRANCH_FIELD_MLIR" "HIR releases the kept field at the branch end and the sibling at scope end, 2026-09-30"
     run_ir_leaks labelled_break llvm "$LEAK_LABELLED_BREAK_LLVM" "FLOW-03 break :outer; HIR loop-exit releases, 2026-09-29"
     run_ir_leaks labelled_break mlir "$LEAK_LABELLED_BREAK_MLIR" "FLOW-03 break :outer; HIR loop-exit releases, 2026-09-29"
     run_c_leaks labelled_continue "" "$LEAK_LABELLED_CONTINUE_C" "FLOW-03 continue :outer releases the outer and inner bodies' locals, 2026-09-22"

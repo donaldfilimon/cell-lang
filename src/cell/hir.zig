@@ -845,8 +845,10 @@ const Lowerer = struct {
     /// allowed through so an owner neither branch moved still gets this one
     /// function-end release. A `while` is allowed through for the same release:
     /// an unmoved owner is not on `while.after`, and a moved one is skipped
-    /// here because `wasMoved` is set. A `match` or any other statement still
-    /// leaves that release out. A body whose length no longer matches
+    /// here because `wasMoved` is set. A field assignment is allowed through
+    /// so a direct record's remaining fields can be released at this exit;
+    /// the assignment itself is not rewritten. A `match` or any other statement
+    /// still leaves that release out. A body whose length no longer matches
     /// the AST cannot be zipped with it and must be kept as lowered.
     /// Evaluate replacements and the return value before releasing confirmed
     /// live owners at the exit.
@@ -870,11 +872,15 @@ const Lowerer = struct {
                 .let => {},
                 .while_stmt => {},
                 .assign => |a| {
-                    if (a.target.kind != .ident or (a.value.kind != .string and a.value.kind != .call) or lowered.kind != .assign) return body;
-                    const place = lowered.kind.assign.place;
-                    if (place.path.len != 0 or place.slot >= self.bindings.items.len) return body;
-                    const binding = self.bindings.items[place.slot];
-                    if (binding.ownership != .owned or binding.ty.tag() != .string or !binding.droppable) return body;
+                    if (a.target.kind == .field) {
+                        if (lowered.kind != .assign) return body;
+                    } else {
+                        if (a.target.kind != .ident or (a.value.kind != .string and a.value.kind != .call) or lowered.kind != .assign) return body;
+                        const place = lowered.kind.assign.place;
+                        if (place.path.len != 0 or place.slot >= self.bindings.items.len) return body;
+                        const binding = self.bindings.items[place.slot];
+                        if (binding.ownership != .owned or binding.ty.tag() != .string or !binding.droppable) return body;
+                    }
                 },
                 .expr => |ex| {
                     if (ex.kind != .if_expr) return body;
@@ -885,7 +891,7 @@ const Lowerer = struct {
         var out: std.ArrayList(Stmt) = .empty;
         for (source, body, 0..) |src, lowered, index| {
             if (terminal_return and index == source.len - 1) continue;
-            if (src.kind == .assign) {
+            if (src.kind == .assign and src.kind.assign.target.kind == .ident) {
                 const a = src.kind.assign;
                 const original = lowered.kind.assign;
                 const binding = self.bindings.items[original.place.slot];
@@ -958,6 +964,30 @@ const Lowerer = struct {
             const call = try self.runtimeCall(release, .none, &.{place});
             try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
             self.drop_inserted = true;
+        }
+        // Direct top-level record lets. The whole binding is not a String,
+        // so the loop above skipped it. Release each remaining direct owned
+        // String or scalar-list field once, the same admission C uses in
+        // `emitPartialFields`: not wholly moved, not moved whole, not dead
+        // at this exit, and not moved in part. Nested records, `arc`, and
+        // a record that is not a direct `let` stay leaks.
+        var j = self.bindings.items.len;
+        while (j > 0) {
+            j -= 1;
+            const binding = self.bindings.items[j];
+            if (!binding.droppable or binding.ownership != .owned or binding.is_param) continue;
+            const struct_name = switch (binding.ty) {
+                .struct_type => |name| name,
+                else => continue,
+            };
+            var is_direct = false;
+            for (body) |stmt| {
+                if (stmt.kind == .let and stmt.kind.let.slot == binding.slot and stmt.kind.let.value != null) is_direct = true;
+            }
+            if (!is_direct) continue;
+            const id = binding.bc_id orelse continue;
+            if (facts.wasWhollyMoved(id)) continue;
+            try self.appendScopeEndFieldDrops(&out, binding, id, struct_name, exit_kind, key);
         }
         if (terminal_return) try out.append(self.arena, .{ .span = source[source.len - 1].span, .kind = .{ .ret = return_value } });
         return out.items;
@@ -1381,6 +1411,60 @@ const Lowerer = struct {
             if (facts.fieldLiveAtExit(.after_branch, merge_key, id, field.name)) continue;
             if (!facts.fieldLiveAtExit(.branch_end, branch_key, id, field.name)) continue;
             if (!facts.fieldDeadAtExit(after.kind, after.key, id, field.name)) continue;
+            const base = try self.box(.{
+                .ty = binding.ty,
+                .span = .none,
+                .own = binding.ownership,
+                .kind = .{ .ref = binding.slot },
+            });
+            const place: Expr = .{
+                .ty = field.ty,
+                .span = .none,
+                .own = field.ownership,
+                .kind = .{ .field = .{
+                    .base = base,
+                    .sel = .{
+                        .struct_name = struct_name,
+                        .index = @intCast(i),
+                        .ty = field.ty,
+                        .ownership = field.ownership,
+                    },
+                } },
+            };
+            const call = try self.runtimeCall(release, .none, &.{place});
+            try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
+            self.drop_inserted = true;
+        }
+    }
+
+    /// Direct owned fields still held at a function or block exit. Reverse
+    /// declaration order. A field the branch-end drop already released is
+    /// dead at this exit and is not freed again. A moved field that is not
+    /// a nested record fails closed. Nested records and `arc` are not spelled.
+    fn appendScopeEndFieldDrops(
+        self: *Lowerer,
+        out: *std.ArrayList(Stmt),
+        binding: Binding,
+        id: u32,
+        struct_name: []const u8,
+        exit_kind: dropfacts.ExitKind,
+        key: usize,
+    ) LowerError!void {
+        const facts = self.facts orelse return;
+        const def = self.findStructDecl(struct_name) orelse return;
+        var i = def.fields.len;
+        while (i > 0) {
+            i -= 1;
+            const field = def.fields[i];
+            if (field.ownership != .owned) continue;
+            const release: Runtime = switch (field.ty) {
+                .string => .string_free,
+                .list => |elem| if (scalarListElement(elem.*)) .slice_free else continue,
+                else => continue,
+            };
+            if (facts.fieldWasMovedWhole(id, field.name)) continue;
+            if (facts.fieldDeadAtExit(exit_kind, key, id, field.name)) continue;
+            if (facts.fieldWasMoved(id, field.name)) continue;
             const base = try self.box(.{
                 .ty = binding.ty,
                 .span = .none,
