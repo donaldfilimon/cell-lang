@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// Cell-lang: multi-language host build (Zig + C + C++ + optional Swift).
-/// Zig 0.17 build graph orchestrates all sources.
+/// Zig master build graph orchestrates all sources.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});

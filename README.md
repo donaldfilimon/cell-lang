@@ -8,7 +8,7 @@
 | **Swift** | Value/reference clarity, ergonomic syntax, optionals (`T?`), ARC for shared objects |
 | **Zig** | Explicit control, comptime-friendly host, zero-hidden-control-flow ethos, C ABI first |
 
-The **toolchain host** is Zig **0.17** (`build.zig`), and the project
+The **toolchain host** is Zig **0.18 master** (`build.zig`), and the project
 first-class supports:
 
 - **`.zig`**: compiler, typechecker, codegen driver
@@ -33,7 +33,7 @@ first-class supports:
 
 ```
 cell-lang/
-  build.zig / build.zig.zon   # Zig 0.17 multi-language build
+  build.zig / build.zig.zon   # Zig master multi-language build
   src/                        # Cell compiler (Zig)
   runtime/                    # C + C++ runtime (cell_rt)
   swift/                      # Swift bridge (CellBridge.swift)
@@ -70,7 +70,7 @@ resolves names from `geometry.cell`. A body with no stem-mate is an error.
 
 ## Requirements
 
-- Zig `0.17.x`. This tree is developed against `0.17.0-dev.2320+1e770dbef`.
+- Zig master `0.18.0-dev.120+9fe22a29b`, selected by Donald on 2026-10-08.
 - A C toolchain (Clang).
 - Optional: C++20 (`-Dcxx=true`, default on).
 - Optional: Swift (`swiftc`, macOS; `-Dswift=true`, default on).

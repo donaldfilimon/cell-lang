@@ -261,6 +261,9 @@ cd "$(dirname "$0")/.." || exit 2
 
 LLVM_BIN=${LLVM_BIN:-/opt/homebrew/opt/llvm/bin}
 ZIG=${ZIG:-zig}
+expected_zig="0.18.0-dev.120+9fe22a29b"
+actual_zig=$("$ZIG" version) || exit 2
+[ "$actual_zig" = "$expected_zig" ] || { printf "Expected Zig %s; found %s\n" "$expected_zig" "$actual_zig" >&2; exit 2; }
 CELL=${CELL:-./zig-out/bin/cell}
 TMP=$(mktemp -d) || exit 2
 trap 'rm -rf "$TMP"' EXIT
