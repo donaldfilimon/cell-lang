@@ -1,0 +1,3 @@
+// EXPECT: currently-rejected
+use module_cycle_a
+pub fn b() {}

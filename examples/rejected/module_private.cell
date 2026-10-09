@@ -1,0 +1,4 @@
+// EXPECT: currently-rejected
+// A qualified call cannot expose a non-public imported definition.
+use lib.module_private
+pub fn main() { module_private.hidden() }

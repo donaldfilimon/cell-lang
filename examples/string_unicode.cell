@@ -1,0 +1,28 @@
+// Byte escapes are raw bytes; Unicode scalar escapes produce UTF-8.
+// Check embedded NUL, non-UTF-8 byte 0xff, 2/4-byte scalars, the maximum
+// scalar, quote and backslash across C, LLVM and MLIR.
+// EXPECT-OUTPUT: 1414
+pub fn print_int(copy value: Int);
+pub fn str_len(shared s: String) -> Int;
+
+pub fn byte_is(shared s: String, copy index: Int, copy expected: Byte) -> Int {
+    return match s[index] {
+        Some(v) => if v == expected { 1 } else { 0 },
+        None => 0,
+    }
+}
+
+pub fn verify(shared s: String) -> Int {
+    return str_len(s) * 100
+        + byte_is(s, 0, 0) + byte_is(s, 1, 255)
+        + byte_is(s, 2, 195) + byte_is(s, 3, 169)
+        + byte_is(s, 4, 240) + byte_is(s, 5, 159)
+        + byte_is(s, 6, 152) + byte_is(s, 7, 128)
+        + byte_is(s, 8, 244) + byte_is(s, 9, 143)
+        + byte_is(s, 10, 191) + byte_is(s, 11, 191)
+        + byte_is(s, 12, 34) + byte_is(s, 13, 92)
+}
+
+pub fn main() {
+    print_int(verify("\x00\xff\u{e9}\u{1f600}\u{10ffff}\"\\"))
+}

@@ -29,8 +29,21 @@ const FieldExpr = @FieldType(ast.Expr.Kind, "field");
 const IndexExpr = @FieldType(ast.Expr.Kind, "index");
 const StructLitExpr = @FieldType(ast.Expr.Kind, "struct_lit");
 
+pub const ModuleImport = struct {
+    name: []const u8,
+    module: *const ast.Module,
+    unit_name: ?[]const u8 = null,
+    /// Already checked declaring context, including its direct imports.
+    context: ?*const Checker = null,
+};
+
 pub const Checker = struct {
     allocator: std.mem.Allocator,
+    unit_name: ?[]const u8 = null,
+    module: ?*const ast.Module = null,
+    imports: []const ModuleImport = &.{},
+    import_contexts: std.ArrayList(*Checker) = .empty,
+    owned_contexts: std.ArrayList(*Checker) = .empty,
     /// Backs every constructed type and every formatted message.
     arena_state: std.heap.ArenaAllocator,
     diagnostics: diag.Bag = .{},
@@ -84,6 +97,12 @@ pub const Checker = struct {
     }
 
     pub fn deinit(self: *Checker) void {
+        for (self.owned_contexts.items) |context| {
+            context.deinit();
+            self.allocator.destroy(context);
+        }
+        self.owned_contexts.deinit(self.allocator);
+        self.import_contexts.deinit(self.allocator);
         self.scopes.deinit(self.allocator);
         self.loop_labels.deinit(self.allocator);
         self.structs.deinit();
@@ -102,15 +121,195 @@ pub const Checker = struct {
     /// returns is allocation failure. The caller decides what to do with a bag
     /// that `hasErrors()`.
     pub fn checkModule(self: *Checker, module: *ast.Module) CheckError!void {
+        try self.checkModuleWithImports(module, null, &.{});
+    }
+
+    pub fn checkModuleWithImports(self: *Checker, module: *ast.Module, unit_name: ?[]const u8, imports: []const ModuleImport) CheckError!void {
         self.diagnostics.path = module.path;
+        self.unit_name = unit_name;
+        self.module = module;
+        self.imports = try self.arena().dupe(ModuleImport, imports);
+        for (imports, 0..) |import, i| {
+            for (imports[0..i]) |previous| {
+                if (std.mem.eql(u8, previous.name, import.name)) try self.duplicate(ast.Span.none, import.name);
+            }
+            if (import.context) |context| {
+                try self.import_contexts.append(self.allocator, @constCast(context));
+            } else {
+                const context = try self.allocator.create(Checker);
+                context.* = Checker.init(self.allocator);
+                self.owned_contexts.append(self.allocator, context) catch |err| {
+                    context.deinit();
+                    self.allocator.destroy(context);
+                    return err;
+                };
+                context.unit_name = import.unit_name orelse import.name;
+                context.module = import.module;
+                try context.collectItems(import.module.items);
+                try self.import_contexts.append(self.allocator, context);
+            }
+        }
         try self.collectItems(module.items);
         for (module.items) |*item| {
             try self.checkItem(item);
         }
     }
 
+    fn nominalName(self: *Checker, name: []const u8) CheckError![]const u8 {
+        return if (self.unit_name) |unit| try std.fmt.allocPrint(self.arena(), "{s}.{s}", .{ unit, name }) else name;
+    }
+
+    fn importIndex(self: *const Checker, name: []const u8) ?usize {
+        for (self.imports, 0..) |import, i| if (std.mem.eql(u8, import.name, name)) return i;
+        return null;
+    }
+
+    fn itemName(item: ast.Item) []const u8 {
+        return switch (item.kind) {
+            .fn_def => |f| f.name,
+            .struct_def => |v| v.name,
+            .enum_def => |v| v.name,
+            .use_decl => "",
+        };
+    }
+
+    fn itemPublic(item: ast.Item) bool {
+        return switch (item.kind) {
+            .fn_def => |f| f.is_public,
+            .struct_def => |v| v.is_public,
+            .enum_def => |v| v.is_public,
+            .use_decl => false,
+        };
+    }
+
+    fn importedItem(self: *const Checker, qualifier: []const u8, name: []const u8) ?ast.Item {
+        const index = self.importIndex(qualifier) orelse return null;
+        for (self.imports[index].module.items) |item| {
+            if (std.mem.eql(u8, itemName(item), name)) return item;
+        }
+        return null;
+    }
+
+    /// Canonical exported AST signatures preserve ownership for borrow checking.
+    fn normalizedType(self: *Checker, te: ast.TypeExpr) CheckError!ast.TypeExpr {
+        return switch (te) {
+            .name => |name| blk: {
+                const semantic = try self.resolveTypeQuiet(&te);
+                break :blk .{ .name = switch (semantic) {
+                    .struct_type, .enum_type => |identity| identity,
+                    else => name,
+                } };
+            },
+            .list, .optional => |inner| blk: {
+                const normalized = try self.arena().create(ast.TypeExpr);
+                normalized.* = try self.normalizedType(inner.*);
+                break :blk if (te == .list) .{ .list = normalized } else .{ .optional = normalized };
+            },
+            .ref => |r| blk: {
+                const normalized = try self.arena().create(ast.TypeExpr);
+                normalized.* = try self.normalizedType(r.inner.*);
+                break :blk .{ .ref = .{ .ownership = r.ownership, .inner = normalized } };
+            },
+            .result => |r| blk: {
+                const ok = try self.arena().create(ast.TypeExpr);
+                const err = try self.arena().create(ast.TypeExpr);
+                ok.* = try self.normalizedType(r.ok.*);
+                err.* = try self.normalizedType(r.err.*);
+                break :blk .{ .result = .{ .ok = ok, .err = err } };
+            },
+            .unit => .unit,
+        };
+    }
+
+    pub fn exportedFunction(self: *Checker, name: []const u8) CheckError!?ast.FnDef {
+        const module = self.module orelse return null;
+        for (module.items) |item| {
+            if (item.kind != .fn_def or !item.kind.fn_def.is_public or !std.mem.eql(u8, item.kind.fn_def.name, name)) continue;
+            var def = item.kind.fn_def;
+            def.name = try self.nominalName(name);
+            def.params = try self.arena().dupe(ast.Param, def.params);
+            for (def.params) |*param| param.ty = try self.normalizedType(param.ty);
+            if (def.return_type) |ty| def.return_type = try self.normalizedType(ty);
+            def.body = null;
+            return def;
+        }
+        return null;
+    }
+
+    pub fn exportedStruct(self: *Checker, name: []const u8) CheckError!?ast.StructDef {
+        const def = self.structs.get(name) orelse return null;
+        if (!def.is_public) return null;
+        var result = def;
+        result.name = try self.nominalName(def.name);
+        result.fields = try self.arena().dupe(ast.Field, def.fields);
+        for (result.fields) |*field| field.ty = try self.normalizedType(field.ty);
+        return result;
+    }
+
+    pub fn exportedEnum(self: *Checker, name: []const u8) CheckError!?ast.EnumDef {
+        var def = self.enums.get(name) orelse return null;
+        if (!def.is_public) return null;
+        def.name = try self.nominalName(def.name);
+        return def;
+    }
+
+    pub fn importedFunction(self: *Checker, name: []const u8) CheckError!?ast.FnDef {
+        const dot = std.mem.indexOfScalar(u8, name, '.') orelse return null;
+        const index = self.importIndex(name[0..dot]) orelse return null;
+        return self.import_contexts.items[index].exportedFunction(name[dot + 1 ..]);
+    }
+
+    fn importedType(self: *Checker, name: []const u8, span: ast.Span, report: bool) CheckError!?Type {
+        const dot = std.mem.indexOfScalar(u8, name, '.') orelse return null;
+        const index = self.importIndex(name[0..dot]) orelse return null;
+        const item = self.importedItem(name[0..dot], name[dot + 1 ..]) orelse return null;
+        if (!itemPublic(item)) {
+            if (report) try self.errf(span, "item '{s}' is private", .{name});
+            return types.t_unknown;
+        }
+        const context = self.import_contexts.items[index];
+        return switch (item.kind) {
+            .struct_def => |def| Type{ .struct_type = try context.nominalName(def.name) },
+            .enum_def => |def| Type{ .enum_type = try context.nominalName(def.name) },
+            else => null,
+        };
+    }
+
+    fn privateType(self: *Checker, te: ast.TypeExpr) ?[]const u8 {
+        return switch (te) {
+            .name => |name| blk: {
+                const module = self.module orelse break :blk null;
+                for (module.items) |item| {
+                    if ((item.kind == .struct_def or item.kind == .enum_def) and std.mem.eql(u8, itemName(item), name) and !itemPublic(item)) break :blk name;
+                }
+                break :blk null;
+            },
+            .list, .optional => |inner| self.privateType(inner.*),
+            .ref => |r| self.privateType(r.inner.*),
+            .result => |r| self.privateType(r.ok.*) orelse self.privateType(r.err.*),
+            .unit => null,
+        };
+    }
+
+    fn publicType(self: *Checker, te: ast.TypeExpr, span: ast.Span) CheckError!void {
+        if (self.privateType(te)) |name| try self.errf(span, "public signature exposes private type '{s}'", .{name});
+    }
+
     /// Pass one: every item name and signature, before any body is walked.
     fn collectItems(self: *Checker, items: []ast.Item) CheckError!void {
+        for (items, 0..) |item, i| {
+            if (item.kind == .use_decl) continue;
+            const name = itemName(item);
+            if (self.importIndex(name) != null) try self.duplicate(item.span, name);
+            for (items[0..i]) |previous| {
+                // Existing type and value tables diagnose duplicates within
+                // their own namespaces; this closes the cross-kind gap.
+                if (previous.kind != .use_decl and (previous.kind == .fn_def) != (item.kind == .fn_def) and std.mem.eql(u8, itemName(previous), name)) {
+                    try self.duplicate(item.span, name);
+                    break;
+                }
+            }
+        }
         for (items) |*item| {
             switch (item.kind) {
                 .struct_def => |s| {
@@ -119,6 +318,7 @@ pub const Checker = struct {
                         continue;
                     }
                     try self.structs.put(s.name, s);
+                    try self.structs.put(try self.nominalName(s.name), s);
                 },
                 .enum_def => |e| {
                     if (self.structs.contains(e.name) or self.enums.contains(e.name)) {
@@ -126,6 +326,7 @@ pub const Checker = struct {
                         continue;
                     }
                     try self.enums.put(e.name, e);
+                    try self.enums.put(try self.nominalName(e.name), e);
                 },
                 .fn_def, .use_decl => {},
             }
@@ -139,8 +340,12 @@ pub const Checker = struct {
                 .fn_def => |f| {
                     const params = try self.arena().alloc(Type, f.params.len);
                     for (f.params, 0..) |p, i| {
+                        if (f.is_public) try self.publicType(p.ty, item.span);
                         params[i] = try self.resolveType(&p.ty, item.span);
                         try self.refuseUnitValue(item.span, params[i]);
+                    }
+                    if (f.is_public) {
+                        if (f.return_type) |rt| try self.publicType(rt, item.span);
                     }
                     const ret = try self.arena().create(Type);
                     ret.* = if (f.return_type) |rt| try self.resolveType(&rt, item.span) else types.t_unit;
@@ -152,6 +357,7 @@ pub const Checker = struct {
                 },
                 .struct_def => |s| {
                     for (s.fields) |field| {
+                        if (s.is_public) try self.publicType(field.ty, item.span);
                         const field_ty = try self.resolveType(&field.ty, item.span);
                         try self.refuseUnitValue(item.span, field_ty);
                     }
@@ -404,6 +610,13 @@ pub const Checker = struct {
                         }
                         return types.t_bool;
                     },
+                    .bit_not => {
+                        if (!operand.isUnknown() and operand.integerBits() == null) {
+                            try self.errf(expr.span, "operator '~' requires an integer operand, found {s}", .{try self.typeName(operand)});
+                            return types.t_unknown;
+                        }
+                        return operand;
+                    },
                     .neg => {
                         if (!operand.isUnknown() and !operand.isNumeric()) {
                             try self.errf(
@@ -497,6 +710,7 @@ pub const Checker = struct {
                     self.pushScope();
                     defer self.popScope();
                     switch (arm.pattern.kind) {
+                        .enum_variant => |variant| try self.checkEnumPattern(arm.pattern.span, variant, scrutinee),
                         .binding => |name| try self.declare(arm.pattern.span, name, .{
                             .ownership = .copy,
                             .mutable = false,
@@ -689,13 +903,13 @@ pub const Checker = struct {
     }
 
     fn checkBinary(self: *Checker, span: ast.Span, b: *const BinaryExpr) CheckError!Type {
-        const left = try self.checkExpr(b.left);
-        const right = try self.checkExpr(b.right);
+        var left = try self.checkExpr(b.left);
+        var right = try self.checkExpr(b.right);
         const op = b.op;
 
         const yields_bool = switch (op) {
             .eq, .ne, .lt, .le, .gt, .ge, .and_op, .or_op => true,
-            .add, .sub, .mul, .div => false,
+            .add, .sub, .mul, .div, .bit_and, .bit_or, .bit_xor, .shl, .shr => false,
         };
         if (left.isUnknown() or right.isUnknown()) {
             return if (yields_bool) types.t_bool else types.t_unknown;
@@ -727,6 +941,33 @@ pub const Checker = struct {
                     );
                 }
                 return types.t_bool;
+            },
+            .bit_and, .bit_or, .bit_xor, .shl, .shr => {
+                if (left.integerBits() == null or right.integerBits() == null) {
+                    try self.errf(span, "operator '{s}' requires integer operands, found {s} and {s}", .{ opText(op), try self.typeName(left), try self.typeName(right) });
+                    return types.t_unknown;
+                }
+                if (op == .shl or op == .shr) {
+                    const width = left.integerBits().?;
+                    const known_count: ?i64 = switch (b.right.kind) {
+                        .int => |value| value,
+                        .unary => |unary| if (unary.op == .neg and unary.operand.kind == .int) -unary.operand.kind.int else null,
+                        else => null,
+                    };
+                    if (known_count) |count| {
+                        if (count < 0 or count >= width) try self.errf(b.right.span, "shift count must be in 0..{d}, found {d}", .{ width - 1, count });
+                    }
+                } else if (!types.compatible(left, right)) {
+                    if (integerLiteralFits(left, b.right)) {
+                        right = left;
+                    } else if (integerLiteralFits(right, b.left)) {
+                        left = right;
+                    } else {
+                        try self.opMismatch(span, op, left, right);
+                        return types.t_unknown;
+                    }
+                }
+                return left;
             },
             .add, .sub, .mul, .div => {
                 if (!types.compatible(left, right)) {
@@ -760,7 +1001,84 @@ pub const Checker = struct {
         });
     }
 
+    fn enumContext(self: *Checker, name: []const u8) ?*Checker {
+        if (self.enums.contains(name)) return self;
+        for (self.import_contexts.items) |context| if (context.enumContext(name)) |found| return found;
+        return null;
+    }
+
+    fn checkEnumPattern(self: *Checker, span: ast.Span, pattern: @FieldType(ast.Pattern.Kind, "enum_variant"), scrutinee: Type) CheckError!void {
+        const pattern_type = if (pattern.enum_name) |name|
+            try self.resolveType(&.{ .name = name }, span)
+        else
+            scrutinee;
+        if (pattern_type.isUnknown()) return;
+        const identity = switch (pattern_type) {
+            .enum_type => |name| name,
+            else => {
+                try self.errf(span, "enum variant pattern needs an enum type, found {s}", .{try self.typeName(pattern_type)});
+                return;
+            },
+        };
+        if (!scrutinee.isUnknown() and !types.compatible(pattern_type, scrutinee)) {
+            try self.errf(span, "enum pattern type mismatch: expected {s}, found {s}", .{ try self.typeName(scrutinee), identity });
+        }
+        const context = self.enumContext(identity) orelse {
+            try self.errf(span, "unknown enum type '{s}'", .{identity});
+            return;
+        };
+        const definition = context.enums.get(identity).?;
+        for (definition.variants) |variant| if (std.mem.eql(u8, variant, pattern.variant)) return;
+        try self.errf(span, "enum '{s}' has no variant '{s}'", .{ identity, pattern.variant });
+    }
+
+    fn structContext(self: *Checker, name: []const u8) ?*Checker {
+        if (self.structs.contains(name)) return self;
+        for (self.import_contexts.items) |context| if (context.structContext(name)) |found| return found;
+        return null;
+    }
+
     fn checkField(self: *Checker, span: ast.Span, f: *const FieldExpr) CheckError!Type {
+        if (f.base.kind == .ident) {
+            const qualifier = f.base.kind.ident;
+            if (self.lookup(qualifier) == null) {
+                if (self.importIndex(qualifier)) |index| {
+                    const item = self.importedItem(qualifier, f.name) orelse {
+                        try self.errf(span, "module '{s}' has no item '{s}'", .{ qualifier, f.name });
+                        return types.t_unknown;
+                    };
+                    if (!itemPublic(item)) {
+                        try self.errf(span, "item '{s}.{s}' is private", .{ qualifier, f.name });
+                        return types.t_unknown;
+                    }
+                    const context = self.import_contexts.items[index];
+                    return switch (item.kind) {
+                        .fn_def => |def| if (context.lookup(def.name)) |sym| sym.ty else types.t_unknown,
+                        .enum_def, .struct_def => blk: {
+                            try self.errf(span, "type '{s}.{s}' cannot be used as a value", .{ qualifier, f.name });
+                            break :blk types.t_unknown;
+                        },
+                        .use_decl => types.t_unknown,
+                    };
+                }
+            }
+        }
+        // A module-qualified enum is a two-field expression, not a value field.
+        if (f.base.kind == .field and f.base.kind.field.base.kind == .ident) {
+            const head = f.base.kind.field;
+            const qualifier = head.base.kind.ident;
+            if (self.lookup(qualifier) == null and self.importIndex(qualifier) != null) {
+                if (self.importedItem(qualifier, head.name)) |item| {
+                    if (item.kind == .enum_def and itemPublic(item)) {
+                        const context = self.import_contexts.items[self.importIndex(qualifier).?];
+                        const identity = try context.nominalName(item.kind.enum_def.name);
+                        for (item.kind.enum_def.variants) |variant| if (std.mem.eql(u8, variant, f.name)) return .{ .enum_type = identity };
+                        try self.errf(span, "enum '{s}' has no variant '{s}'", .{ identity, f.name });
+                        return .{ .enum_type = identity };
+                    }
+                }
+            }
+        }
         // `Color.Red` is a field expression whose base names an enum rather
         // than a value, so enum access is resolved before the base is checked
         // as an expression. A local binding of the same name wins, which is why
@@ -769,10 +1087,10 @@ pub const Checker = struct {
             if (self.lookup(base_name) == null) {
                 if (self.enums.get(base_name)) |e| {
                     for (e.variants) |v| {
-                        if (std.mem.eql(u8, v, f.name)) return .{ .enum_type = e.name };
+                        if (std.mem.eql(u8, v, f.name)) return .{ .enum_type = try self.nominalName(e.name) };
                     }
                     try self.errf(span, "enum '{s}' has no variant '{s}'", .{ e.name, f.name });
-                    return .{ .enum_type = e.name };
+                    return .{ .enum_type = try self.nominalName(e.name) };
                 }
             }
         }
@@ -789,9 +1107,10 @@ pub const Checker = struct {
                 return types.t_unknown;
             },
         };
-        const def = self.structs.get(struct_name) orelse return types.t_unknown;
+        const context = self.structContext(struct_name) orelse return types.t_unknown;
+        const def = context.structs.get(struct_name).?;
         for (def.fields) |field| {
-            if (std.mem.eql(u8, field.name, f.name)) return try self.resolveTypeQuiet(&field.ty);
+            if (std.mem.eql(u8, field.name, f.name)) return try context.resolveTypeQuiet(&field.ty);
         }
         try self.errf(span, "struct '{s}' has no field '{s}'", .{ struct_name, f.name });
         return types.t_unknown;
@@ -832,7 +1151,24 @@ pub const Checker = struct {
     }
 
     fn checkStructLit(self: *Checker, span: ast.Span, sl: *const StructLitExpr) CheckError!Type {
-        const def = self.structs.get(sl.name) orelse {
+        if (std.mem.indexOfScalar(u8, sl.name, '.') == null and !self.structs.contains(sl.name)) {
+            for (sl.fields) |*fi| _ = try self.checkExpr(&fi.value);
+            try self.errf(span, "unknown struct type '{s}'", .{sl.name});
+            return types.t_unknown;
+        }
+        const resolved = try self.resolveType(&.{ .name = sl.name }, span);
+        const identity = switch (resolved) {
+            .struct_type => |name| name,
+            else => {
+                for (sl.fields) |*fi| _ = try self.checkExpr(&fi.value);
+                return types.t_unknown;
+            },
+        };
+        const context = self.structContext(identity) orelse {
+            for (sl.fields) |*fi| _ = try self.checkExpr(&fi.value);
+            return types.t_unknown;
+        };
+        const def = context.structs.get(identity) orelse {
             for (sl.fields) |*fi| _ = try self.checkExpr(&fi.value);
             try self.errf(span, "unknown struct type '{s}'", .{sl.name});
             return types.t_unknown;
@@ -844,7 +1180,7 @@ pub const Checker = struct {
             for (def.fields) |field| {
                 if (!std.mem.eql(u8, field.name, fi.name)) continue;
                 found = true;
-                const want = try self.resolveTypeQuiet(&field.ty);
+                const want = try context.resolveTypeQuiet(&field.ty);
                 if (!accepts(want, actual, &fi.value)) {
                     try self.errf(fi.span, "field '{s}' has type {s}, expected {s}", .{
                         fi.name,
@@ -858,7 +1194,7 @@ pub const Checker = struct {
                 try self.errf(fi.span, "struct '{s}' has no field '{s}'", .{ sl.name, fi.name });
             }
         }
-        return .{ .struct_type = def.name };
+        return .{ .struct_type = identity };
     }
 
     fn listOf(self: *Checker, elem: Type) CheckError!Type {
@@ -988,8 +1324,9 @@ pub const Checker = struct {
         return switch (te.*) {
             .name => |n| blk: {
                 if (types.fromPrimitiveName(n)) |p| break :blk p;
-                if (self.structs.contains(n)) break :blk Type{ .struct_type = n };
-                if (self.enums.contains(n)) break :blk Type{ .enum_type = n };
+                if (try self.importedType(n, span, report)) |ty| break :blk ty;
+                if (self.structs.get(n)) |def| break :blk Type{ .struct_type = try self.nominalName(def.name) };
+                if (self.enums.get(n)) |def| break :blk Type{ .enum_type = try self.nominalName(def.name) };
                 if (report) try self.errf(span, "unknown type '{s}'", .{n});
                 break :blk types.t_unknown;
             },
@@ -1056,6 +1393,11 @@ pub const Checker = struct {
             .ge => ">=",
             .and_op => "&&",
             .or_op => "||",
+            .bit_and => "&",
+            .bit_or => "|",
+            .bit_xor => "^",
+            .shl => "<<",
+            .shr => ">>",
         };
     }
 };
@@ -1069,6 +1411,28 @@ pub const Checker = struct {
 fn accepts(expected: Type, actual: Type, value: *const ast.Expr) bool {
     if (types.compatible(expected, actual)) return true;
     return literalFits(expected, value);
+}
+
+/// Peer typing for integer bit operations never silently truncates a literal.
+fn integerLiteralFits(expected: Type, expr: *const ast.Expr) bool {
+    const bits = expected.integerBits() orelse return false;
+    const value: i64 = switch (expr.kind) {
+        .int => |integer| integer,
+        .unary => |unary| if (unary.op == .neg and unary.operand.kind == .int)
+            std.math.negate(unary.operand.kind.int) catch return false
+        else
+            return false,
+        else => return false,
+    };
+    if (expected.isUnsigned()) {
+        if (value < 0) return false;
+        if (bits == 64) return true;
+        const max = (@as(u64, 1) << @as(u6, @intCast(bits))) - 1;
+        return @as(u64, @intCast(value)) <= max;
+    }
+    if (bits == 64) return true;
+    const limit = @as(i64, 1) << @as(u6, @intCast(bits - 1));
+    return value >= -limit and value < limit;
 }
 
 fn isIndexExpr(e: *const ast.Expr) bool {
@@ -2264,4 +2628,53 @@ test "a jump in a loop's condition belongs to the enclosing loop" {
     // does not enclose it yet; the unlabelled `loop` around it does.
     try t.expectCount(1);
     try t.expectDiag(0, .err, 3, 24, "no enclosing loop is labelled 'outer'");
+}
+
+test {
+    _ = @import("typecheck_imports_tests.zig");
+}
+
+test "integer bitwise typing preserves widths and accepts independently typed shift counts" {
+    inline for (.{ "Int", "Int8", "Int16", "Int32", "UInt", "UInt8", "UInt16", "UInt32", "Byte" }) |name| {
+        var module = TestModule.init();
+        defer module.deinit();
+        try module.check("pub fn f(copy a: " ++ name ++ ", copy b: " ++ name ++ ", copy n: Int32) -> " ++ name ++ " { return (~a & b) ^ ((a | b) << n) >> n }");
+        try module.expectClean();
+    }
+}
+
+test "integer operators reject nonintegers mismatched widths and known invalid shift counts" {
+    inline for (.{
+        "pub fn f() { true & false }",
+        "pub fn f() { 1.5 | 2.0 }",
+        "pub fn f() { ~true }",
+        "pub fn f(copy a: UInt8, copy b: Int8) { a ^ b }",
+        "pub fn f(copy a: Int) { a << true }",
+        "pub fn f(copy a: Byte) { a << 8 }",
+        "pub fn f(copy a: Int32) { a >> -1 }",
+        "pub fn f(copy a: Int) { a << 64 }",
+    }) |source| {
+        var module = TestModule.init();
+        defer module.deinit();
+        try module.check(source);
+        try std.testing.expect(module.checker.diagnostics.hasErrors());
+    }
+}
+
+test "bitwise literals adopt peer integer width without implicit narrowing" {
+    var good = TestModule.init();
+    defer good.deinit();
+    try good.check("pub fn f(copy value: UInt8) -> UInt8 { return (value & 255) | (1 ^ value) } pub fn g(copy value: Int8) -> Int8 { return -128 & value }");
+    try good.expectClean();
+    inline for (.{
+        "pub fn f(copy value: Byte) { value | 256 }",
+        "pub fn f(copy value: Byte) { -1 & value }",
+        "pub fn f(copy value: Int8) { value ^ 128 }",
+        "pub fn f(copy value: Int8) { -129 | value }",
+    }) |source| {
+        var bad = TestModule.init();
+        defer bad.deinit();
+        try bad.check(source);
+        try std.testing.expect(bad.checker.diagnostics.hasErrors());
+    }
 }

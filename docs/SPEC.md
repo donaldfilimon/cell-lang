@@ -248,7 +248,7 @@ ownership model and the C ABI are not up for negotiation. What has landed:
 |---|---|
 | `switch` | `match` is implemented and lowers to C. In the other tree `kw_match` is declared but absent from its keyword map, so `match` does not even lex there, and its own README states "one construct, one keyword". Admitting `switch` also needs `\|x\|` captures, and `\|` is reserved here for pattern alternatives (2.10). |
 | `i32` / `f64` | Section 3.1 is normative and exhaustive. The largest known hole in the compiler is that an unrecognized type name silently becomes `void*`; the fix is an enumeration of known names, and doubling that enumeration for pure synonyms widens the hole for no expressiveness. |
-| `@import("std")` | Neither implementation resolves modules (8.4). Adding `@` to the lexer to admit a namespace that binds nothing is surface debt. |
+| `@import("std")` | Cell uses `use std.prelude` (8.4). The Zig `@import` spelling remains outside Cell syntax. |
 | `const Foo = struct { }` | A second item grammar for a meaning the existing one already expresses. The genuinely missing feature underneath it, a top-level `const` value binding, is worth having on its own and is not this. |
 | macros | The other implementation states outright that its expander is not hygienic. A construct that can invisibly introduce a binding can silently change which place a move kills, and the diagnostic would point into expanded source. That is not deferrable in a language whose claim is that ownership is checkable. |
 | `.bod` as a package manifest | Section 1.2 is normative: `.bod` is a body file. See below. |
@@ -273,9 +273,9 @@ the other implementation are neither admitted nor refused yet:
   `raise` edge is a new CFG edge that the drop pass and borrowck would have to
   model, which this delta admits only on evidence. `match` on a `Result`
   expresses the same program.
-- **A package manifest under any name: deferred until section 8.4 resolves
-  modules.** A manifest describes dependencies to resolve, and nothing
-  resolves modules today, which is the reason `@import("std")` was refused.
+- **A package manifest under any name remains deferred.** Section 8.4 now
+  resolves local module graphs and the embedded prelude; package fetching,
+  version selection, and registry dependencies are not implemented.
   One clause is decided now: when a manifest is admitted it MUST NOT use the
   `.bod` or `.body` extensions, per section 1.2.
 
@@ -437,21 +437,21 @@ module. `examples/pairing/` is the worked pair.
 
 ### 1.3 Compilation unit
 
-**Status: implemented (one module, optionally paired with its body file).**
+**Status: implemented for a local module graph, with optional stem-paired bodies.**
 
-`cell <command> <file>` compiles exactly one module: a `.body`/`.bod` file is
-paired with its `.cell`/`.cel` stem-mate by section 1.2 (a `.cell` entry is not
-yet paired with its `.body`; the approved MOD-02 design pairs every entry).
-There is no module resolution, no include path and no package manager.
-(Corrected 2026-09-22: this paragraph said there was no linking of a module to
-its body file, which section 1.2 contradicts.) A `use` declaration (section 8.4) is recorded and emitted as a C
-comment. Since 2026-09-16 `cell build` and `cell run` take that one file's C
-through `$CC` together with an embedded copy of the runtime; they add no second Cell
-unit and no target other than C, so the compilation unit is unchanged and a
-bodyless declaration with no runtime symbol surfaces as a link error rather
-than a compiler diagnostic. A `.c` positional is a hand-written host for such
-declarations: it is a C translation unit handed to the C compiler, never a
-second Cell unit, and no other command accepts one.
+`cell <command> <file>` loads the entry and its recursive direct `use`
+dependencies. Both a module entry and an imported module pair with a
+same-directory `.body`/`.bod` mate; entering the body loads the same pair.
+Dependencies are checked individually before checked declarations and bodies
+are composed for C, LLVM, or MLIR emission. A diagnostic retains the original
+file and source location after pairing and composition.
+
+`--module-root DIR` adds ordered local search roots (section 8.4). There is no
+package manager, dependency fetcher, or generated module header. `cell build`
+and `cell run` still compile the composed C output through `$CC` with the
+embedded runtime. An additional `.c` positional is a hand-written host,
+never a Cell module. A bodyless function without a matching runtime or host
+symbol still fails at link time.
 
 ---
 
@@ -619,9 +619,9 @@ Float literals are parsed into `f64`.
 
 ### 2.8 String literals
 
-**Status: implemented (lexing, the six simple escapes, and the unterminated
-diagnostic).** `\u{...}`, multi-line, raw, and interpolated strings are
-**designed, not implemented**.
+**Status: implemented (lexing, simple escapes, byte and Unicode scalar
+escapes, and the unterminated diagnostic).** Multi-line, raw, and interpolated
+strings are **designed, not implemented**.
 
 ```
 string_literal = '"' character* '"'
@@ -634,7 +634,16 @@ escape is a parse error. Emitters re-escape those decoded bytes for the
 target (C string syntax, LLVM `c"..."` hex escapes). `"\n"` is one newline
 byte, not the two bytes backslash and n.
 
-`\u{...}` is **designed, not implemented**; `\u` is an unknown escape today.
+`\xNN` consumes exactly two hexadecimal digits and produces one byte,
+including bytes that are not valid UTF-8. `\u{hex}` produces the UTF-8 bytes
+of a Unicode scalar value (U+0000 through U+10FFFF excluding U+D800 through
+U+DFFF). At least one hexadecimal digit and both braces are required;
+leading zeros and either hex case are accepted. Missing digits, malformed
+braces, non-hex characters, surrogate halves, and values above U+10FFFF
+are parse errors. These two escapes follow the pinned Zig string escape
+parser; Cell additionally preserves `\0`. Embedded NUL does not truncate
+the string: all backends preserve its byte length. `examples/string_unicode.cell`
+checks exact decoded bytes on all three backends.
 
 An unterminated string literal (EOF inside `"..."`) is an error at the opening
 quote:
@@ -657,13 +666,13 @@ implemented**.
 ->  =>  ?
 +  -  *  /
 =  ==  !=  <  <=  >  >=
-&  &&  ||  !
+&  |  ^  ~  <<  >>  &&  ||  !
 ```
 
 That is the complete lexical operator set. There is no `%`, no `**`, no
-bitwise `|` `^` `~`, no shifts `<<` `>>`, no compound assignment `+=`, no `++`,
-no `::`, no `..`, and no `|` as a pattern alternative. A bare `|` lexes as
-`invalid`. All of those are **designed, not implemented**.
+compound assignment `+=`, no `++`, no `::`, no `..`, and no `|` as a pattern
+alternative. A bare `|` is a bitwise expression operator; or-pattern grammar
+remains **designed, not implemented**.
 
 ### 2.11 Token spans
 
@@ -1230,14 +1239,18 @@ reading the parenthesization in emitted C.
 
 | Level | Operators | Associativity |
 |---|---|---|
-| 6 (tightest binary) | `*` `/` | left |
-| 5 | `+` `-` | left |
-| 4 | `<` `<=` `>` `>=` | left |
-| 3 | `==` `!=` | left |
+| 10 (tightest binary) | `*` `/` | left |
+| 9 | `+` `-` | left |
+| 8 | `<<` `>>` | left |
+| 7 | `<` `<=` `>` `>=` | left |
+| 6 | `==` `!=` | left |
+| 5 | `&` | left |
+| 4 | `^` | left |
+| 3 | `\|` | left |
 | 2 | `&&` | left |
 | 1 (loosest) | `\|\|` | left |
 
-Unary operators (`-` `!` `&` `&mut` `&exclusive`) bind tighter than every
+Unary operators (`-` `!` `~` `&` `&mut` `&exclusive`) bind tighter than every
 binary operator. Postfix suffixes (`.field` and `(args)`) bind tightest of all
 and chain freely (section 6.4).
 
@@ -1259,11 +1272,36 @@ rule rather than a parser special case (see 0.5 and
 Codegen writes fully parenthesized C for every binary expression, so C's own
 precedence never changes the meaning of an emitted expression.
 
+Integer `&`, `|`, `^`, and `~` preserve the operand width. Two typed
+bitwise operands must have the same integer type; a bare or negated integer
+literal adopts its peer's integer type only when in range. Floats, Booleans,
+enums, and resource types are refused. Complement is narrowed before any
+containing expression, so complementing a `Byte` produces a `Byte`.
+
+At a statement boundary, a newline-leading `&` starts a borrowed expression
+statement. Write the infix operator on the preceding line or enclose the
+expression in delimiters to continue bitwise `&` across a newline. Expression
+contexts such as call arguments and parentheses allow that continuation;
+blocks nested inside them restore the statement boundary rule.
+
+`<<` shifts left and discards bits beyond the left operand's width. `>>`
+shifts signed integers arithmetically and unsigned integers logically. A
+count may have any existing integer type; it must be nonnegative and less
+than the left operand's bit width. A known invalid literal count is a check
+error, and an invalid dynamic count panics before the operation. Counts and
+operands are evaluated once, left before right. These contracts apply to
+8/16/32/64-bit integers and `Byte` on C, LLVM, and MLIR. Unlike Zig's
+log2-width count types, Cell currently uses runtime-checked existing integer
+count types; arbitrary-width integers remain unimplemented. Compound
+assignments, saturating/wrapping arithmetic, and exact-shift builtins remain
+separate capabilities. `>>` closes two nested `Result` argument lists in a
+type context without changing its expression tokenization.
+
 ### 5.2 Not in the grammar
 
 **Status: designed, not implemented.** Assignment is a statement, not an
 expression, so there is no assignment operator level. There is no ternary, no
-range, no `as` cast, no `%`, no bitwise or shift level, no null-coalescing, and
+range, no `as` cast, no `%`, no null-coalescing, and
 no pipeline operator.
 
 ---
@@ -1344,11 +1382,12 @@ specified as an error in 3.8, because those two annotations land in different
 places and produce different C, so there is no single coherent meaning to pick.
 
 
-**Status: `-` and `!` implemented. Reference operators parsed, then collapsed.**
+**Status: `-`, `!`, and integer `~` implemented. Reference operators parsed, then collapsed.**
 
 ```cell
 -x            // negation
 !x            // logical not
+~x            // fixed-width integer complement
 &x            // shared borrow
 &mut x        // exclusive borrow
 &exclusive x  // exclusive borrow, long spelling
@@ -1825,33 +1864,62 @@ Explicit discriminant values are also **designed, not implemented**.
 
 ### 8.4 `use` declarations
 
-**Status: parsed, emitted as a comment.**
+**Status: implemented for local modules and the embedded prelude.**
 
-```
-use_item = ["pub"] "use" path [";"]
+```ebnf
+use_item = "use" path [";"]
 path     = ident ("." ident)*
 ```
 
 ```cell
-use std.io
-use std.mem.alloc
+use geo
+use lib.grid
+use std.prelude
 ```
 
-The path is recorded as a flattened string and emitted as `// use std.io`.
-There is **no module resolution, no import, and no name binding**: nothing a
-`use` names becomes available. `pub use` parses and the `pub` is discarded
-(`Item.use_decl` is just a string). Module resolution is **designed, not
-implemented**.
+A local path `a.b` searches `a/b.cell` and `a/b.cel` relative to the
+importing unit's directory, then each `--module-root` in command-line order.
+The first matching directory wins; both aliases at that location are an
+ambiguity error. Stem pairing applies independently to each resolved unit.
+Repeated imports of one canonical unit are idempotent. Cycles and conflicting
+module qualifiers are refused; distinct non-entry units sharing one leaf
+module name are refused across the graph so nominal identities stay distinct.
+
+`std.<path>` resolves only through the CLI's embedded standard-module table;
+currently only `std.prelude` is provided. A disk `std/` directory cannot shadow
+it. `std` alone and unavailable standard modules are errors.
+
+Only directly imported exports are visible. `use lib.geo` binds the qualifier
+`geo`; calls use `geo.area(...)`, named types and struct literals use
+`geo.Point`, and enum values and patterns use `geo.Color.Red`. Type position
+supports one module qualifier; deeper type qualification is refused. Named
+local values shadow module qualifiers in expression position. An enum or
+struct declaration head by itself is a type, not a value. Enum patterns must
+match the scrutinee's nominal enum and name an existing variant.
+
+An imported type's identity is `geo.Point`, including inside its declaring
+unit, where bare `Point` resolves to that identity. Entry types retain bare
+identities. Exported signatures and fields resolve in their declaring unit;
+transitive nominal metadata does not make transitive functions visible.
+`pub use`, glob imports, and aliases are not implemented and are refused.
 
 ### 8.5 `pub` and visibility
 
-**Status: parsed, minimally used.**
+**Status: implemented for functions, structs, and payload-free enums.**
 
-`pub` is recorded on functions, structs, and enums, and dropped on `use`. Its
-only effect is that a `pub fn` emits a `// export` comment above its C
-definition. Nothing is hidden: a non-`pub` function still emits an externally
-visible C function with the same linkage. Real visibility, and `static` linkage
-for non-`pub` items, are **designed, not implemented**.
+Only `pub` declarations may be accessed through an imported qualifier.
+Private accesses identify the private item in the diagnostic. A public
+function signature or public struct field may not expose a private nominal
+type, including inside list, optional, reference, or Result type annotations.
+Top-level declaration names and module qualifiers may not collide.
+
+Non-public function definitions have internal linkage in every backend: C
+uses `static`, LLVM uses `internal`, and MLIR carries an LLVM internal-linkage
+attribute as well as private visibility. Bodyless declarations retain external
+C ABI linkage. A paired public interface declaration preserves its public
+visibility when the body definition omits `pub`. Only the entry's `main`
+creates the process entry wrapper; an imported `main` is an ordinary qualified
+function.
 
 ---
 
@@ -1955,7 +2023,7 @@ A negative numeric pattern is folded in the parser (`-1` becomes the literal
   no payload (section 8.3). `Pattern.Kind` has no case for subpatterns, so
   adding them means extending the type, not filling a field.
 - **Struct patterns** (`Point { x, y }`), tuple patterns, and slice patterns.
-- **Or-patterns.** There is no `|` operator in the lexer (section 2.10).
+- **Or-patterns.** `|` is a bitwise expression token; pattern alternatives are not parsed.
 - **Guards on binding patterns** (`if cond` after a binding). Other scalar
   pattern guards are implemented as described in section 9.0.
 - **Range patterns.**
@@ -1999,8 +2067,9 @@ Measured.
 
 **Status: implemented for definitions and named call sites.**
 
-The mangling scheme is `cell_<name>`, with no encoding of parameter types,
-arity, ownership, or module path. Consequences: **there is no overloading**, a
+Entry declarations and bodyless external functions use `cell_<name>`;
+non-entry definitions and nominal types use `cell_<module>_<name>`. Neither
+scheme encodes parameter types, arity, or ownership. There is no overloading: a
 Cell module cannot define two functions with the same name, and a Cell symbol
 collides with any C symbol literally named `cell_<name>`.
 
@@ -2016,8 +2085,9 @@ Applied consistently to definitions and to named calls:
 A call to `add` emits `cell_add(...)`. Bodyless declarations of runtime
 intrinsics (`print`, `print_int`, ...) keep the runtime's own symbol.
 
-**Measured, on a binary built with `-Dswift=false`, over all fourteen files in
-`examples/` rather than a chosen few.** Compilation and linking are separate
+**Historical single-file measurement, before module graph support:** on a
+binary built with `-Dswift=false`, over the fourteen files then in
+`examples/`, rather than a chosen few. Compilation and linking are separate
 claims and are reported separately, because a file that compiles may still
 have no `main` or may call a declaration nothing defines.
 
@@ -2036,8 +2106,13 @@ none declares a `pub fn main()` with a body, so `emitEntryPoint` writes no C
 `main` and the link stops at `undefined symbol: _main`. Nothing about their
 emitted code is rejected.
 
-A module-qualified mangling (`cell_<module>_<name>`) is **designed, not
-implemented**.
+Module-qualified symbols are decided once before composition and consumed by
+all three backends. Symbol, drop-glue, and enum-constant collisions are refused.
+Repeated compatible bodyless declarations share one external ABI symbol;
+incompatible signatures are refused. Unused imported bodyless declarations
+are omitted after checking and collision validation; entry declarations retain
+their standalone emission contracts. Local bindings are renamed hygienically
+so source locals cannot capture a qualified emitted call.
 
 ### 10.3 The value model
 
@@ -2229,12 +2304,13 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Exponent float literal | implemented |
 | Hexadecimal float literal | designed, not implemented |
 | String literal lexing | implemented |
-| String escape processing | implemented for `\n \t \r \\ \" \0`; `\u{...}` remains designed, not implemented |
+| String escape processing | implemented for `\n \t \r \\ \" \0`, `\xNN` bytes and `\u{hex}` Unicode scalars |
 | Unterminated string diagnostic | implemented |
 | Multi-line / raw / interpolated strings | designed, not implemented |
 | Boolean literals | implemented |
 | Operator and punctuation set | implemented |
-| `%`, bitwise, shift, compound assignment | designed, not implemented |
+| Bitwise `&`, `\|`, `^`, `~` and shifts `<<`, `>>` | implemented for fixed-width integers; dynamic counts checked |
+| `%`, compound assignment | designed, not implemented |
 | Token byte spans and line/column | implemented |
 
 ### Types
@@ -2294,7 +2370,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | Direct call `f(x)` | implemented |
 | Postfix chaining `a.b(c).d` | implemented |
 | Method dispatch and `impl` blocks | designed, not implemented |
-| Binary operators (12) | implemented |
+| Binary operators (17) | implemented |
 | Precedence and left associativity | implemented |
 | Unary `-` and `!` | implemented |
 | `&x` shared borrow | implemented |
@@ -2352,10 +2428,10 @@ point and separates checking, backend lowering, cleanup and release evidence.
 | `enum` declaration and emission | implemented |
 | Enum variant payloads | designed, not implemented |
 | Explicit enum discriminants | designed, not implemented |
-| `use` declaration syntax | parsed, not enforced |
-| Module resolution | designed, not implemented |
+| `use` declaration syntax | implemented; `pub use` refused |
+| Module resolution | implemented for local graphs and embedded `std.prelude`; no package manager |
 | `pub` recorded and marked in output | implemented |
-| Visibility enforcement and `static` linkage | designed, not implemented |
+| Visibility enforcement and internal linkage | implemented on C, LLVM, and MLIR |
 | Item spans, printed by `cell dump` | implemented |
 
 ### Patterns
@@ -2402,7 +2478,7 @@ point and separates checking, backend lowering, cleanup and release evidence.
 
 | Construct | Status |
 |---|---|
-| Single-file compilation | implemented |
+| Single-file and module-graph compilation | implemented; dependencies checked per unit before composition |
 | `.cell` / `.cel` module files | implemented |
 | `.body` / `.bod` body files | implemented |
 | Stem-based module/body pairing | implemented |
@@ -2424,7 +2500,7 @@ implemented grammar, not the specified one.
 ```ebnf
 module     = item* EOF ;
 
-item       = [ "pub" ] ( fn_item | struct_item | enum_item | use_item ) ;
+item       = [ "pub" ] ( fn_item | struct_item | enum_item ) | use_item ;
 
 fn_item    = "fn" ident "(" [ param { "," param } ] ")" [ "->" type ]
              ( "{" stmt* "}" | [ ";" ] ) ;
@@ -2442,7 +2518,7 @@ ownership  = "owned" | "shared" | "exclusive" | "arc" | "copy" ;
 
 type       = "[" type "]"
            | ownership type
-           | ident [ "?" ] ;
+           | ident [ "." ident ] [ "?" ] ;
 
 stmt       = let_stmt | return_stmt | assign_or_expr_stmt ;
 let_stmt   = ( "let" | "var" ) [ "mut" ] [ ownership ] ident

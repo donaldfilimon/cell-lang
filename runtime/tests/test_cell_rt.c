@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include "cell_rt.h"
 
+#include <errno.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,6 +26,9 @@
 #if defined(__APPLE__) || defined(__linux__) || defined(__unix__)
 #define CELL_RT_TEST_THREADS 1
 #include <pthread.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #else
 #define CELL_RT_TEST_THREADS 0
 #endif
@@ -860,7 +864,68 @@ static void test_prelude_bytes_and_arc(void) {
 
 /* ------------------------------------------------------------------------ */
 
+static void test_integer_shifts(void) {
+    const uint32_t widths[] = { 8, 16, 32, 64 };
+    for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+        const uint32_t width = widths[i];
+        const uint64_t mask = width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - 1;
+        const uint64_t sign = UINT64_C(1) << (width - 1);
+        CHECK(cell_bits_shl(UINT64_MAX, 0, width) == mask);
+        CHECK(cell_bits_shr(UINT64_MAX, 0, width, false) == mask);
+        CHECK(cell_bits_shr(UINT64_MAX, 0, width, true) == mask);
+        CHECK(cell_bits_shl(1, width - 1, width) == sign);
+        CHECK(cell_bits_shl(sign, 1, width) == 0);
+        CHECK(cell_bits_shl(mask, 1, width) == (mask ^ 1));
+        CHECK(cell_bits_shr(sign, width - 1, width, false) == 1);
+        CHECK(cell_bits_shr(sign, width - 1, width, true) == mask);
+        CHECK(cell_bits_shr(mask, width - 1, width, true) == mask);
+        CHECK(cell_bits_shr(sign - 1, width - 1, width, true) == 0);
+        CHECK(cell_bits_shr(sign, 1, width, true) == (sign | (sign >> 1)));
+        CHECK(cell_bits_shr(0, width - 1, width, true) == 0);
+    }
+}
+
+#if CELL_RT_TEST_THREADS
+static void expect_shift_panic(bool right, uint64_t count, uint32_t width) {
+    const pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid < 0) return;
+    if (pid == 0) {
+        (void)freopen("/dev/null", "w", stderr);
+        if (right) (void)cell_bits_shr(1, count, width, true);
+        else (void)cell_bits_shl(1, count, width);
+        _Exit(111); /* A returning invalid shift is a failed refusal. */
+    }
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+    CHECK(waited == pid);
+    if (waited == pid) CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+}
+
+static void test_integer_shift_panics(void) {
+    const uint32_t widths[] = { 8, 16, 32, 64 };
+    for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+        expect_shift_panic(false, widths[i], widths[i]);
+        expect_shift_panic(true, widths[i], widths[i]);
+        expect_shift_panic(false, UINT64_MAX, widths[i]);
+        expect_shift_panic(true, UINT64_MAX, widths[i]);
+    }
+    const uint32_t invalid[] = { 0, 7, 65, UINT32_MAX };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        expect_shift_panic(false, 0, invalid[i]);
+        expect_shift_panic(true, 0, invalid[i]);
+    }
+}
+#else
+static void test_integer_shift_panics(void) {
+    fprintf(stderr, "cell_rt tests: shift panic subprocess checks skipped (no POSIX fork)\n");
+}
+#endif
+
 int main(void) {
+    test_integer_shifts();
+    test_integer_shift_panics();
     test_version();
     test_arena_alignment();
     test_arena_exhaustion();

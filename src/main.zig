@@ -19,6 +19,10 @@ extern fn cell_swift_probe() c_int;
 /// execution stage compiles the same two files from `runtime/` directly.
 const embedded_rt_h = @embedFile("cell_rt_h");
 const embedded_rt_c = @embedFile("cell_rt_c");
+const embedded_rt_header_declarations = @embedFile("cell_rt_header_declarations");
+const embedded_rt_source_declarations = @embedFile("cell_rt_source_declarations");
+const embedded_std_prelude = @embedFile("cell_std_prelude");
+const embedded_std_modules = [_]cell.load_file.StdModule{.{ .name = "prelude", .source = embedded_std_prelude }};
 
 const Usage =
     \\cell - Cell language toolchain (Zig host)
@@ -41,6 +45,7 @@ const Usage =
     \\  --target=llvm         Emit textual LLVM IR
     \\  --target=mlir         Emit textual MLIR (func/arith/memref/scf)
     \\  -o <path>             Output path for build (default: the source stem)
+    \\  --module-root <dir>   Additional module search directory (repeatable)
     \\
     \\The llvm and mlir backends are scalar-first. A construct they cannot
     \\carry yet is reported as a `cannot lower` error at its span, not
@@ -110,11 +115,22 @@ const Invocation = struct {
     /// slice into its own array would dangle. Read through `hosts()`.
     host_buf: [max_hosts][]const u8 = undefined,
     host_count: usize = 0,
+    module_root_buf: [max_module_roots][]const u8 = undefined,
+    module_root_count: usize = 0,
 
     pub const max_hosts = 8;
+    pub const max_module_roots = 32;
 
     pub fn hosts(self: *const Invocation) []const []const u8 {
         return self.host_buf[0..self.host_count];
+    }
+
+    pub fn moduleRoots(self: *const Invocation) []const []const u8 {
+        return self.module_root_buf[0..self.module_root_count];
+    }
+
+    pub fn graphOptions(self: *const Invocation) cell.GraphOptions {
+        return .{ .module_roots = self.moduleRoots(), .std_modules = &embedded_std_modules };
     }
 };
 
@@ -129,6 +145,8 @@ const ParsedArgs = union(enum) {
     unknown_target: []const u8,
     unknown_option: []const u8,
     too_many_hosts,
+    missing_module_root_value,
+    too_many_module_roots,
 };
 
 /// Parse the arguments after the command. The path, `--target=`, `-o` and
@@ -150,6 +168,12 @@ fn parseArgs(args: []const []const u8) ParsedArgs {
             if (i + 1 >= args.len) return .missing_out_value;
             i += 1;
             inv.out = args[i];
+        } else if (std.mem.eql(u8, a, "--module-root")) {
+            if (i + 1 >= args.len or args[i + 1].len == 0 or std.mem.startsWith(u8, args[i + 1], "--")) return .missing_module_root_value;
+            if (inv.module_root_count == Invocation.max_module_roots) return .too_many_module_roots;
+            i += 1;
+            inv.module_root_buf[inv.module_root_count] = args[i];
+            inv.module_root_count += 1;
         } else if (a.len > 1 and a[0] == '-') {
             return .{ .unknown_option = a };
         } else if (std.mem.eql(u8, std.fs.path.extension(a), ".c")) {
@@ -319,6 +343,14 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("error: at most {d} host .c sources per invocation\n", .{Invocation.max_hosts});
             std.process.exit(1);
         },
+        .missing_module_root_value => {
+            std.debug.print("error: --module-root needs a directory\n", .{});
+            std.process.exit(1);
+        },
+        .too_many_module_roots => {
+            std.debug.print("error: at most {d} module roots per invocation\n", .{Invocation.max_module_roots});
+            std.process.exit(1);
+        },
     };
     if (inv.out != null and command != .build) {
         std.debug.print("error: -o applies to build only\n", .{});
@@ -339,7 +371,7 @@ pub fn main(init: std.process.Init) !void {
     const cwd = Io.Dir.cwd();
 
     if (command == .@"test") {
-        const code = try testDir(init, cwd, inv.path);
+        const code = try testDir(init, cwd, inv.path, inv.graphOptions());
         std.process.exit(code);
     }
 
@@ -354,7 +386,7 @@ pub fn main(init: std.process.Init) !void {
     if (command == .check) {
         var buf: [4096]u8 = undefined;
         var fw: Io.File.Writer = .init(.stderr(), io, &buf);
-        var module = loadAndReport(arena, io, cwd, path, &fw) catch |err| {
+        var module = loadAndReport(arena, io, cwd, path, inv.graphOptions(), &fw) catch |err| {
             if (err == error.TypeError) std.process.exit(1);
             return err;
         };
@@ -366,12 +398,12 @@ pub fn main(init: std.process.Init) !void {
     if (command == .dump) {
         var buf: [4096]u8 = undefined;
         var fw: Io.File.Writer = .init(.stderr(), io, &buf);
-        var loaded = cell.load(arena, io, cwd, path, &fw.interface) catch |err| {
+        const graph = cell.loadGraph(arena, io, cwd, path, inv.graphOptions(), &fw.interface) catch |err| {
             try fw.interface.flush();
-            if (err == error.MissingModule or err == error.AmbiguousModule or err == error.PairingMismatch or err == error.ParseFailed) std.process.exit(1);
+            if (cell.load_file.isDiagnosticError(err)) std.process.exit(1);
             return err;
         };
-        try loaded.module.dump(&fw.interface);
+        for (graph.units) |unit| try unit.module.dump(&fw.interface);
         try fw.interface.flush();
         return;
     }
@@ -383,10 +415,9 @@ pub fn main(init: std.process.Init) !void {
         // Loaded rather than loadAndCheck, so the source buffer is still in
         // hand and a backend's `cannot lower` diagnostic renders with the
         // offending line and a caret rather than a bare location.
-        var loaded = cell.load(arena, io, cwd, path, &err_fw.interface) catch |err| {
+        var loaded = loadForCompilation(arena, io, cwd, path, inv.graphOptions(), &err_fw.interface) catch |err| {
             try err_fw.interface.flush();
-            if (err == error.MissingModule or err == error.AmbiguousModule or
-                err == error.PairingMismatch or err == error.ParseFailed)
+            if (cell.load_file.isDiagnosticError(err))
                 std.process.exit(1);
             return err;
         };
@@ -444,7 +475,7 @@ fn buildOrRun(init: std.process.Init, cwd: Io.Dir, command: Command, inv: Invoca
             try err_w.flush();
             return 1;
         }
-        const outcome = try runProgram(init, cwd, inv.path, inv.hosts(), false, err_w);
+        const outcome = try runProgram(init, cwd, inv.path, inv.hosts(), inv.graphOptions(), false, err_w);
         return switch (outcome) {
             .compile_failed => 1,
             .ran => |r| exitCodeOf(r.term, err_w),
@@ -457,10 +488,9 @@ fn buildOrRun(init: std.process.Init, cwd: Io.Dir, command: Command, inv: Invoca
         return 1;
     }
 
-    var loaded = cell.load(arena, io, cwd, inv.path, err_w) catch |err| {
+    var loaded = loadForCompilation(arena, io, cwd, inv.path, inv.graphOptions(), err_w) catch |err| {
         try err_w.flush();
-        if (err == error.MissingModule or err == error.AmbiguousModule or
-            err == error.PairingMismatch or err == error.ParseFailed)
+        if (cell.load_file.isDiagnosticError(err))
             return 1;
         return err;
     };
@@ -559,6 +589,7 @@ fn runProgram(
     cwd: Io.Dir,
     path: []const u8,
     hosts: []const []const u8,
+    options: cell.GraphOptions,
     capture: bool,
     err_w: *Io.Writer,
 ) !RunOutcome {
@@ -571,10 +602,9 @@ fn runProgram(
         return .compile_failed;
     }
 
-    var loaded = cell.load(arena, io, cwd, path, err_w) catch |err| {
+    var loaded = loadForCompilation(arena, io, cwd, path, options, err_w) catch |err| {
         try err_w.flush();
-        if (err == error.MissingModule or err == error.AmbiguousModule or
-            err == error.PairingMismatch or err == error.ParseFailed)
+        if (cell.load_file.isDiagnosticError(err))
             return .compile_failed;
         return err;
     };
@@ -651,7 +681,7 @@ fn runProgram(
 /// that file exists beside it. Returns the process exit code: 0 when every
 /// program passed, 1 when any failed, 2 when `dir` cannot be opened or
 /// holds no program (an empty suite is never green).
-fn testDir(init: std.process.Init, cwd: Io.Dir, dir: []const u8) !u8 {
+fn testDir(init: std.process.Init, cwd: Io.Dir, dir: []const u8, options: cell.GraphOptions) !u8 {
     const arena = init.arena.allocator();
     const io = init.io;
     var err_buf: [4096]u8 = undefined;
@@ -698,7 +728,7 @@ fn testDir(init: std.process.Init, cwd: Io.Dir, dir: []const u8) !u8 {
         const source = cwd.readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch "";
         const want = expectOutputOf(source);
 
-        const outcome: Outcome = switch (try runProgram(init, cwd, path, hosts, true, err_w)) {
+        const outcome: Outcome = switch (try runProgram(init, cwd, path, hosts, options, true, err_w)) {
             .compile_failed => .failed_compile,
             .ran => |r| switch (r.term) {
                 .exited => |code| if (code != 0) Outcome{ .failed_exit = code } else if (want) |w| blk: {
@@ -732,14 +762,72 @@ fn loadAndReport(
     io: Io,
     dir: Io.Dir,
     path: []const u8,
+    options: cell.GraphOptions,
     fw: *Io.File.Writer,
 ) !cell.ast.Module {
-    const module = cell.loadAndCheck(allocator, io, dir, path, &fw.interface) catch |err| {
+    var graph = cell.loadGraph(allocator, io, dir, path, options, &fw.interface) catch |err| {
+        try fw.interface.flush();
+        if (cell.load_file.isDiagnosticError(err)) return error.TypeError;
+        return err;
+    };
+    cell.checkGraph(allocator, &graph, &fw.interface) catch |err| {
+        try fw.interface.flush();
+        return err;
+    };
+    _ = validateGraphSymbols(allocator, &graph, &fw.interface) catch |err| {
         try fw.interface.flush();
         return err;
     };
     try fw.interface.flush();
-    return module;
+    return graph.entry().module;
+}
+
+/// Resolve and check each source in its own import context, then compose a
+/// hygienic whole-program AST using the shared symbol decisions.
+fn loadForCompilation(allocator: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8, options: cell.GraphOptions, writer: *Io.Writer) !cell.Loaded {
+    var graph = cell.loadGraph(allocator, io, dir, path, options, writer) catch |err| {
+        if (cell.load_file.isDiagnosticError(err)) return error.TypeError;
+        return err;
+    };
+    try cell.checkGraph(allocator, &graph, writer);
+    const table = try validateGraphSymbols(allocator, &graph, writer);
+    const module = cell.program.compose(allocator, &graph, &table, writer) catch |err| {
+        if (err == error.InvalidProgram) return error.TypeError;
+        return err;
+    };
+    return .{ .module = module, .source = graph.entry().source };
+}
+fn validateGraphSymbols(allocator: std.mem.Allocator, graph: *const cell.Graph, writer: *Io.Writer) !cell.symbols.Table {
+    const table = cell.symbols.decideSymbols(allocator, graph, writer) catch |err| {
+        if (err == error.SymbolCollision) return error.TypeError;
+        return err;
+    };
+    cell.symbols.reserveRuntimeSymbols(allocator, graph, &table, embedded_rt_header_declarations, embedded_rt_source_declarations, writer) catch |err| {
+        switch (err) {
+            error.RuntimeSymbolCollision, error.RuntimeSignatureConflict, error.UnsupportedRuntimeInterface => return error.TypeError,
+            else => return err,
+        }
+    };
+    return table;
+}
+
+test "module-root arguments preserve order and are bounded without escaping slices" {
+    const parsed = parseArgs(&.{ "--module-root", "first", "main.cell", "--module-root", "second" });
+    try std.testing.expect(parsed == .ok);
+    const invocation = parsed.ok;
+    try std.testing.expectEqualStrings("main.cell", invocation.path);
+    try std.testing.expectEqual(@as(usize, 2), invocation.moduleRoots().len);
+    try std.testing.expectEqualStrings("first", invocation.moduleRoots()[0]);
+    try std.testing.expectEqualStrings("second", invocation.moduleRoots()[1]);
+    try std.testing.expect(parseArgs(&.{ "main.cell", "--module-root" }) == .missing_module_root_value);
+    try std.testing.expect(parseArgs(&.{ "main.cell", "--module-root", "--target=c" }) == .missing_module_root_value);
+    var overflow: [Invocation.max_module_roots * 2 + 3][]const u8 = undefined;
+    overflow[0] = "main.cell";
+    for (0..Invocation.max_module_roots + 1) |i| {
+        overflow[i * 2 + 1] = "--module-root";
+        overflow[i * 2 + 2] = "lib";
+    }
+    try std.testing.expect(parseArgs(&overflow) == .too_many_module_roots);
 }
 
 fn printUsage(io: Io) !void {

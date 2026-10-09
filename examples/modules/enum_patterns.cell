@@ -1,0 +1,10 @@
+// A bare pattern belongs to its scrutinee's nominal enum, regardless of
+// imported enum order. geo.Color has Red first; Shade has Red second.
+// EXPECT-OUTPUT: 11
+use geo
+pub enum Shade { Blue, Red }
+pub fn print_int(copy value: Int);
+pub fn main() {
+    let copy color = Shade.Red
+    print_int(match color { Red => 11, _ => 22 })
+}

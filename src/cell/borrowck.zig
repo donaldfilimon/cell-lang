@@ -170,6 +170,7 @@ const bk_tests_arc = @import("borrowck/tests_arc.zig");
 const bk_tests_loops = @import("borrowck/tests_loops.zig");
 const bk_tests_results = @import("borrowck/tests_results.zig");
 const bk_tests_borrows = @import("borrowck/tests_borrows.zig");
+const bk_tests_modules = @import("borrowck/tests_modules.zig");
 pub const Error = bk_model.Error;
 pub const BorrowError = bk_model.BorrowError;
 pub const LoanKind = bk_model.LoanKind;
@@ -193,9 +194,74 @@ comptime {
     _ = bk_tests_loops;
     _ = bk_tests_results;
     _ = bk_tests_borrows;
+    _ = bk_tests_modules;
 }
 
 pub const Checker = struct {
+    /// Register an already-checked imported signature under its visible key.
+    /// This does not walk its body/declaration or consume binding IDs.
+    /// The caller owns the signature/type lifetime and resolves visibility.
+    pub fn registerImportedSignature(self: *Checker, qualified_name: []const u8, signature: ast.FnDef) std.mem.Allocator.Error!void {
+        const key = try self.arena.allocator().dupe(u8, qualified_name);
+        try self.fns.put(self.allocator, key, signature);
+    }
+
+    pub fn registerImportedStruct(self: *Checker, qualified_name: []const u8, definition: ast.StructDef) std.mem.Allocator.Error!void {
+        const key = try self.arena.allocator().dupe(u8, qualified_name);
+        try self.structs.put(self.allocator, key, definition);
+    }
+
+    pub fn registerImportedEnum(self: *Checker, qualified_name: []const u8, definition: ast.EnumDef) std.mem.Allocator.Error!void {
+        const key = try self.arena.allocator().dupe(u8, qualified_name);
+        try self.enums.put(self.allocator, key, definition);
+    }
+
+    /// Resolve every signature-driven ownership rule through one path.
+    /// A local shadows a module qualifier; arbitrary expression callees are
+    /// never guessed to be imported functions.
+    pub fn calleeSignature(self: *const Checker, expression: *const ast.Expr) ?ast.FnDef {
+        var root = expression;
+        while (root.kind == .field) root = root.kind.field.base;
+        if (root.kind != .ident or self.lookup(root.kind.ident) != null) return null;
+        if (expression.kind == .ident) return self.fns.get(expression.kind.ident);
+        var iterator = self.fns.iterator();
+        while (iterator.next()) |entry| {
+            if (calleeMatchesKey(expression, entry.key_ptr.*)) return entry.value_ptr.*;
+        }
+        return null;
+    }
+
+    /// Resolve a payload-free enum variant from its entire type qualifier.
+    /// Both the type and variant must exist; a local root always wins.
+    pub fn enumVariant(self: *const Checker, expression: *const ast.Expr) ?ast.EnumDef {
+        if (expression.kind != .field) return null;
+        const field = expression.kind.field;
+        var root = field.base;
+        while (root.kind == .field) root = root.kind.field.base;
+        if (root.kind != .ident or self.lookup(root.kind.ident) != null) return null;
+        var iterator = self.enums.iterator();
+        while (iterator.next()) |entry| {
+            if (!calleeMatchesKey(field.base, entry.key_ptr.*)) continue;
+            for (entry.value_ptr.variants) |variant| {
+                if (std.mem.eql(u8, variant, field.name)) return entry.value_ptr.*;
+            }
+            return null;
+        }
+        return null;
+    }
+
+    fn calleeMatchesKey(expression: *const ast.Expr, key: []const u8) bool {
+        return switch (expression.kind) {
+            .ident => |name| std.mem.eql(u8, name, key),
+            .field => |field| blk: {
+                const dot = std.mem.lastIndexOfScalar(u8, key, '.') orelse break :blk false;
+                break :blk std.mem.eql(u8, field.name, key[dot + 1 ..]) and
+                    calleeMatchesKey(field.base, key[0..dot]);
+            },
+            else => false,
+        };
+    }
+
     allocator: std.mem.Allocator,
     /// Owns every formatted diagnostic message, so messages outlive the walk
     /// but die with the checker.

@@ -1,0 +1,3 @@
+// EXPECT: currently-rejected
+pub use std.prelude
+pub fn main() {}

@@ -1,0 +1,4 @@
+// EXPECT: currently-rejected
+// A Cell definition cannot replace the embedded runtime's print function.
+pub fn print_int(copy value: Int) {}
+pub fn main() { print_int(7) }

@@ -528,3 +528,31 @@ __attribute__((weak)) int32_t cell_cxx_probe(void) {
 __attribute__((weak)) int32_t cell_swift_probe(void) {
     return 0;
 }
+
+
+/* ------------------------------------------------------------------------ */
+/* Checked integer shifts                                                    */
+/* ------------------------------------------------------------------------ */
+
+static uint64_t cell_bits_mask(uint64_t count, uint32_t width) {
+    if (width != 8 && width != 16 && width != 32 && width != 64)
+        cell_panic(cell_str_from_cstr("integer shift: invalid width"));
+    if (count >= width)
+        cell_panic(cell_str_from_cstr("integer shift: count out of range"));
+    return width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - UINT64_C(1);
+}
+
+uint64_t cell_bits_shl(uint64_t value, uint64_t count, uint32_t width) {
+    const uint64_t mask = cell_bits_mask(count, width);
+    return ((value & mask) << count) & mask;
+}
+
+uint64_t cell_bits_shr(uint64_t value, uint64_t count, uint32_t width, bool is_signed) {
+    const uint64_t mask = cell_bits_mask(count, width);
+    value &= mask;
+    uint64_t result = value >> count;
+    const uint64_t sign = UINT64_C(1) << (width - 1);
+    if (is_signed && (value & sign) != 0)
+        result |= mask ^ (mask >> count);
+    return result & mask;
+}

@@ -1,0 +1,8 @@
+// EXPECT: currently-rejected
+// Equal variant spellings do not make enums from distinct modules interchangeable.
+use lib.module_color
+use lib.module_other
+pub fn main() {
+    let copy color = module_other.Color.Red
+    let copy result = match color { module_color.Color.Red => 1, _ => 0 }
+}

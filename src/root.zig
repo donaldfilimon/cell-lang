@@ -18,10 +18,15 @@ pub const cfg = @import("cell/cfg.zig");
 pub const liveness = @import("cell/liveness.zig");
 pub const llvmemit = @import("cell/llvmemit.zig");
 pub const mlirmit = @import("cell/mlirmit.zig");
+pub const symbols = @import("cell/symbols.zig");
+pub const program = @import("cell/program.zig");
 
 pub const load = load_file.load;
 pub const Loaded = load_file.Loaded;
 pub const classify = load_file.classify;
+pub const loadGraph = load_file.loadGraph;
+pub const Graph = load_file.Graph;
+pub const GraphOptions = load_file.GraphOptions;
 
 pub const Version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 0 };
 
@@ -61,6 +66,83 @@ pub fn check(
     try tc.diagnostics.printAll(writer);
     try bc.diagnostics.printAll(writer);
     if (tc.diagnostics.hasErrors() or bc.diagnostics.hasErrors()) return error.TypeError;
+}
+
+/// Check dependencies in graph order with per-unit diagnostics and direct
+/// export contexts. Imported declarations are registered in borrowck tables,
+/// never traversed as if they belonged to the importing source file.
+pub fn checkGraph(allocator: std.mem.Allocator, graph: *Graph, writer: *Io.Writer) !void {
+    const contexts = try allocator.alloc(typecheck.Checker, graph.units.len);
+    defer allocator.free(contexts);
+    var initialized: usize = 0;
+    defer for (contexts[0..initialized]) |*context| context.deinit();
+    var failed = false;
+    for (graph.units, 0..) |*unit, unit_index| {
+        const context = &contexts[unit_index];
+        context.* = typecheck.Checker.init(allocator);
+        initialized += 1;
+        context.diagnostics.source = unit.source;
+        const imports = try allocator.alloc(typecheck.ModuleImport, unit.imports.len);
+        defer allocator.free(imports);
+        for (unit.imports, imports) |edge, *import| {
+            const dependency = &graph.units[edge.unit];
+            import.* = .{
+                .name = edge.name,
+                .module = &dependency.module,
+                .unit_name = if (dependency.is_entry) null else dependency.name,
+                .context = &contexts[edge.unit],
+            };
+        }
+        try context.checkModuleWithImports(&unit.module, if (unit.is_entry) null else unit.name, imports);
+        var bc = borrowck.Checker.init(allocator, unit.module.path, unit.source);
+        defer bc.deinit();
+        // Nominal metadata may be transitively referenced by an exported
+        // field/signature without making that module's functions visible.
+        // Register structural metadata only; typecheck owns visibility.
+        for (graph.units[0..unit_index], contexts[0..unit_index]) |dependency_unit, *dependency| {
+            for (dependency_unit.module.items) |item| switch (item.kind) {
+                .struct_def => |def| if (try dependency.exportedStruct(def.name)) |definition| {
+                    try bc.registerImportedStruct(definition.name, definition);
+                },
+                .enum_def => |def| if (try dependency.exportedEnum(def.name)) |definition| {
+                    try bc.registerImportedEnum(definition.name, definition);
+                },
+                .fn_def, .use_decl => {},
+            };
+        }
+        for (unit.imports) |edge| {
+            const dependency = &contexts[edge.unit];
+            for (graph.units[edge.unit].module.items) |item| {
+                switch (item.kind) {
+                    .fn_def => |def| if (try dependency.exportedFunction(def.name)) |signature| {
+                        const key = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ edge.name, def.name });
+                        defer allocator.free(key);
+                        try bc.registerImportedSignature(key, signature);
+                    },
+                    // A single canonical file can be reached through different
+                    // visible qualifiers (for example, symlink spellings).
+                    // Keep canonical names in definitions and nested types,
+                    // while also resolving the source's direct import aliases.
+                    .struct_def => |def| if (try dependency.exportedStruct(def.name)) |definition| {
+                        const key = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ edge.name, def.name });
+                        defer allocator.free(key);
+                        try bc.registerImportedStruct(key, definition);
+                    },
+                    .enum_def => |def| if (try dependency.exportedEnum(def.name)) |definition| {
+                        const key = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ edge.name, def.name });
+                        defer allocator.free(key);
+                        try bc.registerImportedEnum(key, definition);
+                    },
+                    .use_decl => {},
+                }
+            }
+        }
+        try bc.checkModule(&unit.module);
+        try context.diagnostics.printAll(writer);
+        try bc.diagnostics.printAll(writer);
+        failed = failed or context.diagnostics.hasErrors() or bc.hasErrors();
+    }
+    if (failed) return error.TypeError;
 }
 
 /// The code generators this compiler ships.
@@ -142,7 +224,7 @@ pub fn loadAndCheck(
     writer: *Io.Writer,
 ) !ast.Module {
     var loaded = load(allocator, io, dir, path, writer) catch |err| switch (err) {
-        error.MissingModule, error.AmbiguousModule, error.PairingMismatch, error.ParseFailed => return error.TypeError,
+        error.MissingModule, error.AmbiguousModule, error.AmbiguousBody, error.PairingMismatch, error.ParseFailed => return error.TypeError,
         else => |e| return e,
     };
     try check(allocator, &loaded.module, loaded.source, writer);
@@ -2127,6 +2209,52 @@ test "checked HIR scope-releases an unmoved nested scalar-list sibling" {
     const p_slot = f.body.?[0].kind.let.slot;
     try std.testing.expectEqual(@as(usize, 0), countNestedFieldFrees(f.body.?, "cell_slice_free", p_slot, 0, 0));
     try std.testing.expectEqual(@as(usize, 1), countNestedFieldFrees(f.body.?, "cell_slice_free", p_slot, 0, 1));
+}
+
+test "graph checking retains canonical nominal identity through direct import aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const dependency_source = "pub struct Point { copy x: Int } pub enum Color { Red, Blue }";
+    const entry_source = "use geo use alias pub fn keep(copy color: geo.Color) -> geo.Color { return color } pub fn main() -> alias.Color { let owned point: alias.Point = alias.Point { x: 7 }; return keep(copy alias.Color.Red) }";
+    var imports = [_]load_file.Import{
+        .{ .name = "geo", .unit = 0, .span = .none },
+        .{ .name = "alias", .unit = 0, .span = .none },
+    };
+    // These edges model two filesystem spellings deduplicated by loadGraph
+    // to the same canonical unit, without requiring symlink privileges.
+    var units = [_]load_file.Unit{
+        .{ .name = "geo", .path = "geo.cell", .identity = "canonical/geo.cell", .source = dependency_source, .module = try compile(allocator, dependency_source, "geo.cell"), .imports = &.{}, .is_entry = false },
+        .{ .name = "entry", .path = "entry.cell", .identity = "canonical/entry.cell", .source = entry_source, .module = try compile(allocator, entry_source, "entry.cell"), .imports = &imports, .is_entry = true },
+    };
+    var graph: Graph = .{ .units = &units };
+    var diagnostics: Io.Writer.Allocating = .init(allocator);
+    try checkGraph(allocator, &graph, &diagnostics.writer);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.written().len);
+    const table = try symbols.decideSymbols(allocator, &graph, &diagnostics.writer);
+    var composed = try program.compose(allocator, &graph, &table, &diagnostics.writer);
+    try check(allocator, &composed, entry_source, &diagnostics.writer);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.written().len);
+}
+
+test "graph checking applies owning field rules through a canonical import alias" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const dependency_source = "pub struct Box { owned text: String } pub fn fresh() -> arc String;";
+    const entry_source = "use geo use alias pub fn main() { let owned box: alias.Box = alias.Box { text: alias.fresh() } }";
+    var imports = [_]load_file.Import{
+        .{ .name = "geo", .unit = 0, .span = .none },
+        .{ .name = "alias", .unit = 0, .span = .none },
+    };
+    var units = [_]load_file.Unit{
+        .{ .name = "geo", .path = "geo.cell", .identity = "canonical/geo.cell", .source = dependency_source, .module = try compile(allocator, dependency_source, "geo.cell"), .imports = &.{}, .is_entry = false },
+        .{ .name = "entry", .path = "entry.cell", .identity = "canonical/entry.cell", .source = entry_source, .module = try compile(allocator, entry_source, "entry.cell"), .imports = &imports, .is_entry = true },
+    };
+    var graph: Graph = .{ .units = &units };
+    var diagnostics: Io.Writer.Allocating = .init(allocator);
+    try std.testing.expectError(error.TypeError, checkGraph(allocator, &graph, &diagnostics.writer));
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "ownership is shared and cannot be made unique") != null);
 }
 
 test "checked HIR String slice hoists a nested return before releasing its readers" {

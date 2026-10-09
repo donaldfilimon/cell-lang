@@ -104,12 +104,14 @@ test "function and call retain declared return ownership" {
 
 pub const Struct = struct {
     name: []const u8,
+    symbol: ?[]const u8 = null,
     fields: []Field,
     is_public: bool,
 };
 
 pub const Enum = struct {
     name: []const u8,
+    symbol: ?[]const u8 = null,
     /// Variant i has the value i. `codegen.zig` emits an `int32_t` typedef
     /// plus constants rather than a C `enum`, so the values are fixed by
     /// declaration order and this IR records that rather than re-deriving it.
@@ -146,6 +148,7 @@ pub const Fn = struct {
     /// The mangled C ABI symbol. Computed once here so every backend agrees;
     /// `codegen.zig` derives the same string with its own `symbolFor`.
     symbol: []const u8,
+    linkage: ast.Linkage = .external,
     /// Slots `0..param_count` are the parameters, in declaration order.
     param_count: u32,
     bindings: []Binding,
@@ -246,6 +249,8 @@ pub const Runtime = enum {
     list_i32_push,
     list_f64_push,
     list_bool_push,
+    bits_shl,
+    bits_shr,
 
     pub fn callee(self: Runtime) RuntimeCallee {
         return runtime_callees[@backingInt(self)];
@@ -287,7 +292,40 @@ pub const runtime_callees = [_]RuntimeCallee{
     pushEntry("$rt.list_i32_push", "cell_list_i32_push", &types.t_int32),
     pushEntry("$rt.list_f64_push", "cell_list_f64_push", &types.t_float),
     pushEntry("$rt.list_bool_push", "cell_list_bool_push", &types.t_bool),
+    .{
+        .name = "$rt.bits_shl",
+        .symbol = "cell_bits_shl",
+        .params = &.{
+            .{ .name = "value", .ty = .uint, .ownership = .copy },
+            .{ .name = "count", .ty = .uint, .ownership = .copy },
+            .{ .name = "width", .ty = .uint32, .ownership = .copy },
+        },
+        .ret = .uint,
+        .ret_ownership = .owned,
+    },
+    .{
+        .name = "$rt.bits_shr",
+        .symbol = "cell_bits_shr",
+        .params = &.{
+            .{ .name = "value", .ty = .uint, .ownership = .copy },
+            .{ .name = "count", .ty = .uint, .ownership = .copy },
+            .{ .name = "width", .ty = .uint32, .ownership = .copy },
+            .{ .name = "is_signed", .ty = .boolean, .ownership = .copy },
+        },
+        .ret = .uint,
+        .ret_ownership = .owned,
+    },
 };
+
+pub fn integerBitWidth(ty: Ty) ?u7 {
+    return switch (ty) {
+        .int, .uint => 64,
+        .int32, .uint32 => 32,
+        .int16, .uint16 => 16,
+        .int8, .uint8, .byte => 8,
+        else => null,
+    };
+}
 
 /// One index reader: `(shared xs: <base>, copy index: Int) -> <elem>?`.
 fn indexReader(comptime name: []const u8, comptime symbol: []const u8, comptime base: Ty, comptime elem: *const Ty) RuntimeCallee {
@@ -724,12 +762,14 @@ const Lowerer = struct {
                     }
                     try self.structs.append(self.arena, .{
                         .name = s.name,
+                        .symbol = s.symbol,
                         .fields = fields,
                         .is_public = s.is_public,
                     });
                 },
                 .enum_def => |e| try self.enums.append(self.arena, .{
                     .name = e.name,
+                    .symbol = e.symbol,
                     .variants = e.variants,
                     .is_public = e.is_public,
                 }),
@@ -821,6 +861,7 @@ const Lowerer = struct {
             .ret_ownership = ret_ownership,
             .body = body,
             .is_public = f.is_public,
+            .linkage = if (f.body == null) .external else f.linkage orelse .external,
             .span = span,
         });
     }
@@ -1015,8 +1056,8 @@ const Lowerer = struct {
                 if (f.body != null or !sameSignature(f, c)) {
                     try self.cannotLower(f.span, try std.fmt.allocPrint(
                         self.arena,
-                        "'{s}' conflicts with the runtime's {s}, which a String conversion or an index in this module calls",
-                        .{ f.name, c.symbol },
+                        "'{s}' conflicts with the runtime's {s}, which {s} in this module calls",
+                        .{ f.name, c.symbol, if (i == @backingInt(Runtime.bits_shl) or i == @backingInt(Runtime.bits_shr)) "a checked integer shift" else "a String conversion or an index" },
                     ));
                 }
                 continue;
@@ -1091,6 +1132,7 @@ const Lowerer = struct {
     /// is a separate symbol. Getting this wrong is a link error, not a
     /// compile error, so the two must agree.
     fn symbolFor(self: *Lowerer, f: ast.FnDef) LowerError![]const u8 {
+        if (f.symbol) |symbol| return symbol;
         if (f.body == null and std.mem.eql(u8, f.name, "assert") and f.params.len == 2) {
             return "cell_assert_msg";
         }
@@ -1965,8 +2007,30 @@ const Lowerer = struct {
             },
 
             .binary => |b| {
+                const bitwise = b.op == .bit_and or b.op == .bit_or or b.op == .bit_xor;
+                // Only a literal takes its peer's type. Lower nonliteral operands
+                // in source order, and never apply shift-result context to counts.
+                const left_literal = isIntegerLiteral(b.left);
+                const right_literal = isIntegerLiteral(b.right);
                 const left = try self.box(try self.lowerExpr(b.left));
-                const right = try self.box(try self.lowerExpr(b.right));
+                const right = try self.box(try self.lowerExprIn(b.right, if (bitwise and right_literal) left.ty else null));
+                if (bitwise and left_literal and !right_literal) left.* = try self.lowerExprIn(b.left, right.ty);
+                switch (b.op) {
+                    .bit_and, .bit_or, .bit_xor, .shl, .shr => {
+                        if (integerBitWidth(left.ty) == null or integerBitWidth(right.ty) == null) {
+                            try self.cannotLower(e.span, "integer operands required for bitwise or shift operator");
+                            return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "integer operator" });
+                        }
+                        if (b.op == .shl or b.op == .shr) {
+                            const runtime: Runtime = if (b.op == .shl) .bits_shl else .bits_shr;
+                            self.runtime_used[@backingInt(runtime)] = true;
+                        } else if (!sameType(left.ty, right.ty)) {
+                            try self.cannotLower(e.span, "bitwise operands require the same integer type");
+                            return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "integer operator" });
+                        }
+                    },
+                    else => {},
+                }
                 const ty: Ty = switch (b.op) {
                     .eq, .ne, .lt, .le, .gt, .ge, .and_op, .or_op => types.t_bool,
                     // Arithmetic takes the left operand's type. The checker has
@@ -1983,18 +2047,22 @@ const Lowerer = struct {
                     }
                 }
                 const operand = try self.box(try self.lowerExpr(u.operand));
+                if (u.op == .bit_not and integerBitWidth(operand.ty) == null) {
+                    try self.cannotLower(e.span, "integer operand required for bitwise complement");
+                    return self.lit(e.span, types.t_unknown, .{ .unresolved_ref = "integer operator" });
+                }
                 const ty: Ty = switch (u.op) {
                     .not => types.t_bool,
                     // `&x` and `&mut x` do not change the type: ownership is
                     // not part of a type here.
-                    .neg, .ref_shared, .ref_exclusive => operand.ty,
+                    .neg, .bit_not, .ref_shared, .ref_exclusive => operand.ty,
                 };
                 // A borrow sigil is transparent in both emitters, which emit
                 // its operand, so it carries the operand's fact. Without this
                 // `peek(&s)` and `peek(shared s)` would read differently.
                 const own: ?Ownership = switch (u.op) {
                     .ref_shared, .ref_exclusive => operand.own,
-                    .neg, .not => null,
+                    .neg, .not, .bit_not => null,
                 };
                 return .{ .ty = ty, .span = e.span, .kind = .{ .unary = .{ .op = u.op, .operand = operand } }, .own = own };
             },
@@ -2532,7 +2600,22 @@ const Lowerer = struct {
             .string => |v| return .{ .kind = .{ .string = v }, .span = p.span },
             .bool => |v| return .{ .kind = .{ .bool = v }, .span = p.span },
             .enum_variant => |ev| {
-                if (self.findVariant(ev.enum_name, ev.variant)) |found| {
+                const owner = switch (scrutinee_ty) {
+                    .enum_type => |name| name,
+                    else => {
+                        try self.cannotLower(p.span, "enum pattern requires an enum scrutinee");
+                        return .{ .kind = .wildcard, .span = p.span };
+                    },
+                };
+                if (ev.enum_name) |written| {
+                    if (!std.mem.eql(u8, written, owner)) {
+                        try self.cannotLower(p.span, "enum pattern names a different nominal enum than its scrutinee");
+                        return .{ .kind = .wildcard, .span = p.span };
+                    }
+                }
+                // A bare variant belongs to the scrutinee's nominal enum,
+                // never to the first enum with that spelling in graph order.
+                if (self.findVariant(owner, ev.variant)) |found| {
                     return .{
                         .kind = .{ .enum_variant = .{
                             .enum_name = found.enum_name,
@@ -2786,6 +2869,15 @@ const Lowerer = struct {
         return try self.lowerIntLiteral(span, -v, expected);
     }
 };
+
+fn isIntegerLiteral(e: *const ast.Expr) bool {
+    return switch (e.kind) {
+        .int => true,
+        .annotated => |a| isIntegerLiteral(a.value),
+        .unary => |u| u.op == .neg and astIntLiteral(u.operand) != null,
+        else => false,
+    };
+}
 
 fn astIntLiteral(e: *const ast.Expr) ?i64 {
     var cur = e;
@@ -3537,4 +3629,84 @@ test "an unresolvable label is cannot lower, never a guess at the innermost loop
         if (std.mem.eql(u8, d.message, "cannot lower: no enclosing loop is labelled 'nowhere'")) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "bare enum patterns use scrutinee nominal identity rather than declaration order" {
+    var h = try lowerSource(
+        \\pub enum Imported { Blue, Red }
+        \\pub enum Local { Red, Blue }
+        \\pub fn classify(copy color: Local) -> Int {
+        \\  return match color { Red => 11, Blue => 22 }
+        \\}
+    );
+    defer h.deinit();
+    try std.testing.expect(!h.diagnostics.hasErrors());
+    const arms = h.module.findFn("classify").?.body.?[0].kind.ret.?.kind.match_expr.arms;
+    try std.testing.expectEqualStrings("Local", arms[0].pattern.kind.enum_variant.enum_name);
+    try std.testing.expectEqual(@as(i64, 0), arms[0].pattern.kind.enum_variant.value);
+    try std.testing.expectEqualStrings("Local", arms[1].pattern.kind.enum_variant.enum_name);
+    try std.testing.expectEqual(@as(i64, 1), arms[1].pattern.kind.enum_variant.value);
+}
+
+test "enum pattern lowering refuses mismatched nominal identities and non-enum scrutinees" {
+    inline for (.{
+        "pub enum Other { Red } pub enum Local { Red } pub fn f(copy color: Local) -> Int { return match color { Other.Red => 1, _ => 0 } }",
+        "pub enum Other { Red } pub fn f(copy color: Int) -> Int { return match color { Other.Red => 1, _ => 0 } }",
+    }) |source| {
+        var h = try lowerSource(source);
+        defer h.deinit();
+        try std.testing.expect(h.diagnostics.hasErrors());
+    }
+}
+
+test "integer bitwise shifts register checked helpers once and preserve lhs width" {
+    var l = try lowerSource(
+        \\pub fn f(copy a: Int8, copy count: UInt32) -> Int8 { return (~a & a) << count }
+        \\pub fn g(copy a: UInt16, copy count: Int8) -> UInt16 { return (a | a ^ a) >> count }
+        \\pub fn h(copy a: UInt) -> UInt { return a << 63 }
+    );
+    defer l.deinit();
+    try std.testing.expect(!l.diagnostics.hasErrors());
+    try std.testing.expectEqual(@as(usize, 1), countSymbol(l.module, "cell_bits_shl"));
+    try std.testing.expectEqual(@as(usize, 1), countSymbol(l.module, "cell_bits_shr"));
+    try std.testing.expect(Lowerer.sameType(.int8, l.module.findFn("f").?.body.?[0].kind.ret.?.ty));
+    try std.testing.expect(Lowerer.sameType(.uint16, l.module.findFn("g").?.body.?[0].kind.ret.?.ty));
+}
+
+test "integer bitwise shift helper source prototypes are deduplicated or refused" {
+    var matching = try lowerSource(
+        \\pub fn bits_shl(copy value: UInt, copy count: UInt, copy width: UInt32) -> UInt;
+        \\pub fn f(copy value: Int8) -> Int8 { return value << 1 }
+    );
+    defer matching.deinit();
+    try std.testing.expect(!matching.diagnostics.hasErrors());
+    try std.testing.expectEqual(@as(usize, 1), countSymbol(matching.module, "cell_bits_shl"));
+    var conflicting = try lowerSource(
+        \\pub fn bits_shl(copy value: Int, copy count: UInt, copy width: UInt32) -> UInt;
+        \\pub fn f(copy value: Int8) -> Int8 { return value << 1 }
+    );
+    defer conflicting.deinit();
+    try std.testing.expect(conflicting.diagnostics.hasErrors());
+}
+
+test "integer bitwise literals take either typed peer and invalid operands fail closed" {
+    var valid = try lowerSource(
+        \\pub fn left(copy value: UInt8) -> UInt8 { return 1 ^ value }
+        \\pub fn right(copy value: UInt16) -> UInt16 { return value & 255 }
+        \\pub fn negative(copy value: Int8) -> Int8 { return -1 | value }
+    );
+    defer valid.deinit();
+    try std.testing.expect(!valid.diagnostics.hasErrors());
+    try std.testing.expect(Lowerer.sameType(.uint8, valid.module.findFn("left").?.body.?[0].kind.ret.?.ty));
+    const cases = [_][]const u8{
+        "pub fn f(copy value: Bool) -> Bool { return ~value }",
+        "pub fn f(copy value: Float) -> Float { return value << 1 }",
+        "pub fn f(copy value: UInt8) -> UInt8 { return value & 256 }",
+        "pub fn f(copy value: UInt8, copy other: Int8) -> UInt8 { return value ^ other }",
+    };
+    for (cases) |source| {
+        var invalid = try lowerSource(source);
+        defer invalid.deinit();
+        try std.testing.expect(invalid.diagnostics.hasErrors());
+    }
 }

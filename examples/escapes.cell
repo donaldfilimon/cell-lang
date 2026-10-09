@@ -8,8 +8,9 @@
 //
 // Scalar only: string literals and `str_len` on a borrowed view. All three
 // backends already lower that shape (see examples/backends.cell and the LLVM
-// `cell_str` materialization tests). No `\u{...}`, raw, interpolated, or
-// multi-line strings; those are LEX-03.
+// `cell_str` materialization tests). Byte and Unicode escapes are covered
+// by string_unicode.cell. Raw, interpolated and multi-line strings remain
+// absent; those are LEX-03.
 // EXPECT-OUTPUT: 11
 
 pub fn print_int(copy value: Int);

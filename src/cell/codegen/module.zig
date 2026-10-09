@@ -254,14 +254,15 @@ pub fn emitEntryPoint(self: *Generator) EmitError!void {
 
 pub fn emitStruct(self: *Generator, s: ast.StructDef) EmitError!void {
     const out = self.writer;
-    try out.print("typedef struct cell_{s} {{\n", .{s.name});
+    const symbol = s.symbol orelse try std.fmt.allocPrint(self.arena, "cell_{s}", .{s.name});
+    try out.print("typedef struct {s} {{\n", .{symbol});
     for (s.fields) |f| {
         const ty = try self.lowerType(&f.ty, f.ownership);
         try out.writeAll("  ");
         try self.writeDecl(ty, f.name);
         try out.print("; // {s}\n", .{@tagName(f.ownership)});
     }
-    try out.print("}} cell_{s};\n\n", .{s.name});
+    try out.print("}} {s};\n\n", .{symbol});
 }
 
 /// A payload-free Cell enum is a distinct integer type of width int32_t
@@ -271,14 +272,15 @@ pub fn emitStruct(self: *Generator, s: ast.StructDef) EmitError!void {
 /// because an unused `static const` trips -Wunused-const-variable in C.
 pub fn emitEnum(self: *Generator, e: ast.EnumDef) EmitError!void {
     const out = self.writer;
-    try out.print("typedef int32_t cell_{s};\n", .{e.name});
+    const symbol = e.symbol orelse try std.fmt.allocPrint(self.arena, "cell_{s}", .{e.name});
+    try out.print("typedef int32_t {s};\n", .{symbol});
     if (e.variants.len == 0) {
         try out.writeAll("\n");
         return;
     }
     try out.writeAll("enum {\n");
     for (e.variants, 0..) |v, i| {
-        try out.print("  cell_{s}_{s} = {d},\n", .{ e.name, v, i });
+        try out.print("  {s}_{s} = {d},\n", .{ symbol, v, i });
     }
     try out.writeAll("};\n\n");
 }
@@ -296,6 +298,7 @@ pub fn emitPrototype(self: *Generator, f: ast.FnDef) EmitError!void {
 /// lives there as `cell_assert_msg`. A function with a body is never
 /// renamed, because that would define over a runtime symbol.
 pub fn symbolFor(self: *Generator, f: ast.FnDef) Alloc![]const u8 {
+    if (f.symbol) |symbol| return symbol;
     if (f.body == null) {
         if (intrinsicSymbol(f.name, f.params.len)) |sym| return sym;
     }
@@ -346,6 +349,7 @@ pub fn writeSignature(self: *Generator, f: ast.FnDef) EmitError!void {
     const out = self.writer;
     const ret = if (f.return_type) |rt| try self.lowerType(&rt, .owned) else CType.void_type;
     const symbol = try self.symbolFor(f);
+    if (f.body != null and f.linkage == .internal) try out.writeAll("static __attribute__((unused)) ");
     if (ret.pointer) {
         try out.print("{s}{s}(", .{ ret.text, symbol });
     } else {

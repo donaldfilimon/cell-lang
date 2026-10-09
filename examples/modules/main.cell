@@ -1,0 +1,14 @@
+// Direct imports, qualified types/literals/enums, pairing and embedded std.
+// EXPECT-OUTPUT: 43
+use geo
+use grid
+use std.prelude
+
+pub struct Point { copy y: Int }
+
+pub fn main() {
+    let copy point: geo.Point = geo.Point { x: grid.extent() }
+    let copy color: geo.Color = geo.Color.Red
+    let copy bonus = match color { geo.Color.Red => 1, geo.Color.Blue => 0 }
+    prelude.print_int(geo.area(point) + bonus)
+}

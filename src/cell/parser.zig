@@ -17,11 +17,16 @@ pub const Parser = struct {
     allocator: std.mem.Allocator,
     tokens: []const Token,
     index: usize = 0,
+    pending_gt: ?Token = null,
+    last_token: ?Token = null,
     path: []const u8,
     /// While true, a bare `Name {` is not a struct literal. Set while parsing
     /// an `if` condition or a `match` scrutinee, where the brace opens the
     /// body instead. Cleared inside parentheses and brackets.
     no_struct_lit: bool = false,
+    /// A newline-leading `&` starts a borrow statement where statements can
+    /// be adjacent. Delimited expressions may continue with bitwise `&`.
+    allow_newline_bit_and: bool = true,
     /// Position and message of the failure that aborted the parse. Recorded
     /// here so a caller can render it; `root.zig` still returns only the bare
     /// error, so nothing surfaces this to the CLI yet.
@@ -77,6 +82,7 @@ pub const Parser = struct {
             return self.item(.{ .enum_def = try self.parseEnum(is_pub) }, start);
         }
         if (self.match(.kw_use)) {
+            if (is_pub) return self.failSpan(tokenSpan(start), "'pub use' is not supported");
             const name = try self.parsePath();
             _ = self.match(.semicolon);
             return self.item(.{ .use_decl = name }, start);
@@ -228,6 +234,9 @@ pub const Parser = struct {
     }
 
     fn parseStmt(self: *Parser) ParseError!ast.Stmt {
+        const saved = self.allow_newline_bit_and;
+        self.allow_newline_bit_and = false;
+        defer self.allow_newline_bit_and = saved;
         const start = self.current();
         if (self.match(.kw_let) or self.match(.kw_var)) {
             const mutable = self.prev().kind == .kw_var or self.match(.kw_mut);
@@ -296,10 +305,19 @@ pub const Parser = struct {
         return try self.parseBinary(0);
     }
 
+    fn parseDelimitedExpr(self: *Parser) ParseError!ast.Expr {
+        const saved = self.allow_newline_bit_and;
+        self.allow_newline_bit_and = true;
+        defer self.allow_newline_bit_and = saved;
+        return try self.parseExpr();
+    }
+
     fn parseBinary(self: *Parser, min_prec: u8) ParseError!ast.Expr {
         var left = try self.parseUnary();
         while (true) {
             const op_kind = self.current().kind;
+            if (op_kind == .amp and !self.allow_newline_bit_and and
+                self.current().line > self.prev().line) break;
             const prec = binaryPrec(op_kind) orelse break;
             if (prec < min_prec) break;
             const op = tokenToBinary(op_kind) orelse return self.fail("bad binary op");
@@ -321,6 +339,9 @@ pub const Parser = struct {
         const start = self.current();
         if (self.match(.minus)) {
             return self.unary(.neg, try self.parseUnary(), start);
+        }
+        if (self.match(.tilde)) {
+            return self.unary(.bit_not, try self.parseUnary(), start);
         }
         if (self.match(.bang)) {
             return self.unary(.not, try self.parseUnary(), start);
@@ -372,7 +393,7 @@ pub const Parser = struct {
             if (self.match(.l_bracket)) {
                 const saved = self.no_struct_lit;
                 self.no_struct_lit = false;
-                const index = try self.parseExpr();
+                const index = try self.parseDelimitedExpr();
                 self.no_struct_lit = saved;
                 try self.expect(.r_bracket);
                 const base = try self.allocator.create(ast.Expr);
@@ -396,7 +417,7 @@ pub const Parser = struct {
         defer self.no_struct_lit = saved;
         if (!self.check(.r_paren)) {
             while (true) {
-                try args.append(self.allocator, try self.parseExpr());
+                try args.append(self.allocator, try self.parseDelimitedExpr());
                 if (!self.match(.comma)) break;
             }
         }
@@ -434,7 +455,7 @@ pub const Parser = struct {
             try self.expect(.l_paren);
             const saved = self.no_struct_lit;
             self.no_struct_lit = false;
-            const inner = try self.parseExpr();
+            const inner = try self.parseDelimitedExpr();
             self.no_struct_lit = saved;
             try self.expect(.r_paren);
             const p = try self.allocator.create(ast.Expr);
@@ -443,15 +464,23 @@ pub const Parser = struct {
         }
         if (self.match(.ident)) {
             const name = self.prev().lexeme;
-            if (!self.no_struct_lit and self.check(.l_brace)) {
-                return try self.parseStructLit(name, start);
+            if (!self.no_struct_lit) {
+                if (self.check(.l_brace)) return try self.parseStructLit(name, start);
+                // Only consume the qualifier when a brace proves this is a
+                // literal head. Ordinary field/call chains remain postfix ASTs.
+                if (self.check(.dot) and self.peekIs(1, .ident) and self.peekIs(2, .l_brace)) {
+                    _ = self.advance();
+                    const part = self.advance().lexeme;
+                    const qualified = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ name, part });
+                    return try self.parseStructLit(qualified, start);
+                }
             }
             return self.expr(.{ .ident = name }, start);
         }
         if (self.match(.l_paren)) {
             const saved = self.no_struct_lit;
             self.no_struct_lit = false;
-            const e = try self.parseExpr();
+            const e = try self.parseDelimitedExpr();
             self.no_struct_lit = saved;
             try self.expect(.r_paren);
             return .{ .kind = e.kind, .span = self.spanFrom(start) };
@@ -478,7 +507,7 @@ pub const Parser = struct {
             const fname = try self.expectIdent();
             // `Name { x }` is shorthand for `Name { x: x }`.
             const value = if (self.match(.colon))
-                try self.parseExpr()
+                try self.parseDelimitedExpr()
             else
                 self.expr(.{ .ident = fname }, fstart);
             try fields.append(self.allocator, .{
@@ -504,7 +533,7 @@ pub const Parser = struct {
         var items: std.ArrayList(ast.Expr) = .empty;
         errdefer items.deinit(self.allocator);
         while (!self.check(.r_bracket) and !self.check(.eof)) {
-            try items.append(self.allocator, try self.parseExpr());
+            try items.append(self.allocator, try self.parseDelimitedExpr());
             if (!self.match(.comma)) break;
         }
         try self.expect(.r_bracket);
@@ -559,13 +588,13 @@ pub const Parser = struct {
             // `=>` rather than by a brace.
             var guard_ptr: ?*ast.Expr = null;
             if (self.match(.kw_if)) {
-                const guard = try self.parseExpr();
+                const guard = try self.parseDelimitedExpr();
                 const g = try self.allocator.create(ast.Expr);
                 g.* = guard;
                 guard_ptr = g;
             }
             try self.expect(.fat_arrow);
-            const body = try self.parseExpr();
+            const body = try self.parseDelimitedExpr();
             const body_ptr = try self.allocator.create(ast.Expr);
             body_ptr.* = body;
             try arms.append(self.allocator, .{
@@ -592,7 +621,7 @@ pub const Parser = struct {
         const saved = self.no_struct_lit;
         self.no_struct_lit = true;
         defer self.no_struct_lit = saved;
-        return try self.parseExpr();
+        return try self.parseDelimitedExpr();
     }
 
     fn parsePattern(self: *Parser) ParseError!ast.Pattern {
@@ -637,9 +666,15 @@ pub const Parser = struct {
             // `_` lexes as an identifier, so the wildcard is a lexeme test.
             if (std.mem.eql(u8, name, "_")) return self.patternNode(.wildcard, start);
             if (self.match(.dot)) {
-                const variant = try self.expectIdent();
+                var enum_name = name;
+                var variant = try self.expectIdent();
+                if (self.match(.dot)) {
+                    enum_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ name, variant });
+                    variant = try self.expectIdent();
+                    if (self.check(.dot)) return self.fail("enum pattern permits only one module qualifier");
+                }
                 return self.patternNode(.{ .enum_variant = .{
-                    .enum_name = name,
+                    .enum_name = enum_name,
                     .variant = variant,
                 } }, start);
             }
@@ -692,7 +727,12 @@ pub const Parser = struct {
                 }
                 break :blk .unit;
             }
-            const name = try self.expectIdent();
+            var name = try self.expectIdent();
+            if (self.match(.dot)) {
+                const part = try self.expectIdent();
+                name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ name, part });
+                if (self.check(.dot)) return self.fail("type name permits only one module qualifier");
+            }
             var named: ast.TypeExpr = .{ .name = name };
             if (self.check(.lt)) {
                 // `Result<T, E>` is the one type that takes arguments (SPEC 3.4).
@@ -709,7 +749,7 @@ pub const Parser = struct {
                 if (!self.match(.comma)) return self.fail("Result takes exactly two type arguments, Result<T, E>");
                 const err = try self.allocator.create(ast.TypeExpr);
                 err.* = try self.parseType();
-                if (!self.match(.gt)) return self.fail("Result takes exactly two type arguments, Result<T, E>");
+                if (!self.matchTypeClose()) return self.fail("Result takes exactly two type arguments, Result<T, E>");
                 named = .{ .result = .{ .ok = ok, .err = err } };
             }
             break :blk named;
@@ -743,10 +783,14 @@ pub const Parser = struct {
         return switch (kind) {
             .pipe_pipe => 1,
             .amp_amp => 2,
-            .eq_eq, .ne => 3,
-            .lt, .le, .gt, .ge => 4,
-            .plus, .minus => 5,
-            .star, .slash => 6,
+            .pipe => 3,
+            .caret => 4,
+            .amp => 5,
+            .eq_eq, .ne => 6,
+            .lt, .le, .gt, .ge => 7,
+            .shl, .shr => 8,
+            .plus, .minus => 9,
+            .star, .slash => 10,
             else => null,
         };
     }
@@ -765,6 +809,11 @@ pub const Parser = struct {
             .ge => .ge,
             .amp_amp => .and_op,
             .pipe_pipe => .or_op,
+            .amp => .bit_and,
+            .pipe => .bit_or,
+            .caret => .bit_xor,
+            .shl => .shl,
+            .shr => .shr,
             else => null,
         };
     }
@@ -779,7 +828,7 @@ pub const Parser = struct {
     fn spanFrom(self: *const Parser, start: Token) Span {
         const s = tokenSpan(start);
         if (self.index == 0) return s;
-        const last = self.tokens[self.index - 1];
+        const last = self.prev();
         return .{
             .start = s.start,
             .end = @max(s.end, last.end),
@@ -807,6 +856,7 @@ pub const Parser = struct {
     // ── token cursor ────────────────────────────────────────────────────
 
     fn current(self: *const Parser) Token {
+        if (self.pending_gt) |token| return token;
         if (self.index >= self.tokens.len) {
             // Past the end: report at the last real token so a truncated file
             // does not produce a 0:0 location.
@@ -827,12 +877,17 @@ pub const Parser = struct {
     }
 
     fn prev(self: *const Parser) Token {
-        return self.tokens[self.index - 1];
+        return self.last_token orelse self.tokens[self.index - 1];
     }
 
     fn advance(self: *Parser) Token {
         const t = self.current();
-        if (self.index < self.tokens.len) self.index += 1;
+        if (self.pending_gt != null) {
+            self.pending_gt = null;
+        } else if (self.index < self.tokens.len) {
+            self.index += 1;
+        }
+        self.last_token = t;
         return t;
     }
 
@@ -844,7 +899,8 @@ pub const Parser = struct {
     /// Bounded: a peek past the end is a mismatch, never an index out of
     /// range (a hand-built token slice in a test need not end in `eof`).
     fn peekIs(self: *const Parser, offset: usize, kind: TokenKind) bool {
-        const i = self.index + offset;
+        if (self.pending_gt != null and offset == 0) return self.check(kind);
+        const i = self.index + offset - @as(usize, if (self.pending_gt != null) 1 else 0);
         if (i >= self.tokens.len) return false;
         return self.tokens[i].kind == kind;
     }
@@ -855,6 +911,27 @@ pub const Parser = struct {
             return true;
         }
         return false;
+    }
+
+    /// A shift token closes two nested generic argument lists only in a
+    /// type context. The lexer and expression parser still see `>>` as one
+    /// operator; the original immutable token buffer is never rewritten.
+    fn matchTypeClose(self: *Parser) bool {
+        if (self.match(.gt)) return true;
+        if (!self.check(.shr)) return false;
+        const token = self.advance();
+        var first = token;
+        first.kind = .gt;
+        first.lexeme = token.lexeme[0..1];
+        first.end = first.start + 1;
+        var second = first;
+        second.start += 1;
+        second.end += 1;
+        second.column += 1;
+        second.lexeme = token.lexeme[1..2];
+        self.pending_gt = second;
+        self.last_token = first;
+        return true;
     }
 
     fn expect(self: *Parser, kind: TokenKind) ParseError!void {
@@ -869,8 +946,8 @@ pub const Parser = struct {
     /// Strip the surrounding quotes from a string token and decode SPEC 2.8
     /// escapes into the parser arena. Decode shrinks the byte count (`"\n"`
     /// is one byte, not two), so the result is never a slice of the lexeme.
-    /// Supported: `\n \t \r \\ \" \0`. Anything else, including a trailing
-    /// backslash, is a parse error.
+    /// Supports simple Cell escapes, Zig byte escapes and Unicode scalars.
+    /// Byte escapes remain bytes; Unicode scalars are encoded as UTF-8.
     fn stringValue(self: *Parser, raw: []const u8) ParseError![]const u8 {
         const inner = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw[0..0];
         var buf: std.ArrayList(u8) = .empty;
@@ -884,6 +961,29 @@ pub const Parser = struct {
             }
             if (i + 1 >= inner.len) {
                 return self.failSpan(tokenSpan(self.prev()), "unknown string escape");
+            }
+            if (inner[i + 1] == 'x' or inner[i + 1] == 'u') {
+                const byte_escape = inner[i + 1] == 'x';
+                const scalar = switch (std.zig.string_literal.parseEscapeSequence(inner, &i)) {
+                    .success => |value| value,
+                    .failure => |failure| return self.failSpan(tokenSpan(self.prev()), switch (failure) {
+                        .expected_hex_digit => "byte escape requires two hexadecimal digits",
+                        .expected_lbrace => "Unicode escape requires '{'",
+                        .empty_unicode_escape_sequence => "Unicode escape requires hexadecimal digits",
+                        .expected_hex_digit_or_rbrace, .expected_rbrace => "Unicode escape requires hexadecimal digits and '}'",
+                        .invalid_unicode_codepoint => "Unicode escape is not a valid scalar value",
+                        else => "unknown string escape",
+                    }),
+                };
+                if (byte_escape) {
+                    try buf.append(self.allocator, @intCast(scalar));
+                } else {
+                    var encoded: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(scalar, &encoded) catch
+                        return self.failSpan(tokenSpan(self.prev()), "Unicode escape is not a valid scalar value");
+                    try buf.appendSlice(self.allocator, encoded[0..len]);
+                }
+                continue;
             }
             const decoded: u8 = switch (inner[i + 1]) {
                 'n' => '\n',
@@ -1550,13 +1650,13 @@ test "an unknown string escape is a parse error" {
     try std.testing.expectEqualStrings(
         "unknown string escape",
         try parseErrorFor(
-            \\pub fn main() { print("\x") }
+            \\pub fn main() { print("\q") }
         ),
     );
     try std.testing.expectEqualStrings(
         "unknown string escape",
         try parseErrorFor(
-            \\pub fn main() { print("\u{0}") }
+            \\pub fn main() { print("\v") }
         ),
     );
 }
@@ -1686,4 +1786,285 @@ test "a label must be followed by while or loop, and a jump label must be a name
         "expected identifier",
         try parseErrorFor("pub fn f() {\n  loop {\n    break :\n  }\n}"),
     );
+}
+
+test "string byte and Unicode escapes decode exact bytes and scalar boundaries" {
+    const cases = .{
+        .{ "\\x00\\x7f\\x80\\xff\\xAf", "\x00\x7f\x80\xff\xaf" },
+        .{ "\\x414", "A4" }, // Exactly two hex digits, as in Zig strings.
+        .{ "\\u{0}\\u{7f}\\u{80}\\u{7ff}\\u{800}", "\x00\x7f\xc2\x80\xdf\xbf\xe0\xa0\x80" },
+        .{ "\\u{d7ff}\\u{e000}\\u{ffff}", "\xed\x9f\xbf\xee\x80\x80\xef\xbf\xbf" },
+        .{ "\\u{10000}\\u{10ffff}", "\xf0\x90\x80\x80\xf4\x8f\xbf\xbf" },
+        .{ "\\u{000000000000000041}\\u{1F600}", "A\xf0\x9f\x98\x80" },
+        .{ "a\\0b\\x00c\\u{0}d\\\"\\\\", "a\x00b\x00c\x00d\"\\" },
+        .{ "é\\u{e9}", "\xc3\xa9\xc3\xa9" },
+    };
+    inline for (cases) |case| {
+        const src = try std.fmt.allocPrint(std.testing.allocator, "pub fn f() {{ print(\"{s}\") }}", .{case[0]});
+        defer std.testing.allocator.free(src);
+        var tp = try parseForTest(src);
+        defer tp.deinit();
+        try std.testing.expectEqualStrings(case[1], onlyStmt(tp.module).kind.expr.kind.call.args[0].kind.string);
+    }
+    var tp = try parseForTest(
+        \\pub fn f(shared s: String) -> Int {
+        \\  return match s { "\u{e9}\x00" => 1, _ => 0 }
+        \\}
+    );
+    defer tp.deinit();
+    try std.testing.expectEqualStrings("\xc3\xa9\x00", onlyStmt(tp.module).kind.return_stmt.?.kind.match_expr.arms[0].pattern.kind.string);
+}
+
+test "string byte and Unicode escapes reject malformed sequences and non-scalars" {
+    const cases = .{
+        .{ "\\x", "byte escape requires two hexadecimal digits" },
+        .{ "\\x0", "byte escape requires two hexadecimal digits" },
+        .{ "\\xg0", "byte escape requires two hexadecimal digits" },
+        .{ "\\x0g", "byte escape requires two hexadecimal digits" },
+        .{ "\\u", "Unicode escape requires '{'" },
+        .{ "\\u0041", "Unicode escape requires '{'" },
+        .{ "\\u{}", "Unicode escape requires hexadecimal digits" },
+        .{ "\\u{", "Unicode escape requires hexadecimal digits and '}'" },
+        .{ "\\u{41", "Unicode escape requires hexadecimal digits and '}'" },
+        .{ "\\u{4g}", "Unicode escape requires hexadecimal digits and '}'" },
+        .{ "\\u{4_1}", "Unicode escape requires hexadecimal digits and '}'" },
+        .{ "\\u{d800}", "Unicode escape is not a valid scalar value" },
+        .{ "\\u{dfff}", "Unicode escape is not a valid scalar value" },
+        .{ "\\u{110000}", "Unicode escape is not a valid scalar value" },
+        .{ "\\u{ffffffffffffffff}", "Unicode escape is not a valid scalar value" },
+    };
+    inline for (cases) |case| {
+        const src = try std.fmt.allocPrint(std.testing.allocator, "pub fn f() {{ print(\"{s}\") }}", .{case[0]});
+        defer std.testing.allocator.free(src);
+        try std.testing.expectEqualStrings(case[1], try parseErrorFor(src));
+    }
+}
+
+test "pub use is refused instead of silently discarding visibility" {
+    try std.testing.expectEqualStrings("'pub use' is not supported", try parseErrorFor("pub use math;"));
+    var tp = try parseForTest("use math;");
+    defer tp.deinit();
+    try std.testing.expectEqualStrings("math", tp.module.items[0].kind.use_decl);
+}
+
+test "module qualified types compose with list optional Result and reference types" {
+    var tp = try parseForTest(
+        \\pub fn f(shared p: geo . Point, owned ps: [geo.Point],
+        \\  copy maybe: geo.Point?, owned result: Result<geo.Point, err.Error>,
+        \\  owned reference: shared geo.Point) -> geo.Point;
+    );
+    defer tp.deinit();
+    const f = tp.module.items[0].kind.fn_def;
+    try std.testing.expectEqualStrings("geo.Point", f.params[0].ty.name);
+    try std.testing.expectEqualStrings("geo.Point", f.params[1].ty.list.name);
+    try std.testing.expectEqualStrings("geo.Point", f.params[2].ty.optional.name);
+    try std.testing.expectEqualStrings("geo.Point", f.params[3].ty.result.ok.name);
+    try std.testing.expectEqualStrings("err.Error", f.params[3].ty.result.err.name);
+    try std.testing.expectEqual(ast.Ownership.shared, f.params[4].ty.ref.ownership);
+    try std.testing.expectEqualStrings("geo.Point", f.params[4].ty.ref.inner.name);
+    try std.testing.expectEqualStrings("geo.Point", f.return_type.?.name);
+    try std.testing.expectEqualStrings("type name permits only one module qualifier", try parseErrorFor("pub fn f(p: a.b.Point);"));
+}
+
+test "module qualified literals and enum patterns retain names and spans" {
+    const src =
+        \\pub fn f() {
+        \\  let owned p: geo.Point = geo . Point { x: 1 }
+        \\  let copy e = geo.Color.Red
+        \\  let copy n = match e { geo . Color . Red => 1, _ => 0 }
+        \\}
+    ;
+    var tp = try parseForTest(src);
+    defer tp.deinit();
+    const body = tp.module.items[0].kind.fn_def.body.?;
+    const value = body[0].kind.let.value.?;
+    try std.testing.expectEqualStrings("geo.Point", value.kind.struct_lit.name);
+    try std.testing.expectEqualStrings("geo . Point { x: 1 }", src[value.span.start..value.span.end]);
+    try std.testing.expectEqual(@as(i64, 1), value.kind.struct_lit.fields[0].value.kind.int);
+    const variant = body[1].kind.let.value.?.kind.field;
+    try std.testing.expectEqualStrings("Red", variant.name);
+    try std.testing.expectEqualStrings("Color", variant.base.kind.field.name);
+    try std.testing.expectEqualStrings("geo", variant.base.kind.field.base.kind.ident);
+    const pattern = body[2].kind.let.value.?.kind.match_expr.arms[0].pattern.kind.enum_variant;
+    try std.testing.expectEqualStrings("geo.Color", pattern.enum_name.?);
+    try std.testing.expectEqualStrings("Red", pattern.variant);
+    try std.testing.expectEqualStrings("enum pattern permits only one module qualifier", try parseErrorFor("pub fn f() { match e { a.b.Color.Red => 0 } }"));
+}
+
+test "module qualified literal heads preserve condition braces and postfix fields" {
+    var tp = try parseForTest(
+        \\pub fn f() {
+        \\  if geo.enabled { ping() }
+        \\  match geo.color { geo.Color.Red => 1, _ => 0 }
+        \\  while geo.ready { break }
+        \\  if test(geo.Point { x: 1 }) { ping() }
+        \\  if (geo.Point { x: 2 }).x == 2 { ping() }
+        \\  match (geo.Point { x: 3 }).x { _ => 0 }
+        \\  match take(geo.Point { x: 4 }) { _ => 0 }
+        \\  let copy a = geo.point.x
+        \\  let copy b = geo.make(1).x
+        \\}
+    );
+    defer tp.deinit();
+    const body = tp.module.items[0].kind.fn_def.body.?;
+    try std.testing.expectEqualStrings("enabled", body[0].kind.expr.kind.if_expr.cond.kind.field.name);
+    try std.testing.expectEqualStrings("color", body[1].kind.expr.kind.match_expr.scrutinee.kind.field.name);
+    try std.testing.expectEqualStrings("ready", body[2].kind.while_stmt.cond.kind.field.name);
+    try std.testing.expectEqualStrings("geo.Point", body[3].kind.expr.kind.if_expr.cond.kind.call.args[0].kind.struct_lit.name);
+    try std.testing.expectEqualStrings("geo.Point", body[4].kind.expr.kind.if_expr.cond.kind.binary.left.kind.field.base.kind.struct_lit.name);
+    try std.testing.expectEqualStrings("geo.Point", body[5].kind.expr.kind.match_expr.scrutinee.kind.field.base.kind.struct_lit.name);
+    try std.testing.expectEqualStrings("geo.Point", body[6].kind.expr.kind.match_expr.scrutinee.kind.call.args[0].kind.struct_lit.name);
+    const field = body[7].kind.let.value.?.kind.field;
+    try std.testing.expectEqualStrings("x", field.name);
+    try std.testing.expectEqualStrings("point", field.base.kind.field.name);
+    try std.testing.expectEqualStrings("geo", field.base.kind.field.base.kind.ident);
+    const called = body[8].kind.let.value.?.kind.field.base.kind.call;
+    try std.testing.expectEqualStrings("make", called.callee.kind.field.name);
+    try std.testing.expectEqualStrings("geo", called.callee.kind.field.base.kind.ident);
+}
+
+test "bitwise precedence separates shifts arithmetic comparisons and borrow syntax" {
+    var parsed = try parseForTest("pub fn f() { 1 | 2 ^ 3 & 4 == 5 < 6 << 7 + 8 * 9; ~1; &value; &mut value }");
+    defer parsed.deinit();
+    const body = parsed.module.items[0].kind.fn_def.body.?;
+    const expr = body[0].kind.expr.kind.binary;
+    try std.testing.expectEqual(ast.BinaryOp.bit_or, expr.op);
+    const xor = expr.right.kind.binary;
+    try std.testing.expectEqual(ast.BinaryOp.bit_xor, xor.op);
+    const bit_and = xor.right.kind.binary;
+    try std.testing.expectEqual(ast.BinaryOp.bit_and, bit_and.op);
+    const equality = bit_and.right.kind.binary;
+    try std.testing.expectEqual(ast.BinaryOp.eq, equality.op);
+    const relation = equality.right.kind.binary;
+    try std.testing.expectEqual(ast.BinaryOp.lt, relation.op);
+    const shift = relation.right.kind.binary;
+    try std.testing.expectEqual(ast.BinaryOp.shl, shift.op);
+    const add = shift.right.kind.binary;
+    try std.testing.expectEqual(ast.BinaryOp.add, add.op);
+    try std.testing.expectEqual(ast.BinaryOp.mul, add.right.kind.binary.op);
+    try std.testing.expectEqual(ast.UnaryOp.bit_not, body[1].kind.expr.kind.unary.op);
+    try std.testing.expectEqual(ast.UnaryOp.ref_shared, body[2].kind.expr.kind.unary.op);
+    try std.testing.expectEqual(ast.UnaryOp.ref_exclusive, body[3].kind.expr.kind.unary.op);
+}
+
+test "newline-leading borrows remain separate statements after statement expressions" {
+    const statements = [_][]const u8{
+        "let owned t = make()",
+        "var owned t = make()",
+        "t = make()",
+        "make()",
+        "return make()",
+    };
+    const borrows = [_][]const u8{ "&t", "&mut t" };
+    for (statements) |statement| {
+        for (borrows, 0..) |borrow, i| {
+            const source = try std.fmt.allocPrint(std.testing.allocator, "pub fn f() {{ {s}\n {s}\n }}", .{ statement, borrow });
+            defer std.testing.allocator.free(source);
+            var parsed = try parseForTest(source);
+            defer parsed.deinit();
+            const body = parsed.module.items[0].kind.fn_def.body.?;
+            try std.testing.expectEqual(@as(usize, 2), body.len);
+            try std.testing.expectEqual(if (i == 0) ast.UnaryOp.ref_shared else ast.UnaryOp.ref_exclusive, body[1].kind.expr.kind.unary.op);
+            const first = switch (body[0].kind) {
+                .let => |binding| binding.value.?,
+                .assign => |assignment| assignment.value,
+                .expr => |value| value,
+                .return_stmt => |value| value.?,
+                else => unreachable,
+            };
+            try std.testing.expectEqualStrings("make", first.kind.call.callee.kind.ident);
+        }
+    }
+}
+
+test "same-line bitwise and and newline after its operator remain infix" {
+    var parsed = try parseForTest(
+        \\pub fn f() {
+        \\  let copy a = 1 & 3
+        \\  let copy b = 1 &
+        \\    3
+        \\}
+    );
+    defer parsed.deinit();
+    const body = parsed.module.items[0].kind.fn_def.body.?;
+    try std.testing.expectEqual(@as(usize, 2), body.len);
+    for (body) |statement| {
+        const binary = statement.kind.let.value.?.kind.binary;
+        try std.testing.expectEqual(ast.BinaryOp.bit_and, binary.op);
+        try std.testing.expectEqual(@as(i64, 1), binary.left.kind.int);
+        try std.testing.expectEqual(@as(i64, 3), binary.right.kind.int);
+    }
+}
+
+test "delimited expressions allow newline-leading bitwise and" {
+    var parsed = try parseForTest(
+        \\pub fn f() {
+        \\  let copy a = (1
+        \\    & 3)
+        \\  let copy b = take(1
+        \\    & 3)
+        \\  let copy c = [1
+        \\    & 3]
+        \\  let copy d = data[1
+        \\    & 3]
+        \\  let copy e = Some(1
+        \\    & 3)
+        \\  let copy f = Point { x: 1
+        \\    & 3 }
+        \\  let copy g = match 1 { _ => 1
+        \\    & 3 }
+        \\  if 1
+        \\    & 3 { }
+        \\}
+    );
+    defer parsed.deinit();
+    const body = parsed.module.items[0].kind.fn_def.body.?;
+    try std.testing.expectEqual(@as(usize, 8), body.len);
+    const values = [_]ast.Expr{
+        body[0].kind.let.value.?,
+        body[1].kind.let.value.?.kind.call.args[0],
+        body[2].kind.let.value.?.kind.list_lit[0],
+        body[3].kind.let.value.?.kind.index.index.*,
+        body[4].kind.let.value.?.kind.wrap.operand.?.*,
+        body[5].kind.let.value.?.kind.struct_lit.fields[0].value,
+        body[6].kind.let.value.?.kind.match_expr.arms[0].body.*,
+        body[7].kind.expr.kind.if_expr.cond.*,
+    };
+    for (values) |value| {
+        try std.testing.expectEqual(ast.BinaryOp.bit_and, value.kind.binary.op);
+        try std.testing.expectEqual(@as(i64, 3), value.kind.binary.right.kind.int);
+    }
+}
+
+test "blocks inside delimiters restore newline-leading borrow statement boundaries" {
+    var parsed = try parseForTest(
+        \\pub fn f() {
+        \\  take({
+        \\    let owned t = make()
+        \\    &t
+        \\  }
+        \\    & 3);
+        \\  ({
+        \\    var owned t = make()
+        \\    &mut t
+        \\  }
+        \\    & 3)
+        \\  let owned t = make()
+        \\  &t
+        \\}
+    );
+    defer parsed.deinit();
+    const body = parsed.module.items[0].kind.fn_def.body.?;
+    try std.testing.expectEqual(@as(usize, 4), body.len);
+    const expressions = [_]ast.Expr{ body[0].kind.expr.kind.call.args[0], body[1].kind.expr };
+    for (expressions, 0..) |expression, i| {
+        const binary = expression.kind.binary;
+        try std.testing.expectEqual(ast.BinaryOp.bit_and, binary.op);
+        const block = binary.left.kind.block;
+        try std.testing.expectEqual(@as(usize, 2), block.len);
+        try std.testing.expectEqualStrings("make", block[0].kind.let.value.?.kind.call.callee.kind.ident);
+        try std.testing.expectEqual(if (i == 0) ast.UnaryOp.ref_shared else ast.UnaryOp.ref_exclusive, block[1].kind.expr.kind.unary.op);
+    }
+    try std.testing.expectEqualStrings("make", body[2].kind.let.value.?.kind.call.callee.kind.ident);
+    try std.testing.expectEqual(ast.UnaryOp.ref_shared, body[3].kind.expr.kind.unary.op);
 }

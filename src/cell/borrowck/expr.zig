@@ -604,12 +604,9 @@ pub fn checkCall(
     span: Span,
 ) Error!void {
     _ = span;
-    const callee_name: ?[]const u8 = switch (c.callee.kind) {
-        .ident => |n| n,
-        else => null,
-    };
-    const sig: ?ast.FnDef = if (callee_name) |n| self.fns.get(n) else null;
-    if (callee_name == null) try self.checkExpr(c.callee);
+    const sig = self.calleeSignature(c.callee);
+    const callee_name: ?[]const u8 = if (sig) |s| s.name else null;
+    if (sig == null and c.callee.kind != .ident) try self.checkExpr(c.callee);
 
     for (c.args, 0..) |*arg, idx| {
         const param: ?ast.Param = if (sig) |s|

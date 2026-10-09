@@ -80,6 +80,16 @@ pub const Type = union(enum) {
         };
     }
 
+    pub fn integerBits(self: Type) ?u7 {
+        return switch (self) {
+            .byte, .int8, .uint8 => 8,
+            .int16, .uint16 => 16,
+            .int32, .uint32 => 32,
+            .int, .uint => 64,
+            else => null,
+        };
+    }
+
     /// Unsigned integer tags, including `Byte`. Used by the LLVM and MLIR
     /// backends to pick `udiv` / unsigned icmp rather than the signed forms.
     pub fn isUnsigned(self: Type) bool {

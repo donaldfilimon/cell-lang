@@ -1,0 +1,81 @@
+// EXPECT-OUTPUT-ESCAPED: 1\n1\n1\n1\n1\n1\n1\n1\n1\n7\n8\n16\n7\n8\n9\n1\n1\n1\n1\n1\n1
+// Fixed-width integer operations, checked shifts, and source-order evaluation.
+pub fn print_int(copy value: Int);
+fn bits_0(copy a: Int, copy b: Int) -> Bool {
+    let copy six: Int = 6
+    let copy shifted: Int = b << 1
+    return ((~a & b) == b) && ((a | b) == b) && ((b ^ b) == a) && (shifted == six) && ((shifted >> 1) == b)
+}
+fn bits_1(copy a: Int8, copy b: Int8) -> Bool {
+    let copy six: Int8 = 6
+    let copy shifted: Int8 = b << 1
+    return ((~a & b) == b) && ((a | b) == b) && ((b ^ b) == a) && (shifted == six) && ((shifted >> 1) == b)
+}
+fn bits_2(copy a: Int16, copy b: Int16) -> Bool {
+    let copy six: Int16 = 6
+    let copy shifted: Int16 = b << 1
+    return ((~a & b) == b) && ((a | b) == b) && ((b ^ b) == a) && (shifted == six) && ((shifted >> 1) == b)
+}
+fn bits_3(copy a: Int32, copy b: Int32) -> Bool {
+    let copy six: Int32 = 6
+    let copy shifted: Int32 = b << 1
+    return ((~a & b) == b) && ((a | b) == b) && ((b ^ b) == a) && (shifted == six) && ((shifted >> 1) == b)
+}
+fn bits_4(copy a: UInt, copy b: UInt) -> Bool {
+    let copy six: UInt = 6
+    let copy shifted: UInt = b << 1
+    return ((~a & b) == b) && ((a | b) == b) && ((b ^ b) == a) && (shifted == six) && ((shifted >> 1) == b)
+}
+fn bits_5(copy a: UInt8, copy b: UInt8) -> Bool {
+    let copy six: UInt8 = 6
+    let copy shifted: UInt8 = b << 1
+    return ((~a & b) == b) && ((a | b) == b) && ((b ^ b) == a) && (shifted == six) && ((shifted >> 1) == b)
+}
+fn bits_6(copy a: UInt16, copy b: UInt16) -> Bool {
+    let copy six: UInt16 = 6
+    let copy shifted: UInt16 = b << 1
+    return ((~a & b) == b) && ((a | b) == b) && ((b ^ b) == a) && (shifted == six) && ((shifted >> 1) == b)
+}
+fn bits_7(copy a: UInt32, copy b: UInt32) -> Bool {
+    let copy six: UInt32 = 6
+    let copy shifted: UInt32 = b << 1
+    return ((~a & b) == b) && ((a | b) == b) && ((b ^ b) == a) && (shifted == six) && ((shifted >> 1) == b)
+}
+fn bits_8(copy a: Byte, copy b: Byte) -> Bool {
+    let copy six: Byte = 6
+    let copy shifted: Byte = b << 1
+    return ((~a & b) == b) && ((a | b) == b) && ((b ^ b) == a) && (shifted == six) && ((shifted >> 1) == b)
+}
+fn left() -> Int { print_int(7); return 8 }
+fn count() -> Int { print_int(8); return 1 }
+pub fn main() {
+    if bits_0(0, 3) { print_int(1) } else { print_int(0) }
+    if bits_1(0, 3) { print_int(1) } else { print_int(0) }
+    if bits_2(0, 3) { print_int(1) } else { print_int(0) }
+    if bits_3(0, 3) { print_int(1) } else { print_int(0) }
+    if bits_4(0, 3) { print_int(1) } else { print_int(0) }
+    if bits_5(0, 3) { print_int(1) } else { print_int(0) }
+    if bits_6(0, 3) { print_int(1) } else { print_int(0) }
+    if bits_7(0, 3) { print_int(1) } else { print_int(0) }
+    if bits_8(0, 3) { print_int(1) } else { print_int(0) }
+    print_int(left() << count())
+    print_int(left() | count())
+    let copy negative: Int8 = -128
+    let copy minus_one: Int8 = -1
+    if (negative >> 7) == minus_one { print_int(1) } else { print_int(0) }
+    let copy high: UInt8 = 128
+    let copy one: UInt8 = 1
+    if (high >> 7) == one { print_int(1) } else { print_int(0) }
+    let copy sign: Int = 1 << 63
+    if (sign >> 63) == -1 { print_int(1) } else { print_int(0) }
+    let copy byte_high: Byte = 128
+    let copy zero: Byte = 0
+    if (byte_high << 1) == zero { print_int(1) } else { print_int(0) }
+    let copy byte: Byte = 3
+    let copy byte_complement: Byte = 252
+    if ~(1 | byte) == byte_complement { print_int(1) } else { print_int(0) }
+    let copy signed: Int8 = 7
+    let copy seven: Int8 = 7
+    if (-1 & signed) == seven { print_int(1) } else { print_int(0) }
+
+}

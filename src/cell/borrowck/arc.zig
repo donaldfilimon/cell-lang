@@ -32,6 +32,10 @@ pub const ArcSource = union(enum) {
     /// `arc`. The caller's temporary drops that box, so making its pointee
     /// unique frees the same buffer twice.
     arc_value: Site,
+    /// A shared/exclusive call result cannot confer unique ownership either.
+    /// Keeping it in the total consumption verdict covers valued branches at
+    /// every existing owning site without a parallel list of expression forms.
+    borrowed_value: Site,
     /// Ownership could not be decided here. Refused, not permitted.
     unknown: Site,
 
@@ -52,8 +56,12 @@ pub const ArcSource = union(enum) {
                 .arc_place => b,
                 else => a,
             },
-            .unknown => switch (b) {
+            .borrowed_value => switch (b) {
                 .arc_place, .arc_value => b,
+                else => a,
+            },
+            .unknown => switch (b) {
+                .arc_place, .arc_value, .borrowed_value => b,
                 else => a,
             },
             .not_arc => b,
@@ -146,7 +154,7 @@ pub fn arcUniqueSource(self: *Checker, e: *const ast.Expr) Error!ArcSource {
         .binary => .not_arc,
         .unary => |u| switch (u.op) {
             // A fresh scalar.
-            .neg, .not => .not_arc,
+            .neg, .not, .bit_not => .not_arc,
             // A borrow. The value is a reference to the pointee and not
             // an `arc` handle, so it cannot be the thing a box frees
             // twice. Consuming a borrow in an `owned` position is R15's
@@ -172,8 +180,7 @@ pub fn arcUniqueSource(self: *Checker, e: *const ast.Expr) Error!ArcSource {
         //   * `fresh().len`, a field of a temporary. The base's ownership
         //     was not resolved, so neither is the field's.
         .field => |f| blk: {
-            if (f.base.kind == .ident and
-                self.enums.contains(f.base.kind.ident)) break :blk .not_arc;
+            if (self.enumVariant(e) != null) break :blk .not_arc;
             break :blk .{ .unknown = .{
                 .display = try self.msg("the field '{s}' of a temporary value", .{f.name}),
                 .span = e.span,
@@ -241,21 +248,21 @@ pub fn arcUniqueSource(self: *Checker, e: *const ast.Expr) Error!ArcSource {
 /// gained is that a future indirect-call form does not silently inherit a
 /// permissive default.
 pub fn arcCallResult(self: *Checker, callee: *const ast.Expr, span: Span) Error!ArcSource {
-    const name: []const u8 = switch (callee.kind) {
-        .ident => |n| n,
-        else => return .{ .unknown = .{
-            .display = "the result of an indirect call",
-            .span = span,
-        } },
-    };
-    const sig = self.fns.get(name) orelse return .{ .unknown = .{
-        .display = try self.msg("the result of the unresolved callee '{s}'", .{name}),
+    const sig = self.calleeSignature(callee) orelse return .{ .unknown = .{
+        .display = if (callee.kind == .ident)
+            try self.msg("the result of the unresolved callee '{s}'", .{callee.kind.ident})
+        else
+            "the result of an indirect call",
         .span = span,
     } };
     const rt = sig.return_type orelse
         // No declared return type: the call yields unit, and unit is not
         // an `arc` box.
         return .not_arc;
+    if (bk_model.typeIsBorrow(&rt) != null) return .{ .borrowed_value = .{
+        .display = try self.msg("the borrow returned by '{s}'", .{sig.name}),
+        .span = span,
+    } };
     const is_arc = switch (rt) {
         .ref => |r| r.ownership == .arc,
         // A plain, optional, list or result type carries no ownership
@@ -264,7 +271,7 @@ pub fn arcCallResult(self: *Checker, callee: *const ast.Expr, span: Span) Error!
     };
     if (!is_arc) return .not_arc;
     return .{ .arc_value = .{
-        .display = try self.msg("{s}()", .{name}),
+        .display = try self.msg("{s}()", .{sig.name}),
         .span = span,
     } };
 }
@@ -434,7 +441,7 @@ pub fn ownedMoveSource(self: *Checker, e: *const ast.Expr) Error!OwnedMove {
         .binary => .no_owned_place,
         .unary => |u| switch (u.op) {
             // A fresh scalar.
-            .neg, .not => .no_owned_place,
+            .neg, .not, .bit_not => .no_owned_place,
             // A borrow does not own its referent, so consuming it hands
             // over nothing that a drop would free twice. Consuming a
             // borrow in an `owned` position is R18 at a `let`, R3's
@@ -480,8 +487,7 @@ pub fn ownedMoveSource(self: *Checker, e: *const ast.Expr) Error!OwnedMove {
         //   * `mk_box().s`, a field of a temporary. Which place that
         //     temporary's field came from is not resolved here.
         .field => |f| blk: {
-            if (f.base.kind == .ident and
-                self.enums.contains(f.base.kind.ident)) break :blk .no_owned_place;
+            if (self.enumVariant(e) != null) break :blk .no_owned_place;
             break :blk .{ .unknown = .{
                 .display = try self.msg("the field '{s}' of a temporary value", .{f.name}),
                 .span = e.span,
@@ -768,6 +774,18 @@ pub fn refuseArcUnique(
 ) Error!bool {
     switch (src) {
         .not_arc => return false,
+        .borrowed_value => |s| {
+            if (std.mem.eql(u8, slot, "field")) {
+                try self.refuseOwnedFieldTransfer(s, slot_name.?, "a borrow does not transfer ownership");
+                return true;
+            }
+            const message = if (slot_name) |n|
+                try self.msg("cannot {s} {s} {s} 'owned' {s} '{s}': a borrow does not confer ownership", .{ verb, s.display, prep, slot, n })
+            else
+                try self.msg("cannot {s} {s} {s} an 'owned' {s}: a borrow does not confer ownership", .{ verb, s.display, prep, slot });
+            try self.diagnostics.err(self.allocator, s.span, message);
+            try self.diagnostics.note(self.allocator, s.span, "R18: an owning holder would destroy the lender's value; preserve the borrow or return a fresh owned value");
+        },
         .arc_place, .arc_value => |s| {
             const message = if (slot_name) |n|
                 try self.msg(
@@ -1000,7 +1018,7 @@ pub fn refuseArcShared(
 /// verdict whose undecidable case is refused.
 pub fn refuseArcValueBorrow(self: *Checker, operand: *const ast.Expr) Error!bool {
     switch (try self.arcUniqueSource(operand)) {
-        .not_arc => return false,
+        .not_arc, .borrowed_value => return false,
         .arc_place, .arc_value => |s| {
             try self.diagnostics.err(
                 self.allocator,

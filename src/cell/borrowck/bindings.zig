@@ -37,10 +37,8 @@ pub fn checkLet(self: *Checker, l: *const @FieldType(ast.Stmt.Kind, "let"), span
         // and it resolves.
         if (struct_name == null) {
             if (v.kind == .call) {
-                if (v.kind.call.callee.kind == .ident) {
-                    if (self.fns.get(v.kind.call.callee.kind.ident)) |sig| {
-                        if (sig.return_type) |rt| struct_name = typeStructName(&rt);
-                    }
+                if (self.calleeSignature(v.kind.call.callee)) |sig| {
+                    if (sig.return_type) |rt| struct_name = typeStructName(&rt);
                 }
             }
         }

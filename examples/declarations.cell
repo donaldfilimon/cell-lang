@@ -8,8 +8,6 @@
 // link time. This is the mechanism behind body files (SPEC 1.2) and behind
 // stdlib/prelude.cell.
 
-use std.io
-use std.mem.alloc
 
 // `use` is recorded and emitted as a comment. There is NO module resolution:
 // nothing a `use` names becomes available. See SPEC 8.4.

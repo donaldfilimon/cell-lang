@@ -376,3 +376,62 @@ with the module by filename stem in the same directory, so `Point` and
 `Quadrant` resolve. A `.body` file with no `.cell`/`.cel` stem-mate is an
 error that names the body and the missing module. `.cel` is an alias of
 `.cell`. `.txt` and extensionless paths still load as a standalone module.
+
+
+## Module graph contracts
+
+`examples/modules/main.cell` is the accepted graph entry. It imports `geo`,
+the stem-paired `grid.cell`/`grid.body`, and embedded `std.prelude`, and carries
+`EXPECT-OUTPUT: 43`. Its own `Point` differs from `geo.Point`; qualified
+functions, struct literals, enum values and patterns resolve through direct
+exports. `grid.extent` remains public through its interface even though its
+body omits `pub`. `geo.twice` is private.
+
+```sh
+./zig-out/bin/cell check examples/modules/main.cell
+./zig-out/bin/cell run examples/modules/main.cell
+./zig-out/bin/cell emit --target=llvm examples/modules/main.cell
+./zig-out/bin/cell emit --target=mlir examples/modules/main.cell
+```
+
+The gate includes the module corpus and the expected output on all three
+backends. `public_link_host.c` and `private_link_host.c` are linkage controls:
+the public host must link and compute the expected result; linking the private
+host must fail specifically for `cell_geo_twice`. This describes the gate's
+contracts, not a claim that the latest full gate or three-host qualification
+has finished.
+
+`examples/rejected/module_missing.cell`, `module_private.cell`, and the
+`module_cycle_a.cell`/`module_cycle_b.cell` pair pin missing-module, private
+access, and cycle rejection. `module_pub_use.cell` pins the refusal of
+re-export syntax. The current frontend also refuses public
+signatures exposing private types, duplicate module identities/qualifiers,
+unknown or mismatched enum patterns, and nominal declaration heads used as
+ordinary values; focused compiler tests cover those cases.
+
+Both directions of stem pairing apply to entries and imported units. Imported
+extern declarations may be repeated only with a compatible ABI signature.
+Unused imported externs are omitted after validation, so using `print_int`
+does not force IR backends to lower unused ARC APIs in the prelude. Entry
+standalone declarations keep their emission contracts. Only the graph entry's
+`main` creates a process wrapper.
+
+`examples/modules/enum_patterns.cell` prints `11` on C, LLVM, and MLIR:
+a bare enum pattern uses the scrutinee's nominal type even when an imported
+enum defines the same variant in a different position.
+`module_enum_identity.cell` rejects a variant explicitly belonging to another
+enum. `module_runtime_symbol.cell` and `module_runtime_signature.cell` reject
+a definition colliding with a runtime symbol and an incompatible runtime
+prototype, respectively.
+
+`integer_bits.cell` checks the nine existing integer type spellings across
+bitwise/complement/checked-shift operations. Its EXPECT-OUTPUT-ESCAPED pins
+width preservation, arithmetic/logical right shifts, truncating left shifts,
+literal peer typing, and left-before-right exactly-once calls. Both the driver
+and the gate compare the emitted output exactly (apart from trailing newlines).
+The escaped expectation form decodes only `\n`, accepts at most 4096 encoded
+characters, and rejects malformed or duplicate declarations. Ordinary
+EXPECT-OUTPUT declarations remain verbatim.
+`rejected/shift_count.cell` and `rejected/bitwise_float.cell` pin known invalid
+counts and noninteger operands. Dynamic invalid counts are exercised by the
+compiler/runtime tests and abort before performing a shift.

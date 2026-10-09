@@ -1,0 +1,4 @@
+// EXPECT: currently-rejected
+// Missing imports are load errors rather than ignored syntax.
+use no_such_cell_module
+pub fn main() {}

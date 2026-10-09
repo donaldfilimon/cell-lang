@@ -27,6 +27,11 @@ pub const TokenKind = enum {
     le,
     gt,
     ge,
+    pipe, // |
+    caret, // ^
+    tilde, // ~
+    shl, // <<
+    shr, // >>
     amp, // &
     amp_amp, // &&
     pipe_pipe, // ||
@@ -193,6 +198,12 @@ pub const Lexer = struct {
             return self.make(.pipe_pipe, start, line, column);
         }
 
+        if ((c == '<' and self.peek(1) == '<') or (c == '>' and self.peek(1) == '>')) {
+            self.advance();
+            self.advance();
+            return self.make(if (c == '<') .shl else .shr, start, line, column);
+        }
+
         // single-char
         const single: ?TokenKind = switch (c) {
             '(' => .l_paren,
@@ -214,6 +225,9 @@ pub const Lexer = struct {
             '<' => .lt,
             '>' => .gt,
             '&' => .amp,
+            '|' => .pipe,
+            '^' => .caret,
+            '~' => .tilde,
             '!' => .bang,
             else => null,
         };
@@ -736,4 +750,13 @@ test "unterminated string is an invalid token" {
     try std.testing.expectEqual(TokenKind.invalid, t.kind);
     try std.testing.expectEqual(@as(u32, 1), t.column);
     try std.testing.expectEqualStrings("\"hello", t.lexeme);
+}
+
+test "bitwise tokens preserve logical operators borrow and comparison boundaries" {
+    var lexer = Lexer.init("& && | || ^ ~ << >> < <= > >=", "bits.cell");
+    var tokens = try lexer.tokenizeAll(std.testing.allocator);
+    defer tokens.deinit(std.testing.allocator);
+    const expected = [_]TokenKind{ .amp, .amp_amp, .pipe, .pipe_pipe, .caret, .tilde, .shl, .shr, .lt, .le, .gt, .ge, .eof };
+    try std.testing.expectEqual(expected.len, tokens.items.len);
+    for (expected, tokens.items) |kind, token| try std.testing.expectEqual(kind, token.kind);
 }

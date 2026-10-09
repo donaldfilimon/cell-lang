@@ -12,6 +12,16 @@ pub fn build(b: *std.Build) void {
     const c_flags = [_][]const u8{ "-std=c11", "-Wall", "-Wextra" };
     const cxx_flags = [_][]const u8{ "-std=c++20", "-Wall", "-Wextra", "-fno-exceptions" };
 
+    // Expand the runtime's generated declarations before symbol validation.
+    const runtime_header = b.addSystemCommand(&.{ "cc", "-E", "-P", "-x", "c", "-I", "runtime" });
+    runtime_header.addFileArg(b.path("runtime/cell_rt.h"));
+    runtime_header.addArg("-o");
+    const runtime_header_declarations = runtime_header.addOutputFileArg("cell_rt_header.i");
+    const runtime_source = b.addSystemCommand(&.{ "cc", "-E", "-P", "-x", "c", "-I", "runtime" });
+    runtime_source.addFileArg(b.path("runtime/cell_rt.c"));
+    runtime_source.addArg("-o");
+    const runtime_source_declarations = runtime_source.addOutputFileArg("cell_rt_source.i");
+
     // ── Core library module (Zig only; C linked via exe/tests) ──────────
     const cell_mod = b.addModule("cell", .{
         .root_source_file = b.path("src/root.zig"),
@@ -35,6 +45,9 @@ pub fn build(b: *std.Build) void {
     // need the same two names or @embedFile fails at the test build.
     exe_mod.addAnonymousImport("cell_rt_h", .{ .root_source_file = b.path("runtime/cell_rt.h") });
     exe_mod.addAnonymousImport("cell_rt_c", .{ .root_source_file = b.path("runtime/cell_rt.c") });
+    exe_mod.addAnonymousImport("cell_rt_header_declarations", .{ .root_source_file = runtime_header_declarations });
+    exe_mod.addAnonymousImport("cell_rt_source_declarations", .{ .root_source_file = runtime_source_declarations });
+    exe_mod.addAnonymousImport("cell_std_prelude", .{ .root_source_file = b.path("stdlib/prelude.cell") });
     exe_mod.addCSourceFile(.{
         .file = b.path("runtime/cell_rt.c"),
         .flags = &c_flags,
@@ -113,6 +126,9 @@ pub fn build(b: *std.Build) void {
     test_exe_mod.addIncludePath(b.path("runtime"));
     test_exe_mod.addAnonymousImport("cell_rt_h", .{ .root_source_file = b.path("runtime/cell_rt.h") });
     test_exe_mod.addAnonymousImport("cell_rt_c", .{ .root_source_file = b.path("runtime/cell_rt.c") });
+    test_exe_mod.addAnonymousImport("cell_rt_header_declarations", .{ .root_source_file = runtime_header_declarations });
+    test_exe_mod.addAnonymousImport("cell_rt_source_declarations", .{ .root_source_file = runtime_source_declarations });
+    test_exe_mod.addAnonymousImport("cell_std_prelude", .{ .root_source_file = b.path("stdlib/prelude.cell") });
     test_exe_mod.addCSourceFile(.{
         .file = b.path("runtime/cell_rt.c"),
         .flags = &c_flags,

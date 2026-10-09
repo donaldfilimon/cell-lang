@@ -67,7 +67,7 @@ pub fn borrowSource(self: *Checker, e: *const ast.Expr) Error!BorrowSource {
         // Every binary operator in this grammar yields a fresh scalar.
         .binary => .not_borrow,
         .unary => |u| switch (u.op) {
-            .neg, .not => .not_borrow,
+            .neg, .not, .bit_not => .not_borrow,
             .ref_shared, .ref_exclusive => .{ .borrow = .{
                 .display = if (try self.placeOf(u.operand)) |p|
                     try self.msg("a borrow of '{s}'", .{p.display})
@@ -93,8 +93,7 @@ pub fn borrowSource(self: *Checker, e: *const ast.Expr) Error!BorrowSource {
                 // Not rooted at a binding in scope. A qualified enum
                 // variant is a unit constant and can never be a borrow;
                 // anything else is a field of a temporary, unresolved.
-                if (e.kind == .field and e.kind.field.base.kind == .ident and
-                    self.enums.contains(e.kind.field.base.kind.ident)) break :blk .not_borrow;
+                if (self.enumVariant(e) != null) break :blk .not_borrow;
                 break :blk .{ .unresolved = .{
                     .display = try self.msg("the expression at this position", .{}),
                     .span = e.span,
@@ -117,17 +116,14 @@ pub fn borrowSource(self: *Checker, e: *const ast.Expr) Error!BorrowSource {
             };
         },
         .call => |c| blk: {
-            const name: []const u8 = switch (c.callee.kind) {
-                .ident => |n| n,
-                else => break :blk .{ .unresolved = .{
-                    .display = "the result of an indirect call",
-                    .span = e.span,
-                } },
-            };
-            const sig = self.fns.get(name) orelse break :blk .{ .unresolved = .{
-                .display = try self.msg("the result of the unresolved callee '{s}'", .{name}),
+            const sig = self.calleeSignature(c.callee) orelse break :blk .{ .unresolved = .{
+                .display = if (c.callee.kind == .ident)
+                    try self.msg("the result of the unresolved callee '{s}'", .{c.callee.kind.ident})
+                else
+                    "the result of an indirect call",
                 .span = e.span,
             } };
+            const name = sig.name;
             // No declared return type is unit, which is not a borrow.
             const rt = sig.return_type orelse break :blk .not_borrow;
             break :blk if (typeIsBorrow(&rt) != null) .{ .borrow = .{
@@ -386,17 +382,17 @@ pub fn inferBindingType(self: *Checker, e: *const ast.Expr) Error!?ast.TypeExpr 
         .bool => return .{ .name = "Bool" },
         .struct_lit => |sl| return .{ .name = sl.name },
         .call => |c| {
-            if (c.callee.kind != .ident) return null;
-            const sig = self.fns.get(c.callee.kind.ident) orelse return null;
+            const sig = self.calleeSignature(c.callee) orelse return null;
             return sig.return_type;
         },
         // A borrow's binding is not an owner, but what a `copy` of it
         // duplicates is the REFERENT's header, so answer with that.
         .unary => |u| switch (u.op) {
             .ref_shared, .ref_exclusive => return try self.inferBindingType(u.operand),
-            .neg, .not => return null,
+            .neg, .not, .bit_not => return null,
         },
         .ident, .field => {
+            if (self.enumVariant(e)) |definition| return .{ .name = definition.name };
             const place = (try self.placeOf(e)) orelse return null;
             const b = self.bindingById(place.binding) orelse return null;
             const t = self.placeTypeOf(b, place.path) orelse return null;

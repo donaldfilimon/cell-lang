@@ -366,7 +366,7 @@ const Emitter = struct {
         else
             (self.mlirType(f.ret) orelse "");
         self.ret_abi = if (uses_sret) "" else (ret orelse "");
-        try self.out.print("  func.func @{s}(", .{f.symbol});
+        try self.out.print("  func.func {s}@{s}(", .{ if (f.linkage == .internal) "private " else "", f.symbol });
         if (uses_sret) {
             const nat = self.mlirTypeOwned(f.ret, .owned) orelse "!llvm.struct<()>";
             try self.out.print("%sret: !llvm.ptr {{llvm.sret = {s}}}", .{nat});
@@ -384,6 +384,7 @@ const Emitter = struct {
         if (!uses_sret) {
             if (ret) |r| try self.out.print(" -> {s}", .{r});
         }
+        if (f.linkage == .internal) try self.out.writeAll(" attributes {llvm.linkage = #llvm.linkage<internal>}");
         try self.out.writeAll(" {\n");
         self.indent = 4;
 
@@ -1064,18 +1065,22 @@ const Emitter = struct {
         if (left.isNone()) return left;
         const right = try self.emitExpr(right_e);
         if (right.isNone()) return right;
+        if (op == .shl or op == .shr) return self.emitCheckedShift(op, left_e, right_e, left, right);
 
         const float = isFloat(left.ty);
         const unsigned = left_e.ty.isUnsigned();
 
         const s = try self.nextSsa();
         switch (op) {
-            .add, .sub, .mul, .div => {
+            .add, .sub, .mul, .div, .bit_and, .bit_or, .bit_xor => {
                 const mnemonic: []const u8 = switch (op) {
                     .add => if (float) "arith.addf" else "arith.addi",
                     .sub => if (float) "arith.subf" else "arith.subi",
                     .mul => if (float) "arith.mulf" else "arith.muli",
                     .div => if (float) "arith.divf" else if (unsigned) "arith.divui" else "arith.divsi",
+                    .bit_and => "arith.andi",
+                    .bit_or => "arith.ori",
+                    .bit_xor => "arith.xori",
                     else => unreachable,
                 };
                 try self.line("{s} = {s} {s}, {s} : {s}", .{ s, mnemonic, left.text, right.text, left.ty });
@@ -1109,8 +1114,42 @@ const Emitter = struct {
                 }
                 return .{ .text = s, .ty = "i1" };
             },
-            .and_op, .or_op => unreachable,
+            .and_op, .or_op, .shl, .shr => unreachable,
         }
+    }
+
+    fn widenShiftInteger(self: *Emitter, value: Value, signed: bool) EmitError![]const u8 {
+        if (std.mem.eql(u8, value.ty, "i64")) return value.text;
+        const wide = try self.nextSsa();
+        try self.line("{s} = {s} {s} : {s} to i64", .{ wide, if (signed) "arith.extsi" else "arith.extui", value.text, value.ty });
+        return wide;
+    }
+
+    fn emitCheckedShift(self: *Emitter, op: ast.BinaryOp, left_e: *const hir.Expr, right_e: *const hir.Expr, left: Value, right: Value) EmitError!Value {
+        const width = hir.integerBitWidth(left_e.ty) orelse {
+            try self.unsupported(left_e.span, "noninteger shift operand");
+            return Value.none;
+        };
+        if (hir.integerBitWidth(right_e.ty) == null) {
+            try self.unsupported(right_e.span, "noninteger shift count");
+            return Value.none;
+        }
+        const bits = try self.widenShiftInteger(left, false);
+        const count = try self.widenShiftInteger(right, !right_e.ty.isUnsigned());
+        const width_value = try self.nextSsa();
+        try self.line("{s} = arith.constant {d} : i32", .{ width_value, width });
+        const shifted = try self.nextSsa();
+        if (op == .shl) {
+            try self.line("{s} = func.call @cell_bits_shl({s}, {s}, {s}) : (i64, i64, i32) -> i64", .{ shifted, bits, count, width_value });
+        } else {
+            const signed = try self.nextSsa();
+            try self.line("{s} = arith.constant {d} : i1", .{ signed, @intFromBool(!left_e.ty.isUnsigned()) });
+            try self.line("{s} = func.call @cell_bits_shr({s}, {s}, {s}, {s}) : (i64, i64, i32, i1) -> i64", .{ shifted, bits, count, width_value, signed });
+        }
+        if (width == 64) return .{ .text = shifted, .ty = left.ty };
+        const narrowed = try self.nextSsa();
+        try self.line("{s} = arith.trunci {s} : i64 to {s}", .{ narrowed, shifted, left.ty });
+        return .{ .text = narrowed, .ty = left.ty };
     }
 
     fn emitShortCircuit(
@@ -1173,6 +1212,12 @@ const Emitter = struct {
                 try self.line("{s} = arith.constant 1 : i1", .{one});
                 try self.line("{s} = arith.xori {s}, {s} : i1", .{ s, operand.text, one });
                 return .{ .text = s, .ty = "i1" };
+            },
+            .bit_not => {
+                const mask = try self.nextSsa();
+                try self.line("{s} = arith.constant -1 : {s}", .{ mask, operand.ty });
+                try self.line("{s} = arith.xori {s}, {s} : {s}", .{ s, operand.text, mask, operand.ty });
+                return .{ .text = s, .ty = operand.ty };
             },
             .ref_shared, .ref_exclusive => unreachable,
         }
@@ -2250,6 +2295,10 @@ fn runThroughMlir(gpa: std.mem.Allocator, mlir_text: []const u8) ![]u8 {
 /// `runThroughMlir` with an optional hand-written C host, a path relative to
 /// the repository root (IR step (b) Q5).
 fn runThroughMlirHost(gpa: std.mem.Allocator, mlir_text: []const u8, host: ?[]const u8) ![]u8 {
+    return runThroughMlirHostExit(gpa, mlir_text, host, 0);
+}
+
+fn runThroughMlirHostExit(gpa: std.mem.Allocator, mlir_text: []const u8, host: ?[]const u8, expected_exit: u8) ![]u8 {
     const io = std.testing.io;
 
     const mlir_opt = (try findTool(gpa, "mlir-opt")) orelse return error.SkipZigTest;
@@ -2335,7 +2384,13 @@ fn runThroughMlirHost(gpa: std.mem.Allocator, mlir_text: []const u8, host: ?[]co
     errdefer gpa.free(run.stdout);
     // BOTH signals. A program that prints the right answer and then dies is
     // not a passing program.
-    if (!run.term.success()) return error.ProgramFailed;
+    const expected = switch (run.term) {
+        .exited => |status| status == expected_exit,
+        .signal => |signal| expected_exit == 134 and signal == .ABRT,
+        else => false,
+    };
+    if (!expected) return error.ProgramFailed;
+    if (expected_exit == 134) try std.testing.expect(std.mem.indexOf(u8, run.stderr, "integer shift: count out of range") != null);
     return run.stdout;
 }
 
@@ -3582,5 +3637,122 @@ test "an owned String temporary and an arc list are refused as index bases in ML
         );
         defer e.deinit();
         try std.testing.expect(e.bag.hasErrors());
+    }
+}
+
+test "graph symbol metadata and internal linkage survive MLIR lowering and execution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = "pub fn print_int(copy n: Int); fn hidden() -> Int { return 7 } fn main() { print_int(hidden()) }";
+    var lex = lexer.Lexer.init(source, "graph.cell");
+    const tokens = try lex.tokenizeAll(a);
+    var p = parser.Parser.init(a, tokens.items, "graph.cell");
+    var module = try p.parseModule();
+    module.items[0].kind.fn_def.symbol = "cell_print_int";
+    module.items[0].kind.fn_def.linkage = .internal;
+    module.items[1].kind.fn_def.symbol = "cell_geo_hidden";
+    module.items[1].kind.fn_def.linkage = .internal;
+    module.items[2].kind.fn_def.linkage = .external;
+    var bag: diag.Bag = .init(module.path, source);
+    var lowered = try hir.lower(a, &module, &bag);
+    var out: Io.Writer.Allocating = .init(a);
+    try emitModule(a, &lowered, &out.writer, &bag);
+    try std.testing.expect(!bag.hasErrors());
+    try expectContains(out.written(), "func.func private @cell_geo_hidden(");
+    try expectContains(out.written(), "attributes {llvm.linkage = #llvm.linkage<internal>}");
+    try expectContains(out.written(), "call @cell_geo_hidden(");
+    const output = try runThroughMlir(std.testing.allocator, out.written());
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("7\n", output);
+}
+
+test "MLIR integer bitwise and checked shifts execute every width and evaluate once" {
+    var e = try emitSource(
+        \\pub fn assert(copy value: Bool);
+        \\pub fn println(shared value: String);
+        \\pub fn count() -> Int { println("once") return 1 }
+        \\pub fn main() {
+        \\    let copy a: Int8 = -2
+        \\    let copy b: UInt8 = 255
+        \\    let copy c: Int16 = -2
+        \\    let copy d: UInt16 = 65535
+        \\    let copy e: Int32 = -2
+        \\    let copy f: UInt32 = 4294967295
+        \\    let copy g: Int = -2
+        \\    let copy zero: UInt = 0
+        \\    let copy h: UInt = ~zero
+        \\    let copy byte: Byte = 255
+        \\    let copy a_expected: Int8 = -1
+        \\    assert((a >> 1) == a_expected)
+        \\    let copy expect0: UInt8 = 127
+        \\    assert((b >> 1) == expect0)
+        \\    let copy c_expected: Int16 = -1
+        \\    assert((c >> 1) == c_expected)
+        \\    let copy expect1: UInt16 = 32767
+        \\    assert((d >> 1) == expect1)
+        \\    let copy e_expected: Int32 = -1
+        \\    assert((e >> 1) == e_expected)
+        \\    let copy expect2: UInt32 = 2147483647
+        \\    assert((f >> 1) == expect2)
+        \\    assert((g >> 1) == -1)
+        \\    let copy expect3: UInt = 9223372036854775807
+        \\    assert((h >> 1) == expect3)
+        \\    let copy expect4: Byte = 1
+        \\    assert((byte >> 7) == expect4)
+        \\    let copy expect5: UInt8 = 254
+        \\    assert((b << 1) == expect5)
+        \\    let copy expect6: UInt16 = 65534
+        \\    assert((d << 1) == expect6)
+        \\    let copy expect7: UInt32 = 4294967294
+        \\    assert((f << 1) == expect7)
+        \\    assert((h << 1) == (h ^ 1))
+        \\    let copy expect8: Int8 = 0
+        \\    assert((a << 7) == expect8)
+        \\    let copy expect9: Int16 = 0
+        \\    assert((c << 15) == expect9)
+        \\    let copy expect10: Int32 = 0
+        \\    assert((e << 31) == expect10)
+        \\    let copy expect11: Int = 0
+        \\    assert((g << 63) == expect11)
+        \\    let copy complement_a: Int8 = 1
+        \\    assert((~a) == complement_a)
+        \\    let copy complement_b: UInt8 = 0
+        \\    assert((~b) == complement_b)
+        \\    assert((b & b) == b)
+        \\    assert((b | b) == b)
+        \\    let copy expect12: UInt8 = 0
+        \\    assert((b ^ b) == expect12)
+        \\    let copy shifted: UInt8 = b << count()
+        \\    let copy expect13: UInt8 = 254
+        \\    assert(shifted == expect13)
+        \\}
+    );
+    defer e.deinit();
+    for (e.bag.list.items) |d| std.debug.print("diag line {d}: {s}\n", .{ d.span.start, d.message });
+    try std.testing.expect(!e.bag.hasErrors());
+    const output = try runThroughMlir(std.testing.allocator, e.text);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("once\n", output);
+}
+
+test "MLIR integer bitwise shifts reject dynamic negative and oversized counts" {
+    const cases = [_][]const u8{
+        \\pub fn main() { let copy value: UInt8 = 255 let copy count: Int8 = -1 let copy result = value << count }
+        ,
+        \\pub fn main() { let copy value: Int16 = -2 let copy count: UInt16 = 16 let copy result = value >> count }
+        ,
+        \\pub fn main() { let copy value: UInt = 1 let copy count: UInt = 64 let copy result = value << count }
+        ,
+        \\pub fn main() { let copy value: Int = -2 let copy count: Int = -1 let copy result = value >> count }
+        ,
+    };
+    for (cases) |source| {
+        var e = try emitSource(source);
+        defer e.deinit();
+        try std.testing.expect(!e.bag.hasErrors());
+        const output = try runThroughMlirHostExit(std.testing.allocator, e.text, null, 134);
+        defer std.testing.allocator.free(output);
+        try std.testing.expectEqualStrings("", output);
     }
 }

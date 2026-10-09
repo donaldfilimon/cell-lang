@@ -189,6 +189,37 @@ pub fn emitValueInto(self: *Generator, e: *const ast.Expr, dest: Dest, indent: u
 /// `-Wparentheses-equality` (it reads as an intended assignment).
 pub fn emitBinary(self: *Generator, b: anytype, indent: usize) EmitError!void {
     const out = self.writer;
+    switch (b.op) {
+        .shl, .shr, .bit_and, .bit_or, .bit_xor => {
+            const left = try self.inferExpr(b.left);
+            const rhs = try self.inferExpr(b.right);
+            const bitwise = b.op == .bit_and or b.op == .bit_or or b.op == .bit_xor;
+            const ty = if (bitwise and cg_helpers.integerLiteral(b.left) and cg_helpers.integerInfo(rhs) != null) rhs else left;
+            const id = self.temp_counter;
+            self.temp_counter += 1;
+            try out.print("({{ {s} _bits_left_{d} = ", .{ ty.text, id });
+            try self.emitExpr(b.left, indent);
+            try out.print("; {s} _bits_right_{d} = ", .{ rhs.text, id });
+            try self.emitExpr(b.right, indent);
+            try out.print("; ({s})(", .{ty.text});
+            if (b.op == .shl or b.op == .shr) {
+                const info = cg_helpers.integerInfo(ty) orelse unreachable;
+                try out.print("cell_bits_{s}((uint64_t)_bits_left_{d}, (uint64_t)_bits_right_{d}, {d}", .{ if (b.op == .shl) "shl" else "shr", id, id, info.bits });
+                if (b.op == .shr) try out.writeAll(if (info.signed) ", true" else ", false");
+                try out.writeAll(")");
+            } else {
+                try out.print("_bits_left_{d}{s}_bits_right_{d}", .{ id, switch (b.op) {
+                    .bit_and => " & ",
+                    .bit_or => " | ",
+                    .bit_xor => " ^ ",
+                    else => unreachable,
+                }, id });
+            }
+            try out.writeAll("); })");
+            return;
+        },
+        else => {},
+    }
     try self.emitExpr(b.left, indent);
     try out.writeAll(switch (b.op) {
         .add => " + ",
@@ -203,6 +234,7 @@ pub fn emitBinary(self: *Generator, b: anytype, indent: usize) EmitError!void {
         .ge => " >= ",
         .and_op => " && ",
         .or_op => " || ",
+        .bit_and, .bit_or, .bit_xor, .shl, .shr => unreachable,
     });
     try self.emitExpr(b.right, indent);
 }
@@ -366,6 +398,12 @@ pub fn emitWrap(self: *Generator, wrap_e: *const ast.Expr, want: ?CType, indent:
 pub fn emitUnary(self: *Generator, op: ast.UnaryOp, operand: *const ast.Expr, indent: usize) EmitError!void {
     const out = self.writer;
     switch (op) {
+        .bit_not => {
+            const ty = try self.inferExpr(operand);
+            try out.print("(({s})(~(", .{ty.text});
+            try self.emitExpr(operand, indent);
+            try out.writeAll(")))");
+        },
         .neg => {
             try out.writeAll("-");
             try self.emitExpr(operand, indent);

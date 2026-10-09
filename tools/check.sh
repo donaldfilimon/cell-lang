@@ -70,6 +70,8 @@
 #                       example may declare `// EXPECT-OUTPUT:` to pin the
 #                       answer itself, since three backends agreeing is not the
 #                       same as three backends being right.
+#                       `// EXPECT-OUTPUT-ESCAPED:` explicitly supports internal
+#                       newlines written as \n; ordinary expectations stay literal.
 #                       AND IT STILL ONLY SEES THE SHAPES THE CORPUS CONTAINS.
 #                       This stage was green over three further LLVM defects at
 #                       once, because no example BOUND a borrow to a name
@@ -674,6 +676,59 @@ fail() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
 pass() { printf '  ok    %s\n' "$*"; }
 skip() { printf '  SKIP  %s\n' "$*"; skips=$((skips + 1)); }
 
+# Ordinary expectations stay verbatim. The explicit escaped form accepts only
+# \n, at most 4096 encoded characters, and exactly one declaration. Shell
+# command substitution removes trailing newlines from both actual and expected.
+read_output_expectation() {
+    EXPECT_OUTPUT_KIND=none
+    EXPECT_OUTPUT_VALUE=''
+    if _expectation=$(awk '
+        function invalid(message) {
+            print "invalid output expectation: " message > "/dev/stderr"
+            bad = 1
+            exit 1
+        }
+        /^[[:space:]]*\/\/[[:space:]]*EXPECT-OUTPUT(-ESCAPED)?([[:space:]:]|$)/ {
+            if ($0 !~ /^\/\/ EXPECT-OUTPUT(-ESCAPED)?: /)
+                invalid("expected // EXPECT-OUTPUT[-ESCAPED]: followed by a space")
+            if (++count != 1) invalid("duplicate or conflicting declarations")
+            escaped = ($0 ~ /^\/\/ EXPECT-OUTPUT-ESCAPED:/)
+            prefix = escaped ? "// EXPECT-OUTPUT-ESCAPED:" : "// EXPECT-OUTPUT:"
+            value = substr($0, length(prefix) + 1)
+            if (substr(value, 1, 1) != " ") invalid("expected a space after colon")
+            value = substr(value, 2)
+            if (escaped) {
+                if (length(value) > 4096) invalid("escaped value exceeds 4096 characters")
+                decoded = ""
+                for (i = 1; i <= length(value); i++) {
+                    c = substr(value, i, 1)
+                    if (c == "\\") {
+                        if (substr(value, ++i, 1) != "n") invalid("only \\n is supported")
+                        decoded = decoded "\n"
+                    } else decoded = decoded c
+                }
+                value = decoded
+            }
+        }
+        END {
+            if (bad) exit 1
+            if (count) printf "%s:%s", escaped ? "escaped" : "verbatim", value
+            else printf "none:"
+        }
+    ' "$1"); then
+        EXPECT_OUTPUT_KIND=${_expectation%%:*}
+        EXPECT_OUTPUT_VALUE=${_expectation#*:}
+    else
+        return 1
+    fi
+}
+
+check_expected_output() {
+    [ "$EXPECT_OUTPUT_KIND" = none ] && return 0
+    [ "$3" = "$EXPECT_OUTPUT_VALUE" ] ||
+        fail "answers $1: $2 printed '$3', the file declares $EXPECT_OUTPUT_KIND output '$EXPECT_OUTPUT_VALUE'"
+}
+
 # The mlir-opt pipeline, read back out of the emitted file's own
 # `// lower with:` comment. Stage 5 says in as many words that the pipeline is
 # NOT written into this script because a second copy could drift from the
@@ -686,7 +741,7 @@ mlir_pipeline() {
 }
 
 accepted_examples() {
-    for _example in examples/*.cell examples/pairing/*.cell examples/signatures/*.cell; do
+    for _example in examples/*.cell examples/pairing/*.cell examples/signatures/*.cell examples/modules/*.cell; do
         [ -f "$_example" ] && printf '%s\n' "$_example"
     done
 }
@@ -758,6 +813,316 @@ signature_coverage_verdict() {
     fi
 }
 
+# Emit the exact stage-10 canonicalizer for both the gate and its regression
+# harness. Attribute removal stays an explicit allowlist: an unknown word is
+# preserved and consequently fails type parsing.
+write_signature_canonicalizer() {
+    cat > "$1" <<'SIG_AWK_END'
+# Reduce every `@cell_*` declaration in an LLVM IR file to an ABI-shaped
+# signature: "name<TAB>ret|p0|p1|...". Stage 10's header says what the shape
+# deliberately keeps and deliberately throws away, and why each.
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+
+# Split s on TOP-LEVEL commas into arr[1..n]. Depth-aware, so a comma inside
+# `{ ptr, i64 }` or `sret({ ... })` never splits a parameter in half.
+function tsplit(s, arr,   i, d, cur, n, c) {
+    n = 0; d = 0; cur = ""
+    for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "{" || c == "[" || c == "(" || c == "<") d++
+        else if (c == "}" || c == "]" || c == ")" || c == ">") d--
+        if (c == "," && d == 0) { n++; arr[n] = trim(cur); cur = "" }
+        else cur = cur c
+    }
+    if (trim(cur) != "") { n++; arr[n] = trim(cur) }
+    return n
+}
+
+# Size and alignment, AArch64/Darwin. Anything not listed returns -1 and the
+# caller reports UNPARSEABLE rather than guessing a layout: a wrong size here
+# would make two different ABIs compare equal, which is the one outcome this
+# stage exists to prevent.
+function talign(t,   inner, n, i, a, mx, parts) {
+    t = trim(t)
+    if (t == "ptr" || t == "i64" || t == "double") return 8
+    if (t == "i32" || t == "float") return 4
+    if (t == "i16") return 2
+    if (t == "i8" || t == "i1") return 1
+    if (substr(t, 1, 1) == "[") {
+        inner = substr(t, 2, length(t) - 2)
+        if (inner !~ /^[0-9]+ x /) return -1
+        sub(/^[0-9]+ x /, "", inner)
+        return talign(inner)
+    }
+    if (substr(t, 1, 1) == "{") {
+        inner = trim(substr(t, 2, length(t) - 2))
+        if (inner == "") return 1
+        n = tsplit(inner, parts); mx = 1
+        for (i = 1; i <= n; i++) { a = talign(parts[i]); if (a < 0) return -1; if (a > mx) mx = a }
+        return mx
+    }
+    return -1
+}
+
+function tsize(t,   inner, cnt, n, i, off, a, s, mx, parts) {
+    t = trim(t)
+    if (t == "ptr" || t == "i64" || t == "double") return 8
+    if (t == "i32" || t == "float") return 4
+    if (t == "i16") return 2
+    if (t == "i8" || t == "i1") return 1
+    if (substr(t, 1, 1) == "[") {
+        inner = substr(t, 2, length(t) - 2)
+        if (inner !~ /^[0-9]+ x /) return -1
+        cnt = inner; sub(/ x .*$/, "", cnt)
+        sub(/^[0-9]+ x /, "", inner)
+        s = tsize(inner); if (s < 0) return -1
+        return (cnt + 0) * s
+    }
+    if (substr(t, 1, 1) == "{") {
+        inner = trim(substr(t, 2, length(t) - 2))
+        if (inner == "") return 0
+        n = tsplit(inner, parts); off = 0; mx = 1
+        for (i = 1; i <= n; i++) {
+            a = talign(parts[i]); s = tsize(parts[i])
+            if (a < 0 || s < 0) return -1
+            if (a > mx) mx = a
+            if (off % a != 0) off += a - (off % a)
+            off += s
+        }
+        if (off % mx != 0) off += mx - (off % mx)
+        return off
+    }
+    return -1
+}
+
+# An HFA and an integer aggregate of the SAME SIZE go to different register
+# files, so `agg8` must not be able to mean both.
+function allfp(t,   inner, n, i, parts) {
+    t = trim(t)
+    if (t == "float" || t == "double") return 1
+    if (t ~ /^(ptr|i1|i8|i16|i32|i64)$/) return 0
+    if (substr(t, 1, 1) == "[") { inner = substr(t, 2, length(t) - 2); sub(/^[0-9]+ x /, "", inner); return allfp(inner) }
+    if (substr(t, 1, 1) == "{") {
+        inner = trim(substr(t, 2, length(t) - 2))
+        if (inner == "") return 0
+        n = tsplit(inner, parts)
+        for (i = 1; i <= n; i++) if (!allfp(parts[i])) return 0
+        return 1
+    }
+    return 0
+}
+
+# A one-element aggregate occupies exactly what its element does, and the three
+# emitters spell that three ways: i64, [1 x i64], { i64 }. Collapse, repeatedly.
+function collapse(t,   inner, n, parts) {
+    t = trim(t)
+    while (1) {
+        if (substr(t, 1, 1) == "{") {
+            inner = trim(substr(t, 2, length(t) - 2))
+            if (inner == "") return t
+            delete parts
+            n = tsplit(inner, parts)
+            if (n != 1) return t
+            t = trim(parts[1])
+        } else if (substr(t, 1, 1) == "[") {
+            inner = substr(t, 2, length(t) - 2)
+            if (inner !~ /^1 x /) return t
+            sub(/^1 x /, "", inner)
+            t = trim(inner)
+        } else return t
+    }
+}
+
+# A DIRECTLY passed or returned type. clang has already coerced these into
+# register-shaped types (any 16-byte aggregate becomes [2 x i64]), so the field
+# structure is NOT recoverable from the C leg and comparing it would fail on
+# spelling. Scalars keep their name; aggregates reduce to size plus float-ness.
+function canon(t,   c, s) {
+    c = collapse(t)
+    if (c ~ /^(ptr|i1|i8|i16|i32|i64|float|double|void)$/) return c
+    if (substr(c, 1, 1) == "{" || substr(c, 1, 1) == "[") {
+        s = tsize(c)
+        if (s < 0) return "UNPARSEABLE<" c ">"
+        return "agg" s (allfp(c) ? "f" : "")
+    }
+    return "UNPARSEABLE<" c ">"
+}
+
+# Named struct types, substituted into every use. An INDIRECT type is compared
+# field by field, so the substitution must be complete; a name that never
+# resolves is reported rather than silently dropped with the value names.
+function resolve(t,   pass, i, c, out, tok, changed) {
+    for (pass = 0; pass < 12; pass++) {
+        changed = 0; out = ""; i = 1
+        while (i <= length(t)) {
+            c = substr(t, i, 1)
+            if (c == "%") {
+                tok = "%"; i++
+                while (i <= length(t) && substr(t, i, 1) ~ /[A-Za-z0-9_.$]/) { tok = tok substr(t, i, 1); i++ }
+                if (tok in ty) { out = out ty[tok]; changed = 1 } else { out = out tok }
+            } else { out = out c; i++ }
+        }
+        t = out
+        if (!changed) break
+    }
+    return t
+}
+
+# Drop the words that are HINTS rather than calling convention, and the value
+# names. What survives is the type. zeroext/signext are dropped here too and
+# they are NOT hints; stage 10's header records that as a named blind spot.
+# dead_on_return, like dead_on_unwind, describes the lifetime of memory
+# reachable through a pointer; it changes neither the parameter type nor its
+# register/stack classification. clang 23 emits it for indirect aggregates.
+function bareType(s,   i, n, out, w, parts) {
+    gsub(/align +[0-9]+/, " ", s)
+    gsub(/dereferenceable(_or_null)?\([0-9]+\)/, " ", s)
+    gsub(/(captures|initializes|range|memory|alignstack)\([^)]*\)/, " ", s)
+    gsub(/#[0-9]+/, " ", s)
+    gsub(/%[A-Za-z0-9_.$]+/, " ", s)
+    gsub(/,/, " , ", s)
+    n = split(s, parts, /[ \t]+/)
+    out = ""
+    for (i = 1; i <= n; i++) {
+        w = parts[i]
+        if (w == "") continue
+        if (w ~ /^(dead_on_unwind|dead_on_return|writable|noalias|noundef|nonnull|nocapture|readonly|readnone|writeonly|inreg|returned|immarg|willreturn|nofree|nosync|nounwind|zeroext|signext|inalloca|swiftself|swifterror|disjoint|dso_local|local_unnamed_addr|internal|private|external|weak|weak_odr|linkonce|linkonce_odr|hidden|protected|available_externally|fastcc|ccc|coldcc|tailcc|swiftcc)$/) continue
+        out = out (out == "" ? "" : " ") w
+    }
+    return out
+}
+
+# An unresolved NAMED type would be deleted by bareType along with the value
+# names, and two different opaque structs would then compare equal. Refuse.
+function unresolved(s) { return (s ~ /%(struct|union|class)\.|%cell_/) }
+
+/^%[A-Za-z0-9_.$]+ = type / {
+    body = $0; sub(/^[^=]*= type /, "", body)
+    ty[$1] = trim(body)
+    next
+}
+
+/^(declare|define)[^@]*@cell_[A-Za-z0-9_]*[ ]*\(/ {
+    line = $0
+    at = index(line, "@cell_")
+    head = substr(line, 1, at - 1)
+    rest = substr(line, at + 1)
+    fname = rest; sub(/[ (].*$/, "", fname)
+
+    # The balanced argument list, so `sret({ ptr, i64, i64 })` survives whole.
+    depth = 0; args = ""; started = 0
+    for (i = index(rest, "("); i <= length(rest); i++) {
+        ch = substr(rest, i, 1)
+        if (ch == "(") { depth++; if (depth == 1) { started = 1; continue } }
+        else if (ch == ")") { depth--; if (depth == 0) break }
+        if (started) args = args ch
+    }
+
+    sub(/^(declare|define) */, "", head)
+    rt = resolve(head)
+    if (unresolved(rt)) { print fname "\tUNRESOLVED-RETURN-TYPE"; next }
+    sig = bareType(rt)
+    sig = (sig == "" ? "void" : canon(sig))
+
+    ra = resolve(args)
+    delete ps
+    np = tsplit(ra, ps)
+    for (i = 1; i <= np; i++) {
+        p = ps[i]
+        if (match(p, /sret\(/) || match(p, /byval\(/)) {
+            kind = (match(p, /sret\(/) ? "sret" : "byval")
+            match(p, /(sret|byval)\(/)
+            st = substr(p, RSTART + RLENGTH); d = 1; inner = ""
+            for (j = 1; j <= length(st); j++) {
+                ch = substr(st, j, 1)
+                if (ch == "(") d++
+                else if (ch == ")") { d--; if (d == 0) break }
+                inner = inner ch
+            }
+            if (unresolved(inner)) { sig = sig "|" kind ":UNRESOLVED"; continue }
+            gsub(/[ \t]/, "", inner)
+            sig = sig "|" kind ":" inner
+        } else if (unresolved(p)) {
+            sig = sig "|UNRESOLVED-PARAM-TYPE"
+        } else {
+            sig = sig "|" canon(bareType(p))
+        }
+    }
+    print fname "\t" sig
+}
+SIG_AWK_END
+}
+
+sig_pinned() { printf '%s\n' "$SIG_DISCLOSED" | grep -qx "$1"; }
+
+# One (function, leg) verdict. Three outcomes, and the third is the one that
+# keeps the pin list honest: a pin that stops disagreeing FAILS.
+sig_verdict() {
+    _key=$1; _fn=$2; _leg=$3; _c=$4; _b=$5
+    _pin="$_key:$_fn:$_leg"
+    if [ "$_c" = "$_b" ]; then
+        if sig_pinned "$_pin"; then
+            fail "signatures $_pin AGREES now: the disclosed gap is CLOSED. Delete the pin from SIG_DISCLOSED and cite the commit that closed it."
+        fi
+        : > "$TMP/sighit_$(printf '%s' "$_pin" | tr '/:' '__')"
+        return
+    fi
+    sig_disagree=$((sig_disagree + 1))
+    : > "$TMP/sighit_$(printf '%s' "$_pin" | tr '/:' '__')"
+    if sig_pinned "$_pin"; then
+        pass "signatures $_key $_fn: $_leg disagrees with C (DISCLOSED, pinned in SIG_DISCLOSED)"
+        printf '        C    %s\n        %-4s %s\n' "$_c" "$_leg" "$_b"
+    else
+        sig_undisclosed=$((sig_undisclosed + 1))
+        fail "signatures $_key $_fn: $_leg declares a DIFFERENT calling convention from C"
+        printf '        C    %s\n        %-4s %s\n' "$_c" "$_leg" "$_b"
+    fi
+}
+
+# join(1) needs both sides sorted in the SAME collation as its own comparison.
+# LC_ALL=C on both sides rather than trusting the ambient locale.
+sig_join() {
+    _key=$1; _leg=$2; _cs=$3; _bs=$4
+    LC_ALL=C join -t"$SIGTAB" "$_cs" "$_bs" > "$TMP/sig_join.txt"
+    # Redirected from a FILE, not a pipe: a `while read` in a pipeline runs in
+    # a subshell and every fails++ inside it would be discarded on exit.
+    while IFS="$SIGTAB" read -r _fn _a _b; do
+        [ -n "$_fn" ] || continue
+        sig_compared=$((sig_compared + 1))
+        case "$_a$_b" in
+            *UNPARSEABLE*|*UNRESOLVED*)
+                fail "signatures $_key $_fn: this stage could not parse a type it must compare exactly (C='$_a' $_leg='$_b'); teach tsize/talign the type rather than letting it compare equal"
+                continue ;;
+        esac
+        sig_verdict "$_key" "$_fn" "$_leg" "$_a" "$_b"
+    done < "$TMP/sig_join.txt"
+}
+
+
+# The public control uses the same generated object/runtime/link options as
+# the private probe. Host compile errors and unrelated linker failures cannot
+# count as a successful privacy test.
+module_private_link_verdict() {
+    _module_object=$1; _public_host=$2; _private_host=$3; _leg=$4
+    if ! cc "$_module_object" "$_public_host" "$TMP/rt.o" -o "$TMP/module_public_$_leg" > "$TMP/module_public_$_leg.log" 2>&1; then
+        fail "$_leg module public linkage control failed"
+        return
+    fi
+    if ! "$TMP/module_public_$_leg"; then
+        fail "$_leg module public linkage control computed the wrong answer"
+        return
+    fi
+    pass "$_leg public cell_geo_area links and returns 42"
+    if cc "$_module_object" "$_private_host" "$TMP/rt.o" -o "$TMP/module_private_$_leg" > "$TMP/module_private_$_leg.log" 2>&1; then
+        fail "$_leg private cell_geo_twice is externally linkable"
+    elif grep -Eq "(Undefined symbols|undefined reference|undefined symbol)" "$TMP/module_private_$_leg.log" \
+        && grep -q 'cell_geo_twice' "$TMP/module_private_$_leg.log"; then
+        pass "$_leg private cell_geo_twice refuses external linkage"
+    else
+        fail "$_leg private-link probe failed for a reason other than undefined cell_geo_twice"
+    fi
+}
+
 if [ "${CELL_GATE_LIBRARY_ONLY:-0}" = 1 ]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -816,7 +1181,7 @@ fi
 printf '\n== corpus ==\n'
 corpus_before=$fails
 
-for f in examples/*.cell; do
+for f in examples/*.cell examples/modules/*.cell; do
     if ! $CELL check "$f" > /dev/null 2>&1; then
         fail "$f must pass check"
     fi
@@ -1036,14 +1401,57 @@ run_mlir() {
     [ "$got" = "$want" ] && pass "MLIR $ex -> $got" || fail "MLIR $ex -> $got, want $want"
 }
 
+mkdir -p "$TMP/modules"
+
 # hello uses a struct; backends is scalar-only and is the cross-backend
 # agreement case; loops covers while/break/continue.
-for pair in "hello 42" "backends 24" "loops 55" "loop 21" "labels 227"; do
+for pair in "hello 42" "backends 24" "loops 55" "loop 21" "labels 227" "string_unicode 1414" "modules/main 43"; do
     set -- $pair
     run_c "$1" "$2"
     run_llvm "$1" "$2"
     run_mlir "$1" "$2"
 done
+
+# Linkage is measured by an independent C host, not inferred from emitted
+# text. No Cell main is emitted, leaving the host as the sole entry point.
+printf 'use geo\npub fn probe() -> Int { return geo.area(geo.Point { x: 21 }) }\n' > "$TMP/module_link.cell"
+module_hosts=yes
+for visibility in public private; do
+    if ! cc -std=c11 -Wall -Wextra -Werror -c "examples/modules/${visibility}_link_host.c" -o "$TMP/module_${visibility}_host.o" > "$TMP/module_${visibility}_host.log" 2>&1; then
+        fail "module $visibility linkage host did not compile"
+        module_hosts=no
+    fi
+done
+if [ "$module_hosts" = yes ]; then
+    if "$CELL" emit --module-root examples/modules "$TMP/module_link.cell" > "$TMP/module_link.c" 2> "$TMP/module_link_c.err" \
+        && cc -std=c11 -Wall -Wextra -Werror -I runtime -c "$TMP/module_link.c" -o "$TMP/module_link_c.o" > "$TMP/module_link_c.log" 2>&1; then
+        module_private_link_verdict "$TMP/module_link_c.o" "$TMP/module_public_host.o" "$TMP/module_private_host.o" C
+    else
+        fail "C module linkage object did not emit/compile"
+    fi
+    if "$CELL" emit --target=llvm --module-root examples/modules "$TMP/module_link.cell" > "$TMP/module_link.ll" 2> "$TMP/module_link_llvm.err" \
+        && cc -Wno-override-module -x ir -c "$TMP/module_link.ll" -o "$TMP/module_link_l.o" > "$TMP/module_link_l.log" 2>&1; then
+        module_private_link_verdict "$TMP/module_link_l.o" "$TMP/module_public_host.o" "$TMP/module_private_host.o" LLVM
+    else
+        fail "LLVM module linkage object did not emit/compile"
+    fi
+    if [ -x "$LLVM_BIN/mlir-opt" ] && [ -x "$LLVM_BIN/mlir-translate" ] && [ -x "$LLVM_BIN/llc" ]; then
+        if "$CELL" emit --target=mlir --module-root examples/modules "$TMP/module_link.cell" > "$TMP/module_link.mlir" 2> "$TMP/module_link_mlir.err"; then
+            pipeline=$(mlir_pipeline "$TMP/module_link.mlir")
+            if [ -n "$pipeline" ] \
+                && mlir_to_llvm "$TMP/module_link.mlir" "$pipeline" "$TMP/module_link_low.mlir" "$TMP/module_link_m.ll" "$TMP/module_link_m" \
+                && "$LLVM_BIN/llc" -filetype=obj "$TMP/module_link_m.ll" -o "$TMP/module_link_m.o" > "$TMP/module_link_m.log" 2>&1; then
+                module_private_link_verdict "$TMP/module_link_m.o" "$TMP/module_public_host.o" "$TMP/module_private_host.o" MLIR
+            else
+                fail "MLIR module linkage object did not lower/translate/compile"
+            fi
+        else
+            fail "MLIR module linkage object did not emit"
+        fi
+    else
+        skip "MLIR module linkage (backend tools unavailable)"
+    fi
+fi
 
 # arc is C only: the LLVM and MLIR backends refuse `arc` outright, which the
 # agreement section above already checks. 13 is a refcount measurement, not
@@ -1376,6 +1784,8 @@ fi
 # of PINNED programs is reported below and zero is a FAILURE, for the same
 # reason zero printing programs is: a stage that compared only unpinned
 # programs has proved agreement and not correctness.
+# `// EXPECT-OUTPUT-ESCAPED:` is the explicit multiline form, with only \n
+# supported and malformed or conflicting declarations failing the stage.
 #
 # THIS STAGE STILL ONLY SEES THE SHAPES THE CORPUS CONTAINS, and that is not a
 # limitation to be engineered away, it is a standing obligation on whoever
@@ -1415,8 +1825,8 @@ else
     answers_mlir=yes
 fi
 
-for f in examples/*.cell; do
-    n=$(basename "$f" .cell)
+for f in examples/*.cell examples/modules/*.cell; do
+    n=$(printf '%s' "${f#examples/}" | sed 's|/|_|g; s|\.cell$||')
 
     # Only a `main` WITH A BODY produces a program. The rest of the corpus
     # emits no C `main`, so its link stops at `_main`, and that is by design
@@ -1432,11 +1842,11 @@ for f in examples/*.cell; do
     # LLVM/MLIR build failure that is really a missing include path. Measured,
     # not imagined: that is exactly what the first run of this stage reported.
     host=""
-    if [ -f "examples/${n}_host.c" ]; then
-        if cc -c -I runtime "examples/${n}_host.c" -o "$TMP/ans_${n}_host.o" 2>"$TMP/ans_${n}_host.log"; then
+    if [ -f "${f%.cell}_host.c" ]; then
+        if cc -c -I runtime "${f%.cell}_host.c" -o "$TMP/ans_${n}_host.o" 2>"$TMP/ans_${n}_host.log"; then
             host="$TMP/ans_${n}_host.o"
         else
-            fail "answers $n: examples/${n}_host.c does not compile"
+            fail "answers $n: ${f%.cell}_host.c does not compile"
             sed -n '1,4p' "$TMP/ans_${n}_host.log"
             continue
         fi
@@ -1445,7 +1855,10 @@ for f in examples/*.cell; do
     # The example's own declared answer, when it states one. Absent is allowed:
     # cross-backend agreement is still checked, and most of this corpus
     # predates the convention.
-    want=$(sed -n 's|^// EXPECT-OUTPUT: ||p' "$f" | head -1)
+    if ! read_output_expectation "$f"; then
+        fail "answers $n: malformed output expectation"
+        continue
+    fi
 
     ran=""
     out_c=""; st_c=""
@@ -1525,7 +1938,7 @@ for f in examples/*.cell; do
     # The declared answer, when the example states one. Backends that are all
     # wrong in the same way still agree with each other, and this is the only
     # check in the stage that can tell that case apart.
-    if [ -n "$want" ]; then
+    if [ "$EXPECT_OUTPUT_KIND" != none ]; then
         answers_pinned=$((answers_pinned + 1))
         for b in $ran; do
             case $b in
@@ -1533,8 +1946,7 @@ for f in examples/*.cell; do
                 LLVM) this_out=$out_l ;;
                 MLIR) this_out=$out_m ;;
             esac
-            [ "$this_out" = "$want" ] || \
-                fail "answers $n: $b printed '$this_out', the file declares EXPECT-OUTPUT '$want'"
+            check_expected_output "$n" "$b" "$this_out"
         done
     fi
 
@@ -1622,16 +2034,16 @@ printf 'int main(void){return 0;}\n' > "$TMP/asan_probe.c"
 if ! cc -fsanitize=address "$TMP/asan_probe.c" -o "$TMP/asan_probe" 2>/dev/null; then
     skip "sanitized execution of every runnable example (cc -fsanitize=address does not link here)"
 else
-    for f in examples/*.cell; do
-        n=$(basename "$f" .cell)
+    for f in examples/*.cell examples/modules/*.cell; do
+        n=$(printf '%s' "${f#examples/}" | sed 's|/|_|g; s|\.cell$||')
         grep -q '^pub fn main() *{' "$f" || continue
 
         # An emit refusal is stage 4's subject, not this one.
         $CELL emit "$f" > "$TMP/san_$n.c" 2>/dev/null || continue
 
         host=""
-        if [ -f "examples/${n}_host.c" ]; then
-            host="examples/${n}_host.c"
+        if [ -f "${f%.cell}_host.c" ]; then
+            host="${f%.cell}_host.c"
         fi
 
         # -Werror on purpose, and the log is printed rather than discarded.
@@ -1802,7 +2214,7 @@ fi
 #     with C here perfectly. That is a real hole in this stage and it is named
 #     rather than papered over; ownership of the pointee is abi.zig's subject
 #     and its own tests', not this comparison's.
-#   * hint attributes (noalias, noundef, dead_on_unwind, writable, align, ...),
+#   * hint attributes (noalias, noundef, dead_on_unwind, dead_on_return, writable, align, ...),
 #     parameter names, and linkage. None of those are calling convention.
 #   * functions that are not present in BOTH IRs. clang drops a declaration
 #     nothing references, and the IR backends declare only what they use, so
@@ -1839,282 +2251,8 @@ sig_examples=0
 sig_conly=0
 SIGTAB=$(printf '\t')
 
-cat > "$TMP/sig.awk" <<'SIG_AWK_END'
-# Reduce every `@cell_*` declaration in an LLVM IR file to an ABI-shaped
-# signature: "name<TAB>ret|p0|p1|...". Stage 10's header says what the shape
-# deliberately keeps and deliberately throws away, and why each.
-function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+write_signature_canonicalizer "$TMP/sig.awk"
 
-# Split s on TOP-LEVEL commas into arr[1..n]. Depth-aware, so a comma inside
-# `{ ptr, i64 }` or `sret({ ... })` never splits a parameter in half.
-function tsplit(s, arr,   i, d, cur, n, c) {
-    n = 0; d = 0; cur = ""
-    for (i = 1; i <= length(s); i++) {
-        c = substr(s, i, 1)
-        if (c == "{" || c == "[" || c == "(" || c == "<") d++
-        else if (c == "}" || c == "]" || c == ")" || c == ">") d--
-        if (c == "," && d == 0) { n++; arr[n] = trim(cur); cur = "" }
-        else cur = cur c
-    }
-    if (trim(cur) != "") { n++; arr[n] = trim(cur) }
-    return n
-}
-
-# Size and alignment, AArch64/Darwin. Anything not listed returns -1 and the
-# caller reports UNPARSEABLE rather than guessing a layout: a wrong size here
-# would make two different ABIs compare equal, which is the one outcome this
-# stage exists to prevent.
-function talign(t,   inner, n, i, a, mx, parts) {
-    t = trim(t)
-    if (t == "ptr" || t == "i64" || t == "double") return 8
-    if (t == "i32" || t == "float") return 4
-    if (t == "i16") return 2
-    if (t == "i8" || t == "i1") return 1
-    if (substr(t, 1, 1) == "[") {
-        inner = substr(t, 2, length(t) - 2)
-        if (inner !~ /^[0-9]+ x /) return -1
-        sub(/^[0-9]+ x /, "", inner)
-        return talign(inner)
-    }
-    if (substr(t, 1, 1) == "{") {
-        inner = trim(substr(t, 2, length(t) - 2))
-        if (inner == "") return 1
-        n = tsplit(inner, parts); mx = 1
-        for (i = 1; i <= n; i++) { a = talign(parts[i]); if (a < 0) return -1; if (a > mx) mx = a }
-        return mx
-    }
-    return -1
-}
-
-function tsize(t,   inner, cnt, n, i, off, a, s, mx, parts) {
-    t = trim(t)
-    if (t == "ptr" || t == "i64" || t == "double") return 8
-    if (t == "i32" || t == "float") return 4
-    if (t == "i16") return 2
-    if (t == "i8" || t == "i1") return 1
-    if (substr(t, 1, 1) == "[") {
-        inner = substr(t, 2, length(t) - 2)
-        if (inner !~ /^[0-9]+ x /) return -1
-        cnt = inner; sub(/ x .*$/, "", cnt)
-        sub(/^[0-9]+ x /, "", inner)
-        s = tsize(inner); if (s < 0) return -1
-        return (cnt + 0) * s
-    }
-    if (substr(t, 1, 1) == "{") {
-        inner = trim(substr(t, 2, length(t) - 2))
-        if (inner == "") return 0
-        n = tsplit(inner, parts); off = 0; mx = 1
-        for (i = 1; i <= n; i++) {
-            a = talign(parts[i]); s = tsize(parts[i])
-            if (a < 0 || s < 0) return -1
-            if (a > mx) mx = a
-            if (off % a != 0) off += a - (off % a)
-            off += s
-        }
-        if (off % mx != 0) off += mx - (off % mx)
-        return off
-    }
-    return -1
-}
-
-# An HFA and an integer aggregate of the SAME SIZE go to different register
-# files, so `agg8` must not be able to mean both.
-function allfp(t,   inner, n, i, parts) {
-    t = trim(t)
-    if (t == "float" || t == "double") return 1
-    if (t ~ /^(ptr|i1|i8|i16|i32|i64)$/) return 0
-    if (substr(t, 1, 1) == "[") { inner = substr(t, 2, length(t) - 2); sub(/^[0-9]+ x /, "", inner); return allfp(inner) }
-    if (substr(t, 1, 1) == "{") {
-        inner = trim(substr(t, 2, length(t) - 2))
-        if (inner == "") return 0
-        n = tsplit(inner, parts)
-        for (i = 1; i <= n; i++) if (!allfp(parts[i])) return 0
-        return 1
-    }
-    return 0
-}
-
-# A one-element aggregate occupies exactly what its element does, and the three
-# emitters spell that three ways: i64, [1 x i64], { i64 }. Collapse, repeatedly.
-function collapse(t,   inner, n, parts) {
-    t = trim(t)
-    while (1) {
-        if (substr(t, 1, 1) == "{") {
-            inner = trim(substr(t, 2, length(t) - 2))
-            if (inner == "") return t
-            delete parts
-            n = tsplit(inner, parts)
-            if (n != 1) return t
-            t = trim(parts[1])
-        } else if (substr(t, 1, 1) == "[") {
-            inner = substr(t, 2, length(t) - 2)
-            if (inner !~ /^1 x /) return t
-            sub(/^1 x /, "", inner)
-            t = trim(inner)
-        } else return t
-    }
-}
-
-# A DIRECTLY passed or returned type. clang has already coerced these into
-# register-shaped types (any 16-byte aggregate becomes [2 x i64]), so the field
-# structure is NOT recoverable from the C leg and comparing it would fail on
-# spelling. Scalars keep their name; aggregates reduce to size plus float-ness.
-function canon(t,   c, s) {
-    c = collapse(t)
-    if (c ~ /^(ptr|i1|i8|i16|i32|i64|float|double|void)$/) return c
-    if (substr(c, 1, 1) == "{" || substr(c, 1, 1) == "[") {
-        s = tsize(c)
-        if (s < 0) return "UNPARSEABLE<" c ">"
-        return "agg" s (allfp(c) ? "f" : "")
-    }
-    return "UNPARSEABLE<" c ">"
-}
-
-# Named struct types, substituted into every use. An INDIRECT type is compared
-# field by field, so the substitution must be complete; a name that never
-# resolves is reported rather than silently dropped with the value names.
-function resolve(t,   pass, i, c, out, tok, changed) {
-    for (pass = 0; pass < 12; pass++) {
-        changed = 0; out = ""; i = 1
-        while (i <= length(t)) {
-            c = substr(t, i, 1)
-            if (c == "%") {
-                tok = "%"; i++
-                while (i <= length(t) && substr(t, i, 1) ~ /[A-Za-z0-9_.$]/) { tok = tok substr(t, i, 1); i++ }
-                if (tok in ty) { out = out ty[tok]; changed = 1 } else { out = out tok }
-            } else { out = out c; i++ }
-        }
-        t = out
-        if (!changed) break
-    }
-    return t
-}
-
-# Drop the words that are HINTS rather than calling convention, and the value
-# names. What survives is the type. zeroext/signext are dropped here too and
-# they are NOT hints; stage 10's header records that as a named blind spot.
-function bareType(s,   i, n, out, w, parts) {
-    gsub(/align +[0-9]+/, " ", s)
-    gsub(/dereferenceable(_or_null)?\([0-9]+\)/, " ", s)
-    gsub(/(captures|initializes|range|memory|alignstack)\([^)]*\)/, " ", s)
-    gsub(/#[0-9]+/, " ", s)
-    gsub(/%[A-Za-z0-9_.$]+/, " ", s)
-    gsub(/,/, " , ", s)
-    n = split(s, parts, /[ \t]+/)
-    out = ""
-    for (i = 1; i <= n; i++) {
-        w = parts[i]
-        if (w == "") continue
-        if (w ~ /^(dead_on_unwind|writable|noalias|noundef|nonnull|nocapture|readonly|readnone|writeonly|inreg|returned|immarg|willreturn|nofree|nosync|nounwind|zeroext|signext|inalloca|swiftself|swifterror|disjoint|dso_local|local_unnamed_addr|internal|private|external|weak|weak_odr|linkonce|linkonce_odr|hidden|protected|available_externally|fastcc|ccc|coldcc|tailcc|swiftcc)$/) continue
-        out = out (out == "" ? "" : " ") w
-    }
-    return out
-}
-
-# An unresolved NAMED type would be deleted by bareType along with the value
-# names, and two different opaque structs would then compare equal. Refuse.
-function unresolved(s) { return (s ~ /%(struct|union|class)\.|%cell_/) }
-
-/^%[A-Za-z0-9_.$]+ = type / {
-    body = $0; sub(/^[^=]*= type /, "", body)
-    ty[$1] = trim(body)
-    next
-}
-
-/^(declare|define)[^@]*@cell_[A-Za-z0-9_]*[ ]*\(/ {
-    line = $0
-    at = index(line, "@cell_")
-    head = substr(line, 1, at - 1)
-    rest = substr(line, at + 1)
-    fname = rest; sub(/[ (].*$/, "", fname)
-
-    # The balanced argument list, so `sret({ ptr, i64, i64 })` survives whole.
-    depth = 0; args = ""; started = 0
-    for (i = index(rest, "("); i <= length(rest); i++) {
-        ch = substr(rest, i, 1)
-        if (ch == "(") { depth++; if (depth == 1) { started = 1; continue } }
-        else if (ch == ")") { depth--; if (depth == 0) break }
-        if (started) args = args ch
-    }
-
-    sub(/^(declare|define) */, "", head)
-    rt = resolve(head)
-    if (unresolved(rt)) { print fname "\tUNRESOLVED-RETURN-TYPE"; next }
-    sig = bareType(rt)
-    sig = (sig == "" ? "void" : canon(sig))
-
-    ra = resolve(args)
-    delete ps
-    np = tsplit(ra, ps)
-    for (i = 1; i <= np; i++) {
-        p = ps[i]
-        if (match(p, /sret\(/) || match(p, /byval\(/)) {
-            kind = (match(p, /sret\(/) ? "sret" : "byval")
-            match(p, /(sret|byval)\(/)
-            st = substr(p, RSTART + RLENGTH); d = 1; inner = ""
-            for (j = 1; j <= length(st); j++) {
-                ch = substr(st, j, 1)
-                if (ch == "(") d++
-                else if (ch == ")") { d--; if (d == 0) break }
-                inner = inner ch
-            }
-            if (unresolved(inner)) { sig = sig "|" kind ":UNRESOLVED"; continue }
-            gsub(/[ \t]/, "", inner)
-            sig = sig "|" kind ":" inner
-        } else if (unresolved(p)) {
-            sig = sig "|UNRESOLVED-PARAM-TYPE"
-        } else {
-            sig = sig "|" canon(bareType(p))
-        }
-    }
-    print fname "\t" sig
-}
-SIG_AWK_END
-
-sig_pinned() { printf '%s\n' "$SIG_DISCLOSED" | grep -qx "$1"; }
-
-# One (function, leg) verdict. Three outcomes, and the third is the one that
-# keeps the pin list honest: a pin that stops disagreeing FAILS.
-sig_verdict() {
-    _key=$1; _fn=$2; _leg=$3; _c=$4; _b=$5
-    _pin="$_key:$_fn:$_leg"
-    if [ "$_c" = "$_b" ]; then
-        if sig_pinned "$_pin"; then
-            fail "signatures $_pin AGREES now: the disclosed gap is CLOSED. Delete the pin from SIG_DISCLOSED and cite the commit that closed it."
-        fi
-        : > "$TMP/sighit_$(printf '%s' "$_pin" | tr '/:' '__')"
-        return
-    fi
-    sig_disagree=$((sig_disagree + 1))
-    : > "$TMP/sighit_$(printf '%s' "$_pin" | tr '/:' '__')"
-    if sig_pinned "$_pin"; then
-        pass "signatures $_key $_fn: $_leg disagrees with C (DISCLOSED, pinned in SIG_DISCLOSED)"
-        printf '        C    %s\n        %-4s %s\n' "$_c" "$_leg" "$_b"
-    else
-        sig_undisclosed=$((sig_undisclosed + 1))
-        fail "signatures $_key $_fn: $_leg declares a DIFFERENT calling convention from C"
-        printf '        C    %s\n        %-4s %s\n' "$_c" "$_leg" "$_b"
-    fi
-}
-
-# join(1) needs both sides sorted in the SAME collation as its own comparison.
-# LC_ALL=C on both sides rather than trusting the ambient locale.
-sig_join() {
-    _key=$1; _leg=$2; _cs=$3; _bs=$4
-    LC_ALL=C join -t"$SIGTAB" "$_cs" "$_bs" > "$TMP/sig_join.txt"
-    # Redirected from a FILE, not a pipe: a `while read` in a pipeline runs in
-    # a subshell and every fails++ inside it would be discarded on exit.
-    while IFS="$SIGTAB" read -r _fn _a _b; do
-        [ -n "$_fn" ] || continue
-        sig_compared=$((sig_compared + 1))
-        case "$_a$_b" in
-            *UNPARSEABLE*|*UNRESOLVED*)
-                fail "signatures $_key $_fn: this stage could not parse a type it must compare exactly (C='$_a' $_leg='$_b'); teach tsize/talign the type rather than letting it compare equal"
-                continue ;;
-        esac
-        sig_verdict "$_key" "$_fn" "$_leg" "$_a" "$_b"
-    done < "$TMP/sig_join.txt"
-}
 
 printf 'int cell__sig_probe_fn(void){return 0;}\n' > "$TMP/sig_probe.c"
 if ! cc -std=c11 -S -emit-llvm -o "$TMP/sig_probe.ll" "$TMP/sig_probe.c" 2>/dev/null; then
@@ -2127,7 +2265,7 @@ else
         sig_mlir=yes
     fi
 
-    for f in examples/*.cell examples/pairing/*.cell examples/signatures/*.cell; do
+    for f in examples/*.cell examples/pairing/*.cell examples/signatures/*.cell examples/modules/*.cell; do
         # An unmatched glob stays literal in sh rather than vanishing, and a
         # literal path is not a file.
         [ -f "$f" ] || continue
@@ -2296,6 +2434,14 @@ for pair in hello:42 backends:24 loops:55 prelude:123; do
         fail "cell run $ex -> '$got' (exit $rc), want $want; stderr: $(head -3 "$TMP/run_$ex.err" | tr '\n' ' ')"
     fi
 done
+# Dependencies remain in the repo while the entry lives in scratch: this
+# succeeds only when --module-root is actually forwarded into graph loading.
+cp examples/modules/main.cell "$TMP/module_root_main.cell"
+got=$("$CELL" run --module-root examples/modules "$TMP/module_root_main.cell" 2> "$TMP/run_module_root.err"); rc=$?
+[ "$rc" -eq 0 ] && [ "$got" = 43 ] \
+    && pass "cell run with explicit module root -> 43" \
+    || fail "cell run --module-root -> '$got' (exit $rc), want 43; stderr: $(head -3 "$TMP/run_module_root.err" | tr '\n' ' ')"
+
 # The two host-linked answers stage 6 pins through run_c_host: 13 is a
 # refcount measurement only a C host can take, 44 exercises owned String at
 # the boundary. A .c positional is handed to cc as given.

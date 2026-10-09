@@ -336,7 +336,6 @@ pub const LoopJump = struct {
     cont_used: bool = false,
 };
 
-
 pub const Exit = struct {
     kind: borrowck.ExitKind,
     key: usize,
@@ -607,5 +606,25 @@ pub fn targetReads(e: *const ast.Expr, name: []const u8) bool {
         .ident => false,
         .annotated => |a| targetReads(a.value, name),
         else => exprUses(e, name),
+    };
+}
+
+/// Exact scalar storage width; C's integer promotions do not define Cell widths.
+pub fn integerInfo(ty: CType) ?struct { bits: u7, signed: bool } {
+    if (ty.pointer or (ty.shape != .integer and ty.shape != .byte)) return null;
+    inline for (.{ 8, 16, 32, 64 }) |bits| {
+        if (eq(ty.text, std.fmt.comptimePrint("int{d}_t", .{bits}))) return .{ .bits = bits, .signed = true };
+        if (eq(ty.text, std.fmt.comptimePrint("uint{d}_t", .{bits}))) return .{ .bits = bits, .signed = false };
+    }
+    return null;
+}
+
+/// Only literal syntax receives peer integer width; typed operands retain theirs.
+pub fn integerLiteral(e: *const ast.Expr) bool {
+    const inner = unwrapAnnotated(e);
+    return switch (inner.kind) {
+        .int => true,
+        .unary => |u| u.op == .neg and unwrapAnnotated(u.operand).kind == .int,
+        else => false,
     };
 }

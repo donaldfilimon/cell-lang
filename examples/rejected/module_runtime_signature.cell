@@ -1,0 +1,4 @@
+// EXPECT: currently-rejected
+// Runtime declarations must use the runtime's actual ABI.
+pub fn print_int(copy value: Float);
+pub fn main() { print_int(1.5) }

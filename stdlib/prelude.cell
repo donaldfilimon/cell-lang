@@ -5,13 +5,16 @@
 // C prototype and no definition, and the symbol comes from runtime/cell_rt.c
 // at link time. Gate stage 13 keeps every emitted prototype in cell_rt.h.
 //
-// STATUS. Everything in this file parses and passes `cell check`. Verified
-// against commit 9fb12af:
-//     ./zig-out/bin/cell check stdlib/prelude.cell
-//     ./zig-out/bin/cell emit  stdlib/prelude.cell
-// Nothing here is imported automatically. There is no module resolution in the
-// compiler (SPEC section 8.4), so `use std.prelude` binds no names. This file
-// is a specification of the intended surface, checked by the parser.
+// STATUS. The CLI embeds this module for `use std.prelude`; direct exports
+// are called through `prelude`, for example `prelude.print_int(copy 42)`.
+// Filesystem modules cannot shadow the embedded std root. No automatic import
+// occurs. Other std modules are not yet provided by the embedded table.
+//
+// The module's signatures are checked before program composition. Unused
+// imported bodyless declarations are omitted from composed output, while
+// standalone emission of this file retains every declaration for ABI checks.
+// Import support does not mean every declaration lowers on every backend;
+// existing ARC/resource restrictions remain explicit compiler refusals.
 //
 // The declarations are split into three groups on purpose:
 //   (1) declarations whose emitted C prototype MATCHES a real runtime symbol

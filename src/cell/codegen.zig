@@ -1362,3 +1362,87 @@ pub const Generator = struct {
     pub const writeSignature = cg_module.writeSignature;
     pub const writeDecl = cg_module.writeDecl;
 };
+
+test "C bitwise preserves narrow widths and checked shift evaluation" {
+    const support = @import("codegen/tests_support.zig");
+    var emitted = try support.emitSource(
+        \\pub fn print_int(copy n: Int);
+        \\fn narrow(copy n: Byte) -> Byte { return ~n }
+        \\fn peer_left(copy n: Byte) -> Byte { return ~(1 | n) }
+        \\fn peer_right(copy n: Byte) -> Byte { return ~(n | 1) }
+        \\fn peer_truth(copy n: Byte) -> Bool { return ~(1 | n) == 252 }
+        \\fn peer_negative(copy n: Int8) -> Int8 { return ~(-1 & n) }
+        \\fn left(copy n: Byte, copy k: Int) -> Byte { return n << k }
+        \\fn right(copy n: Int8, copy k: UInt32) -> Int8 { return n >> k }
+        \\fn mixed(copy a: Byte, copy b: Byte) -> Byte { return (a | b) ^ (a & b) }
+        \\fn value() -> Byte { print_int(7); return 8 }
+        \\fn count() -> Int { print_int(8); return 1 }
+        \\fn mask() -> Byte { print_int(9); return 3 }
+        \\pub fn ordered() -> Byte { return value() << count() }
+        \\pub fn ordered_bits() -> Byte { return value() | mask() }
+        \\pub fn main() {}
+    );
+    defer emitted.deinit();
+    // The host calls the generated functions with their exact ABI types and
+    // checks dynamic counts; this also proves promoted complement is narrowed.
+    const host =
+        \\#include "cell_rt.h"
+        \\uint8_t cell_narrow(uint8_t);
+        \\uint8_t cell_peer_left(uint8_t);
+        \\uint8_t cell_peer_right(uint8_t);
+        \\bool cell_peer_truth(uint8_t);
+        \\int8_t cell_peer_negative(int8_t);
+        \\uint8_t cell_left(uint8_t,int64_t);
+        \\int8_t cell_right(int8_t,uint32_t);
+        \\uint8_t cell_mixed(uint8_t,uint8_t);
+        \\uint8_t cell_ordered(void);
+        \\uint8_t cell_ordered_bits(void);
+        \\int main(int argc, char **argv) {
+        \\  (void)argv;
+        \\  if(argc>1) { (void)cell_left(1,argc>2 ? -1 : 8); return 99; }
+        \\  if(cell_narrow(0)!=255 || cell_narrow(255)!=0) return 1;
+        \\  if(cell_peer_left(2)!=252 || cell_peer_right(2)!=252 || cell_peer_negative(2)!=-3 || !cell_peer_truth(2)) return 6;
+        \\  if(cell_left(129,1)!=2 || cell_left(1,7)!=128) return 2;
+        \\  if(cell_right(-128,7)!=-1 || cell_right(-2,1)!=-1) return 3;
+        \\  if(cell_mixed(170,15)!=165) return 4;
+        \\  if(cell_ordered()!=16 || cell_ordered_bits()!=11) return 5;
+        \\  return 0;
+        \\}
+    ;
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Remove Cell's main so the independently compiled host owns the entry.
+    const cutoff = std.mem.indexOf(u8, emitted.text, "int main(") orelse return error.MissingEntry;
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.c", .data = emitted.text[0..cutoff] });
+    try tmp.dir.writeFile(io, .{ .sub_path = "host.c", .data = host });
+    var cwd: [4096]u8 = undefined;
+    const n = try std.process.currentPath(io, &cwd);
+    const include = try std.fmt.allocPrint(alloc, "{s}/runtime", .{cwd[0..n]});
+    defer alloc.free(include);
+    const runtime = try std.fmt.allocPrint(alloc, "{s}/runtime/cell_rt.c", .{cwd[0..n]});
+    defer alloc.free(runtime);
+    const compiled = try std.process.run(alloc, io, .{ .argv = &.{ "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "body.c", "host.c", runtime, "-I", include, "-o", "body" }, .cwd = .{ .dir = tmp.dir } });
+    defer alloc.free(compiled.stdout);
+    defer alloc.free(compiled.stderr);
+    if (!compiled.term.success()) {
+        std.debug.print("{s}\n{s}\n", .{ compiled.stderr, emitted.text });
+        return error.CcRejected;
+    }
+    const ran = try std.process.run(alloc, io, .{ .argv = &.{"./body"}, .cwd = .{ .dir = tmp.dir } });
+    defer alloc.free(ran.stdout);
+    defer alloc.free(ran.stderr);
+    try std.testing.expect(ran.term.success());
+    try std.testing.expectEqualStrings("7\n8\n7\n9\n", ran.stdout);
+    const refused = try std.process.run(alloc, io, .{ .argv = &.{ "./body", "bad-count" }, .cwd = .{ .dir = tmp.dir } });
+    defer alloc.free(refused.stdout);
+    defer alloc.free(refused.stderr);
+    try std.testing.expect(!refused.term.success());
+    try std.testing.expect(std.mem.indexOf(u8, refused.stderr, "shift") != null);
+    const negative = try std.process.run(alloc, io, .{ .argv = &.{ "./body", "bad-count", "negative" }, .cwd = .{ .dir = tmp.dir } });
+    defer alloc.free(negative.stdout);
+    defer alloc.free(negative.stderr);
+    try std.testing.expect(!negative.term.success());
+    try std.testing.expect(std.mem.indexOf(u8, negative.stderr, "shift") != null);
+}

@@ -586,6 +586,14 @@ void cell_assert_msg(bool cond, cell_str_t msg);
  *  the prototype matches `cell emit stdlib/prelude.cell` byte for byte. */
 void cell_panic(cell_str_t msg);
 
+/* Checked bit shifts. width is exactly 8, 16, 32 or 64; count < width.
+ * Invalid widths/counts panic before any shift. Inputs/results are bit
+ * patterns masked to width. Left shifts truncate; signed right shifts
+ * extend the width's sign bit without implementation-defined signed shifts. */
+uint64_t cell_bits_shl(uint64_t value, uint64_t count, uint32_t width);
+uint64_t cell_bits_shr(uint64_t value, uint64_t count, uint32_t width, bool is_signed);
+
+
 /* ------------------------------------------------------------------------ */
 /* Bridge probes. ABI frozen: src/main.zig externs both.                     */
 /* ------------------------------------------------------------------------ */

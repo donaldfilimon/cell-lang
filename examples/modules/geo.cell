@@ -1,0 +1,11 @@
+// Nominal identity and private linkage across a module boundary.
+pub struct Point { copy x: Int }
+pub enum Color { Red, Blue }
+
+fn twice(copy value: Int) -> Int {
+    return value * 2
+}
+
+pub fn area(copy point: Point) -> Int {
+    return twice(point.x)
+}

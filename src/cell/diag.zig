@@ -20,9 +20,8 @@ pub const Level = enum {
     }
 };
 
-/// One diagnostic. The module path lives on the `Bag`, not here: every
-/// diagnostic in a bag comes from the same module, so storing it per
-/// diagnostic would repeat it and let the two disagree.
+/// One diagnostic. A bag supplies the default source; span provenance keeps
+/// diagnostics attached to their original file after pairing/composition.
 pub const Diagnostic = struct {
     level: Level,
     span: Span,
@@ -30,7 +29,7 @@ pub const Diagnostic = struct {
 };
 
 pub const Bag = struct {
-    /// Module path used as the `path:line:col` prefix.
+    /// Default path used when a span has no source provenance.
     path: []const u8 = "",
     /// The module's source buffer, when the caller has it. Without it a
     /// diagnostic still renders its location and message, just no snippet.
@@ -95,14 +94,14 @@ pub const Bag = struct {
     /// The snippet is omitted when no source buffer was supplied.
     pub fn render(self: *const Bag, d: Diagnostic, writer: *Io.Writer) !void {
         try writer.print("{s}:{d}:{d}: {s}: {s}\n", .{
-            self.path,
+            d.span.path orelse self.path,
             d.span.line,
             d.span.column,
             d.level.text(),
             d.message,
         });
 
-        const source = self.source orelse return;
+        const source = d.span.source orelse self.source orelse return;
         // The byte offset is authoritative; recounting newlines from the
         // recorded line number would drift if either one were stale.
         if (d.span.start > source.len) return;
@@ -266,4 +265,20 @@ test "a caret under a tab-indented line echoes the tab" {
             "    \t^~~\n",
         out,
     );
+}
+
+test "diagnostics preserve body source provenance across module composition" {
+    var bag: Bag = .init("interface.cell", "pub fn f();\n");
+    defer bag.deinit(std.testing.allocator);
+    try bag.err(std.testing.allocator, .{
+        .start = 0,
+        .end = 3,
+        .line = 1,
+        .column = 1,
+        .path = "implementation.body",
+        .source = "bad value\n",
+    }, "invalid expression");
+    var buf: [256]u8 = undefined;
+    const out = try renderToBuf(&bag, &buf);
+    try std.testing.expectEqualStrings("implementation.body:1:1: error: invalid expression\n    bad value\n    ^~~\n", out);
 }

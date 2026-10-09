@@ -200,7 +200,7 @@ const Emitter = struct {
         );
 
         for (self.module.structs) |s| {
-            try self.out.print("%cell_{s} = type {{ ", .{s.name});
+            try self.out.print("%{s} = type {{ ", .{try self.structSymbol(s.name)});
             for (s.fields, 0..) |f, i| {
                 if (i != 0) try self.out.writeAll(", ");
                 // Per-field OWNERSHIP, matching abi.structLayout. Rendering a
@@ -275,16 +275,43 @@ const Emitter = struct {
         for (self.module.fns) |*f| {
             if (!std.mem.eql(u8, f.name, "main")) continue;
             if (f.body == null or f.param_count != 0) continue;
-            try self.out.writeAll(
-                \\define i32 @main() {
-                \\entry:
-                \\  call void @cell_main()
-                \\  ret i32 0
-                \\}
-                \\
-            );
+            try self.emitEntryPoint(f);
             break;
         }
+    }
+
+    fn emitEntryPoint(self: *Emitter, f: *const hir.Fn) EmitError!void {
+        const ret = abi.renderReturn(self.arena, self.module, f.ret) orelse {
+            try self.unsupported(f.span, "entry point return type");
+            return;
+        };
+        try self.out.writeAll("define i32 @main() {\nentry:\n");
+        if (abi.classifyReturn(self.module, f.ret) == .indirect) {
+            const natural = self.llTypeOwned(f.ret, .owned) orelse {
+                try self.unsupported(f.span, "entry point return storage");
+                return;
+            };
+            try self.out.print("  %main.result = alloca {s}\n  call void @{s}(ptr sret({s}) %main.result)\n  ret i32 0\n", .{ natural, f.symbol, natural });
+        } else switch (f.ret) {
+            .int, .uint, .int8, .int16, .int32, .uint8, .uint16, .uint32, .byte => {
+                try self.out.print("  %main.result = call {s} @{s}()\n", .{ ret, f.symbol });
+                if (std.mem.eql(u8, ret, "i32")) {
+                    try self.out.writeAll("  ret i32 %main.result\n");
+                } else {
+                    const operation: []const u8 = switch (f.ret) {
+                        .int, .uint => "trunc",
+                        .int8, .int16 => "sext",
+                        .uint8, .uint16, .byte => "zext",
+                        else => unreachable,
+                    };
+                    try self.out.print("  %main.status = {s} {s} %main.result to i32\n  ret i32 %main.status\n", .{ operation, ret });
+                }
+            },
+            // C ignores every noninteger result and reports success. The call
+            // still uses the actual return ABI, including aggregate coercions.
+            else => try self.out.print("  call {s} @{s}()\n  ret i32 0\n", .{ ret, f.symbol }),
+        }
+        try self.out.writeAll("}\n");
     }
 
     fn emitDeclare(self: *Emitter, f: *const hir.Fn) EmitError!void {
@@ -367,7 +394,7 @@ const Emitter = struct {
         self.ret_abi = ret;
         self.sret = if (uses_sret) "%sret" else null;
 
-        try self.out.print("define {s} @{s}(", .{ ret, f.symbol });
+        try self.out.print("define {s}{s} @{s}(", .{ if (f.linkage == .internal) "internal " else "", ret, f.symbol });
         if (uses_sret) {
             const natural = self.llTypeOwned(f.ret, .owned) orelse "i8";
             try self.out.print("ptr sret({s}) %sret", .{natural});
@@ -866,7 +893,7 @@ const Emitter = struct {
             addr = loaded;
         }
         for (place.path) |sel| {
-            const t = try std.fmt.allocPrint(self.arena, "%cell_{s}", .{sel.struct_name});
+            const t = try std.fmt.allocPrint(self.arena, "%{s}", .{try self.structSymbol(sel.struct_name)});
             const next = try self.nextTemp();
             try self.out.print(
                 "  {s} = getelementptr inbounds {s}, ptr {s}, i32 0, i32 {d}\n",
@@ -1065,6 +1092,7 @@ const Emitter = struct {
         const left = try self.emitExpr(left_e);
         const right = try self.emitExpr(right_e);
         if (left.isVoid() or right.isVoid()) return Value.void_value;
+        if (op == .shl or op == .shr) return self.emitCheckedShift(op, left_e, right_e, left, right);
 
         const float = isFloatType(left.ty);
         const unsigned = left_e.ty.isUnsigned();
@@ -1074,6 +1102,9 @@ const Emitter = struct {
             .sub => if (float) "fsub" else "sub nsw",
             .mul => if (float) "fmul" else "mul nsw",
             .div => if (float) "fdiv" else if (unsigned) "udiv" else "sdiv",
+            .bit_and => "and",
+            .bit_or => "or",
+            .bit_xor => "xor",
             // Ordered comparisons: an operand that is NaN compares false,
             // which is what a source-level `<` means.
             .eq => if (float) "fcmp oeq" else "icmp eq",
@@ -1082,7 +1113,7 @@ const Emitter = struct {
             .le => if (float) "fcmp ole" else if (unsigned) "icmp ule" else "icmp sle",
             .gt => if (float) "fcmp ogt" else if (unsigned) "icmp ugt" else "icmp sgt",
             .ge => if (float) "fcmp oge" else if (unsigned) "icmp uge" else "icmp sge",
-            .and_op, .or_op => unreachable,
+            .and_op, .or_op, .shl, .shr => unreachable,
         };
 
         const tmp = try self.nextTemp();
@@ -1092,6 +1123,39 @@ const Emitter = struct {
         );
         const result_ty = self.llType(e.ty) orelse left.ty;
         return .{ .text = tmp, .ty = result_ty };
+    }
+
+    fn widenShiftInteger(self: *Emitter, value: Value, signed: bool) EmitError![]const u8 {
+        if (std.mem.eql(u8, value.ty, "i64")) return value.text;
+        const wide = try self.nextTemp();
+        try self.out.print("  {s} = {s} {s} {s} to i64\n", .{ wide, if (signed) "sext" else "zext", value.ty, value.text });
+        return wide;
+    }
+
+    fn emitCheckedShift(self: *Emitter, op: ast.BinaryOp, left_e: *const hir.Expr, right_e: *const hir.Expr, left: Value, right: Value) EmitError!Value {
+        const width = hir.integerBitWidth(left_e.ty) orelse {
+            try self.unsupported(left_e.span, "noninteger shift operand");
+            return Value.void_value;
+        };
+        if (hir.integerBitWidth(right_e.ty) == null) {
+            try self.unsupported(right_e.span, "noninteger shift count");
+            return Value.void_value;
+        }
+        // The helper interprets only `width` low bits of the left operand.
+        // Negative signed counts extend to a huge unsigned value and fail the
+        // helper's bound check, rather than becoming a small positive count.
+        const bits = try self.widenShiftInteger(left, false);
+        const count = try self.widenShiftInteger(right, !right_e.ty.isUnsigned());
+        const shifted = try self.nextTemp();
+        if (op == .shl) {
+            try self.out.print("  {s} = call i64 @cell_bits_shl(i64 {s}, i64 {s}, i32 {d})\n", .{ shifted, bits, count, width });
+        } else {
+            try self.out.print("  {s} = call i64 @cell_bits_shr(i64 {s}, i64 {s}, i32 {d}, i1 zeroext {s})\n", .{ shifted, bits, count, width, if (left_e.ty.isUnsigned()) "false" else "true" });
+        }
+        if (width == 64) return .{ .text = shifted, .ty = left.ty };
+        const narrowed = try self.nextTemp();
+        try self.out.print("  {s} = trunc i64 {s} to {s}\n", .{ narrowed, shifted, left.ty });
+        return .{ .text = narrowed, .ty = left.ty };
     }
 
     /// `a and b` evaluates `b` only when `a` is true. Lowered as a branch into
@@ -1155,6 +1219,10 @@ const Emitter = struct {
             .not => {
                 try self.out.print("  {s} = xor i1 {s}, true\n", .{ tmp, operand.text });
                 return .{ .text = tmp, .ty = "i1" };
+            },
+            .bit_not => {
+                try self.out.print("  {s} = xor {s} {s}, -1\n", .{ tmp, operand.ty, operand.text });
+                return .{ .text = tmp, .ty = operand.ty };
             },
             .ref_shared, .ref_exclusive => unreachable,
         }
@@ -1233,7 +1301,7 @@ const Emitter = struct {
                 // The struct is read off the SELECTION, not re-derived from
                 // the base's type, so this indexes the same layout
                 // `placeAddress` does and cannot drift from it.
-                const owner = try std.fmt.allocPrint(self.arena, "%cell_{s}", .{f.sel.struct_name});
+                const owner = try std.fmt.allocPrint(self.arena, "%{s}", .{try self.structSymbol(f.sel.struct_name)});
                 const base = (try self.argPlaceAddress(f.base)) orelse return null;
                 const gep = try self.nextTemp();
                 try self.out.print(
@@ -1511,7 +1579,7 @@ const Emitter = struct {
         name: []const u8,
         fields: []const hir.Expr,
     ) EmitError!Value {
-        const ty = try std.fmt.allocPrint(self.arena, "%cell_{s}", .{name});
+        const ty = try std.fmt.allocPrint(self.arena, "%{s}", .{try self.structSymbol(name)});
         const decl = self.module.findStruct(name) orelse {
             try self.unsupported(e.span, try std.fmt.allocPrint(
                 self.arena,
@@ -1881,6 +1949,13 @@ const Emitter = struct {
     /// The LLVM type for a Cell type, or null when this backend cannot carry
     /// it yet. Null is always turned into a diagnostic by the caller; it is
     /// never silently replaced with a plausible type.
+    fn structSymbol(self: *Emitter, name: []const u8) std.mem.Allocator.Error![]const u8 {
+        if (self.module.findStruct(name)) |s| {
+            if (s.symbol) |symbol| return symbol;
+        }
+        return std.fmt.allocPrint(self.arena, "cell_{s}", .{name});
+    }
+
     fn llType(self: *Emitter, ty: hir.Ty) ?[]const u8 {
         return switch (ty) {
             .unit => "void",
@@ -1898,7 +1973,7 @@ const Emitter = struct {
             // callers fall back to "i64", which allocated 8 bytes for a slot
             // that then took a 16-byte store. That is the exact failure this
             // backend claims not to have: wrong output instead of a refusal.
-            .struct_type => |n| std.fmt.allocPrint(self.arena, "%cell_{s}", .{n}) catch null,
+            .struct_type => |n| std.fmt.allocPrint(self.arena, "%{s}", .{self.structSymbol(n) catch return null}) catch null,
             // A bare String in expression position is a borrowed view: that is
             // what a literal is, and what codegen emits for one. A BINDING's
             // String may be owning instead, which is why slots and parameters
@@ -2281,6 +2356,10 @@ fn runEmitted(text: []const u8) ![]const u8 {
 /// repository root (IR step (b) Q5), linked between the program and the
 /// runtime exactly as the gate's `run_llvm` links one.
 fn runEmittedHost(text: []const u8, host: ?[]const u8) ![]const u8 {
+    return runEmittedHostExit(text, host, 0);
+}
+
+fn runEmittedHostExit(text: []const u8, host: ?[]const u8, expected_exit: u8) ![]const u8 {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2329,9 +2408,18 @@ fn runEmittedHost(text: []const u8, host: ?[]const u8) ![]const u8 {
         .cwd = .{ .dir = tmp.dir },
     });
     defer gpa.free(run.stderr);
-    if (!run.term.success()) {
+    const expected = switch (run.term) {
+        .exited => |status| status == expected_exit,
+        .signal => |signal| expected_exit == 134 and signal == .ABRT,
+        else => false,
+    };
+    if (!expected) {
         gpa.free(run.stdout);
         return error.ProgramFailed;
+    }
+    if (expected_exit == 134 and std.mem.indexOf(u8, run.stderr, "integer shift: count out of range") == null) {
+        gpa.free(run.stdout);
+        return error.TestUnexpectedResult;
     }
     return run.stdout;
 }
@@ -3668,5 +3756,165 @@ test "an owned String temporary and an arc list are refused as index bases" {
         );
         defer e.deinit();
         try std.testing.expect(e.bag.hasErrors());
+    }
+}
+
+test "graph symbol metadata and internal linkage survive LLVM lowering and execution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = "pub fn print_int(copy n: Int); fn hidden() -> Int { return 7 } fn main() { print_int(hidden()) }";
+    var lex = lexer.Lexer.init(source, "graph.cell");
+    const tokens = try lex.tokenizeAll(a);
+    var p = parser.Parser.init(a, tokens.items, "graph.cell");
+    var module = try p.parseModule();
+    module.items[0].kind.fn_def.symbol = "cell_print_int";
+    module.items[0].kind.fn_def.linkage = .internal; // A declaration never gains internal linkage.
+    module.items[1].kind.fn_def.symbol = "cell_geo_hidden";
+    module.items[1].kind.fn_def.linkage = .internal;
+    module.items[2].kind.fn_def.linkage = .external;
+    var bag: diag.Bag = .init(module.path, source);
+    var lowered = try hir.lower(a, &module, &bag);
+    try std.testing.expectEqual(ast.Linkage.internal, lowered.findFn("hidden").?.linkage);
+    try std.testing.expectEqual(ast.Linkage.external, lowered.findFn("print_int").?.linkage);
+    var out: Io.Writer.Allocating = .init(a);
+    try emitModule(a, &lowered, &out.writer, &bag);
+    try std.testing.expect(!bag.hasErrors());
+    try expectContains(out.written(), "define internal i64 @cell_geo_hidden(");
+    try expectContains(out.written(), "call i64 @cell_geo_hidden(");
+    try expectContains(out.written(), "declare void @cell_print_int(");
+    const output = try runEmitted(out.written());
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("7\n", output);
+}
+
+test "LLVM main wrapper forwards signed and unsigned integer exit status" {
+    const cases = [_]struct { source: []const u8, call: []const u8, conversion: []const u8, status: u8 }{
+        .{ .source = "pub fn main() -> Int { return 37 }", .call = "call i64 @cell_main()", .conversion = "trunc i64 %main.result to i32", .status = 37 },
+        .{ .source = "pub fn main() -> Int { return -1 }", .call = "call i64 @cell_main()", .conversion = "trunc i64 %main.result to i32", .status = 255 },
+        .{ .source = "pub fn main() -> Int32 { let copy n: Int32 = 23; return n }", .call = "call i32 @cell_main()", .conversion = "ret i32 %main.result", .status = 23 },
+        .{ .source = "pub fn main() -> Int8 { let copy n: Int8 = -2; return n }", .call = "call i8 @cell_main()", .conversion = "sext i8 %main.result to i32", .status = 254 },
+        .{ .source = "pub fn main() -> UInt16 { let copy n: UInt16 = 250; return n }", .call = "call i16 @cell_main()", .conversion = "zext i16 %main.result to i32", .status = 250 },
+        .{ .source = "pub fn main() -> UInt { let copy n: UInt = 4294967297; return n }", .call = "call i64 @cell_main()", .conversion = "trunc i64 %main.result to i32", .status = 1 },
+    };
+    for (cases) |case| {
+        var e = try emitSource(case.source);
+        defer e.deinit();
+        try std.testing.expect(!e.bag.hasErrors());
+        try expectContains(e.text, case.call);
+        try expectContains(e.text, case.conversion);
+        const output = try runEmittedHostExit(e.text, null, case.status);
+        defer std.testing.allocator.free(output);
+        try std.testing.expectEqualStrings("", output);
+    }
+}
+
+test "LLVM main wrapper calls noninteger and indirect returns with their declared ABI" {
+    const cases = [_]struct { source: []const u8, call: []const u8 }{
+        .{ .source = "pub fn main() -> Bool { return true }", .call = "call i1 @cell_main()" },
+        .{ .source = "pub fn main() -> Float { return 1.5 }", .call = "call double @cell_main()" },
+        .{ .source = "pub enum Color { Red, Blue } pub fn main() -> Color { return Color.Blue }", .call = "call i32 @cell_main()" },
+        .{ .source = "pub struct Point { copy x: Int } pub fn main() -> Point { return Point { x: 29 } }", .call = "call i64 @cell_main()" },
+        .{ .source = "pub fn main() -> String { return \"ok\" }", .call = "call void @cell_main(ptr sret(%cell_string) %main.result)" },
+    };
+    for (cases) |case| {
+        var e = try emitSource(case.source);
+        defer e.deinit();
+        try std.testing.expect(!e.bag.hasErrors());
+        try expectContains(e.text, case.call);
+        try expectContains(e.text, "ret i32 0");
+        const output = try runEmittedHostExit(e.text, null, 0);
+        defer std.testing.allocator.free(output);
+        try std.testing.expectEqualStrings("", output);
+    }
+}
+
+test "LLVM integer bitwise and checked shifts execute every width and evaluate once" {
+    var e = try emitSource(
+        \\pub fn assert(copy value: Bool);
+        \\pub fn println(shared value: String);
+        \\pub fn count() -> Int { println("once") return 1 }
+        \\pub fn main() {
+        \\    let copy a: Int8 = -2
+        \\    let copy b: UInt8 = 255
+        \\    let copy c: Int16 = -2
+        \\    let copy d: UInt16 = 65535
+        \\    let copy e: Int32 = -2
+        \\    let copy f: UInt32 = 4294967295
+        \\    let copy g: Int = -2
+        \\    let copy zero: UInt = 0
+        \\    let copy h: UInt = ~zero
+        \\    let copy byte: Byte = 255
+        \\    let copy a_expected: Int8 = -1
+        \\    assert((a >> 1) == a_expected)
+        \\    let copy expect0: UInt8 = 127
+        \\    assert((b >> 1) == expect0)
+        \\    let copy c_expected: Int16 = -1
+        \\    assert((c >> 1) == c_expected)
+        \\    let copy expect1: UInt16 = 32767
+        \\    assert((d >> 1) == expect1)
+        \\    let copy e_expected: Int32 = -1
+        \\    assert((e >> 1) == e_expected)
+        \\    let copy expect2: UInt32 = 2147483647
+        \\    assert((f >> 1) == expect2)
+        \\    assert((g >> 1) == -1)
+        \\    let copy expect3: UInt = 9223372036854775807
+        \\    assert((h >> 1) == expect3)
+        \\    let copy expect4: Byte = 1
+        \\    assert((byte >> 7) == expect4)
+        \\    let copy expect5: UInt8 = 254
+        \\    assert((b << 1) == expect5)
+        \\    let copy expect6: UInt16 = 65534
+        \\    assert((d << 1) == expect6)
+        \\    let copy expect7: UInt32 = 4294967294
+        \\    assert((f << 1) == expect7)
+        \\    assert((h << 1) == (h ^ 1))
+        \\    let copy expect8: Int8 = 0
+        \\    assert((a << 7) == expect8)
+        \\    let copy expect9: Int16 = 0
+        \\    assert((c << 15) == expect9)
+        \\    let copy expect10: Int32 = 0
+        \\    assert((e << 31) == expect10)
+        \\    let copy expect11: Int = 0
+        \\    assert((g << 63) == expect11)
+        \\    let copy complement_a: Int8 = 1
+        \\    assert((~a) == complement_a)
+        \\    let copy complement_b: UInt8 = 0
+        \\    assert((~b) == complement_b)
+        \\    assert((b & b) == b)
+        \\    assert((b | b) == b)
+        \\    let copy expect12: UInt8 = 0
+        \\    assert((b ^ b) == expect12)
+        \\    let copy shifted: UInt8 = b << count()
+        \\    let copy expect13: UInt8 = 254
+        \\    assert(shifted == expect13)
+        \\}
+    );
+    defer e.deinit();
+    for (e.bag.list.items) |d| std.debug.print("diag line {d}: {s}\n", .{ d.span.start, d.message });
+    try std.testing.expect(!e.bag.hasErrors());
+    const output = try runEmitted(e.text);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("once\n", output);
+}
+
+test "LLVM integer bitwise shifts reject dynamic negative and oversized counts" {
+    const cases = [_][]const u8{
+        \\pub fn main() { let copy value: UInt8 = 255 let copy count: Int8 = -1 let copy result = value << count }
+        ,
+        \\pub fn main() { let copy value: Int16 = -2 let copy count: UInt16 = 16 let copy result = value >> count }
+        ,
+        \\pub fn main() { let copy value: UInt = 1 let copy count: UInt = 64 let copy result = value << count }
+        ,
+        \\pub fn main() { let copy value: Int = -2 let copy count: Int = -1 let copy result = value >> count }
+        ,
+    };
+    for (cases) |source| {
+        var e = try emitSource(source);
+        defer e.deinit();
+        try std.testing.expect(!e.bag.hasErrors());
+        const output = try runEmittedHostExit(e.text, null, 134);
+        defer std.testing.allocator.free(output);
+        try std.testing.expectEqualStrings("", output);
     }
 }

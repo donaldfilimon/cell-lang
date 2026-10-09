@@ -119,16 +119,16 @@ pub fn namedType(self: *Generator, n: []const u8) Alloc!CType {
     if (eq(n, "String")) return CType.string;
     if (eq(n, "Unit")) return CType.void_type;
 
-    if (self.findStruct(n) != null) {
+    if (self.findStruct(n)) |def| {
         return .{
-            .text = try std.fmt.allocPrint(self.arena, "cell_{s}", .{n}),
+            .text = def.symbol orelse try std.fmt.allocPrint(self.arena, "cell_{s}", .{n}),
             .shape = .record,
             .name = n,
         };
     }
-    if (self.findEnum(n) != null) {
+    if (self.findEnum(n)) |def| {
         return .{
-            .text = try std.fmt.allocPrint(self.arena, "cell_{s}", .{n}),
+            .text = def.symbol orelse try std.fmt.allocPrint(self.arena, "cell_{s}", .{n}),
             .shape = .enumeration,
             .name = n,
         };
@@ -199,6 +199,12 @@ pub fn inferExpr(self: *Generator, e: *const ast.Expr) Alloc!CType {
         .string => return CType.str,
         .binary => |b| switch (b.op) {
             .eq, .ne, .lt, .le, .gt, .ge, .and_op, .or_op => return CType.boolean,
+            .bit_and, .bit_or, .bit_xor => {
+                const right = try self.inferExpr(b.right);
+                if (cg_helpers.integerLiteral(b.left) and cg_helpers.integerInfo(right) != null)
+                    return right;
+                return try self.inferExpr(b.left);
+            },
             else => {
                 const left = try self.inferExpr(b.left);
                 if (left.shape != .unknown) return left;
@@ -207,7 +213,7 @@ pub fn inferExpr(self: *Generator, e: *const ast.Expr) Alloc!CType {
         },
         .unary => |u| switch (u.op) {
             .not => return CType.boolean,
-            .neg => return try self.inferExpr(u.operand),
+            .neg, .bit_not => return try self.inferExpr(u.operand),
             .ref_shared => {
                 const inner = try self.inferExpr(u.operand);
                 if (inner.pointer or inner.shape.isPrimitive()) return inner;

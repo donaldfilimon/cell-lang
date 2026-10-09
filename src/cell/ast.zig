@@ -9,13 +9,15 @@ const Io = std.Io;
 /// rather than a bare union. The alternative was a side table keyed by node
 /// index, which is cheaper per node but requires an index-based arena AST;
 /// this tree is pointer-based, so a side table would need a stable key that
-/// does not exist. The wrapper costs 16 bytes per node and makes `node.span`
+/// does not exist. The wrapper carries source provenance and makes `node.span`
 /// available everywhere without threading a table through every function.
 pub const Span = struct {
     start: u32,
     end: u32,
     line: u32,
     column: u32,
+    path: ?[]const u8 = null,
+    source: ?[]const u8 = null,
 
     /// A span that points nowhere. Use only for synthesized nodes.
     pub const none: Span = .{ .start = 0, .end = 0, .line = 0, .column = 0 };
@@ -27,6 +29,8 @@ pub const Span = struct {
             .end = @max(a.end, b.end),
             .line = a.line,
             .column = a.column,
+            .path = a.path,
+            .source = a.source,
         };
     }
 };
@@ -54,8 +58,8 @@ pub const TypeExpr = union(enum) {
     unit,
 };
 
-pub const BinaryOp = enum { add, sub, mul, div, eq, ne, lt, le, gt, ge, and_op, or_op };
-pub const UnaryOp = enum { neg, not, ref_shared, ref_exclusive };
+pub const BinaryOp = enum { add, sub, mul, div, eq, ne, lt, le, gt, ge, and_op, or_op, bit_and, bit_or, bit_xor, shl, shr };
+pub const UnaryOp = enum { neg, not, bit_not, ref_shared, ref_exclusive };
 
 /// One `name: value` initializer inside a struct literal.
 pub const FieldInit = struct {
@@ -206,8 +210,13 @@ pub fn rootName(expr: *const Expr) ?[]const u8 {
     };
 }
 
+pub const Linkage = enum { external, internal };
+
 pub const FnDef = struct {
     name: []const u8,
+    /// Graph-wide symbol decisions; null retains standalone mangling.
+    symbol: ?[]const u8 = null,
+    linkage: ?Linkage = null,
     params: []Param,
     return_type: ?TypeExpr,
     body: ?[]Stmt,
@@ -222,6 +231,7 @@ pub const Param = struct {
 
 pub const StructDef = struct {
     name: []const u8,
+    symbol: ?[]const u8 = null,
     fields: []Field,
     is_public: bool,
 };
@@ -234,6 +244,7 @@ pub const Field = struct {
 
 pub const EnumDef = struct {
     name: []const u8,
+    symbol: ?[]const u8 = null,
     variants: [][]const u8,
     is_public: bool,
 };

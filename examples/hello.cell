@@ -7,7 +7,6 @@
 //   zig cc -std=c11 -Wall -Wextra -Werror -I runtime hello.c runtime/cell_rt.c
 // It prints 42.
 
-use std.io
 
 // `use` binds no names (SPEC 8.4), and the checker resolves identifiers, so
 // anything this file calls must be declared here. Declared bodyless: an

@@ -1,0 +1,6 @@
+// EXPECT: currently-rejected
+// Unicode escapes must encode scalar values; UTF-16 surrogate halves
+// cannot be encoded as UTF-8, even though they fit in 21 bits.
+pub fn invalid() {
+    let owned s: String = "\u{d800}"
+}

@@ -1,0 +1,4 @@
+// This interface's pub visibility survives the body's omitted pub keyword.
+pub fn extent() -> Int;
+// The same external ABI is declared by std.prelude too.
+pub fn print_int(copy value: Int);
