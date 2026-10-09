@@ -1,5 +1,41 @@
 # IR String step (c): a drop pass on HIR
 
+## Current implementation slice, 2026-10-09
+
+Grounded against the current HIR implementation, which already contains
+loop/jump cleanup, after-loop releases, branch cleanup and nested record
+field walks. The original observations below describe `ccfb331`, not today's
+compiler.
+
+This slice extends the existing `DropFacts` interface and runtime-call path:
+
+- Nested returns outside loops and owning String returns release confirmed
+  live String/scalar-list owners after evaluating the return into a scratch.
+  The returned owner is transferred, never freed. A return with no pending
+  release remains unchanged.
+- Direct block-local Strings release at fallthrough when borrow facts confirm
+  identity and liveness. Tail-reachable owners retain C's conservative skip.
+  Diverging blocks get no appended fallthrough cleanup.
+- Discarded fresh owned String calls land in nondroppable scratch slots and
+  are freed immediately through the slot address. Discarded places and other
+  expression shapes do not acquire a release.
+- Existing labelled loop cleanup is exercised by a fixture using both
+  `continue :outer` and `break :outer`, with a surviving owner read afterward.
+
+The C emitter and all existing leak constants are preserved. The fixtures
+`examples/ir_string_exits.cell`, `ir_string_discard.cell`, and
+`ir_string_labels.cell` add exact answers, zero-live-allocation assertions,
+and runtime-ASan checks for both IR backends to `tools/check.sh`.
+
+Remaining boundaries: general complex-function fallthrough, tail-reachable
+block owners, non-call discarded expressions, record cleanup at early returns
+and jumps, and general reassignment cleanup are not completed by this slice.
+The existing `owned_string` LLVM/MLIR pin remains 8. Runtime-ASan covers runtime
+allocation/free and runtime reads; it does not instrument every generated IR
+instruction.
+
+## Original design and measurements
+
 Status: direction approved by Donald 2026-09-17 ("pin the IR leak, then
 build": conversions, indexing, list literals, then a drop pass ported onto
 HIR). Step (a) has landed; step (b) is drafted separately. This document is

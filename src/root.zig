@@ -2128,3 +2128,152 @@ test "checked HIR scope-releases an unmoved nested scalar-list sibling" {
     try std.testing.expectEqual(@as(usize, 0), countNestedFieldFrees(f.body.?, "cell_slice_free", p_slot, 0, 0));
     try std.testing.expectEqual(@as(usize, 1), countNestedFieldFrees(f.body.?, "cell_slice_free", p_slot, 0, 1));
 }
+
+test "checked HIR String slice hoists a nested return before releasing its readers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn str_len(shared s: String) -> Int;
+        \\pub fn f(owned input: String, copy flag: Bool) -> Int {
+        \\    if flag {
+        \\        let owned local: String = "abc"
+        \\        return str_len(input) + str_len(local)
+        \\    }
+        \\    return 0
+        \\}
+    );
+    const branch = f.body.?[0].kind.expr.kind.if_expr.then_body.kind.block;
+    try std.testing.expect(branch.tail == null);
+    try std.testing.expectEqual(@as(usize, 5), branch.stmts.len);
+    const local = branch.stmts[0].kind.let.slot;
+    const scratch = branch.stmts[1].kind.let.slot;
+    try std.testing.expect(!f.bindings[scratch].droppable);
+    try std.testing.expect(stmtFreesSlot(branch.stmts[2], "cell_string_free", local));
+    try std.testing.expect(stmtFreesSlot(branch.stmts[3], "cell_string_free", 0));
+    try std.testing.expectEqual(scratch, branch.stmts[4].kind.ret.?.kind.ref);
+}
+
+test "checked HIR String slice transfers the returned owner and frees the sibling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn f(owned input: String) -> String {
+        \\    let owned other: String = "other"
+        \\    return input
+        \\}
+    );
+    const body = f.body.?;
+    try std.testing.expectEqual(@as(usize, 4), body.len);
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(body, "cell_string_free", 0));
+    try std.testing.expect(stmtFreesSlot(body[2], "cell_string_free", body[0].kind.let.slot));
+    try std.testing.expectEqual(body[1].kind.let.slot, body[3].kind.ret.?.kind.ref);
+}
+
+test "checked HIR String slice releases branch locals after computing an unrelated tail" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn f(copy flag: Bool) -> Int {
+        \\    return if flag { let owned s: String = "abc" 7 } else { 8 }
+        \\}
+    );
+    const branch = f.body.?[0].kind.let.value.?.kind.if_expr.then_body.kind.block;
+    try std.testing.expectEqual(@as(usize, 3), branch.stmts.len);
+    try std.testing.expect(stmtFreesSlot(branch.stmts[2], "cell_string_free", branch.stmts[0].kind.let.slot));
+    try std.testing.expectEqual(branch.stmts[1].kind.let.slot, branch.tail.?.kind.ref);
+}
+
+test "checked HIR String slice preserves a tail reachable owner and moved aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn str_len(shared s: String) -> Int;
+        \\pub fn f() -> Int {
+        \\    return { let owned s: String = "abc" str_len(s) }
+        \\}
+    );
+    const branch = f.body.?[0].kind.let.value.?.kind.block;
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(branch.stmts, "cell_string_free", branch.stmts[0].kind.let.slot));
+}
+
+test "checked HIR String slice releases fresh discarded calls but never discarded places" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn make() -> String;
+        \\pub fn f(owned input: String) {
+        \\    make()
+        \\    input
+        \\}
+    );
+    const body = f.body.?;
+    try std.testing.expectEqual(@as(usize, 3), body.len);
+    const scratch = body[0].kind.let.slot;
+    try std.testing.expect(!f.bindings[scratch].droppable);
+    try std.testing.expect(f.bindings[scratch].bc_id == null);
+    try std.testing.expect(stmtFreesSlot(body[1], "cell_string_free", scratch));
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(body, "cell_string_free", 0));
+}
+
+test "checked HIR String slice releases both labelled break scopes in reverse order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = try checkedLoopBody(arena.allocator(),
+        \\pub fn f() {
+        \\    outer: loop {
+        \\        let owned a: String = "a"
+        \\        loop {
+        \\            let owned b: String = "b"
+        \\            break :outer
+        \\        }
+        \\    }
+        \\}
+    );
+    const inner = body[1].kind.while_loop.body;
+    try std.testing.expectEqual(@as(usize, 4), inner.len);
+    try std.testing.expect(stmtFreesSlot(inner[1], "cell_string_free", inner[0].kind.let.slot));
+    try std.testing.expect(stmtFreesSlot(inner[2], "cell_string_free", body[0].kind.let.slot));
+    try std.testing.expectEqual(@as(u32, 1), inner[3].kind.brk.depth);
+}
+
+test "checked HIR String slice keeps owners referenced by a tail match guard" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn str_len(shared s: String) -> Int;
+        \\pub fn f() -> Int {
+        \\    return {
+        \\        let owned s: String = "abc"
+        \\        match 1 { _ if str_len(s) > 0 => 7, _ => 8 }
+        \\    }
+        \\}
+    );
+    const block = f.body.?[0].kind.let.value.?.kind.block;
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(block.stmts, "cell_string_free", block.stmts[0].kind.let.slot));
+}
+
+test "checked HIR String slice leaves unchecked discarded calls unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var module = try compile(a, "pub fn make() -> String; pub fn f() { make() }", "t.cell");
+    var bag: diag.Bag = .init("t.cell", "");
+    const lowered = try hir.lower(a, &module, &bag);
+    try std.testing.expect(!bag.hasErrors());
+    const body = lowered.findFn("f").?.body.?;
+    try std.testing.expectEqual(@as(usize, 1), body.len);
+    try std.testing.expectEqualStrings("cell_make", body[0].kind.expr.kind.call.symbol.?);
+    try std.testing.expect(lowered.findFn("$rt.string_free") == null);
+}
+
+test "checked HIR String slice preserves an owning block tail transfer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try checkedFn(arena.allocator(),
+        \\pub fn f() -> String {
+        \\    return { let owned s: String = "abc" s }
+        \\}
+    );
+    const block = f.body.?[0].kind.ret.?.kind.block;
+    try std.testing.expectEqual(@as(usize, 0), countTopLevelFrees(block.stmts, "cell_string_free", block.stmts[0].kind.let.slot));
+}

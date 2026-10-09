@@ -1,0 +1,17 @@
+// Fresh discarded String calls have scratch owners; places remain borrowed.
+// EXPECT-OUTPUT: 1000
+pub fn print_int(copy value: Int);
+pub fn str_from_int(copy value: Int) -> String;
+pub fn make() -> String { return "discard" }
+pub fn once(copy i: Int) {
+    str_from_int(i)
+    make()
+}
+pub fn main() {
+    var i = 0
+    while i < 1000 {
+        once(i)
+        i = i + 1
+    }
+    print_int(i)
+}

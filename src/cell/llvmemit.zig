@@ -23,10 +23,10 @@
 //!      String step (a) the view-to-owning conversion CALLS the first: hir.lower
 //!      inserts the call (and its declaration, through `hir.runtime_callees`),
 //!      and this backend lowers it like any other bodyless callee. A first
-//!      shared HIR cleanup slice frees simple fall-through Strings, but
-//!      return, branch, loop and temporary cleanup remain absent;
-//!      `examples/leaks/ir_owned_string.cell` and `ir_string_conversion.cell`
-//!      pin that leak in gate stage 7.
+//!      shared HIR cleanup frees checked String owners at supported scope,
+//!      branch, loop and return exits, and fresh discarded call results.
+//!      Complex function fallthrough and tail-reachable block owners retain
+//!      their existing leak pins; cleanup is not yet complete.
 //!
 //! So this slice crosses the C boundary only through SCALAR-ABI symbols:
 //! `cell_print_int(int64_t)`, `cell_assert(bool)`, `cell_panic(cell_str_t)`,

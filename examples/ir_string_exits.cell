@@ -1,0 +1,32 @@
+// Checked String cleanup on nested returns, return transfers, and block ends.
+// EXPECT-OUTPUT: 8000
+pub fn print_int(copy value: Int);
+pub fn str_len(shared s: String) -> Int;
+pub fn choose(owned input: String, copy flag: Bool) -> String {
+    let owned other: String = "unused"
+    if flag {
+        let owned nested: String = "nested"
+        return input
+    }
+    return input
+}
+pub fn score(copy flag: Bool) -> Int {
+    let owned result: String = choose("abc", flag)
+    if flag {
+        let owned nested: String = "defgh"
+        return str_len(result) + str_len(nested)
+    }
+    return str_len(result) + 5
+}
+pub fn block_score() -> Int {
+    return if true { let owned unused: String = "block" 0 } else { 1 }
+}
+pub fn main() {
+    var i = 0
+    var total = 0
+    while i < 1000 {
+        total = total + score(i < 500) + block_score()
+        i = i + 1
+    }
+    print_int(total)
+}

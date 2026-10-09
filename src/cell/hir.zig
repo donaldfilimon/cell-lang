@@ -1100,11 +1100,12 @@ const Lowerer = struct {
     /// Lower a statement list. A `break` or `continue` is preceded by the
     /// releases for the loop bodies it leaves (`appendLoopExitDrops`). A
     /// `return` inside a loop is preceded by the releases for every owner
-    /// still live at that return (`appendReturnInLoopDrops`), after the
+    /// still live at that return (`appendReturnDrops`), after the
     /// returned value has been bound. A `while` carries the releases for
     /// owners declared before it on `while_loop.after`
-    /// (`collectAfterLoopDrops`). Outside a loop a `return` is unchanged
-    /// here; the function-end slice owns that case.
+    /// (`collectAfterLoopDrops`). Nested returns and owning String returns
+    /// use the same checked return path. Straight-line scalar returns remain
+    /// on the existing function-end path, including its replacement cleanup.
     fn lowerStmts(self: *Lowerer, stmts: []const ast.Stmt) LowerError![]Stmt {
         var out: std.ArrayList(Stmt) = try .initCapacity(self.arena, stmts.len);
         // By address: the borrow checker keys a jump's exit record by the
@@ -1114,8 +1115,8 @@ const Lowerer = struct {
             switch (lowered.kind) {
                 .brk => |j| try self.appendLoopExitDrops(&out, .jump, @intFromPtr(s), j.depth),
                 .cont => |n| try self.appendLoopExitDrops(&out, .jump, @intFromPtr(s), n),
-                .ret => if (self.loop_scope_starts.items.len != 0) {
-                    try self.appendReturnInLoopDrops(&out, lowered, @intFromPtr(s));
+                .ret => if (self.loop_scope_starts.items.len != 0 or self.depth > 1 or self.ret_ty.tag() == .string) {
+                    try self.appendReturnDrops(&out, lowered, @intFromPtr(s));
                     continue;
                 },
                 .while_loop => {
@@ -1123,6 +1124,21 @@ const Lowerer = struct {
                     loop_stmt.kind.while_loop.after = try self.collectAfterLoopDrops(@intFromPtr(s), stmts[index + 1 ..]);
                     try out.append(self.arena, loop_stmt);
                     continue;
+                },
+                .expr => |value| {
+                    // Only a fresh owned call result has no other owner.
+                    // Reading a place for effect must never release it.
+                    if (self.facts != null and !self.identity_failed and value.ty.tag() == .string and
+                        value.own == .owned and value.kind == .call)
+                    {
+                        const scratch = try self.branchScratch(&value);
+                        try out.append(self.arena, .{ .span = s.span, .kind = .{ .let = .{ .slot = scratch, .value = value } } });
+                        const place: Expr = .{ .ty = value.ty, .span = value.span, .own = .owned, .kind = .{ .ref = scratch } };
+                        const call = try self.runtimeCall(.string_free, s.span, &.{place});
+                        try out.append(self.arena, .{ .span = s.span, .kind = .{ .expr = call } });
+                        self.drop_inserted = true;
+                        continue;
+                    }
                 },
                 else => {},
             }
@@ -1162,14 +1178,14 @@ const Lowerer = struct {
         }
     }
 
-    /// Release owners a `return` inside a loop still holds. The value is
+    /// Release owners a checked `return` still holds. The value is
     /// bound first: it may read a local this return is about to free.
     /// Admission is liveness at this return, not the loop-exit `!wasMoved`
     /// rule, so a revived owner is released and an owner still dead between
     /// the move and the revival is not. A missing record keeps the leak.
     /// String and scalar lists only. The returned owner itself is dead at
     /// this exit and is not released. Records, fields, and `arc` stay out.
-    fn appendReturnInLoopDrops(self: *Lowerer, out: *std.ArrayList(Stmt), ret: Stmt, key: usize) LowerError!void {
+    fn appendReturnDrops(self: *Lowerer, out: *std.ArrayList(Stmt), ret: Stmt, key: usize) LowerError!void {
         const facts = self.facts orelse {
             try out.append(self.arena, ret);
             return;
@@ -1178,20 +1194,7 @@ const Lowerer = struct {
             try out.append(self.arena, ret);
             return;
         }
-        var returning = ret;
-        if (ret.kind.ret) |value| {
-            const scratch = try self.branchScratch(&value);
-            try out.append(self.arena, .{ .span = value.span, .kind = .{ .let = .{ .slot = scratch, .value = value } } });
-            returning = .{
-                .span = ret.span,
-                .kind = .{ .ret = .{
-                    .ty = value.ty,
-                    .span = value.span,
-                    .own = value.own,
-                    .kind = .{ .ref = scratch },
-                } },
-            };
-        }
+        var drops: std.ArrayList(Stmt) = .empty;
         var i = self.scope.items.len;
         while (i > 0) {
             i -= 1;
@@ -1209,9 +1212,28 @@ const Lowerer = struct {
             if (!facts.liveAtExit(.return_stmt, key, id)) continue;
             const place: Expr = .{ .ty = binding.ty, .span = .none, .own = .owned, .kind = .{ .ref = binding.slot } };
             const call = try self.runtimeCall(release, .none, &.{place});
-            try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
+            try drops.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
             self.drop_inserted = true;
         }
+        if (drops.items.len == 0) {
+            try out.append(self.arena, ret);
+            return;
+        }
+        var returning = ret;
+        if (ret.kind.ret) |value| {
+            const scratch = try self.branchScratch(&value);
+            try out.append(self.arena, .{ .span = value.span, .kind = .{ .let = .{ .slot = scratch, .value = value } } });
+            returning = .{
+                .span = ret.span,
+                .kind = .{ .ret = .{
+                    .ty = value.ty,
+                    .span = value.span,
+                    .own = value.own,
+                    .kind = .{ .ref = scratch },
+                } },
+            };
+        }
+        try out.appendSlice(self.arena, drops.items);
         try out.append(self.arena, returning);
     }
 
@@ -1324,6 +1346,7 @@ const Lowerer = struct {
             .match_expr => |m| blk: {
                 if (astExprUses(m.scrutinee, name)) break :blk true;
                 for (m.arms) |arm| {
+                    if (arm.guard) |guard| if (astExprUses(guard, name)) break :blk true;
                     if (astExprUses(arm.body, name)) break :blk true;
                 }
                 break :blk false;
@@ -1520,6 +1543,28 @@ const Lowerer = struct {
             const id = binding.bc_id orelse continue;
             if (facts.wasWhollyMoved(id)) continue;
             try self.appendScopeEndFieldDrops(out, binding, id, struct_name, exit_kind, key);
+        }
+    }
+
+    /// Direct block-local Strings at a fallthrough exit. The value has already
+    /// been hoisted, but a borrowed view can still point into its owner. Keep
+    /// C's conservative tail-use skip instead of freeing behind that view.
+    fn appendBlockStringDrops(self: *Lowerer, out: *std.ArrayList(Stmt), slots: []const u32, source: []const ast.Stmt, key: usize) LowerError!void {
+        const facts = self.facts orelse return;
+        if (self.identity_failed or source.len == 0) return;
+        var i = slots.len;
+        while (i > 0) {
+            i -= 1;
+            const binding = self.bindings.items[slots[i]];
+            if (!binding.droppable or binding.ownership != .owned or binding.ty.tag() != .string) continue;
+            const id = binding.bc_id orelse continue;
+            if (facts.wasMoved(id) or !facts.liveAtExit(.block_end, key, id)) continue;
+            const last = &source[source.len - 1];
+            if (last.kind == .expr and astExprUses(&last.kind.expr, binding.name)) continue;
+            const place: Expr = .{ .ty = binding.ty, .span = .none, .own = .owned, .kind = .{ .ref = binding.slot } };
+            const call = try self.runtimeCall(.string_free, .none, &.{place});
+            try out.append(self.arena, .{ .span = .none, .kind = .{ .expr = call } });
+            self.drop_inserted = true;
         }
     }
 
@@ -2070,7 +2115,10 @@ const Lowerer = struct {
                         .kind = .{ .ref = scratch },
                     });
                 }
-                try self.appendNestedRecordDrops(&out, slots, .block_end, exit_key);
+                if (!astBranchDiverges(e)) {
+                    try self.appendBlockStringDrops(&out, slots, stmts, exit_key);
+                    try self.appendNestedRecordDrops(&out, slots, .block_end, exit_key);
+                }
                 return .{
                     .ty = if (tail) |t| t.ty else types.t_unit,
                     .span = e.span,

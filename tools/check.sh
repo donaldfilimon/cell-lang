@@ -1100,6 +1100,17 @@ run_c_host ir_list_order 246 examples/ir_list_order_host.c
 run_llvm ir_list_order 246 examples/ir_list_order_host.c
 run_mlir ir_list_order 246 examples/ir_list_order_host.c
 
+# String drop slice: answers across all backends before the leak assertions.
+run_c ir_string_exits 8000
+run_llvm ir_string_exits 8000
+run_mlir ir_string_exits 8000
+run_c ir_string_discard 1000
+run_llvm ir_string_discard 1000
+run_mlir ir_string_discard 1000
+run_c ir_string_labels 4000
+run_llvm ir_string_labels 4000
+run_mlir ir_string_labels 4000
+
 # -------------------------------------------------------------- 7. leaks --
 # THESE FIXTURES ASSERT LEAKS THAT CURRENTLY EXIST. Read this script's header
 # comment (stage 7) before touching anything below: a fixture failing because
@@ -1280,6 +1291,12 @@ else
         fi
     }
 
+    # New String witnesses; existing disclosed-leak constants are unchanged.
+    for string_slice in ir_string_exits ir_string_discard ir_string_labels; do
+        run_c_leaks "$string_slice" "" 0 "String exit slice, 2026-10-09" "examples/$string_slice.cell"
+        run_ir_leaks "$string_slice" llvm 0 "String exit slice, 2026-10-09" "examples/$string_slice.cell"
+        run_ir_leaks "$string_slice" mlir 0 "String exit slice, 2026-10-09" "examples/$string_slice.cell"
+    done
     run_c_leaks ir_owned_string "" "$LEAK_IR_OWNED_STRING_C" "three direct String owners and a call replacement, 2026-09-24"
     run_ir_leaks ir_owned_string llvm "$LEAK_IR_OWNED_STRING_LLVM" "call replacement and terminal scalar-return cleanup, 2026-09-24"
     run_ir_leaks ir_owned_string mlir "$LEAK_IR_OWNED_STRING_MLIR" "call replacement and terminal scalar-return cleanup, 2026-09-24"
@@ -1647,10 +1664,12 @@ else
     # the runtime allocator and release called by that IR are. This catches
     # a duplicate/wrong release but is not whole-program IR instrumentation.
     if cc -fsanitize=address -g -c runtime/cell_rt.c -o "$TMP/san_drop_rt.o" 2>/dev/null; then
-      for drop_src in examples/leaks/ir_fallthrough_string.cell examples/leaks/ir_reassign_string.cell examples/leaks/ir_fallthrough_list.cell examples/leaks/ir_list_literal.cell examples/leaks/ir_string_conversion.cell examples/leaks/ir_owned_string.cell examples/leaks/ir_return_in_loop.cell examples/leaks/ir_after_loop.cell examples/leaks/ir_skip_revival.cell examples/leaks/ir_unmoved_while.cell examples/leaks/ir_branch_field.cell examples/leaks/ir_nested_field.cell examples/leaks/ir_block_record.cell examples/leaks/ir_param_record.cell examples/leaks/ir_branch_nested.cell; do
+      for drop_src in examples/ir_string_exits.cell examples/ir_string_discard.cell examples/ir_string_labels.cell examples/leaks/ir_fallthrough_string.cell examples/leaks/ir_reassign_string.cell examples/leaks/ir_fallthrough_list.cell examples/leaks/ir_list_literal.cell examples/leaks/ir_string_conversion.cell examples/leaks/ir_owned_string.cell examples/leaks/ir_return_in_loop.cell examples/leaks/ir_after_loop.cell examples/leaks/ir_skip_revival.cell examples/leaks/ir_unmoved_while.cell examples/leaks/ir_branch_field.cell examples/leaks/ir_nested_field.cell examples/leaks/ir_block_record.cell examples/leaks/ir_param_record.cell examples/leaks/ir_branch_nested.cell; do
         drop_name=$(basename "$drop_src" .cell)
         drop_expected=1000
         case "$drop_name" in
+            ir_string_exits) drop_expected=8000 ;;
+            ir_string_labels) drop_expected=4000 ;;
             ir_list_literal) drop_expected=500500 ;;
             ir_string_conversion) drop_expected=44000 ;;
             ir_owned_string) drop_expected=4890 ;;

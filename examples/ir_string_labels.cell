@@ -1,0 +1,28 @@
+// Both labelled jumps release inner and outer body owners, never the lender
+// declared before the target loop. The String is read after every jump.
+// EXPECT-OUTPUT: 4000
+pub fn print_int(copy value: Int);
+pub fn str_len(shared s: String) -> Int;
+pub fn once() -> Int {
+    let owned survivor: String = "keep"
+    var i = 0
+    outer: loop {
+        let owned a: String = "outer"
+        i = i + 1
+        loop {
+            let owned b: String = "inner"
+            if i < 2 { continue :outer }
+            break :outer
+        }
+    }
+    return str_len(survivor)
+}
+pub fn main() {
+    var i = 0
+    var total = 0
+    while i < 1000 {
+        total = total + once()
+        i = i + 1
+    }
+    print_int(total)
+}
