@@ -8,7 +8,7 @@ This is the canonical checkout. **CORRECTED 2026-09-07: it HAS a remote**, `http
 
 ## Toolchain and gates
 
-Targets Zig **master, pinned** by `build.zig.zon` `.minimum_zig_version` (`0.18.0-dev.120+9fe22a29b` as of 2026-09-28; bump the pin as the toolchain moves).
+Targets Zig **master, pinned** by `build.zig.zon` `.minimum_zig_version` (`0.18.0-dev.120+9fe22a29b` as of 2026-10-08; bump the pin as the toolchain moves).
 
 ```sh
 zig version
