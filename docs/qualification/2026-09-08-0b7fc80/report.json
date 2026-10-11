@@ -167,7 +167,7 @@
     "clang": "Apple clang version 21.0.0 (clang-2100.3.33.1)",
     "llvm": "Homebrew LLVM version 23.1.0",
     "python": "3.14.7",
-    "zig": "0.17.0-dev.2018+ab30a0b9a"
+    "zig": "0.18.0-dev.120+9fe22a29b"
   },
   "verdict": "disclosed"
 }

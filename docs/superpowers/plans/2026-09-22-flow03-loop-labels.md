@@ -6,7 +6,7 @@
 
 **Architecture:** The parser turns `loop` into the `while_stmt` a `while true` would build, so no later stage has a `loop` case. Labels are carried on the AST (`while_stmt.label`, `ast.Jump.label`), checked by typecheck (unknown and repeated labels refused), and resolved exactly once in `hir.lower` to a depth (`brk: u32`, `cont: u32`, loops left beyond the innermost) that `cfg`, `liveness`, `llvmemit` and `mlirmit` index into their own loop stacks. borrowck and the C emitter walk the AST, so each resolves the label against its own loop stack and acts on the TARGET loop only: borrowck saves `break` state into and asks R2.a of the target frame; C releases every local since the target loop's mark and jumps with `goto` to a label placed at the target.
 
-**Tech Stack:** Zig master `0.17.0-dev.2251+1175a3e99` (the repo's pin), the Cell compiler in `src/cell/`, C runtime in `runtime/`, Homebrew LLVM/MLIR (`mlir-opt`, `mlir-translate`, `llc`), the gate `tools/check.sh`.
+**Tech Stack:** Zig master `0.18.0-dev.120+9fe22a29b` (the repo's pin), the Cell compiler in `src/cell/`, C runtime in `runtime/`, Homebrew LLVM/MLIR (`mlir-opt`, `mlir-translate`, `llc`), the gate `tools/check.sh`.
 
 **Spec:** `docs/superpowers/specs/2026-09-21-mod02-flow03-ir-first-design.md` (drafted as `~/Archive/2026-09-21-goal-ledger-rework/drafts/2026-09-21-mod02-flow03-ir-first-design.md`; approved by Donald 2026-09-22). This plan covers FLOW-03 only: the Rulings' D-F1 and D-F2, the "Labels (D-F1, D-F2)" architecture section, invariants 13 to 16, the label rows of "Error handling", and slices 1 and 2 of "Slices, in order". MOD-02 (D1 to D6) has its own plan, `docs/superpowers/plans/2026-09-22-mod02-modules-ir-first.md`.
 

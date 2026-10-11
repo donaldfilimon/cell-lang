@@ -523,7 +523,7 @@ Replace the `.result` arm of `layoutOf` and its comment with:
             .{ .size = 24, .alignment = 8 },
 ```
 
-In Zig 0.17-dev, `if (ok) |o| if (...) return null;` inside a function body may need braces. Write it as `if (ok) |o| { if (o.size > chosen.size) return null; }` if the compiler asks.
+In Zig 0.18-dev, `if (ok) |o| if (...) return null;` inside a function body may need braces. Write it as `if (ok) |o| { if (o.size > chosen.size) return null; }` if the compiler asks.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 

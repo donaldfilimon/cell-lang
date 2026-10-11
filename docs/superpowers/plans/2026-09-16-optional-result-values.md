@@ -6,7 +6,7 @@
 
 **Architecture:** Four new keywords lex; the parser produces one new expression kind (`wrap`) and one new pattern kind (`wrap_pattern`); the type checker types constructors and patterns against the existing `optional`/`result` types; borrowck treats payloads as `copy` reads; the C backend lowers onto the runtime's existing `cell_opt_*` and `cell_ok_*` helpers plus one new `cell_err`; the HIR (LLVM and MLIR) refuses with `cannot lower`.
 
-**Tech Stack:** Zig master (`~/.zvm/bin/zig`, `0.17.0-dev.2131+d08989840`), C11 runtime compiled by `cc` at `-Wall -Wextra -Werror`, `tools/check.sh` as the gate.
+**Tech Stack:** Zig master (`~/.zvm/bin/zig`, `0.18.0-dev.120+9fe22a29b`), C11 runtime compiled by `cc` at `-Wall -Wextra -Werror`, `tools/check.sh` as the gate.
 
 **Spec:** `docs/superpowers/specs/2026-09-16-optional-result-and-prelude-design.md`, section B.
 

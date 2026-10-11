@@ -6,7 +6,7 @@
 
 **Architecture:** A pure function of `(module, type, ownership)` returning a `Class`. It imports `hir.zig` and `types.zig` and nothing else, so it is testable standalone and neither backend can smuggle target knowledge past it. Correctness is enforced by a test that compiles a C probe with clang and asserts the classifier predicted clang's exact signature.
 
-**Tech Stack:** Zig master (`0.17.0-dev.2018+ab30a0b9a` via zvm), Apple clang 21.0.0, target `arm64-apple-darwin27.0.0`.
+**Tech Stack:** Zig master (`0.18.0-dev.120+9fe22a29b` via zvm), Apple clang 21.0.0, target `arm64-apple-darwin27.0.0`.
 
 **Spec:** `docs/superpowers/specs/2026-09-07-aggregate-abi-design.md`
 
